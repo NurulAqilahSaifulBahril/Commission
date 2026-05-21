@@ -1,0 +1,5 @@
+Paste your pg-proxy Bearer token on the next line, then save as:
+  pg_proxy_token.txt
+(same token Basic Commission uses — do not commit the real file to git)
+
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.example...

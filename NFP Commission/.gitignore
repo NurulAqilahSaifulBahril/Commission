@@ -1,0 +1,13 @@
+# Secrets
+4. data/pg_proxy_token.txt
+4. data/.pg_proxy_token
+
+# Python
+__pycache__/
+5. _py_cache/
+*.pyc
+
+# Generated reports (re-run nfp_commission.py)
+4. data/reports/
+4. data/nfp_commission_report.*
+1. Excel/nfp_commission_report.csv

@@ -1,0 +1,6 @@
+agent_monthly_commission: 0 rows, 11 columns -> c:\Users\User\Desktop\Basic Commission\commission_table_exports\agent_monthly_commission_20260515_010913UTC.csv
+agent_monthly_perf: 604 rows, 14 columns -> c:\Users\User\Desktop\Basic Commission\commission_table_exports\agent_monthly_perf_20260515_010913UTC.csv
+commission_adjustment: 0 rows, 14 columns -> c:\Users\User\Desktop\Basic Commission\commission_table_exports\commission_adjustment_20260515_010913UTC.csv
+commission_adjustment_v2: 0 rows, 8 columns -> c:\Users\User\Desktop\Basic Commission\commission_table_exports\commission_adjustment_v2_20260515_010913UTC.csv
+generated_commission_report: 4 rows, 14 columns -> c:\Users\User\Desktop\Basic Commission\commission_table_exports\generated_commission_report_20260515_010913UTC.csv
+saving_report: 0 rows, 16 columns -> c:\Users\User\Desktop\Basic Commission\commission_table_exports\saving_report_20260515_010913UTC.csv

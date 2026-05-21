@@ -1,0 +1,16 @@
+# Secrets — never commit tokens
+.env
+**/.env
+**/pg_proxy_token.txt
+**/.pg_proxy_token
+
+# Python
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/5. _py_cache/
+
+# Generated reports (re-run scripts to recreate)
+**/output/
+**/4. data/reports/
+**/4. data/nfp_commission_report.*

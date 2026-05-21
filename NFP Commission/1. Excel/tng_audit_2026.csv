@@ -1,0 +1,46 @@
+﻿invoice_number,customer_name,agent_name,tng_rebate,tng_evidence,net_floor_price,nfp_source
+1008294,LAI LI KUN (ATAP),Chee Kai Kian,No,,,missing_panel_qty_or_rating
+1006684,HOW LOCKSMITH (ATAP),CHING ZHE HANG,Yes,TNG Cash Option,,before_oct_2025_no_nfp
+1008113,ALL BEST STEEL CONSTRUCTION SDN. BHD. (ATAP),JOSHUA YAP JIA HAO,No,,,missing_panel_qty_or_rating
+1006065,CHOW WA (ATAP),MARTIN HING,No,,,before_oct_2025_no_nfp
+1007637,W & T ABS EDGING (SELCO-Commercial),MARTIN HING,No,,,missing_panel_qty_or_rating
+1007849,FAISAL BIN MOHD NOR (ATAP),MARTIN HING,No,,,unknown_panel_rating
+1007905,GE MARRIE (ATAP),MARTIN HING,No,,,missing_panel_qty_or_rating
+1008161,HA LIGHTING WHOLESALE  SDN BHD (ATAP-Commercial),MARTIN HING,No,,,missing_panel_qty_or_rating
+1008543,MARY WONG (ATAP),MARTIN HING,Yes,"Road Show Day (30/01/2026) Swap TNG RM300 to rebate for solar package between RM30,000-RM39,999.",,missing_panel_qty_or_rating
+INV-1008389,CHAN CHENG FATT (ATAP),MARTIN HING,No,,33043.34,FEB 2026
+INV-1008395,Sharazali Bin Saban (ATAP),MARTIN HING,No,,20135.75,FEB 2026
+INV-1008632,LIM KUI WEN (ATAP),MARTIN HING,Yes,"Road Show Day (23/03/2026) Swap TNG RM300 to rebate for solar package between RM30,000-RM39,999.",27269.0,MAC 2026_with_tng
+1007063,SIM WEI LING (ATAP),Ng Zhan Yi,Yes,TNG Cash Option,,before_oct_2025_no_nfp
+1008310,NG CHEE HONG,Ng Zhan Yi,No,,,missing_panel_qty_or_rating
+1006404,"WOO SIAU YUN, 18 JLN HIJAU (ATAP)",Sunny Tan,Yes,Swap TnG 200 to rebate,,before_oct_2025_no_nfp
+1007070,CHIN YONG WEE (SELCO - ATAP),Sunny Tan,No,,,before_oct_2025_no_nfp
+1007550,GOH LEE WEE (ATAP),Sunny Tan,No,,,before_oct_2025_no_nfp
+1008159,TAM DI YANG (ATAP),Sunny Tan,No,,,missing_panel_qty_or_rating
+INV-1008337,CHAI YONG BING (ATAP),Sunny Tan,No,,33043.34,FEB 2026
+INV-1008598,CHAN YOU KIANG (ATAP),Sunny Tan,No,,26027.7,MAC 2026
+INV-1008693,WONG YUNG MING (ATAP),Sunny Tan,No,,19535.6,MAC 2026
+1005425,LOW LEONG MENG,TAN JIA HAO,No,,,before_oct_2025_no_nfp
+1008118,HO LEE KIAN (ATAP),TAN JIA HAO,No,,,missing_panel_qty_or_rating
+1008540,Lee Zhan Hong (ATAP),TAN JIA HAO,No,,,missing_panel_qty_or_rating
+INV-1008377,BONG KUET TSIN (ATAP),TAN JIA HAO,No,,20135.75,FEB 2026
+1006425,Chu Seng Kong (Atap),Teng Kah Kent,No,,,before_oct_2025_no_nfp
+1007157,Tay Chee Siong (Atap),Teng Kah Kent,Yes,TNG Cash Option,,before_oct_2025_no_nfp
+1007532,Mohammad Nazri Bin Mansor (Atap),Teng Kah Kent,No,,,before_oct_2025_no_nfp
+1007809,Yeo Soh Hoon (Atap),Teng Kah Kent,No,,,missing_panel_qty_or_rating
+1008391,Yuki Teng Hui Xin (Atap),Teng Kah Kent,No,,,650w_no_row_FEB 2026_1_panels
+1008435,Cheong Hong Wee (Atap),Teng Kah Kent,No,,,missing_panel_qty_or_rating
+INV-1008468,Lee Kim Hoi @ Lee Kim Hai (ATAP),Teng Kah Kent,No,,36824.8,MAC 2026
+INV-1008656,Tang Kam Keong (ATAP),Teng Kah Kent,No,,18488.7,MAC 2026
+1007889,DOREEN CHEE (ATAP),Vincent Tan,No,,,missing_panel_qty_or_rating
+1007986,TAN SHAU LEE (ATAP),Vincent Tan,No,,,missing_panel_qty_or_rating
+1007987,TAN SHAU CHUAN (ATAP),Vincent Tan,No,,,missing_panel_qty_or_rating
+1007990,Tan Shau Chuan  (NO 10 SHOP-LOT) ATAP,Vincent Tan,No,,,missing_panel_qty_or_rating
+1007993,"Tan shau chuan (NO 8,SHOP-LOT) ATAP",Vincent Tan,No,,,missing_panel_qty_or_rating
+1008475,Liew Pui Yee (ATAP),Vincent Tan,No,,,650w_no_row_FEB 2026_450_panels
+1008548,Chong Shek Har (ATAP),Vincent Tan,No,,,missing_panel_qty_or_rating
+INV-1008554,SOU POI MEW (ATAP),Vincent Tan,No,,32113.1,MAC 2026
+1006426,NUR AYU BINTI MD YUSOF (ATAP),ZUL,Yes,TNG Cash Option,,before_oct_2025_no_nfp
+1007845,TUAH BIN IBRAHIM (ATAP),ZUL,No,,,missing_panel_qty_or_rating
+1008296,MOHD AZAM BIN MOHAMAD (ATAP) SEJAPAC SB,ZUL,No,,,missing_panel_qty_or_rating
+1008297,MOHAMAD ZULHAFIZ BIN MOHD AZAM (ATAP),ZUL,No,,,missing_panel_qty_or_rating
