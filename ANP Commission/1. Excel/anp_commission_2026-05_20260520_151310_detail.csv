@@ -1,0 +1,7 @@
+﻿payout_period,agent_name,agent_type,customer_name,invoice_number,invoice_date,first_payment_date,invoice_total_amount,epp_internal,sales_price,accumulated_sales_price,anp_commission_line,anp_commission_accumulated_tier
+inv-2026-05_pay-2026-06,TAN JIA HAO,internal,"ZHANG, HE-JIE (ATAP)",INV-1009619,2026-05-12,2026-05-12,59000.00,0.00,59000.00,59000.00,0.00,0.00
+inv-2026-05_pay-2026-06,Sunny Tan,internal,AMOS CHONG,INV-1009622,2026-05-12,2026-05-11,12000.00,0.00,12000.00,12000.00,0.00,0.00
+inv-2026-05_pay-2026-06,Vincent Tan,internal,Soh swee yu,INV-1009481,2026-05-01,2026-04-28,36500.00,0.00,36500.00,36500.00,0.00,0.00
+inv-2026-05_pay-2026-06,CHING ZHE HANG,internal,NGC SANCTUARY SDN BHD,INV-1009485,2026-05-01,2026-04-30,43000.00,0.00,43000.00,43000.00,0.00,0.00
+inv-2026-05_pay-2026-06,CHING ZHE HANG,internal,AH CHING ALIGNMENT AUTO,INV-1009486,2026-05-01,2026-04-30,27000.00,0.00,27000.00,70000.00,0.00,500.00
+inv-2026-05_pay-2026-06,ZUL,internal,MOHD FAIZAL BIN RAMLI (ATAP),INV-1009507,2026-05-04,2026-05-04,26700.00,0.00,26700.00,26700.00,0.00,0.00
