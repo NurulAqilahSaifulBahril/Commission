@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """
-ANP commission report for internal full-time agents.
+ANP commission report for internal and full-time agents.
 
 Data source: prod_main via Postgres SQL proxy API.
 
-Amount per invoice: invoice total_amount (EPP not applied).
+Total amount (tier basis):
+    invoice total_amount (same as invoice_total_amount in app).
+
+Sales price (informational):
+    total_amount - epp_internal
+
+epp_internal:
+    total_amount * (effective_epp / 100) when effective_epp > 0, else 0.
 
 Eligibility:
-    - Agent agent_type = 'internal' (see --agent-types)
+    - Agent agent_type in --agent-types (default: internal + FULL TIME)
     - Invoice has 1st payment secured (1st_payment_date IS NOT NULL)
     - Invoice not soft-deleted (is_deleted IS NOT TRUE)
 
 Commission timing:
-    Payout in month M includes invoices with invoice_date in month M-1
-    (e.g. January invoice -> February commission), once 1st payment is secured.
+    ANP is paid in the calendar month after the invoice_date month,
+    once 1st payment is secured (e.g. Jan 2026 invoice -> Feb 2026 payout).
+    Each invoicing month accumulates total_amount separately per agent.
 
 ANP tier (on accumulated total amount per agent within each invoicing month):
     RM 0      : below RM 60,000
@@ -154,29 +162,24 @@ def anp_commission(accumulated_total_amount: Decimal) -> Decimal:
     return TIERS[-1].commission_rm
 
 
-def anp_commission_payout_ym(inv_date: date | None) -> str:
-    if inv_date is None:
-        return ""
-    py, pm = commission_payout_month_for_invoice_month(inv_date.year, inv_date.month)
-    return f"{py:04d}-{pm:02d}"
+def epp_internal_amount(
+    total_amount: Decimal, effective_epp: Decimal, payment_1_charges: Decimal | None
+) -> Decimal:
+    if payment_1_charges and payment_1_charges > 0:
+        return payment_1_charges
+    if effective_epp > 0:
+        return (total_amount * effective_epp / Decimal("100")).quantize(
+            MONEY, rounding=ROUND_HALF_UP
+        )
+    return Decimal("0")
 
 
-def count_distinct_agents_in_year(
-    invoices: list[dict[str, Any]],
-    allowed_agent_ids: set[str],
-    year: int,
-) -> int:
-    seen: set[str] = set()
-    for inv in invoices:
-        if is_deleted_type(inv):
-            continue
-        inv_date = parse_date(inv.get("invoice_date"))
-        if inv_date is None or inv_date.year != year:
-            continue
-        aid = str(inv.get("linked_agent") or "")
-        if aid in allowed_agent_ids:
-            seen.add(aid)
-    return len(seen)
+def sales_price(
+    total_amount: Decimal, effective_epp: Decimal, payment_1_charges: Decimal | None
+) -> Decimal:
+    return total_amount - epp_internal_amount(
+        total_amount, effective_epp, payment_1_charges
+    )
 
 
 def invoice_period_bounds(payout_year: int, payout_month: int) -> tuple[date, date]:
@@ -206,17 +209,39 @@ def commission_payout_month_for_invoice_month(inv_year: int, inv_month: int) -> 
     return inv_year, inv_month + 1
 
 
-def anp_month_receive(inv_date: date | None) -> str:
-    """Human-readable month the agent receives ANP for this invoice."""
+def anp_commission_payout_ym(inv_date: date | None) -> str:
+    """YYYY-MM of the month when ANP is received (month after invoice_date)."""
     if inv_date is None:
         return ""
     py, pm = commission_payout_month_for_invoice_month(inv_date.year, inv_date.month)
-    return f"{calendar.month_name[pm]} {py}"
+    return f"{py:04d}-{pm:02d}"
 
 
-def payout_label_calendar_invoice_month(inv_year: int, inv_month: int) -> str:
-    py, pm = commission_payout_month_for_invoice_month(inv_year, inv_month)
-    return f"inv-{inv_year:04d}-{inv_month:02d}_pay-{py:04d}-{pm:02d}"
+def anp_commission_date_remark(inv_date: date | None) -> str:
+    """Human-readable month when the agent receives ANP for this invoice."""
+    if inv_date is None:
+        return ""
+    py, pm = commission_payout_month_for_invoice_month(inv_date.year, inv_date.month)
+    return f"{calendar.month_name[pm]} {py} (paid in this calendar month)"
+
+
+def count_distinct_agents_in_invoice_year(
+    invoices: list[dict[str, Any]],
+    allowed_agent_ids: set[str],
+    year: int,
+) -> int:
+    """Agents with at least one qualifying invoice dated in `year`."""
+    seen: set[str] = set()
+    for inv in invoices:
+        if is_deleted_type(inv):
+            continue
+        inv_d = parse_date(inv.get("invoice_date"))
+        if inv_d is None or inv_d.year != year:
+            continue
+        aid = str(inv.get("linked_agent") or "")
+        if aid in allowed_agent_ids:
+            seen.add(aid)
+    return len(seen)
 
 
 def sql_in_list(values: Iterable[str]) -> str:
@@ -251,6 +276,7 @@ def fetch_invoices_for_agents(
           invoice_date,
           amount,
           total_amount,
+          effective_epp,
           customer_name_snapshot,
           linked_customer,
           "1st_payment_date",
@@ -263,6 +289,31 @@ def fetch_invoices_for_agents(
         ORDER BY linked_agent, invoice_date, invoice_number
         """
     )
+
+
+def fetch_payment_planning(
+    client: PostgresProxyClient, invoice_bubble_ids: list[str]
+) -> dict[str, dict[str, Any]]:
+    if not invoice_bubble_ids:
+        return {}
+    # Proxy may limit payload size; batch in chunks
+    out: dict[str, dict[str, Any]] = {}
+    chunk_size = 200
+    for i in range(0, len(invoice_bubble_ids), chunk_size):
+        chunk = invoice_bubble_ids[i : i + chunk_size]
+        ids_sql = sql_in_list(chunk)
+        rows = client.query(
+            f"""
+            SELECT linked_invoice, payment_1_charges
+            FROM invoice_payment_planning
+            WHERE linked_invoice IN ({ids_sql})
+            """
+        )
+        for row in rows:
+            key = row.get("linked_invoice")
+            if key:
+                out[str(key)] = row
+    return out
 
 
 def fetch_customers(
@@ -319,167 +370,93 @@ def is_deleted_type(invoice: dict[str, Any]) -> bool:
     return False
 
 
-def count_distinct_agents_in_year(
-    invoices: list[dict[str, Any]],
-    allowed_agent_ids: set[str],
-    year: int,
-) -> int:
-    seen: set[str] = set()
-    for inv in invoices:
-        if is_deleted_type(inv):
-            continue
-        inv_date = parse_date(inv.get("invoice_date"))
-        if inv_date is None or inv_date.year != year:
-            continue
-        aid = str(inv.get("linked_agent") or "")
-        if aid in allowed_agent_ids:
-            seen.add(aid)
-    return len(seen)
-
-
-def table2_sort_key(row: dict[str, Any]) -> tuple:
-    inv_date = row.get("invoice_date")
-    if not isinstance(inv_date, date):
-        inv_date = parse_date(inv_date) or date.min
-    return (
-        row.get("agent_name", ""),
-        inv_date,
-        str(row.get("invoice_number", "")),
-    )
-
-
-def table1_sort_key(row: dict[str, Any]) -> tuple:
-    return (
-        row.get("agent_name", ""),
-        row.get("invoice_year", 0),
-        row.get("invoice_month", 0),
-    )
-
-
-def finalize_table2_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Recompute running accumulated total amount and ANP commission per agent
-    per calendar invoice month (matches Table 1 monthly tier logic).
-    """
-    sorted_rows = sorted(rows, key=table2_sort_key)
-    out: list[dict[str, Any]] = []
-    current_month_key: tuple[str, int, int] | None = None
-    running = Decimal("0")
-
-    for row in sorted_rows:
-        inv_date = row.get("invoice_date")
-        if not isinstance(inv_date, date):
-            inv_date = parse_date(inv_date) or date.min
-        month_key = (
-            row.get("agent_name", ""),
-            inv_date.year,
-            inv_date.month,
-        )
-        if month_key != current_month_key:
-            current_month_key = month_key
-            running = Decimal("0")
-
-        line_total = to_decimal(row.get("total_amount"))
-        running += line_total
-        out.append(
-            {
-                **row,
-                "accumulated_total_amount": running,
-                "anp_commission": anp_commission(running),
-            }
-        )
-    return out
-
-
-def build_anp_tables(
+def build_report_rows(
     agents: list[dict[str, Any]],
     invoices: list[dict[str, Any]],
+    planning: dict[str, dict[str, Any]],
     customers: dict[str, str],
     period_start: date | None,
     period_end: date | None,
+    payout_label: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """
-    Build Table 1 (per agent per invoicing month) and Table 2 (per invoice).
-
-    Tier uses accumulated total_amount within each (agent, year, month) group.
-    ANP Commission Date = month after invoice_date (Jan invoice -> Feb payout).
-    """
     agent_by_id = {str(a["bubble_id"]): a for a in agents}
-    table1_rows: list[dict[str, Any]] = []
-    table2_rows: list[dict[str, Any]] = []
+    detail_rows: list[dict[str, Any]] = []
+    summary_rows: list[dict[str, Any]] = []
 
-    # (agent_id, inv_year, inv_month) -> list of invoice dicts
-    buckets: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
-
+    invoices_by_agent: dict[str, list[dict[str, Any]]] = {}
     for inv in invoices:
         if is_deleted_type(inv):
             continue
         if not invoice_in_period(inv, period_start, period_end):
             continue
-        inv_date = parse_date(inv.get("invoice_date"))
-        if inv_date is None:
-            continue
         agent_id = str(inv.get("linked_agent") or "")
         if agent_id not in agent_by_id:
             continue
-        key = (agent_id, inv_date.year, inv_date.month)
-        buckets.setdefault(key, []).append(inv)
+        invoices_by_agent.setdefault(agent_id, []).append(inv)
 
-    for agent_id, inv_year, inv_month in sorted(
-        buckets.keys(), key=lambda k: (k[0], k[1], k[2])
-    ):
-        inv_list = buckets[(agent_id, inv_year, inv_month)]
+    qualifying_agent_ids = sorted(invoices_by_agent.keys())
+
+    for agent_id in qualifying_agent_ids:
         agent = agent_by_id[agent_id]
         agent_name = (agent.get("name") or "").strip()
-        month_total = Decimal("0")
-        for inv in sorted(
-            inv_list,
+        agent_invoices = sorted(
+            invoices_by_agent[agent_id],
             key=lambda x: (
                 parse_date(x.get("invoice_date")) or date.min,
                 str(x.get("invoice_number") or ""),
             ),
-        ):
-            month_total += to_decimal(inv.get("total_amount") or inv.get("amount"))
-
-        commission_rm = anp_commission(month_total)
-        pay_y, pay_m = commission_payout_month_for_invoice_month(inv_year, inv_month)
-        payout_ym = f"{pay_y:04d}-{pay_m:02d}"
-
-        table1_rows.append(
-            {
-                "agent_name": agent_name,
-                "invoice_year": inv_year,
-                "invoice_month": inv_month,
-                "accumulated_total_amount": month_total,
-                "anp_commission": commission_rm,
-                "anp_commission_date": payout_ym,
-            }
         )
-
-        for inv in sorted(
-            inv_list,
-            key=lambda x: (
-                parse_date(x.get("invoice_date")) or date.min,
-                str(x.get("invoice_number") or ""),
-            ),
-        ):
+        accumulated_total = Decimal("0")
+        for inv in agent_invoices:
             inv_date = parse_date(inv.get("invoice_date"))
             total = to_decimal(inv.get("total_amount") or inv.get("amount"))
-            payout_ym = anp_commission_payout_ym(inv_date) if inv_date else ""
-
-            table2_rows.append(
+            epp_pct = to_decimal(inv.get("effective_epp"))
+            plan = planning.get(str(inv.get("bubble_id")))
+            p1_charges = (
+                to_decimal(plan.get("payment_1_charges"))
+                if plan and plan.get("payment_1_charges") is not None
+                else None
+            )
+            epp_int = epp_internal_amount(total, epp_pct, p1_charges)
+            sp = sales_price(total, epp_pct, p1_charges)
+            accumulated_total += total
+            detail_rows.append(
                 {
+                    "payout_period": payout_label,
                     "agent_name": agent_name,
+                    "agent_bubble_id": agent_id,
+                    "agent_type": agent.get("agent_type"),
                     "customer_name": resolve_customer_name(inv, customers),
                     "invoice_number": inv.get("invoice_number") or inv.get("bubble_id"),
                     "invoice_date": inv_date,
-                    "total_amount": total,
-                    "anp_commission_date": payout_ym,
+                    "first_payment_date": parse_date(inv.get("1st_payment_date")),
+                    "invoice_total_amount": total,
+                    "epp_internal": epp_int,
+                    "sales_price": sp,
+                    "accumulated_total_amount": accumulated_total,
+                    "anp_commission_line": Decimal("0"),
+                    "anp_commission_accumulated_tier": anp_commission(
+                        accumulated_total
+                    ),
+                    "anp_commission_date": anp_commission_payout_ym(inv_date),
+                    "anp_commission_date_remark": anp_commission_date_remark(inv_date),
                 }
             )
 
-    table2_rows = finalize_table2_rows(table2_rows)
-    return table1_rows, table2_rows
+        final_commission = anp_commission(accumulated_total)
+        summary_rows.append(
+            {
+                "payout_period": payout_label,
+                "agent_name": agent_name,
+                "agent_bubble_id": agent_id,
+                "agent_type": agent.get("agent_type"),
+                "invoice_count": len(agent_invoices),
+                "accumulated_total_amount": accumulated_total,
+                "anp_commission": final_commission,
+            }
+        )
+
+    return detail_rows, summary_rows
 
 
 def _fmt_date(val: Any) -> str:
@@ -496,65 +473,51 @@ def _fmt_money(val: Any) -> str:
     return f"{Decimal(str(val)):,.2f}"
 
 
-TABLE1_HEADERS = [
-    "Agent Name",
-    "Accumulated Total Amount (RM)",
-    "ANP Commission (RM)",
-    "ANP Commission Date",
-]
-
-TABLE2_HEADERS = [
-    "Agent Name",
-    "Customer Name",
-    "Invoice #",
-    "Invoice Date",
-    "Total Amount (RM)",
-    "Accumulated Total Amount (RM)",
-    "ANP Commission (RM)",
-    "ANP Commission Date",
-]
-
-
-def table1_display_rows(rows: list[dict[str, Any]]) -> list[list[str]]:
-    out = []
-    for r in sorted(rows, key=table1_sort_key):
-        out.append(
+def summary_table_rows(summary_rows: list[dict[str, Any]]) -> list[list[str]]:
+    """Table 1: agent totals."""
+    rows = []
+    for r in summary_rows:
+        rows.append(
             [
                 r.get("agent_name", ""),
+                str(r.get("invoice_count", 0)),
                 _fmt_money(r.get("accumulated_total_amount")),
                 _fmt_money(r.get("anp_commission")),
-                r.get("anp_commission_date", ""),
             ]
         )
-    return out
+    return rows
 
 
-def table2_display_rows(rows: list[dict[str, Any]]) -> list[list[str]]:
-    out = []
-    for r in sorted(rows, key=table2_sort_key):
-        out.append(
+def detail_table_rows(detail_rows: list[dict[str, Any]]) -> list[list[str]]:
+    """Table 2: per-invoice lines."""
+    rows = []
+    for r in detail_rows:
+        rows.append(
             [
                 r.get("agent_name", ""),
                 r.get("customer_name", ""),
                 str(r.get("invoice_number", "")),
                 _fmt_date(r.get("invoice_date")),
-                _fmt_money(r.get("total_amount")),
+                _fmt_money(r.get("invoice_total_amount")),
+                _fmt_money(r.get("sales_price")),
                 _fmt_money(r.get("accumulated_total_amount")),
-                _fmt_money(r.get("anp_commission")),
+                _fmt_money(r.get("anp_commission_accumulated_tier")),
                 r.get("anp_commission_date", ""),
+                (r.get("anp_commission_date_remark") or "")[:60],
             ]
         )
-    return out
+    return rows
 
 
 def print_report_tables(
     meta: dict[str, Any],
-    table1_rows: list[dict[str, Any]],
-    table2_rows: list[dict[str, Any]],
+    summary_rows: list[dict[str, Any]],
+    detail_rows: list[dict[str, Any]],
     max_detail_console_rows: int | None,
 ) -> None:
     from tabulate import tabulate
 
+    # ASCII table format works on Windows cp1252 consoles
     table_fmt = "simple"
 
     print()
@@ -562,49 +525,73 @@ def print_report_tables(
     print("ANP COMMISSION REPORT")
     print("=" * 100)
     overview = [
-        ["Filter", meta.get("filter_description", "")],
+        ["Billing period label", meta.get("payout_period", "")],
+        ["Invoice calendar month", meta.get("invoice_calendar_month", "")],
+        ["Commission payout month", meta.get("commission_payout_month", "")],
+        [
+            "Distinct agents (invoice year)",
+            meta.get("distinct_agents_invoice_year", ""),
+        ],
         ["Invoice date from", meta.get("invoice_date_from", "")],
         ["Invoice date to", meta.get("invoice_date_to", "")],
         ["Agent types", meta.get("agent_types", "")],
-        ["Total qualifying agents (distinct)", meta.get("total_qualifying_agents", 0)],
-        ["Table 1 rows (agent-month)", len(table1_rows)],
-        ["Table 2 rows (invoices)", len(table2_rows)],
+        ["Agents in this period slice", meta.get("total_qualifying_agents", 0)],
+        ["Invoices in this period slice", meta.get("total_qualifying_invoices", 0)],
     ]
     print(tabulate(overview, headers=["Field", "Value"], tablefmt=table_fmt, disable_numparse=True))
     print()
 
-    print("TABLE 1 - Accumulated ANP Commission")
+    print("TABLE 1 - Agent summary (accumulated total amount & ANP commission)")
     print("-" * 100)
-    t1 = table1_display_rows(table1_rows)
-    if t1:
-        print(tabulate(t1, headers=TABLE1_HEADERS, tablefmt=table_fmt, disable_numparse=True))
-        total_anp = sum(Decimal(str(r.get("anp_commission", 0))) for r in table1_rows)
+    summary_headers = [
+        "Agent Name",
+        "Invoices",
+        "Accumulated Total (RM)",
+        "ANP Commission (RM)",
+    ]
+    summary_data = summary_table_rows(summary_rows)
+    if summary_data:
+        print(tabulate(summary_data, headers=summary_headers, tablefmt=table_fmt, disable_numparse=True))
+        total_anp = sum(Decimal(str(r.get("anp_commission", 0))) for r in summary_rows)
+        total_inv = sum(int(r.get("invoice_count", 0)) for r in summary_rows)
         print(
             tabulate(
-                [["TOTAL", "-", _fmt_money(total_anp), "-"]],
-                headers=TABLE1_HEADERS,
+                [["TOTAL", str(total_inv), "-", _fmt_money(total_anp)]],
+                headers=summary_headers,
                 tablefmt=table_fmt,
                 disable_numparse=True,
             )
         )
     else:
-        print("(no qualifying data for Table 1)")
+        print("(no qualifying agents)")
     print()
 
-    print("TABLE 2 - ANP commission by customer")
+    print("TABLE 2 - Invoice detail (per customer)")
     print("-" * 100)
-    t2 = table2_display_rows(table2_rows)
-    if t2:
+    detail_headers = [
+        "Agent Name",
+        "Customer Name",
+        "Invoice #",
+        "Invoice Date",
+        "Invoice Total (RM)",
+        "Sales Price (RM)",
+        "Accumulated Total (RM)",
+        "ANP Tier (RM)",
+        "ANP Date YYYY-MM",
+        "ANP month (remark)",
+    ]
+    detail_data = detail_table_rows(detail_rows)
+    if detail_data:
         limit = max_detail_console_rows
-        if limit is not None and len(t2) > limit:
+        if limit is not None and len(detail_data) > limit:
             print(
-                f"(Showing first {limit} of {len(t2)} invoice rows in console. "
-                "Full output is in the Excel/CSV files.)"
+                f"(Showing first {limit} of {len(detail_data)} invoice rows in console. "
+                "Full table is in the Excel/CSV files.)"
             )
-            t2 = t2[:limit]
-        print(tabulate(t2, headers=TABLE2_HEADERS, tablefmt=table_fmt, disable_numparse=True))
+            detail_data = detail_data[:limit]
+        print(tabulate(detail_data, headers=detail_headers, tablefmt=table_fmt, disable_numparse=True))
     else:
-        print("(no qualifying data for Table 2)")
+        print("(no qualifying invoices)")
     print()
 
 
@@ -673,8 +660,8 @@ def _style_sheet_header(
 
 def write_excel(
     path: Path,
-    table1_rows: list[dict[str, Any]],
-    table2_rows: list[dict[str, Any]],
+    summary: list[dict[str, Any]],
+    detail: list[dict[str, Any]],
     meta: dict[str, Any],
 ) -> None:
     from openpyxl import Workbook
@@ -693,39 +680,104 @@ def write_excel(
     ws_meta.column_dimensions["A"].width = 28
     ws_meta.column_dimensions["B"].width = 40
 
-    # Table 1 — Accumulated ANP Commission
-    ws1 = wb.create_sheet("Table1_Accumulated_ANP")
-    ws1.append(TABLE1_HEADERS)
-    for row in table1_display_rows(table1_rows):
-        ws1.append(row)
-    _style_sheet_header(ws1, TABLE1_HEADERS, money_cols={2, 3}, date_cols={4})
+    # Table 1 — Agent summary
+    ws_agents = wb.create_sheet("Table1_Agent_Summary")
+    agent_headers = [
+        "Agent Name",
+        "Agent Type",
+        "Invoice Count",
+        "Accumulated Total (RM)",
+        "ANP Commission (RM)",
+    ]
+    ws_agents.append(agent_headers)
+    for r in summary:
+        ws_agents.append(
+            [
+                r.get("agent_name"),
+                r.get("agent_type"),
+                r.get("invoice_count"),
+                float(r.get("accumulated_total_amount", 0)),
+                float(r.get("anp_commission", 0)),
+            ]
+        )
+    if summary:
+        ws_agents.append(
+            [
+                "TOTAL",
+                "",
+                sum(int(r.get("invoice_count", 0)) for r in summary),
+                "N/A",
+                float(sum(Decimal(str(r.get("anp_commission", 0))) for r in summary)),
+            ]
+        )
+    _style_sheet_header(ws_agents, agent_headers, money_cols={4, 5})
 
-    # Table 2 — ANP commission by customer
-    ws2 = wb.create_sheet("Table2_ANP_by_Customer")
-    ws2.append(TABLE2_HEADERS)
-    for row in table2_display_rows(table2_rows):
-        ws2.append(row)
-    _style_sheet_header(ws2, TABLE2_HEADERS, money_cols={5, 6, 7}, date_cols={4})
+    # Table 2 — Invoice detail
+    ws_detail = wb.create_sheet("Table2_Invoice_Detail")
+    detail_headers = [
+        "Agent Name",
+        "Customer Name",
+        "Invoice #",
+        "Invoice Date",
+        "1st Payment Date",
+        "Invoice Total (RM)",
+        "EPP Internal (RM)",
+        "Sales Price (RM)",
+        "Accumulated Total (RM)",
+        "ANP Tier (RM)",
+        "ANP Commission Date YYYY-MM",
+        "ANP Commission Month (remark)",
+    ]
+    ws_detail.append(detail_headers)
+    for r in detail:
+        ws_detail.append(
+            [
+                r.get("agent_name"),
+                r.get("customer_name"),
+                r.get("invoice_number"),
+                _fmt_date(r.get("invoice_date")),
+                _fmt_date(r.get("first_payment_date")),
+                float(r.get("invoice_total_amount", 0)),
+                float(r.get("epp_internal", 0)),
+                float(r.get("sales_price", 0)),
+                float(r.get("accumulated_total_amount", 0)),
+                float(r.get("anp_commission_accumulated_tier", 0)),
+                r.get("anp_commission_date") or "",
+                r.get("anp_commission_date_remark") or "",
+            ]
+        )
+    _style_sheet_header(
+        ws_detail, detail_headers, money_cols={6, 7, 8, 9, 10}, date_cols={4, 5}
+    )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
 
 
-TABLE1_CSV_FIELDS = [
+DETAIL_CSV_FIELDS = [
+    "payout_period",
     "agent_name",
-    "accumulated_total_amount",
-    "anp_commission",
-    "anp_commission_date",
-]
-TABLE2_CSV_FIELDS = [
-    "agent_name",
+    "agent_type",
     "customer_name",
     "invoice_number",
     "invoice_date",
-    "total_amount",
+    "first_payment_date",
+    "invoice_total_amount",
+    "epp_internal",
+    "sales_price",
+    "accumulated_total_amount",
+    "anp_commission_line",
+    "anp_commission_accumulated_tier",
+    "anp_commission_date",
+    "anp_commission_date_remark",
+]
+SUMMARY_CSV_FIELDS = [
+    "payout_period",
+    "agent_name",
+    "agent_type",
+    "invoice_count",
     "accumulated_total_amount",
     "anp_commission",
-    "anp_commission_date",
 ]
 
 
@@ -759,6 +811,22 @@ def parse_args() -> argparse.Namespace:
         "--full-console",
         action="store_true",
         help="Print every invoice row in the console (default: first 40 rows only).",
+    )
+    parser.add_argument(
+        "--invoice-year",
+        type=int,
+        metavar="YYYY",
+        help="Same as --year-invoice-months: one bundle per invoicing month in that year.",
+    )
+    parser.add_argument(
+        "--headcount-year",
+        type=int,
+        default=2026,
+        metavar="YYYY",
+        help=(
+            "Print/count distinct agents with at least one qualifying invoice dated in "
+            "this year (default: 2026)."
+        ),
     )
     parser.add_argument(
         "--year-invoice-months",
@@ -801,6 +869,15 @@ def print_year_month_overview(rows: list[list[Any]]) -> None:
 def main() -> int:
     args = parse_args()
 
+    if args.invoice_year is not None and args.year_invoice_months is not None:
+        print(
+            "Use only one of --invoice-year and --year-invoice-months.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.invoice_year is not None:
+        args.year_invoice_months = args.invoice_year
+
     base_url = os.getenv("PG_PROXY_URL", "").strip()
     token = normalize_proxy_token(os.getenv("PG_PROXY_TOKEN", ""))
     db_name = os.getenv("PG_DB_NAME", "prod_main").strip()
@@ -829,10 +906,6 @@ def main() -> int:
             args.year_invoice_months is not None,
         ]
     )
-    default_invoice_year_mode = mode_flags == 0
-    if mode_flags == 0:
-        # Default behavior requested by user: all invoices in 2026 (single report).
-        args.year_invoice_months = None
     if mode_flags > 1:
         print(
             "Use only one period mode: --all-time, --payout-month YYYY-MM, or --year-invoice-months YYYY",
@@ -856,12 +929,28 @@ def main() -> int:
     invoices = fetch_invoices_for_agents(client, agent_ids)
     print(f"  Raw invoices: {len(invoices)}")
 
+    invoice_ids = [str(i["bubble_id"]) for i in invoices if i.get("bubble_id")]
     customer_ids = list(
         {str(i["linked_customer"]) for i in invoices if i.get("linked_customer")}
     )
 
+    print("Fetching payment planning (EPP charges)...")
+    planning = fetch_payment_planning(client, invoice_ids)
+
     print("Fetching customer names...")
     customers = fetch_customers(client, customer_ids)
+
+    agent_id_set = set(agent_ids)
+    n_distinct_headcount = count_distinct_agents_in_invoice_year(
+        invoices, agent_id_set, args.headcount_year
+    )
+    print(
+        f"\nDistinct agents with >=1 qualifying invoice dated in "
+        f"{args.headcount_year}: {n_distinct_headcount}\n"
+    )
+    headcount_meta = (
+        f"{n_distinct_headcount} (invoice_date in {args.headcount_year})"
+    )
 
     out_dir = Path(args.output_dir)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -871,27 +960,34 @@ def main() -> int:
         year = args.year_invoice_months
         overview_rows: list[list[Any]] = []
 
-        months = list(range(1, 13))
-        for inv_month in months:
+        for inv_month in range(1, 13):
             ps, pe = invoice_calendar_month_bounds(year, inv_month)
             pay_y, pay_m = commission_payout_month_for_invoice_month(year, inv_month)
             label = payout_label_calendar_invoice_month(year, inv_month)
             calendar_label = f"{year:04d}-{inv_month:02d}"
             pay_label = f"{pay_y:04d}-{pay_m:02d}"
 
-            table1_rows, table2_rows = build_anp_tables(
-                agents, invoices, customers, ps, pe
+            detail_rows, summary_rows = build_report_rows(
+                agents,
+                invoices,
+                planning,
+                customers,
+                ps,
+                pe,
+                label,
             )
-            if not table2_rows:
+            if not detail_rows:
                 continue
 
-            total_anp = sum(Decimal(str(r.get("anp_commission", 0))) for r in table1_rows)
+            total_anp = sum(
+                Decimal(str(r.get("anp_commission", 0))) for r in summary_rows
+            )
             overview_rows.append(
                 [
                     calendar_label,
                     pay_label,
-                    len({r["agent_name"] for r in table1_rows}),
-                    len(table2_rows),
+                    len(summary_rows),
+                    len(detail_rows),
                     _fmt_money(total_anp),
                 ]
             )
@@ -903,25 +999,29 @@ def main() -> int:
                 "commission_payout_month": pay_label,
                 "invoice_date_from": ps.isoformat(),
                 "invoice_date_to": pe.isoformat(),
+                "distinct_agents_invoice_year": headcount_meta,
                 "agent_types": agent_types_str,
-                "total_qualifying_agents": len({r["agent_name"] for r in table1_rows}),
-                "total_qualifying_invoices": len(table2_rows),
-                "filter_description": (
-                    "2026 invoices, 1st payment secured, agent types: internal + FULL TIME"
+                "total_qualifying_agents": len(summary_rows),
+                "total_qualifying_invoices": len(detail_rows),
+                "note_agent_filter": (
+                    "Default agent types: internal + FULL TIME; override with --agent-types."
                 ),
-                "tier_basis": "Accumulated total amount (invoice total_amount)",
-                "anp_timing": "Commission paid in month after invoice_date month",
+                "accumulated_basis": "Sum of invoice total_amount within each invoicing month",
+                "sales_price_formula": "total_amount - epp_internal (informational)",
+                "epp_internal_formula": (
+                    "total_amount * (effective_epp/100) or payment_1_charges"
+                ),
             }
 
-            dc = out_dir / f"{prefix}_table2_by_customer.csv"
-            sc = out_dir / f"{prefix}_table1_accumulated_anp.csv"
-            write_csv(dc, table2_rows, TABLE2_CSV_FIELDS)
-            write_csv(sc, table1_rows, TABLE1_CSV_FIELDS)
+            dc = out_dir / f"{prefix}_detail.csv"
+            sc = out_dir / f"{prefix}_agent_summary.csv"
+            write_csv(dc, detail_rows, DETAIL_CSV_FIELDS)
+            write_csv(sc, summary_rows, SUMMARY_CSV_FIELDS)
 
             xlsx_path = out_dir / f"{prefix}.xlsx"
             if not args.no_excel:
                 try:
-                    write_excel(xlsx_path, table1_rows, table2_rows, meta)
+                    write_excel(xlsx_path, summary_rows, detail_rows, meta)
                 except ImportError:
                     print("openpyxl not installed; skipped Excel.", file=sys.stderr)
 
@@ -931,7 +1031,7 @@ def main() -> int:
                     detail_limit = (
                         None if args.full_console else max(0, args.console_detail_limit)
                     )
-                    print_report_tables(meta, table1_rows, table2_rows, detail_limit)
+                    print_report_tables(meta, summary_rows, detail_rows, detail_limit)
                 except ImportError:
                     print(
                         "Install tabulate for table output: pip install tabulate",
@@ -952,7 +1052,7 @@ def main() -> int:
         print("=" * 100)
         print(
             "One report per invoicing calendar month where data exists "
-            "(first payment secured). Commission is paid in the following month.",
+            "(first payment secured). ANP is paid in the month after invoice_date."
         )
         print()
         try:
@@ -996,12 +1096,6 @@ def main() -> int:
             print(
                 "Warning: --payout-month ignored when --all-time is set.", file=sys.stderr
             )
-    elif default_invoice_year_mode:
-        period_start = date(2026, 1, 1)
-        period_end = date(2026, 12, 31)
-        invoice_calendar_month = "2026-01..2026-12"
-        commission_payout_month = "varies by invoice month"
-        payout_label = "invoice-year-2026"
     else:
         if args.payout_month:
             py, pm = map(int, args.payout_month.split("-"))
@@ -1017,20 +1111,25 @@ def main() -> int:
         commission_payout_month = f"{py:04d}-{pm:02d}"
         payout_label = f"inv-{invoice_calendar_month}_pay-{commission_payout_month}"
 
-    table1_rows, table2_rows = build_anp_tables(
-        agents, invoices, customers, period_start, period_end
+    detail_rows, summary_rows = build_report_rows(
+        agents,
+        invoices,
+        planning,
+        customers,
+        period_start,
+        period_end,
+        payout_label,
     )
 
-    report_year = period_start.year if period_start else date.today().year
-    total_users = count_distinct_agents_in_year(
-        invoices, set(agent_ids), report_year
-    )
+    total_qualifying_agents = len(summary_rows)
+    total_invoices = len(detail_rows)
 
     prefix = f"anp_commission_{payout_label}_{stamp}"
-    table1_csv = out_dir / f"{prefix}_table1_accumulated_anp.csv"
-    table2_csv = out_dir / f"{prefix}_table2_by_customer.csv"
-    write_csv(table1_csv, table1_rows, TABLE1_CSV_FIELDS)
-    write_csv(table2_csv, table2_rows, TABLE2_CSV_FIELDS)
+
+    detail_csv = out_dir / f"{prefix}_detail.csv"
+    summary_csv = out_dir / f"{prefix}_agent_summary.csv"
+    write_csv(detail_csv, detail_rows, DETAIL_CSV_FIELDS)
+    write_csv(summary_csv, summary_rows, SUMMARY_CSV_FIELDS)
 
     meta = {
         "payout_period": payout_label,
@@ -1038,33 +1137,35 @@ def main() -> int:
         "commission_payout_month": commission_payout_month,
         "invoice_date_from": period_start.isoformat() if period_start else "all",
         "invoice_date_to": period_end.isoformat() if period_end else "all",
+        "distinct_agents_invoice_year": headcount_meta,
         "agent_types": agent_types_str,
-        "total_qualifying_agents": total_users,
-        "total_qualifying_invoices": len(table2_rows),
-        "filter_description": (
-            "2026 invoices, 1st payment secured, agent types: internal + FULL TIME"
+        "total_qualifying_agents": total_qualifying_agents,
+        "total_qualifying_invoices": total_invoices,
+        "note_agent_filter": (
+            "Default agent types: internal + FULL TIME; override with --agent-types."
         ),
-        "tier_basis": "Accumulated total amount (invoice total_amount)",
-        "anp_timing": "Commission paid in month after invoice_date month",
+        "accumulated_basis": "Sum of invoice total_amount in this period slice",
+        "sales_price_formula": "total_amount - epp_internal (informational)",
+        "epp_internal_formula": "total_amount * (effective_epp/100) or payment_1_charges",
     }
 
     xlsx_path = out_dir / f"{prefix}.xlsx"
     if not args.no_excel:
         try:
-            write_excel(xlsx_path, table1_rows, table2_rows, meta)
+            write_excel(xlsx_path, summary_rows, detail_rows, meta)
         except ImportError:
-            print("openpyxl not installed; skipped Excel.", file=sys.stderr)
+            print("openpyxl not installed; skipped Excel. CSV files written.", file=sys.stderr)
 
     try:
         detail_limit = None if args.full_console else max(0, args.console_detail_limit)
-        print_report_tables(meta, table1_rows, table2_rows, detail_limit)
+        print_report_tables(meta, summary_rows, detail_rows, detail_limit)
     except ImportError:
         print("Install tabulate for table output: pip install tabulate", file=sys.stderr)
 
     print("Files saved:")
     print(f"  Excel (tables): {xlsx_path.resolve() if xlsx_path.exists() else '(skipped)'}")
-    print(f"  Table 1 CSV:    {table1_csv.resolve()}")
-    print(f"  Table 2 CSV:    {table2_csv.resolve()}")
+    print(f"  Summary CSV:    {summary_csv.resolve()}")
+    print(f"  Detail CSV:     {detail_csv.resolve()}")
 
     return 0
 

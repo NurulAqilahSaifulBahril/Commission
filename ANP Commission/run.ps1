@@ -18,14 +18,9 @@ if (-not (Test-Path $envFile)) {
 }
 
 $tokenLine = Get-Content $envFile | Where-Object { $_ -match '^\s*PG_PROXY_TOKEN\s*=' } | Select-Object -First 1
-$tokenValue = (($tokenLine -split '=', 2)[1]).Trim().Trim('"').Trim("'")
-if ($tokenValue -match 'your_bearer_token_here|paste_your_jwt_token_here' -or [string]::IsNullOrWhiteSpace($tokenValue)) {
+if ($tokenLine -match 'your_bearer_token_here' -or [string]::IsNullOrWhiteSpace(($tokenLine -split '=', 2)[1])) {
     Write-Host "ERROR: PG_PROXY_TOKEN is not set in .env" -ForegroundColor Red
-    Write-Host "Open .env and paste the JWT only (eyJ...), without the word Bearer." -ForegroundColor Yellow
-    exit 1
-}
-if (($tokenValue -split '\.').Count -ne 3) {
-    Write-Host "ERROR: PG_PROXY_TOKEN does not look like a valid JWT." -ForegroundColor Red
+    Write-Host "Open .env and paste your Postgres proxy Bearer token." -ForegroundColor Yellow
     exit 1
 }
 
