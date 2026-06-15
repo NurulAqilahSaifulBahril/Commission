@@ -12,5 +12,8 @@
 
 # Generated reports (re-run scripts to recreate)
 **/output/
+**/Finance Output/
+**/2. Output/
 **/4. data/reports/
 **/4. data/nfp_commission_report.*
+
