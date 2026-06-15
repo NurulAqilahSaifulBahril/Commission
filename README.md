@@ -7,18 +7,18 @@ Token is stored in `.env` files (same as running each report alone). You do **no
 ## Individual reports
 
 ```powershell
-cd "C:\Users\User\OneDrive\Documents\Commission\Basic Commission\3. Python Script"
+cd "C:\Users\User\OneDrive\Documents\Commission\1. Basic Commission\3. Python Script"
 python full_internal_basic_commission.py
 
-cd "C:\Users\User\OneDrive\Documents\Commission\ANP Commission\3. Python Script"
+cd "C:\Users\User\OneDrive\Documents\Commission\3. ANP Commission\3. Python Script"
 python anp_commission.py
 REM Default: full-year invoice-year-2026 (same data as finance Excel/PDF ANP sheet)
 
-cd "C:\Users\User\OneDrive\Documents\Commission\NFP Commission\3. Python script"
+cd "C:\Users\User\OneDrive\Documents\Commission\2. NFP Commission\3. Python script"
 python nfp_commission.py
 REM Do not run anp_commission.py from the NFP folder — that file is not there.
 
-cd "C:\Users\User\OneDrive\Documents\Commission\NFP Commission\3. Python script"
+cd "C:\Users\User\OneDrive\Documents\Commission\2. NFP Commission\3. Python script"
 python nfp_commission.py
 ```
 
@@ -46,9 +46,9 @@ PDF layout (presentation for finance):
 
 Keep `PG_PROXY_TOKEN` in any of these (already set up):
 
-- `ANP Commission\3. Python Script\.env`
-- `Basic Commission\3. Python Script\.env`
-- `NFP Commission\4. data\pg_proxy_token.txt`
+- `3. ANP Commission\3. Python Script\.env`
+- `1. Basic Commission\3. Python Script\.env`
+- `2. NFP Commission\4. data\pg_proxy_token.txt`
 
 Get a new JWT from your Postgres proxy admin when you see **Token expired**.
 

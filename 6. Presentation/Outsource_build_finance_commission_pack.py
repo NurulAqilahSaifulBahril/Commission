@@ -15,9 +15,9 @@ Sheets:
 Requires: openpyxl, python-dotenv, and each commission script's dependencies.
 Token (any one location — never commit the real token):
   - Commission-git/.env  or  Commission-git/pg_proxy_token.txt  (easiest for finance pack)
-  - Basic Commission/3. Python Script/.env
-  - ANP Commission/.env
-  - NFP Commission/4. data/pg_proxy_token.txt
+  - 1. Basic Commission/3. Python Script/.env
+  - 3. ANP Commission/.env
+  - 2. NFP Commission/4. data/pg_proxy_token.txt
 """
 
 from __future__ import annotations
@@ -320,9 +320,9 @@ def _load_env_files() -> None:
     except ImportError:
         return
     for candidate in (
-        REPO_ROOT / "Basic Commission" / "3. Python Script" / ".env",
-        REPO_ROOT / "ANP Commission" / "3. Python Script" / ".env",
-        REPO_ROOT / "ANP Commission" / ".env",
+        REPO_ROOT / "1. Basic Commission" / "3. Python Script" / ".env",
+        REPO_ROOT / "3. ANP Commission" / "3. Python Script" / ".env",
+        REPO_ROOT / "3. ANP Commission" / ".env",
         REPO_ROOT / ".env",
     ):
         if candidate.is_file():

@@ -24,7 +24,7 @@ $env:POSTGRES_PROXY_URL="http://127.0.0.1:YOUR_PORT/api/sql"
 ## Run
 
 ```powershell
-cd "C:\Users\User\Desktop\Commission\NFP Commission\3. Python script"
+cd "C:\Users\User\OneDrive\Documents\Commission\2. NFP Commission\3. Python script"
 pip install -r "..\4. data\requirements.txt"
 
 # Easiest: save token in NFP data folder (one line, no quotes)

@@ -1,7 +1,7 @@
 """
 Paths for the reorganized NFP Commission project.
 
-Expected layout (sibling folders under NFP Commission):
+Expected layout (sibling folders under 2. NFP Commission):
 
   1. Excel/          — .xlsx price schedules
   2. Screenshot/     — images (not used by scripts)
@@ -72,7 +72,7 @@ def get_default_excel_path() -> Path:
 def get_620w_json_path() -> Path:
     """
     620W schedule JSON — expected in:
-    C:\\...\\NFP Commission\\4. data\\nfp_620w_schedule.json
+    C:\\...\\2. NFP Commission\\4. data\\nfp_620w_schedule.json
     (or nfp_620W_schedule.json)
     """
     for name in SCHEDULE_620W_JSON_CANDIDATES:
