@@ -90,6 +90,7 @@ def _write_basic_pdf(
                     "Invoice Date",
                     "Full Payment Date",
                     "Total Amount",
+                    "Payment Received",
                     "Epp",
                     "Sales Price",
                     "Rate %",
@@ -108,6 +109,7 @@ def _write_basic_pdf(
                     "Invoice Date",
                     "Full Payment Date",
                     "Total Amount",
+                    "Payment Received",
                     "Epp",
                     "Sales Price",
                     "Rate %",
@@ -122,11 +124,15 @@ def _write_basic_pdf(
                 headers=[
                     "Referral Name",
                     "Agent Name",
+                    "Customer Name",
+                    "Invoice Number",
+                    "Invoice Date",
+                    "Full Payment Date",
                     "Sales Price",
                     "Rate %",
                     "Referral Fee",
                 ],
-                rows=table4 if table4 else [["No referral fee", "-", "-", "-", "-"]],
+                rows=table4 if table4 else [["No referral fee", "-", "-", "-", "-", "-", "-", "-", "-"]],
             ),
         ],
     )
@@ -201,8 +207,8 @@ def get_reporting_senior(agent_name: str) -> str | None:
     if any(tok in n for tok in ["louis ng", "anisah najwa", "anisah"]):
         return "Teng Kah Kent"
         
-    # Jia Keat, Zul, Denise, Jia Xuan, and Ah Zu are under Sunny Tan
-    if any(tok in n for tok in ["jia keat", "zul", "denise", "jia xuan", "ah zu"]):
+    # Jia Keat, Zul, Zulkarnain, Denise, Jia Xuan, and Ah Zu are under Sunny Tan
+    if any(tok in n for tok in ["jia keat", "zul", "zulkarnain", "denise", "jia xuan", "ah zu"]):
         return "Sunny Tan"
         
     # Joshua is under Zhe Hang
@@ -356,71 +362,133 @@ def _render_table(headers: list[str], rows: list[list[str]]) -> str:
 
 def _invoices_sql(*, year: int, customer_filter_sql: str) -> str:
     return f"""
-SELECT
-  i.invoice_number,
-  i.invoice_date,
-  i.full_payment_date,
-  COALESCE(i.total_amount, 0)::numeric AS total_amount,
-  COALESCE(
-    NULLIF(epp_items.epp_interest, 0),
-    NULLIF(pay.epp_sum, 0),
-    NULLIF(
-      CASE
-        WHEN i.effective_epp > 1.0 AND i.effective_epp < 2.0 THEN (i.total_amount * (i.effective_epp - 1.0) / i.effective_epp)::numeric
-        WHEN i.effective_epp >= 2.0 AND i.effective_epp <= 100.0 THEN (i.total_amount * (i.effective_epp / 100.0) / (1.0 + i.effective_epp / 100.0))::numeric
-        ELSE 0
-      END,
-      0
-    ),
-    0
-  )::numeric AS epp_interest,
-  COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name, '(unknown)') AS customer_name,
-  COALESCE(NULLIF(TRIM(a.name), ''), '(unknown)') AS agent_name,
-  a.agent_type,
-  i.package_type,
-  i.package_name_snapshot,
-  i.description,
-  COALESCE(sr_link.nem_type, sr_back.nem_type) AS seda_nem_type,
-  ref.project_type AS referral_project_type,
-  COALESCE(NULLIF(TRIM(ref.name), ''), NULLIF(TRIM(i.referrer_name), '')) AS referral_name
-FROM invoice i
-INNER JOIN agent a ON a.bubble_id = i.linked_agent
-LEFT JOIN customer c ON c.customer_id = i.linked_customer
-LEFT JOIN SEDA_registration sr_link ON sr_link.bubble_id = i.linked_seda_registration
-LEFT JOIN SEDA_registration sr_back ON i.bubble_id = ANY(sr_back.linked_invoice)
-LEFT JOIN referral ref ON ref.bubble_id = i.linked_referral
-LEFT JOIN LATERAL (
-  SELECT COALESCE(
-    SUM(ii_dedup.epp_interest_amount),
-    0
-  ) AS epp_interest
-  FROM (
-    SELECT 
-      MAX(
+WITH candidates AS (
+  SELECT
+    i.invoice_number,
+    i.invoice_date,
+    i.full_payment_date,
+    COALESCE(i.total_amount, 0)::numeric AS total_amount,
+    COALESCE((SELECT SUM(p.amount) FROM payment p WHERE p.linked_invoice = i.bubble_id), 0)::numeric AS paid_amount,
+    COALESCE(
+      NULLIF(epp_items.epp_interest, 0),
+      NULLIF(pay.epp_sum, 0),
+      NULLIF(
         CASE
-          WHEN COALESCE(ii.description, '') ILIKE '%%epp%%interest%%'
-               OR COALESCE(ii.description, '') ILIKE '%%epp interest%%'
-          THEN COALESCE(ii.amount, ii.unit_price, 0)
+          WHEN i.effective_epp > 1.0 AND i.effective_epp < 2.0 THEN (i.total_amount * (i.effective_epp - 1.0) / i.effective_epp)::numeric
+          WHEN i.effective_epp >= 2.0 AND i.effective_epp <= 100.0 THEN (i.total_amount * (i.effective_epp / 100.0) / (1.0 + i.effective_epp / 100.0))::numeric
           ELSE 0
+        END,
+        0
+      ),
+      0
+    )::numeric AS epp_interest,
+    COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name, '(unknown)') AS customer_name,
+    COALESCE(NULLIF(TRIM(a.name), ''), '(unknown)') AS agent_name,
+    a.agent_type,
+    i.package_type,
+    i.package_name_snapshot,
+    i.description,
+    COALESCE(sr_link.nem_type, sr_back.nem_type) AS seda_nem_type,
+    ref.project_type AS referral_project_type,
+    COALESCE(NULLIF(TRIM(c_referrer.name), ''), NULLIF(TRIM(i.referrer_name), '')) AS referral_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY i.bubble_id
+      ORDER BY COALESCE(i.is_latest, FALSE) DESC,
+               i.full_payment_date DESC NULLS LAST,
+               i.id DESC
+    ) AS rn
+  FROM invoice i
+  INNER JOIN agent a ON a.bubble_id = i.linked_agent
+  LEFT JOIN customer c ON c.customer_id = i.linked_customer
+  LEFT JOIN SEDA_registration sr_link ON sr_link.bubble_id = i.linked_seda_registration
+  LEFT JOIN SEDA_registration sr_back ON i.bubble_id = ANY(sr_back.linked_invoice)
+  LEFT JOIN customer c_ref ON LOWER(TRIM(c_ref.name)) = LOWER(TRIM(COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name)))
+  LEFT JOIN referral ref ON (
+      ref.linked_invoice = c_ref.customer_id
+      OR LOWER(TRIM(ref.name)) = LOWER(TRIM(c_ref.name))
+      OR (
+        ref.mobile_number IS NOT NULL
+        AND c_ref.phone IS NOT NULL
+        AND right(regexp_replace(ref.mobile_number, '\\D', '', 'g'), 9) = right(regexp_replace(c_ref.phone, '\\D', '', 'g'), 9)
+      )
+      OR ref.linked_customer_profile = c_ref.customer_id
+    )
+    AND EXISTS (
+      SELECT 1 FROM agent a_ref
+      WHERE (
+        CASE
+          WHEN ref.linked_agent ~ '^[0-9]+$' THEN a_ref.id = CAST(ref.linked_agent AS integer)
+          ELSE a_ref.bubble_id = ref.linked_agent
         END
-      ) AS epp_interest_amount
-    FROM invoice_item ii
-    WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
-    GROUP BY COALESCE(ii.description, '')
-  ) ii_dedup
-) epp_items ON TRUE
-LEFT JOIN LATERAL (
-  SELECT SUM(COALESCE(p.epp_cost, 0)) AS epp_sum
-  FROM payment p
-  WHERE p.linked_invoice = i.bubble_id
-) pay ON TRUE
-WHERE i.paid IS TRUE
-  AND i.full_payment_date IS NOT NULL
-  AND EXTRACT(YEAR FROM i.full_payment_date)::int = {int(year)}
-  AND LOWER(btrim(COALESCE(a.agent_type, ''))) IN ({AGENT_TYPES_SQL})
-  AND COALESCE(i.percent_of_total_amount, 0) >= 100.0
-  {customer_filter_sql}
-ORDER BY agent_name ASC, i.full_payment_date ASC NULLS LAST, i.invoice_number ASC NULLS LAST
+      ) AND LOWER(TRIM(a_ref.name)) = LOWER(TRIM(a.name))
+    )
+  LEFT JOIN customer c_referrer ON c_referrer.customer_id = ref.linked_customer_profile
+  LEFT JOIN LATERAL (
+    SELECT COALESCE(
+      SUM(ii_dedup.epp_interest_amount),
+      0
+    ) AS epp_interest
+    FROM (
+      SELECT 
+        MAX(
+          CASE
+            WHEN COALESCE(ii.description, '') ILIKE '%%epp%%interest%%'
+                 OR COALESCE(ii.description, '') ILIKE '%%epp interest%%'
+            THEN COALESCE(ii.amount, ii.unit_price, 0)
+            ELSE 0
+          END
+        ) AS epp_interest_amount
+      FROM invoice_item ii
+      WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
+      GROUP BY TRIM(
+        REGEXP_REPLACE(
+          REGEXP_REPLACE(
+            REGEXP_REPLACE(COALESCE(ii.description, ''), 'moths', 'months', 'gi'),
+            '(\\d+)\\s*months',
+            '\\1months',
+            'gi'
+          ),
+          '\\s+',
+          ' ',
+          'g'
+        )
+      )
+    ) ii_dedup
+  ) epp_items ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT SUM(COALESCE(p.epp_cost, 0)) AS epp_sum
+    FROM payment p
+    WHERE p.linked_invoice = i.bubble_id
+  ) pay ON TRUE
+  WHERE i.paid IS TRUE
+    AND i.full_payment_date IS NOT NULL
+    AND (
+      EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
+      OR EXTRACT(YEAR FROM i.full_payment_date)::int = {int(year)}
+    )
+    AND LOWER(btrim(COALESCE(a.agent_type, ''))) IN ({AGENT_TYPES_SQL})
+    AND (COALESCE(i.percent_of_total_amount, 0) >= 1.0 OR i.paid IS TRUE)
+    {customer_filter_sql}
+)
+SELECT
+  invoice_number,
+  invoice_date,
+  full_payment_date,
+  total_amount,
+  paid_amount,
+  epp_interest,
+  customer_name,
+  agent_name,
+  agent_type,
+  package_type,
+  package_name_snapshot,
+  description,
+  seda_nem_type,
+  referral_project_type,
+  referral_name
+FROM candidates
+WHERE rn = 1
+ORDER BY agent_name ASC, full_payment_date ASC NULLS LAST, invoice_number ASC NULLS LAST
 """.strip()
 
 
@@ -433,6 +501,7 @@ class InvoiceLine:
     invoice_date: str
     full_payment_date: str
     total_amount: Decimal
+    paid_amount: Decimal
     epp_interest: Decimal
     sales_price: Decimal
     commission_rate: Decimal
@@ -467,20 +536,9 @@ def _parse_invoice_date(date_val: Any) -> datetime | None:
 
 def _referral_rate(invoice_date_val: Any) -> Decimal:
     """
-    Formula from sheet 'Referal' in 2. Basic Commission.xlsx:
-      - Before March 2026: 1%
-      - From March 2026: 2%
-      - March Specials (March 2026): 2% + 0.5% = 2.5%
+    Referral fee is 2% from sales price per invoice.
     """
-    dt = _parse_invoice_date(invoice_date_val)
-    if not dt:
-        return Decimal("0.02")
-    if dt < datetime(2026, 3, 1):
-        return Decimal("0.01")
-    elif dt.year == 2026 and dt.month == 3:
-        return Decimal("0.025")
-    else:
-        return Decimal("0.02")
+    return Decimal("0.02")
 
 
 def _is_valid_referral(ref_name: str | None) -> bool:
@@ -505,6 +563,7 @@ def _process_invoices(
         prop_type = classify_property_type(row)
         
         total = _to_decimal(row.get("total_amount"))
+        paid_amount = _to_decimal(row.get("paid_amount"))
         epp = _to_decimal(row.get("epp_interest"))
         sales_price = total - epp
         
@@ -522,7 +581,11 @@ def _process_invoices(
                 safwan_sharing = sharing_tuple
             comm = sales_price * (rate + sharing)
         else:
-            rate = SENIOR_RATE if is_agent_senior else EXECUTIVE_RATE
+            from basic_commission_rates import get_basic_rate
+            pay_date_parsed = _parse_invoice_date(row.get("full_payment_date"))
+            pay_month = pay_date_parsed.month if pay_date_parsed else 5
+            hierarchy = "Senior" if is_agent_senior else "Executive"
+            rate = get_basic_rate("Internal", hierarchy, pay_month)
             comm = sales_price * rate
             
         inv_dt = str(row.get("invoice_date") or "")[:10]
@@ -540,6 +603,7 @@ def _process_invoices(
                 invoice_date=inv_dt,
                 full_payment_date=pay_dt,
                 total_amount=total,
+                paid_amount=paid_amount,
                 epp_interest=epp,
                 sales_price=sales_price,
                 commission_rate=rate,
@@ -561,6 +625,7 @@ def _process_invoices(
                     invoice_date=inv_dt,
                     full_payment_date=pay_dt,
                     total_amount=total,
+                    paid_amount=paid_amount,
                     epp_interest=epp,
                     sales_price=sales_price,
                     commission_rate=safwan_rate,
@@ -624,6 +689,7 @@ def _table2_rows(lines: list[InvoiceLine]) -> list[list[str]]:
             ln.invoice_date,
             ln.full_payment_date,
             _fmt_money(ln.total_amount),
+            _fmt_money(ln.paid_amount),
             _fmt_money(ln.epp_interest),
             _fmt_money(ln.sales_price),
             _fmt_rate(ln.commission_rate),
@@ -648,6 +714,7 @@ def _table3_rows(lines: list[InvoiceLine]) -> list[list[str]]:
             ln.invoice_date,
             ln.full_payment_date,
             _fmt_money(ln.total_amount),
+            _fmt_money(ln.paid_amount),
             _fmt_money(ln.epp_interest),
             _fmt_money(ln.sales_price),
             _fmt_rate(ln.commission_rate),
@@ -671,6 +738,10 @@ def _table4_rows(lines: list[InvoiceLine]) -> list[list[str]]:
             table_rows.append([
                 ln.referral_name.strip(),
                 ln.agent_name.strip(),
+                ln.customer_name.strip(),
+                ln.invoice_number.strip(),
+                ln.invoice_date.strip(),
+                ln.full_payment_date.strip(),
                 _fmt_money(sales_price),
                 _fmt_rate(rate),
                 _fmt_money(fee),
@@ -730,6 +801,7 @@ def main(argv: list[str]) -> int:
         description="Basic Commission report — Tables 1, 2, 3 and 4."
     )
     parser.add_argument("--year", type=int, default=2026)
+    parser.add_argument("--month", type=int, default=None, help="Month to filter (1-12)")
     parser.add_argument(
         "--customer-contains",
         action="append",
@@ -740,12 +812,12 @@ def main(argv: list[str]) -> int:
         "--profit-sharing",
         type=float,
         default=None,
-        help="Default profit sharing % for Factory (e.g. 5.0 for 5%)",
+        help="Default profit sharing %% for Factory (e.g. 5.0 for 5%%)",
     )
     parser.add_argument(
         "--factory-rates",
         default=None,
-        help="JSON string or comma-separated key:value pairs mapping invoice_number to profit sharing %",
+        help="JSON string or comma-separated key:value pairs mapping invoice_number to profit sharing %%",
     )
     parser.add_argument(
         "--proxy-url",
@@ -804,6 +876,17 @@ def main(argv: list[str]) -> int:
         params=[],
     )
     raw_rows = list(payload.get("rows") or [])
+
+    if args.month is not None:
+        filtered_rows = []
+        for r in raw_rows:
+            inv_dt = _parse_invoice_date(r.get("invoice_date"))
+            pay_dt = _parse_invoice_date(r.get("full_payment_date"))
+            inv_match = inv_dt and inv_dt.year == args.year and inv_dt.month == args.month
+            pay_match = pay_dt and pay_dt.year == args.year and pay_dt.month == args.month
+            if inv_match or pay_match:
+                filtered_rows.append(r)
+        raw_rows = filtered_rows
     
     cli_factory_rates: dict[str, Decimal] = {}
     if args.factory_rates:
@@ -855,7 +938,7 @@ def main(argv: list[str]) -> int:
     print("Rates: Executive m = 3.00%; Senior m = 3.25%; Factory = 2.00% + profit sharing")
     print(
         "Senior override: +0.25% of each report's accumulated basic commission (Executive tier only) "
-        "(Sunny: Jia Keat, Zul, Denise, Jia Xuan, Ah Zu; "
+        "(Sunny: Jia Keat, Zulkarnain, Denise, Jia Xuan, Ah Zu; "
         "Kent: Louis Ng, Anisah Najwa)"
     )
     print()
@@ -875,6 +958,7 @@ def main(argv: list[str]) -> int:
                 "Invoice Date",
                 "Full Payment Date",
                 "Total Amount",
+                "Payment Received",
                 "Epp",
                 "Sales Price",
                 "Rate %",
@@ -896,6 +980,7 @@ def main(argv: list[str]) -> int:
                 "Invoice Date",
                 "Full Payment Date",
                 "Total Amount",
+                "Payment Received",
                 "Epp",
                 "Sales Price",
                 "Rate %",
@@ -913,6 +998,10 @@ def main(argv: list[str]) -> int:
             [
                 "Referral Name",
                 "Agent Name",
+                "Customer Name",
+                "Invoice Number",
+                "Invoice Date",
+                "Full Payment Date",
                 "Sales Price",
                 "Rate %",
                 "Referral Fee",
@@ -936,7 +1025,7 @@ def main(argv: list[str]) -> int:
         w = csv.writer(f)
         w.writerow([
             "Agent Name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date",
-            "Total Amount", "Epp", "Sales Price", "Rate %", "Basic Commission"
+            "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Basic Commission"
         ])
         w.writerows(table2)
         
@@ -945,7 +1034,7 @@ def main(argv: list[str]) -> int:
         w = csv.writer(f)
         w.writerow([
             "Agent Name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date",
-            "Total Amount", "Epp", "Sales Price", "Rate %", "Profit Sharing", "Basic Commission"
+            "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Profit Sharing", "Basic Commission"
         ])
         w.writerows(table3)
 
@@ -954,7 +1043,7 @@ def main(argv: list[str]) -> int:
         with open(csv_t4, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow([
-                "Referral Name", "Agent Name", "Sales Price", "Rate %", "Referral Fee"
+                "Referral Name", "Agent Name", "Customer Name", "Invoice Number", "Invoice Date", "Full Payment Date", "Sales Price", "Rate %", "Referral Fee"
             ])
             w.writerows(table4)
         

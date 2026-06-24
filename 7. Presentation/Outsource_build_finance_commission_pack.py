@@ -3,8 +3,8 @@
 Build one finance Excel workbook for Basic, ANP, and NFP commission (year 2026).
 
 Output:
-  Finance Output/Commission_Pack_2026_<timestamp>.xlsx
-  Finance Output/Commission_Pack_2026_<timestamp>.pdf   (with --pdf or --both)
+  Finance Output/Outsource_Commission_Pack_2026_<timestamp>.xlsx
+  Finance Output/Outsource_Commission_Pack_2026_<timestamp>.pdf   (with --pdf or --both)
 
 Sheets:
   - Finance Summary
@@ -207,7 +207,7 @@ def _get_mock_data_for_fetching(year: int, h1_only: bool = False) -> dict[str, A
         "total_commission": Decimal(str(sum(basic_total_comm.values()))),
         "filter": "mock data",
     }
-    basic_t4 = []
+    basic_t3 = []
     
     # ANP
     anp_agent_sales = defaultdict(float)
@@ -275,8 +275,9 @@ def _get_mock_data_for_fetching(year: int, h1_only: bool = False) -> dict[str, A
         "filter": "payment 0-100%; internal (MOCK)",
     }
     
+    basic_t4 = []
     return {
-        "basic": (basic_t1, basic_t2, basic_t4, basic_meta, basic_lines),
+        "basic": (basic_t1, basic_t2, basic_t3, basic_t4, basic_meta, basic_lines),
         "anp": (anp_summary, anp_detail, anp_meta),
         "nfp": (nfp_agent_summary_table, nfp_detail_table, nfp_meta, nfp_rows)
     }
@@ -522,7 +523,7 @@ def get_reporting_senior(agent_name: str) -> str | None:
         return None
     if any(tok in n for tok in ["louis ng", "anisah najwa", "anisah"]):
         return "Teng Kah Kent"
-    if any(tok in n for tok in ["jia keat", "zul", "denise", "jia xuan", "ah zu"]):
+    if any(tok in n for tok in ["jia keat", "zul", "zulkarnain", "denise", "jia xuan", "ah zu"]):
         return "Sunny Tan"
     if "joshua" in n:
         return "CHING ZHE HANG"
@@ -559,8 +560,8 @@ def get_basic_monthly_tables(lines: list[Any]) -> dict[int, list[list[str]]]:
                 ln.agent_name,
                 ln.customer_name,
                 str(count),
-                f"{ln.net_base:,.2f}",
-                f"{ln.commission_rate * 100:.2f}%",
+                f"{ln.sales_price:,.2f}",
+                f"{ln.rate * 100:.2f}%",
                 f"{override_val * 100:.2f}%" if override_val > 0 else "-",
                 f"{ln.basic_commission:,.2f}"
             ])
@@ -731,94 +732,185 @@ def write_excel_stacked_details(ws, title_suffix: str, headers: list[str], month
         ws.column_dimensions[letter].width = max(max_len + 4, 15)
 
 
-def fetch_basic(year: int, h1_only: bool = False) -> tuple[list[list[str]], list[list[str]], list[list[str]], dict[str, Any], list[Any]]:
+def fetch_basic(year: int, h1_only: bool = False) -> tuple[list[list[str]], list[list[str]], list[list[str]], list[list[str]], dict[str, Any], list[Any]]:
     if MOCK_MODE:
-        return _get_mock_data_for_fetching(year, h1_only=h1_only)["basic"]
+        return [], [], [], [], {"agents":0, "invoices":0, "total_commission":0, "filter":""}, []
 
-    basic_path = REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "full_internal_basic_commission.py"
-    basic = _load_module("basic_commission", basic_path)
-    token = os.environ.get("PG_PROXY_TOKEN", "") or basic._env("PG_PROXY_TOKEN")
+    out_dir = REPO_ROOT / "1. Basic Commission" / "3. Python Script"
+    out_path = out_dir / "outsource_basic_commission.py"
+    basic = _load_module("outsource_basic_commission", out_path)
+    
+    token = os.environ.get("PG_PROXY_TOKEN", "").strip() or basic._env("PG_PROXY_TOKEN")
     if not token:
         raise RuntimeError(_token_help_message())
+
     proxy_url = basic._normalize_proxy_url(
         basic._env("PG_PROXY_URL", "https://pg-proxy-production.up.railway.app/api/sql")
     )
     db_name = basic._env("PG_PROXY_DB") or basic._env("PG_DB_NAME", "prod_main")
+
     payload = basic._proxy_sql(
         proxy_url=proxy_url,
         db_name=db_name,
         token=token,
-        sql=basic._invoices_sql(year=year, customer_filter_sql=""),
-        params=[],
+        sql=basic._invoices_sql(year=year),
+        params=[]
     )
     raw_rows = list(payload.get("rows") or [])
-    factory_rates = basic.get_factory_rates(raw_rows)
-    lines = basic._process_invoices(raw_rows, factory_rates)
-    if h1_only:
-        lines = [ln for ln in lines if _parse_month(ln.full_payment_date) in (1, 2, 3, 4, 5, 6)]
-    user_count, table1 = basic._table1_rows(lines)
-    table2 = basic._table2_rows(lines) + basic._table3_rows(lines)
-    table4 = basic._table4_rows(lines)
-    total_comm = _money_sum([r[4] for r in table1])
-    meta = {
-        "agents": user_count,
-        "invoices": len(table2),
-        "total_commission": total_comm,
-        "filter": "paid=TRUE; full_payment_date year; agent internal/full time" + (" (H1)" if h1_only else ""),
-    }
-    return table1, table2, table4, meta, lines
+    
+    from decimal import Decimal
+    from collections import defaultdict
+    processed_outsource_invoices = []
+    processed_outsource_factory = []
+    agent_own_commissions = defaultdict(Decimal)
+    agent_sales = defaultdict(Decimal)
+    override_commissions = defaultdict(Decimal)
+    
+    for r in raw_rows:
+        agent_name = str(r.get("agent_name") or "(unknown)").strip()
+        agent_comm_field = r.get("agent_comm_field")
+        
+        info = basic.get_agent_hierarchy_info(agent_name)
+        is_db_outsource = "outsource" in str(r.get("agent_type") or "").lower()
+        if not info and not is_db_outsource:
+            continue
+            
+        if not info:
+            info = {"canonical_name": agent_name, "tier": "OSA", "osa_parent": None, "oum_parent": None}
+            
+        canonical_name = info["canonical_name"]
+        customer_name = str(r.get("customer_name") or "(unknown)").strip()
+        invoice_num = str(r.get("invoice_number") or "").strip()
+        prop_type = basic.classify_property_type(r)
+        
+        total = basic._to_decimal(r.get("total_amount"))
+        paid_amount = basic._to_decimal(r.get("paid_amount"))
+        epp = basic._to_decimal(r.get("epp_interest"))
+        sales_price = total - epp
+        
+        inv_dt = str(r.get("invoice_date") or "")[:10]
+        pay_dt = str(r.get("full_payment_date") or "")[:10]
+        
+        ref_name = r.get("referral_name")
+        
+        if h1_only:
+            m = _parse_month(pay_dt)
+            if not m or m > 6:
+                continue
+        
+        if prop_type == "Factory":
+            rate = Decimal("0.02")
+            sharing = Decimal("0") # fallback
+            
+            osa_sharing = sharing
+            if info["tier"] in ("OSA", "OSA 1") and sharing > 0:
+                osa_sharing = sharing * Decimal("0.70")
+                oum_p = info.get("oum_parent")
+                if oum_p:
+                    override_commissions[oum_p] += sales_price * sharing * Decimal("0.20")
+                override_commissions["OGM Pool"] += sales_price * sharing * Decimal("0.10")
+                
+            comm = sales_price * (rate + osa_sharing)
+            
+            processed_outsource_factory.append(
+                basic.OutsourceFactoryInvoiceLine(
+                    agent_name=canonical_name,
+                    customer_name=customer_name,
+                    invoice_number=invoice_num,
+                    package=prop_type,
+                    invoice_date=inv_dt,
+                    full_payment_date=pay_dt,
+                    total_amount=total,
+                    paid_amount=paid_amount,
+                    epp=epp,
+                    sales_price=sales_price,
+                    rate=rate,
+                    profit_sharing=osa_sharing,
+                    basic_commission=comm,
+                    referral_name=ref_name
+                )
+            )
+        else:
+            rate = basic.get_own_commission_rate(info, agent_comm_field, pay_dt)
+            comm = sales_price * rate
+            
+            processed_outsource_invoices.append(
+                basic.OutsourceInvoiceLine(
+                    agent_name=canonical_name,
+                    customer_name=customer_name,
+                    invoice_number=invoice_num,
+                    package=prop_type,
+                    invoice_date=inv_dt,
+                    full_payment_date=pay_dt,
+                    total_amount=total,
+                    paid_amount=paid_amount,
+                    epp=epp,
+                    sales_price=sales_price,
+                    rate=rate,
+                    basic_commission=comm,
+                    referral_name=ref_name
+                )
+            )
+            
+        agent_sales[canonical_name] += total
+        agent_own_commissions[canonical_name] += comm
+        
+        tier = info["tier"]
+        if tier == "OSA 1":
+            oum_p = info.get("oum_parent")
+            if oum_p: override_commissions[oum_p] += total * Decimal("0.005")
+        elif tier == "OSA":
+            oum_p = info.get("oum_parent")
+            internal_senior = info.get("internal_senior_parent")
+            if oum_p: override_commissions[oum_p] += total * Decimal("0.005")
+            if internal_senior: override_commissions[internal_senior] += total * Decimal("0.005")
+            
+    all_payout_agents = set(agent_own_commissions.keys()) | set(override_commissions.keys())
+    t1_rows = []
+    for agent in sorted(all_payout_agents):
+        own = agent_own_commissions.get(agent, Decimal("0"))
+        ovr = override_commissions.get(agent, Decimal("0"))
+        sales = agent_sales.get(agent, Decimal("0"))
+        total_payout = own + ovr
+        t1_rows.append([agent, f"{sales:,.2f}", f"{own:,.2f}", f"{ovr:,.2f}", f"{total_payout:,.2f}"])
+        
+    t2_rows = []
+    for inv in processed_outsource_invoices:
+        t2_rows.append([inv.agent_name, inv.customer_name, inv.invoice_number, inv.package, inv.invoice_date, inv.full_payment_date, f"{inv.total_amount:,.2f}", f"{inv.epp:,.2f}", f"{inv.sales_price:,.2f}", f"{(inv.rate * 100):.2f}%", f"{inv.basic_commission:,.2f}"])
+        
+    t3_rows = []
+    for inv in processed_outsource_factory:
+        t3_rows.append([inv.agent_name, inv.customer_name, inv.invoice_number, inv.package, inv.invoice_date, inv.full_payment_date, f"{inv.total_amount:,.2f}", f"{inv.epp:,.2f}", f"{inv.sales_price:,.2f}", f"{(inv.rate * 100):.2f}%", f"{(getattr(inv, 'profit_sharing', 0) * 100):.2f}%", f"{inv.basic_commission:,.2f}"])
+        
+    t4_rows = []
+    for ln in processed_outsource_invoices + processed_outsource_factory:
+        if basic._is_valid_referral(ln.referral_name):
+            sales_price = ln.sales_price
+            rate = basic._referral_rate(ln.invoice_date)
+            fee = sales_price * rate
+            t4_rows.append([
+                ln.referral_name.strip(),
+                ln.agent_name.strip(),
+                ln.customer_name.strip(),
+                ln.invoice_number.strip(),
+                ln.invoice_date.strip(),
+                ln.full_payment_date.strip(),
+                f"{sales_price:,.2f}",
+                f"{(rate * 100):.2f}%",
+                f"{fee:,.2f}"
+            ])
+    t4_rows.sort(key=lambda r: (r[0].lower(), r[1].lower()))
 
+    total_comm = sum(Decimal(r[4].replace(',','')) for r in t1_rows if len(r)>4)
+    meta = {"agents": len(t1_rows), "invoices": len(t2_rows) + len(t3_rows), "total_commission": total_comm, "filter": "outsource agents"}
+    processed_lines = processed_outsource_invoices + processed_outsource_factory
+    
+    return t1_rows, t2_rows, t3_rows, t4_rows, meta, processed_lines
 
-def _anp_script_path() -> Path:
-    for candidate in (
-        REPO_ROOT / "3. ANP Commission" / "anp_commission.py",
-        REPO_ROOT / "3. ANP Commission" / "3. Python Script" / "anp_commission.py",
-    ):
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError(
-        f"ANP script not found under {REPO_ROOT / '3. ANP Commission'} "
-        "(expected anp_commission.py at folder root or in 3. Python Script/)"
-    )
+def fetch_anp(year: int, h1_only: bool = False) -> tuple[list[Any], list[Any], dict[str, Any]]:
+    from decimal import Decimal
+    return [], [], {"agents": 0, "invoices": 0, "total_commission": Decimal("0"), "filter": "N/A"}
 
-
-def fetch_anp(year: int, h1_only: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    if MOCK_MODE:
-        return _get_mock_data_for_fetching(year, h1_only=h1_only)["anp"]
-
-    anp_path = _anp_script_path()
-    anp = _load_module("anp_commission", anp_path)
-    base_url = os.getenv("PG_PROXY_URL", "").strip().rstrip("/")
-    if base_url.endswith("/api/sql"):
-        base_url = base_url[: -len("/api/sql")]
-    token = anp.normalize_proxy_token(os.getenv("PG_PROXY_TOKEN", ""))
-    db_name = os.getenv("PG_DB_NAME", "prod_main").strip()
-    if not base_url or not token:
-        raise RuntimeError(_token_help_message())
-    anp.validate_proxy_token(token)
-    client = anp.PostgresProxyClient(base_url, token, db_name)
-    agent_types = ["internal", "FULL TIME"]
-    agents = anp.fetch_agents(client, agent_types)
-    agent_ids = [str(a["bubble_id"]) for a in agents]
-    invoices = anp.fetch_invoices_for_agents(client, agent_ids)
-    invoice_ids = [str(i["bubble_id"]) for i in invoices if i.get("bubble_id")]
-    customer_ids = list({str(i["linked_customer"]) for i in invoices if i.get("linked_customer")})
-    planning = anp.fetch_payment_planning(client, invoice_ids)
-    customers = anp.fetch_customers(client, customer_ids)
-    period_start = date(year, 1, 1)
-    period_end = date(year, 6, 30) if h1_only else date(year, 12, 31)
-    payout_label = f"invoice-year-{year}-h1" if h1_only else f"invoice-year-{year}"
-    detail_rows, summary_rows = anp.build_report_rows(
-        agents, invoices, planning, customers, period_start, period_end, payout_label
-    )
-    total_comm = sum(Decimal(str(r.get("anp_commission", 0))) for r in summary_rows)
-    meta = {
-        "agents": len(summary_rows),
-        "invoices": len(detail_rows),
-        "total_commission": total_comm,
-        "filter": "invoice_date in year; 1st payment secured; internal + FULL TIME" + (" (H1)" if h1_only else ""),
-    }
-    return summary_rows, detail_rows, meta
 
 
 def fetch_nfp(year: int, h1_only: bool = False) -> tuple[list[list[str]], list[list[str]], dict[str, Any], list[Any]]:
@@ -826,8 +918,8 @@ def fetch_nfp(year: int, h1_only: bool = False) -> tuple[list[list[str]], list[l
         return _get_mock_data_for_fetching(year, h1_only=h1_only)["nfp"]
 
     nfp_dir = REPO_ROOT / "2. NFP Commission" / "3. Python script"
-    nfp_path = nfp_dir / "nfp_commission.py"
-    nfp = _load_module("nfp_commission", nfp_path)
+    nfp_path = nfp_dir / "outsource_nfp_commission.py"
+    nfp = _load_module("outsource_nfp_commission", nfp_path)
     nfp_paths = _load_module("nfp_paths", nfp_dir / "nfp_paths.py")
     token = os.environ.get("PG_PROXY_TOKEN", "").strip() or nfp_paths.get_proxy_token()
     if not token:
@@ -887,8 +979,8 @@ def fetch_ega_esa(year: int) -> tuple[list[list[str]], list[list[str]], list[lis
         return [], [], [], [], [], []
 
     ega_dir = REPO_ROOT / "4. EGA ESA Awards" / "3. Python script"
-    ega_path = ega_dir / "full_internal_EGA_ESA_Awards.py"
-    ega = _load_module("ega_esa", ega_path)
+    ega_path = ega_dir / "outsource_EGA_ESA_Awards.py"
+    ega = _load_module("outsource_ega_esa", ega_path)
     
     nfp_dir = REPO_ROOT / "2. NFP Commission" / "3. Python script"
     nfp_paths = _load_module("nfp_paths", nfp_dir / "nfp_paths.py")
@@ -910,6 +1002,17 @@ def fetch_ega_esa(year: int) -> tuple[list[list[str]], list[list[str]], list[lis
     return t1, t2, t3, ega.T1_HEADERS, ega.T2_HEADERS, ega.T3_HEADERS
 
 
+def fetch_production_bonus(year: int) -> dict[str, Any] | None:
+    if MOCK_MODE:
+        return None
+
+    prod_dir = REPO_ROOT / "5. Production Bonus" / "3. Python Script"
+    prod_path = prod_dir / "full_outsource_Production_Bonus.py"
+    prod = _load_module("full_outsource_Production_Bonus", prod_path)
+    
+    return prod.build_report(year)
+
+
 def aggregate_monthly_metrics(basic_lines: list[Any], anp_detail: list[dict[str, Any]], nfp_rows: list[Any], year: int) -> dict[str, Any]:
     monthly_data = {m: {"month": m, "year": year, "customer_count": 0, "total_commission": 0.0, "total_sales": 0.0, "agent_commissions": {}} for m in range(1, 13)}
     monthly_agent_cust = {m: defaultdict(set) for m in range(1, 13)}
@@ -928,7 +1031,7 @@ def aggregate_monthly_metrics(basic_lines: list[Any], anp_detail: list[dict[str,
             agent = line.agent_name.strip()
             cust = line.customer_name.strip()
             comm = float(line.basic_commission)
-            sales = float(line.net_base)
+            sales = float(line.sales_price)
             
             all_agents.add(agent)
             all_customers.add(cust)
@@ -1036,7 +1139,7 @@ def build_workbook(year: int, output_path: Path) -> Path:
     from openpyxl.styles import Font
 
     print(f"Building finance pack for {year}...")
-    basic_t1, basic_t2, basic_t4, basic_meta, basic_lines = fetch_basic(year)
+    basic_t1, basic_t2, basic_t3, basic_t4, basic_meta, basic_lines = fetch_basic(year)
     print(f"  Basic: {basic_meta['agents']} agents, {basic_meta['invoices']} invoices")
 
     anp_summary, anp_detail, anp_meta = fetch_anp(year)
@@ -1051,7 +1154,7 @@ def build_workbook(year: int, output_path: Path) -> Path:
     wb = Workbook()
     ws0 = wb.active
     ws0.title = "Finance Summary"
-    ws0["A1"] = f"Commission Pack — calendar year {year}"
+    ws0["A1"] = f"Outsource Commission Pack — calendar year {year}"
     ws0["A1"].font = Font(bold=True, size=14)
     run_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     overview = [
@@ -1112,28 +1215,6 @@ def build_workbook(year: int, output_path: Path) -> Path:
         nfp_agent,
         {2, 3, 4, 5},
     )
-    _append_sheet(
-        wb,
-        "ANP - By Agent",
-        ["Agent Name", "Invoice Count", "Accumulated Total (RM)", "ANP Commission (RM)"],
-        nfp_agent,
-        {3, 4},
-    )
-    if not MOCK_MODE:
-        anp_mod = sys.modules["anp_commission"]
-        anp_summary_table = anp_mod.summary_table_rows(anp_summary)
-        wb.remove(wb["ANP - By Agent"])
-        _append_sheet(
-            wb,
-            "ANP - By Agent",
-            ["Agent Name", "Invoice Count", "Accumulated Total (RM)", "ANP Commission (RM)"],
-            anp_summary_table,
-            {3, 4},
-        )
-        
-
-
-    # Details sheets
     ws_basic_det = wb.create_sheet("Basic - By Invoice")
     write_excel_stacked_details(
         ws_basic_det,
@@ -1150,15 +1231,6 @@ def build_workbook(year: int, output_path: Path) -> Path:
         ["Agent Name", "Customer Name", "Count of Customer", "Sales Price", "System Price", "Net Floor Price", "Commission Rate", "NFP Commission"],
         get_nfp_monthly_tables(nfp_rows),
         {4, 5, 6, 8}
-    )
-
-    ws_anp_det = wb.create_sheet("ANP - By Invoice")
-    write_excel_stacked_details(
-        ws_anp_det,
-        "ANP Commission",
-        ["Agent Name", "Customer Name", "Count of Customer", "Sales Price", "ANP Commission"],
-        get_anp_monthly_tables(anp_detail),
-        {4, 5}
     )
 
 
@@ -1260,11 +1332,30 @@ def _combined_agent_totals(
     return combined
 
 
+def determine_nfp_rate(matched_rows: list[Any]) -> str:
+    rates = set()
+    for r in matched_rows:
+        sales = float(r.sales_price)
+        nfp = float(r.net_floor_price) if r.net_floor_price is not None else None
+        if nfp is None:
+            continue
+        if sales > nfp:
+            rates.add("25%")
+        elif sales < nfp:
+            rates.add("20%")
+        else:
+            rates.add("25%")
+    if not rates:
+        return "25%"
+    sorted_rates = sorted(list(rates), key=lambda x: x, reverse=True)
+    return "/".join(sorted_rates)
+
+
 def build_pdf(year: int, output_path: Path) -> Path:
     from commission_pdf import FinanceChartData, PdfSection, write_finance_presentation_pdf
 
     print(f"Building finance PDF for {year}...")
-    basic_t1, basic_t2, basic_t4, basic_meta, basic_lines = fetch_basic(year, h1_only=True)
+    basic_t1, basic_t2, basic_t3, basic_t4, basic_meta, basic_lines = fetch_basic(year, h1_only=True)
     print(f"  Basic: {basic_meta['agents']} agents, {basic_meta['invoices']} invoices")
 
     anp_summary, anp_detail, anp_meta = fetch_anp(year, h1_only=True)
@@ -1279,11 +1370,6 @@ def build_pdf(year: int, output_path: Path) -> Path:
     monthly_metrics = aggregate_monthly_metrics(basic_lines, anp_detail, nfp_rows, year)
 
     anp_summary_table = []
-    if MOCK_MODE:
-        anp_summary_table = [[r["agent_name"], str(r["invoice_count"]), f"{r['accumulated_total_amount']:.2f}", f"{r['anp_commission']:.2f}"] for r in anp_summary]
-    else:
-        anp_mod = sys.modules["anp_commission"]
-        anp_summary_table = _rows_to_str(anp_mod.summary_table_rows(anp_summary))
 
     grand = (
         basic_meta["total_commission"]
@@ -1295,7 +1381,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
     # Fetch agent rates from basic lines
     agent_rates_map = defaultdict(set)
     for ln in basic_lines:
-        rate_val = float(ln.commission_rate) * 100
+        rate_val = float(ln.rate) * 100
         rate_str = f"{rate_val:g}%"
         
         if ln.package == "Factory":
@@ -1308,10 +1394,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         else:
             agent_rates_map[ln.agent_name.strip()].add(f"{rate_str}")
             
-        senior = get_reporting_senior(ln.agent_name)
-        if senior:
-            agent_rates_map[senior.strip()].add("0.25%")
-            
+        # Senior override logic removed for outsource agents            
     agent_rates = {}
     for agent, rates in agent_rates_map.items():
         # Sort so 3.25% is first, then 2%, then 0.5%, then 0.25%
@@ -1326,16 +1409,10 @@ def build_pdf(year: int, output_path: Path) -> Path:
         m = _parse_month(ln.full_payment_date)
         if m and 1 <= m <= 6:
             agent = ln.agent_name.strip()
-            basic_matrix[agent][m]["sales"] += float(ln.net_base)
+            basic_matrix[agent][m]["sales"] += float(ln.sales_price)
             basic_matrix[agent][m]["comm"] += float(ln.basic_commission)
 
-    # Apply override commission to seniors
-    for ln in basic_lines:
-        m = _parse_month(ln.full_payment_date)
-        if m and 1 <= m <= 6:
-            senior = get_reporting_senior(ln.agent_name)
-            if senior:
-                basic_matrix[senior][m]["comm"] += float(ln.net_base) * 0.0025
+    # Senior override commission logic removed for outsource agents
 
     basic_matrix_rows = []
     for agent in sorted(basic_matrix.keys()):
@@ -1362,7 +1439,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         m = _parse_month(r.get("invoice_date"))
         if m and 1 <= m <= 6:
             agent = r.get("agent_name", "").strip()
-            anp_matrix[agent][m]["sales"] += float(r.get("sales_price", 0.0))
+            anp_matrix[agent][m]["sales"] += float(r.get("invoice_total_amount", 0.0))
             anp_matrix[agent][m]["comm"] += float(r.get("anp_commission_accumulated_tier", 0.0))
 
     anp_matrix_rows = []
@@ -1396,7 +1473,9 @@ def build_pdf(year: int, output_path: Path) -> Path:
 
     nfp_matrix_rows = []
     for agent in sorted(nfp_matrix.keys()):
-        row = [agent, "25%/20%"]
+        agent_rows = [r for r in nfp_rows if r.agent_name.strip().lower() == agent.strip().lower()]
+        rate_str = determine_nfp_rate(agent_rows)
+        row = [agent, rate_str]
         for m in range(1, 7):
             sales = nfp_matrix[agent][m]["sales"]
             system = nfp_matrix[agent][m]["system"]
@@ -1426,7 +1505,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         unfiltered_h1_rows = [r for r in mock_raw["nfp_rows"] if _parse_month(r.invoice_date) in (1, 2, 3, 4, 5, 6)]
     else:
         nfp_dir = REPO_ROOT / "2. NFP Commission" / "3. Python script"
-        nfp_mod = _load_module("nfp_commission", nfp_dir / "nfp_commission.py")
+        nfp_mod = _load_module("outsource_nfp_commission", nfp_dir / "outsource_nfp_commission.py")
         unfiltered_rows, _ = nfp_mod.build_report(year)
         unfiltered_h1_rows = [r for r in unfiltered_rows if _parse_month(r.invoice_date) in (1, 2, 3, 4, 5, 6)]
 
@@ -1441,7 +1520,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
     invoice_sales_map = {}
     for ln in basic_lines:
         inv = getattr(ln, "invoice_number", None)
-        if inv: invoice_sales_map[inv.strip()] = float(ln.net_base)
+        if inv: invoice_sales_map[inv.strip()] = float(ln.sales_price)
     for r in anp_detail:
         inv = r.get("invoice_number")
         if inv: invoice_sales_map[inv.strip()] = float(r.get("sales_price", 0.0))
@@ -1499,47 +1578,44 @@ def build_pdf(year: int, output_path: Path) -> Path:
         ),
     ]
     
-    if not basic_t4:
-        basic_t4_pdf = [["No referral fee", "-", "-", "-", "-"]]
-    else:
-        basic_t4_pdf = basic_t4
+    # Referral fee rows
+    basic_t4_pdf = _rows_to_str(basic_t4) if basic_t4 else [["No referral fee", "-", "-", "-", "-", "-", "-", "-", "-"]]
         
     sections.append(PdfSection(
         "Referral Fee Details",
-        ["Referral Name", "Agent Name", "Sales Price", "Rate %", "Referral Fee"],
+        ["Referral Name", "Agent Name", "Customer Name", "Invoice Number", "Invoice Date", "Full Payment Date", "Sales Price", "Rate %", "Referral Fee"],
         basic_t4_pdf,
         footer_text=[
             "<b>Note:</b>",
-            "• All Residential and non-residential: 1% (Before Mar 2026)",
-            "• All Residential and non-residential: 2% (From Mar 2026)",
-            "• All Residential and non-residential: Additional 0.5% (Mar Specials 2026)",
+            "• Referral Fee: All Residential and non-residential: 1% (Before Mar 2026), 2% (From Mar 2026), Additional 0.5% (Mar Specials 2026)",
             "• Referral fee eligibility excludes spouses"
         ]
     ))
 
-    sections.extend([
-        PdfSection(
-            "NFP Commission Details",
-            [],
-            nfp_matrix_rows,
-            landscape=True,
-            total_agents=nfp_meta["agents"],
-            total_customers=len(nfp_rows),
-            footer_text=[
-                "<b>Note:</b>",
-                "• NFP Commission distributions are contingent upon the receipt of 100% full payment",
-                "• Effective October 1, 2025, NFP computations are applicable exclusively to invoices issued on or after this date. Invoices predating this period are structurally excluded from NFP allocations."
-            ]
-        ),
-        PdfSection(
-            "ANP Commission Details",
-            [],
-            anp_matrix_rows,
-            landscape=True,
-            total_agents=anp_meta["agents"],
-            total_customers=len(anp_detail),
-        ),
-    ])
+    if basic_t3:
+        sections.append(PdfSection(
+            "Outsource Factory Details",
+            ["Agent Name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Payment Date", "Total (RM)", "EPP (RM)", "Sales (RM)", "Rate", "Profit Share", "Commission"],
+            basic_t3,
+            landscape=True
+        ))
+    sections.append(PdfSection(
+        "NFP Commission Details",
+        [],
+        nfp_matrix_rows,
+        landscape=True,
+        total_agents=nfp_meta["agents"],
+        total_customers=len(nfp_rows),
+        footer_text=[
+            "<b>Note:</b>",
+            "• NFP Commission distributions are contingent upon the receipt of 100% full payment.",
+            "• Three types of Net Floor Price Commission:",
+            "  * Sales above Net Floor Price: Sales Price > Net Floor Price. Formula: (Sales Price - Net Floor Price) x 25% = NFP Commission",
+            "  * Sales above System Price: System Price > Net Floor Price. Formula: (System Price - Net Floor Price) x 100% = NFP Commission",
+            "  * Sales below Net Floor price: Sales Price < Net Floor Price. Formula: (Sales Price - Net Floor Price) x Bears 20% = NFP Commission",
+            "• Effective October 1, 2025, NFP computations are applicable exclusively to invoices issued on or after this date. Invoices predating this period are structurally excluded from NFP allocations."
+        ]
+    ))
 
     if ega_t1:
         sections.append(PdfSection(
@@ -1550,18 +1626,48 @@ def build_pdf(year: int, output_path: Path) -> Path:
             total_agents=len(ega_t1) - 1 if ega_t1 and ega_t1[-1][0] == "Total" else len(ega_t1),
             total_customers=(len(ega_t2) if ega_t2 else 0) + (len(ega_t3) if ega_t3 else 0),
             footer_text=[
-                "Qualification is contingent upon the successful accumulation of a minimum of 450,000 cumulative EP points by the end of the April performance period.",
+                "<b>EGA Targets (Standard):</b> EP Points > 720,000. <b>Early Bird EGA:</b> Feb &ge; 420,000 | Mar &ge; 480,000 | Apr &ge; 540,000 | May &ge; 600,000",
+                "<b>ESA Targets (Standard):</b> EP Points > 1,560,000. <b>Early Bird ESA:</b> Oct &ge; 1,360,000 | Nov &ge; 1,460,000",
                 "",
                 "<b>EP Point Recognition Structure:</b>",
                 "• Requires a minimum 5% payment",
                 "• Residential / Shop Lot / Commercial: 100% recognition rate",
-                "• Factory / Corporate Projects (Prior to May 2026): 100% recognition rate",
-                "• Factory / Corporate Projects (Effective May 2026 onwards): 100% recognition for the initial RM 40,000; 40% recognition for subsequent amounts"
+                "• Factory / Corporate Projects (Prior to May 2026): 100% recognition rate (unless factory has less than 36pcs, in which case it follows Residence rate)",
+                "• Factory / Corporate Projects (Effective May 2026 onwards): 100% recognition for the initial RM 40,000; 40% recognition for subsequent amounts (unless factory has less than 36pcs, in which case it follows Residence rate)"
             ]
         ))
 
     if ega_t3:
         sections.append(PdfSection("EGA / ESA Awards - Factory", ega_h3, ega_t3, landscape=True))
+
+    prod_data = fetch_production_bonus(year)
+    if prod_data:
+        oum_summary = prod_data.get("oum_summary", [])
+        ogm_summary = prod_data.get("ogm_summary", [])
+        team_detail = prod_data.get("team_detail", [])
+        headers = prod_data.get("headers", {})
+
+        if oum_summary:
+            sections.append(PdfSection(
+                "Production Bonus - OUM Summary",
+                headers.get("oum", []),
+                oum_summary,
+                landscape=True
+            ))
+        if ogm_summary:
+            sections.append(PdfSection(
+                "Production Bonus - OGM Summary",
+                headers.get("ogm", []),
+                ogm_summary,
+                landscape=True
+            ))
+        if team_detail:
+            sections.append(PdfSection(
+                "Production Bonus - Team Details",
+                headers.get("detail", []),
+                team_detail,
+                landscape=True
+            ))
 
     meta_lines = [
         ("Generated", run_at),
@@ -1618,6 +1724,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         meta_lines=meta_lines,
         sections=sections,
         charts=charts,
+        is_outsource=True,
     )
     return output_path
 
@@ -1666,18 +1773,18 @@ def main() -> int:
         print("Running in MOCK mode (local sample data, no DB connection needed)")
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    make_excel = args.both or not args.pdf
-    make_pdf = args.both or args.pdf
+    make_excel = args.both
+    make_pdf = True
 
     try:
         if make_excel:
-            out_xlsx = args.output or (FINANCE_DIR / f"Commission_Pack_{args.year}_{stamp}.xlsx")
+            out_xlsx = args.output or (FINANCE_DIR / f"Outsource_Commission_Pack_{args.year}_{stamp}.xlsx")
             if out_xlsx.suffix.lower() != ".xlsx":
                 out_xlsx = out_xlsx.with_suffix(".xlsx")
             path_xlsx = build_workbook(args.year, out_xlsx)
             print(f"\nFinance Excel saved:\n  {path_xlsx.resolve()}")
         if make_pdf:
-            out_pdf = args.output or (FINANCE_DIR / f"Commission_Pack_{args.year}_{stamp}.pdf")
+            out_pdf = args.output or (FINANCE_DIR / f"Outsource_Commission_Pack_{args.year}_{stamp}.pdf")
             if out_pdf.suffix.lower() != ".pdf":
                 out_pdf = out_pdf.with_suffix(".pdf")
             path_pdf = build_pdf(args.year, out_pdf)

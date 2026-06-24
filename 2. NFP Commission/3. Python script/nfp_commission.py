@@ -175,7 +175,7 @@ WITH candidates AS (
       AND EXTRACT(YEAR FROM i.full_payment_date) = {year}
       AND LOWER(TRIM(COALESCE(a.agent_type, ''))) IN ({agent_types})
       AND COALESCE(i.is_deleted, FALSE) IS NOT TRUE
-      AND COALESCE(i.percent_of_total_amount, 0) >= 100.0
+      AND (COALESCE(i.percent_of_total_amount, 0) >= 1.0 OR i.paid IS TRUE)
 ),
 epp_once AS (
     SELECT
@@ -284,6 +284,7 @@ class InvoiceCommission:
     commission_b: float
     commission_c: float
     nfp_commission: float
+    package_description: Optional[str] = None
 
 
 def calc_commission(
@@ -328,8 +329,8 @@ def resolve_panels(row: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
         panel_rating = infer_panel_rating_from_text(text_blob)
 
     inv_date = parse_date(row.get("invoice_date"))
-    # NFP tables from 2026 use 650W monthly Excel; ignore "620W" in legacy line text.
-    if inv_date and inv_date.year >= 2026:
+    # NFP tables from Feb 2026 use 650W monthly Excel; ignore "620W" in legacy line text.
+    if inv_date and inv_date >= date(2026, 2, 1):
         panel_rating = 650
     elif panel_rating is None and inv_date and inv_date >= NFP_CUTOFF:
         panel_rating = 650
@@ -355,11 +356,13 @@ def is_three_phase_from_seda(phase_type: Optional[str]) -> bool:
     return False
 
 
-def build_report(year: int) -> tuple[List[InvoiceCommission], Dict[str, Any]]:
+def build_report(year: int, month: Optional[int] = None) -> tuple[List[InvoiceCommission], Dict[str, Any]]:
     agent_types = [t.lower() for t in AGENT_TYPES]
     types_sql = ", ".join(f"'{t}'" for t in agent_types)
     sql = INVOICES_SQL.format(year=year, agent_types=types_sql)
     rows = q(sql)
+    if month is not None:
+        rows = [r for r in rows if parse_date(r.get("full_payment_date")) and parse_date(r.get("full_payment_date")).month == month]
     schedules_650 = load_650w_schedules()
     schedule_620 = load_620w_schedule()
 
@@ -429,6 +432,7 @@ def build_report(year: int) -> tuple[List[InvoiceCommission], Dict[str, Any]]:
                 commission_b=float(money(b)),
                 commission_c=float(money(c)),
                 nfp_commission=float(money(total_comm)),
+                package_description=row.get("package_description"),
             )
         )
 
@@ -457,6 +461,7 @@ def build_report(year: int) -> tuple[List[InvoiceCommission], Dict[str, Any]]:
 
     summary = {
         "report_year": year,
+        "report_month": month,
         "agent_types": list(AGENT_TYPES),
         "total_qualifying_agents": len(agents),
         "total_invoices": len(results),
@@ -609,10 +614,11 @@ def render_tables(
     lines.append("=" * 80)
     lines.append("")
 
+    month_str = f" / {summary['report_month']:02d}" if summary.get("report_month") is not None else ""
     summary_info = [
         ["Filter: Paid", "TRUE"],
         ["Filter: Agent Type", "Internal + FULL TIME"],
-        ["Filter: Full payment year", str(summary["report_year"])],
+        ["Filter: Full payment period", f"{summary['report_year']}{month_str}"],
         ["Total qualifying agents (users)", str(summary["total_qualifying_agents"])],
         ["Total invoices", str(summary["total_invoices"])],
         ["Invoices with TNG rebate", str(summary.get("invoices_with_tng_rebate", 0))],
@@ -670,10 +676,11 @@ def render_html_table(
         )
         return f"<h2>{title}</h2><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
 
+    month_str = f" / {summary['report_month']:02d}" if summary.get("report_month") is not None else ""
     summary_info = [
         ["Filter: Paid", "TRUE"],
         ["Filter: Agent Type", "Internal + FULL TIME"],
-        ["Filter: Full payment year", str(summary["report_year"])],
+        ["Filter: Full payment period", f"{summary['report_year']}{month_str}"],
         ["Total qualifying agents (users)", str(summary["total_qualifying_agents"])],
         ["Total invoices", str(summary["total_invoices"])],
         ["Total NFP commission (RM)", _fmt_rm(summary["total_nfp_commission"])],
@@ -757,10 +764,11 @@ def _import_pdf_writer():
 
 def write_nfp_pdf(path: Path, rows: List[InvoiceCommission], summary: Dict[str, Any]) -> Path:
     PdfSection, write_commission_pdf = _import_pdf_writer()
+    month_str = f" / {summary['report_month']:02d}" if summary.get("report_month") is not None else ""
     summary_info = [
         ("Filter: Paid", "TRUE"),
         ("Filter: Agent Type", "Internal + FULL TIME"),
-        ("Filter: Full payment year", str(summary["report_year"])),
+        ("Filter: Full payment period", f"{summary['report_year']}{month_str}"),
         ("Total qualifying agents", str(summary["total_qualifying_agents"])),
         ("Total invoices", str(summary["total_invoices"])),
         ("Invoices with TNG rebate", str(summary.get("invoices_with_tng_rebate", 0))),
@@ -820,22 +828,23 @@ def main() -> None:
             pass
     parser = argparse.ArgumentParser(description="NFP commission report")
     parser.add_argument("--year", type=int, default=2026)
+    parser.add_argument("--month", type=int, default=None, help="Month to filter (1-12)")
     parser.add_argument(
         "--output",
         type=Path,
-        default=REPORTS_DIR / "nfp_commission_report.csv",
+        default=None,
         help="Table-format CSV (default: ../4. data/reports/)",
     )
     parser.add_argument(
         "--table-output",
         type=Path,
-        default=REPORTS_DIR / "nfp_commission_report.txt",
+        default=None,
         help="ASCII table text file (default: ../4. data/reports/)",
     )
     parser.add_argument(
         "--html-output",
         type=Path,
-        default=REPORTS_DIR / "nfp_commission_report.html",
+        default=None,
         help="HTML table file (default: ../4. data/reports/)",
     )
     parser.add_argument(
@@ -865,7 +874,12 @@ def main() -> None:
         print("OK — API connection works.", rows)
         return
 
-    rows, summary = build_report(args.year)
+    month_suffix = f"_{args.month:02d}" if args.month is not None else ""
+    output_csv = args.output or (REPORTS_DIR / f"nfp_commission_report{month_suffix}.csv")
+    table_output = args.table_output or (REPORTS_DIR / f"nfp_commission_report{month_suffix}.txt")
+    html_output = args.html_output or (REPORTS_DIR / f"nfp_commission_report{month_suffix}.html")
+
+    rows, summary = build_report(args.year, args.month)
 
     # --- Table output (console) ---
     print_tables(rows, summary)
@@ -873,14 +887,14 @@ def main() -> None:
     if not rows:
         print("\nNo invoices matched filters.")
     elif not args.no_save:
-        write_table_file(args.table_output, rows, summary)
-        write_table_csv(args.output, rows, summary)
-        args.html_output.write_text(render_html_table(rows, summary), encoding="utf-8")
-        tng_audit_path = REPORTS_DIR / f"tng_audit_{args.year}.csv"
+        write_table_file(table_output, rows, summary)
+        write_table_csv(output_csv, rows, summary)
+        html_output.write_text(render_html_table(rows, summary), encoding="utf-8")
+        tng_audit_path = REPORTS_DIR / f"tng_audit_{args.year}{month_suffix}.csv"
         write_tng_audit_csv(tng_audit_path, rows)
         if not args.no_pdf:
             pdf_path = args.pdf_output or (
-                OUTPUT_DIR / f"nfp_commission_{args.year}.pdf"
+                OUTPUT_DIR / f"nfp_commission_{args.year}{month_suffix}.pdf"
             )
             try:
                 write_nfp_pdf(pdf_path, rows, summary)
@@ -888,9 +902,9 @@ def main() -> None:
             except ImportError as exc:
                 print(f"  Table (PDF):  skipped ({exc})", file=sys.stderr)
         print(f"\nFiles saved:")
-        print(f"  Table (text): {args.table_output}")
-        print(f"  Table (CSV):  {args.output}")
-        print(f"  Table (HTML): {args.html_output}")
+        print(f"  Table (text): {table_output}")
+        print(f"  Table (CSV):  {output_csv}")
+        print(f"  Table (HTML): {html_output}")
         print(f"  TNG audit:    {tng_audit_path}")
         if args.full_csv:
             write_full_csv(args.full_csv, rows, summary)

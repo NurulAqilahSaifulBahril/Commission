@@ -16,15 +16,15 @@ EP Point Rules (from 1. EGA ASA Awards.xlsx -- Outsource 2026 sheet):
 
 Eligibility -- Outsource 2026:
   EGA (half-year award):
-    Early Bird -- by end of Feb  : >= 350,000 pts  -> "EGA (Feb)"
-    Early Bird -- by end of Mar  : >= 400,000 pts  -> "EGA (Mar)"
-    Early Bird -- by end of Apr  : >= 450,000 pts  -> "EGA (Apr)"
-    Early Bird -- by end of May  : >= 500,000 pts  -> "EGA (May)"
-    Standard   -- any time       :  > 600,000 pts  -> "EGA"
+    Early Bird -- by end of Feb  : >= 420,000 pts  -> "EGA (Feb)"
+    Early Bird -- by end of Mar  : >= 480,000 pts  -> "EGA (Mar)"
+    Early Bird -- by end of Apr  : >= 540,000 pts  -> "EGA (Apr)"
+    Early Bird -- by end of May  : >= 600,000 pts  -> "EGA (May)"
+    Standard   -- any time       :  > 720,000 pts  -> "EGA"
   ESA (end-of-year award):
-    Early Bird -- by end of Oct  : >= 1,000,000 pts -> "ESA (Oct)"
-    Early Bird -- by end of Nov  : >= 1,200,000 pts -> "ESA (Nov)"
-    Standard   -- any time       :  > 1,300,000 pts -> "ESA"
+    Early Bird -- by end of Oct  : >= 1,360,000 pts -> "ESA (Oct)"
+    Early Bird -- by end of Nov  : >= 1,460,000 pts -> "ESA (Nov)"
+    Standard   -- any time       :  > 1,560,000 pts -> "ESA"
 
   Eligibility is determined by CUMULATIVE EP points accumulated
   up to the end of each month (based on invoice_date).
@@ -33,7 +33,7 @@ Eligibility -- Outsource 2026:
 Filters:
   - EXTRACT(YEAR FROM i.invoice_date) = 2026
   - agent_type = 'Outsource' OR known outsource agent by name
-  - COALESCE(percent_of_total_amount, 0) >= 5.0   (at least 5% paid)
+  - i.1st_payment_date IS NOT NULL (first payment secured)
   - COALESCE(is_deleted, FALSE) IS NOT TRUE
   - Deduplication by bubble_id (avoids SEDA double-join duplicates)
 
@@ -85,22 +85,22 @@ from api_client import query_sql  # noqa: E402  (after sys.path setup)
 # Constants
 # ---------------------------------------------------------------------------
 # Standard thresholds (cumulative EP, any time in the year)
-EGA_THRESHOLD = Decimal("600000")    # EP Points > 600,000  -> EGA
-ESA_THRESHOLD = Decimal("1300000")   # EP Points > 1,300,000 -> ESA
+EGA_THRESHOLD = Decimal("720000")    # EP Points > 720,000  -> EGA
+ESA_THRESHOLD = Decimal("1560000")   # EP Points > 1,560,000 -> ESA
 
 # Early Bird EGA -- cumulative EP by END of that calendar month qualifies
 # {month_number: (threshold, label)}
 EGA_EARLY_BIRD: dict[int, tuple[Decimal, str]] = {
-    2: (Decimal("350000"), "EGA (Feb)"),
-    3: (Decimal("400000"), "EGA (Mar)"),
-    4: (Decimal("450000"), "EGA (Apr)"),
-    5: (Decimal("500000"), "EGA (May)"),
+    2: (Decimal("420000"), "EGA (Feb)"),
+    3: (Decimal("480000"), "EGA (Mar)"),
+    4: (Decimal("540000"), "EGA (Apr)"),
+    5: (Decimal("600000"), "EGA (May)"),
 }
 
 # Early Bird ESA -- cumulative EP by END of that calendar month qualifies
 ESA_EARLY_BIRD: dict[int, tuple[Decimal, str]] = {
-    10: (Decimal("1000000"), "ESA (Oct)"),
-    11: (Decimal("1200000"), "ESA (Nov)"),
+    10: (Decimal("1360000"), "ESA (Oct)"),
+    11: (Decimal("1460000"), "ESA (Nov)"),
 }
 
 FACTORY_CUTOFF_DATE  = datetime(2026, 5, 1)   # "After May 2026" starts here
@@ -195,7 +195,8 @@ def _get_token() -> str | None:
 # ---------------------------------------------------------------------------
 # SQL
 # ---------------------------------------------------------------------------
-def _invoices_sql(year: int) -> str:
+def _invoices_sql(year: int, may_only: bool = False) -> str:
+    month_filter = "AND EXTRACT(MONTH FROM i.invoice_date)::int <= 5" if may_only else ""
     # Notice we remove the agent_type = 'internal', 'full time' filter here.
     # The python logic filters strictly for outsource agents.
     return f"""
@@ -257,7 +258,19 @@ WITH candidates AS (
       ) AS epp_interest_amount
       FROM invoice_item ii
       WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
-      GROUP BY COALESCE(ii.description, '')
+      GROUP BY TRIM(
+        REGEXP_REPLACE(
+          REGEXP_REPLACE(
+            REGEXP_REPLACE(COALESCE(ii.description, ''), 'moths', 'months', 'gi'),
+            '(\\d+)\\s*months',
+            '\\1months',
+            'gi'
+          ),
+          '\\s+',
+          ' ',
+          'g'
+        )
+      )
     ) ii_dedup
   ) epp_items ON TRUE
   LEFT JOIN LATERAL (
@@ -267,8 +280,9 @@ WITH candidates AS (
   ) pay ON TRUE
   WHERE i.invoice_date IS NOT NULL
     AND EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
+    {month_filter}
     AND COALESCE(i.is_deleted, FALSE) IS NOT TRUE
-    AND COALESCE(i.percent_of_total_amount, 0) >= 5.0
+    AND i."1st_payment_date" IS NOT NULL
 )
 SELECT
   bubble_id,
@@ -382,23 +396,10 @@ def calc_ep_points(
     invoice_date_val: Any,
     panel_qty: int,
 ) -> Decimal:
-    if prop_type in TABLE2_PACKAGES:
-        return sales_price
-
-    if panel_qty > 0 and panel_qty < FACTORY_MIN_PANELS:
-        return sales_price
-
-    inv_dt = _parse_invoice_date(invoice_date_val)
-    is_from_may_2026 = inv_dt is not None and inv_dt >= FACTORY_CUTOFF_DATE
-
-    if not is_from_may_2026:
-        return sales_price
-
-    if sales_price <= FACTORY_FIRST_BLOCK:
-        return sales_price
-    else:
-        balance = sales_price - FACTORY_FIRST_BLOCK
-        return FACTORY_FIRST_BLOCK + (balance * FACTORY_BALANCE_RATE)
+    """
+    Accumulate EP points directly by Sales Price (1 pt per RM1 of Sales Price).
+    """
+    return sales_price
 
 # ---------------------------------------------------------------------------
 # Eligibility -- Early Bird cumulative logic
@@ -462,6 +463,7 @@ class AwardLine:
     sales_price:    Decimal
     ep_points:      Decimal
     panel_qty:      int
+    accum_ep:       Decimal = Decimal("0")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -544,6 +546,18 @@ def build_report(rows: list[dict[str, Any]]) -> tuple[
             panel_qty=panel_qty,
         ))
 
+    # Calculate combined running total of EP points chronologically per agent
+    agent_lines = defaultdict(list)
+    for ln in lines:
+        agent_lines[ln.agent_name].append(ln)
+
+    for agent, ln_list in agent_lines.items():
+        ln_list.sort(key=lambda x: (x.invoice_date, x.invoice_number))
+        running_sum = Decimal("0")
+        for ln in ln_list:
+            running_sum += ln.ep_points
+            ln.accum_ep = running_sum
+
     agent_eligibility: dict[str, str] = {
         agent: determine_eligibility(agent_invoice_ep[agent])
         for agent in agent_ep
@@ -554,9 +568,9 @@ def build_report(rows: list[dict[str, Any]]) -> tuple[
 # ---------------------------------------------------------------------------
 # Table builders
 # ---------------------------------------------------------------------------
-T1_HEADERS = ["Agent Name", "Total Sales", "EP Point", "Eligibility"]
+T1_HEADERS = ["Agent Name", "Total Sales", "Accumulated EP Point", "Eligibility"]
 T2_HEADERS = ["Agent Name", "Customer Name", "Invoice Number", "Package",
-              "Invoice Date", "Sales Price", "EP Point", "Eligibility"]
+              "Invoice Date", "Sales Price", "Accumulated EP Point", "Eligibility"]
 T3_HEADERS = T2_HEADERS
 
 
@@ -592,7 +606,7 @@ def build_table2(
             ln.prop_type,
             ln.invoice_date,
             _fmt_money(ln.sales_price),
-            _fmt_dec(ln.ep_points, 2),
+            _fmt_dec(ln.accum_ep, 2),
             agent_eligibility.get(ln.agent_name, "-"),
         ]
         for ln in filtered
@@ -613,7 +627,7 @@ def build_table3(
             ln.prop_type,
             ln.invoice_date,
             _fmt_money(ln.sales_price),
-            _fmt_dec(ln.ep_points, 2),
+            _fmt_dec(ln.accum_ep, 2),
             agent_eligibility.get(ln.agent_name, "-"),
         ]
         for ln in filtered
@@ -643,6 +657,8 @@ def main(argv: list[str]) -> int:
                         help="Invoice date year (default: 2026)")
     parser.add_argument("--no-csv", action="store_true",
                         help="Skip CSV output")
+    parser.add_argument("--May", "--may", action="store_true", dest="May",
+                        help="Limit report to January through May")
     args = parser.parse_args(argv)
 
     token = _get_token()
@@ -663,8 +679,8 @@ def main(argv: list[str]) -> int:
     if not os.environ.get("POSTGRES_PROXY_TOKEN"):
         os.environ["POSTGRES_PROXY_TOKEN"] = token
 
-    print(f"Fetching invoices for year {args.year}...")
-    rows = query_sql(_invoices_sql(args.year))
+    print(f"Fetching invoices for year {args.year} (May only: {args.May})...")
+    rows = query_sql(_invoices_sql(args.year, may_only=args.May))
     print(f"  {len(rows)} invoice rows fetched.\n")
 
     lines, agent_ep, agent_sales, agent_eligibility = build_report(rows)
@@ -677,8 +693,8 @@ def main(argv: list[str]) -> int:
     print(sep)
     print(f"  EGA / ESA AWARDS REPORT  --  {args.year}  (Outsource Agents)")
     print(sep)
-    print(f"  EGA Early Bird : Feb>=350k | Mar>=400k | Apr>=450k | May>=500k | Standard>600k")
-    print(f"  ESA Early Bird : Oct>=1.0M | Nov>=1.2M | Standard>1.3M")
+    print(f"  EGA Early Bird : Feb>=420k | Mar>=480k | Apr>=540k | May>=600k | Standard>720k")
+    print(f"  ESA Early Bird : Oct>=1.36M | Nov>=1.46M | Standard>1.56M")
     print(f"  Total invoices   : {len(lines)}")
     print(f"  Qualifying agents: {len(agent_ep)}")
     ega_agents = [a for a, e in agent_eligibility.items() if e.startswith("EGA")]

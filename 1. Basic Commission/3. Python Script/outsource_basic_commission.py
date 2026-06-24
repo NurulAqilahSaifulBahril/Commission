@@ -135,15 +135,10 @@ def _parse_invoice_date(date_val: Any) -> datetime | None:
     return None
 
 def _referral_rate(invoice_date_val: Any) -> Decimal:
-    dt = _parse_invoice_date(invoice_date_val)
-    if not dt:
-        return Decimal("0.02")
-    if dt < datetime(2026, 3, 1):
-        return Decimal("0.01")
-    elif dt.year == 2026 and dt.month == 3:
-        return Decimal("0.025")
-    else:
-        return Decimal("0.02")
+    """
+    Referral fee is 2% from sales price per invoice.
+    """
+    return Decimal("0.02")
 
 def _is_valid_referral(ref_name: str | None) -> bool:
     if not ref_name:
@@ -319,8 +314,23 @@ def is_outsource_agent(agent_name: str, agent_type_field: str | None) -> bool:
     is_db_outsource = "outsource" in str(agent_type_field or "").lower()
     return (info is not None) or is_db_outsource
 
-def get_own_commission_rate(info: dict[str, Any], agent_comm_field: int | None) -> Decimal:
-    return Decimal("0.045")
+def get_own_commission_rate(info: dict[str, Any], agent_comm_field: int | None, invoice_date: Any = None) -> Decimal:
+    from basic_commission_rates import get_basic_rate
+    month = 5
+    if invoice_date:
+        parsed_dt = _parse_invoice_date(invoice_date)
+        if parsed_dt:
+            month = parsed_dt.month
+            
+    tier = info.get("tier") if info else "OSA/OSA1"
+    if tier == "OUM":
+        hierarchy = "OUM"
+    elif tier == "OGM":
+        hierarchy = "OGM"
+    else:
+        hierarchy = "OSA/OSA1"
+        
+    return get_basic_rate("Outsource", hierarchy, month)
 
 def _render_table(headers: list[str], rows: list[list[str]]) -> str:
     if not rows:
@@ -347,6 +357,7 @@ WITH candidates AS (
     i.invoice_date,
     i.full_payment_date,
     COALESCE(i.total_amount, 0)::numeric AS total_amount,
+    COALESCE((SELECT SUM(p.amount) FROM payment p WHERE p.linked_invoice = i.bubble_id), 0)::numeric AS paid_amount,
     COALESCE(
       NULLIF(epp_items.epp_interest, 0),
       NULLIF(pay.epp_sum, 0),
@@ -369,7 +380,7 @@ WITH candidates AS (
     i.description,
     COALESCE(sr_link.nem_type, sr_back.nem_type) AS seda_nem_type,
     ref.project_type AS referral_project_type,
-    COALESCE(NULLIF(TRIM(ref.name), ''), NULLIF(TRIM(i.referrer_name), '')) AS referral_name,
+    COALESCE(NULLIF(TRIM(c_referrer.name), ''), NULLIF(TRIM(i.referrer_name), '')) AS referral_name,
     ROW_NUMBER() OVER (
       PARTITION BY i.bubble_id
       ORDER BY COALESCE(i.is_latest, FALSE) DESC,
@@ -381,7 +392,27 @@ WITH candidates AS (
   LEFT JOIN customer c ON c.customer_id = i.linked_customer
   LEFT JOIN SEDA_registration sr_link ON sr_link.bubble_id = i.linked_seda_registration
   LEFT JOIN SEDA_registration sr_back ON i.bubble_id = ANY(sr_back.linked_invoice)
-  LEFT JOIN referral ref ON ref.bubble_id = i.linked_referral
+  LEFT JOIN customer c_ref ON LOWER(TRIM(c_ref.name)) = LOWER(TRIM(COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name)))
+  LEFT JOIN referral ref ON (
+      ref.linked_invoice = c_ref.customer_id
+      OR LOWER(TRIM(ref.name)) = LOWER(TRIM(c_ref.name))
+      OR (
+        ref.mobile_number IS NOT NULL
+        AND c_ref.phone IS NOT NULL
+        AND right(regexp_replace(ref.mobile_number, '\\D', '', 'g'), 9) = right(regexp_replace(c_ref.phone, '\\D', '', 'g'), 9)
+      )
+      OR ref.linked_customer_profile = c_ref.customer_id
+    )
+    AND EXISTS (
+      SELECT 1 FROM agent a_ref
+      WHERE (
+        CASE
+          WHEN ref.linked_agent ~ '^[0-9]+$' THEN a_ref.id = CAST(ref.linked_agent AS integer)
+          ELSE a_ref.bubble_id = ref.linked_agent
+        END
+      ) AND LOWER(TRIM(a_ref.name)) = LOWER(TRIM(a.name))
+    )
+  LEFT JOIN customer c_referrer ON c_referrer.customer_id = ref.linked_customer_profile
   LEFT JOIN LATERAL (
     SELECT COALESCE(
       SUM(ii_dedup.epp_interest_amount),
@@ -399,7 +430,19 @@ WITH candidates AS (
         ) AS epp_interest_amount
       FROM invoice_item ii
       WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
-      GROUP BY COALESCE(ii.description, '')
+      GROUP BY TRIM(
+        REGEXP_REPLACE(
+          REGEXP_REPLACE(
+            REGEXP_REPLACE(COALESCE(ii.description, ''), 'moths', 'months', 'gi'),
+            '(\\d+)\\s*months',
+            '\\1months',
+            'gi'
+          ),
+          '\\s+',
+          ' ',
+          'g'
+        )
+      )
     ) ii_dedup
   ) epp_items ON TRUE
   LEFT JOIN LATERAL (
@@ -409,14 +452,18 @@ WITH candidates AS (
   ) pay ON TRUE
   WHERE i.paid IS TRUE
     AND i.full_payment_date IS NOT NULL
-    AND EXTRACT(YEAR FROM i.full_payment_date)::int = {int(year)}
-    AND COALESCE(i.percent_of_total_amount, 0) >= 100.0
+    AND (
+      EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
+      OR EXTRACT(YEAR FROM i.full_payment_date)::int = {int(year)}
+    )
+    AND (COALESCE(i.percent_of_total_amount, 0) >= 1.0 OR i.paid IS TRUE)
 )
 SELECT
   invoice_number,
   invoice_date,
   full_payment_date,
   total_amount,
+  paid_amount,
   epp_interest,
   customer_name,
   agent_name,
@@ -442,11 +489,13 @@ class OutsourceInvoiceLine:
     invoice_date: str
     full_payment_date: str
     total_amount: Decimal
+    paid_amount: Decimal
     epp: Decimal
     sales_price: Decimal
     rate: Decimal
     basic_commission: Decimal
     referral_name: str | None = None
+    gan_lai_soon: Decimal = Decimal("0")
 
 @dataclass
 class OutsourceFactoryInvoiceLine:
@@ -457,12 +506,14 @@ class OutsourceFactoryInvoiceLine:
     invoice_date: str
     full_payment_date: str
     total_amount: Decimal
+    paid_amount: Decimal
     epp: Decimal
     sales_price: Decimal
     rate: Decimal
     profit_sharing: Decimal
     basic_commission: Decimal
     referral_name: str | None = None
+    gan_lai_soon: Decimal = Decimal("0")
 
 def main(argv: list[str]) -> int:
     _load_dotenv()
@@ -470,11 +521,12 @@ def main(argv: list[str]) -> int:
         description="Calculate outsource basic commission, overrides, and factory commission."
     )
     parser.add_argument("--year", type=int, default=2026)
-    parser.add_argument("--profit-sharing", type=float, default=None, help="Default profit sharing % for Factory (e.g. 5.0 for 5%)")
+    parser.add_argument("--month", type=int, default=None, help="Month to filter (1-12)")
+    parser.add_argument("--profit-sharing", type=float, default=None, help="Default profit sharing %% for Factory (e.g. 5.0 for 5%%)")
     parser.add_argument(
         "--factory-rates",
         default=None,
-        help="JSON string or comma-separated key:value pairs mapping invoice_number to profit sharing % (e.g. '1007637:5.0,1008000:3.5')"
+        help="JSON string or comma-separated key:value pairs mapping invoice_number to profit sharing %% (e.g. '1007637:5.0,1008000:3.5')"
     )
     parser.add_argument(
         "--proxy-url",
@@ -510,6 +562,17 @@ def main(argv: list[str]) -> int:
         return 1
 
     raw_rows = list(payload.get("rows") or [])
+
+    if args.month is not None:
+        filtered_rows = []
+        for r in raw_rows:
+            inv_dt = _parse_invoice_date(r.get("invoice_date"))
+            pay_dt = _parse_invoice_date(r.get("full_payment_date"))
+            inv_match = inv_dt and inv_dt.year == args.year and inv_dt.month == args.month
+            pay_match = pay_dt and pay_dt.year == args.year and pay_dt.month == args.month
+            if inv_match or pay_match:
+                filtered_rows.append(r)
+        raw_rows = filtered_rows
 
     # Filter outsource Factory invoices for Table 3
     outsource_factory_rows = []
@@ -608,6 +671,7 @@ def main(argv: list[str]) -> int:
         prop_type = classify_property_type(r)
         
         total = _to_decimal(r.get("total_amount"))
+        paid_amount = _to_decimal(r.get("paid_amount"))
         epp = _to_decimal(r.get("epp_interest"))
         sales_price = total - epp
         
@@ -629,6 +693,15 @@ def main(argv: list[str]) -> int:
                     override_commissions[oum_p] += sales_price * sharing * Decimal("0.20")
                 override_commissions["OGM Pool"] += sales_price * sharing * Decimal("0.10")
                 
+            # Gan Lai Soon OGM Override Commission
+            tier = info["tier"]
+            if tier in ("OSA", "OSA 1", "OUM"):
+                ogm_rate = Decimal("0.0075")
+            else:
+                ogm_rate = Decimal("0")
+            ogm_comm = sales_price * ogm_rate
+            override_commissions["Gan Lai Soon"] += ogm_comm
+
             comm = sales_price * (rate + osa_sharing)
             
             processed_outsource_factory.append(
@@ -640,12 +713,14 @@ def main(argv: list[str]) -> int:
                     invoice_date=inv_dt,
                     full_payment_date=pay_dt,
                     total_amount=total,
+                    paid_amount=paid_amount,
                     epp=epp,
                     sales_price=sales_price,
                     rate=rate,
                     profit_sharing=osa_sharing,
                     basic_commission=comm,
-                    referral_name=ref_name
+                    referral_name=ref_name,
+                    gan_lai_soon=ogm_comm
                 )
             )
             
@@ -660,20 +735,31 @@ def main(argv: list[str]) -> int:
                     invoice_date=inv_dt,
                     full_payment_date=pay_dt,
                     total_amount=total,
+                    paid_amount=paid_amount,
                     epp=epp,
                     sales_price=sales_price,
                     rate=safwan_rate,
                     profit_sharing=sharing,
                     basic_commission=safwan_comm,
-                    referral_name=ref_name
+                    referral_name=ref_name,
+                    gan_lai_soon=Decimal("0")
                 )
             )
             agent_sales["Safwan"] += total
             agent_own_commissions["Safwan"] += safwan_comm
         else:
-            rate = get_own_commission_rate(info, agent_comm_field)
+            rate = get_own_commission_rate(info, agent_comm_field, pay_dt)
             comm = sales_price * rate
             
+            # Gan Lai Soon OGM Override Commission
+            tier = info["tier"]
+            if tier in ("OSA", "OSA 1", "OUM"):
+                ogm_rate = Decimal("0.0075")
+            else:
+                ogm_rate = Decimal("0")
+            ogm_comm = sales_price * ogm_rate
+            override_commissions["Gan Lai Soon"] += ogm_comm
+ 
             processed_outsource_invoices.append(
                 OutsourceInvoiceLine(
                     agent_name=canonical_name,
@@ -683,11 +769,13 @@ def main(argv: list[str]) -> int:
                     invoice_date=inv_dt,
                     full_payment_date=pay_dt,
                     total_amount=total,
+                    paid_amount=paid_amount,
                     epp=epp,
                     sales_price=sales_price,
                     rate=rate,
                     basic_commission=comm,
-                    referral_name=ref_name
+                    referral_name=ref_name,
+                    gan_lai_soon=ogm_comm
                 )
             )
         
@@ -740,10 +828,12 @@ def main(argv: list[str]) -> int:
             inv.invoice_date,
             inv.full_payment_date,
             _fmt_money(inv.total_amount),
+            _fmt_money(inv.paid_amount),
             _fmt_money(inv.epp),
             _fmt_money(inv.sales_price),
             _fmt_rate(inv.rate),
-            _fmt_money(inv.basic_commission)
+            _fmt_money(inv.basic_commission),
+            _fmt_money(inv.gan_lai_soon)
         ])
 
     # ------------------ TABLE 3 ------------------
@@ -760,11 +850,13 @@ def main(argv: list[str]) -> int:
             inv.invoice_date,
             inv.full_payment_date,
             _fmt_money(inv.total_amount),
+            _fmt_money(inv.paid_amount),
             _fmt_money(inv.epp),
             _fmt_money(inv.sales_price),
             _fmt_rate(inv.rate),
             _fmt_rate(inv.profit_sharing),
-            _fmt_money(inv.basic_commission)
+            _fmt_money(inv.basic_commission),
+            _fmt_money(inv.gan_lai_soon)
         ])
 
     # ------------------ TABLE 4 ------------------
@@ -778,6 +870,10 @@ def main(argv: list[str]) -> int:
             t4_rows.append([
                 ln.referral_name.strip(),
                 ln.agent_name.strip(),
+                ln.customer_name.strip(),
+                ln.invoice_number.strip(),
+                ln.invoice_date.strip(),
+                ln.full_payment_date.strip(),
                 _fmt_money(sales_price),
                 _fmt_rate(rate),
                 _fmt_money(fee)
@@ -794,20 +890,20 @@ def main(argv: list[str]) -> int:
     print("=== Table 2: Accumulated Basic Commission by Customer (Residential & Shop Lot) ===")
     print(_render_table([
         "Agent name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date",
-        "Total Amount", "Epp", "Sales Price", "Rate %", "Basic Commission"
+        "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Basic Commission", "Gan Lai Soon (RM)"
     ], t2_rows))
     print()
 
     print("=== Table 3: Accumulated Basic Commission by Customer (Factory) ===")
     print(_render_table([
         "Agent name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date",
-        "Total Amount", "Epp", "Sales Price", "Rate %", "Profit Sharing", "Basic Commission"
+        "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Profit Sharing", "Basic Commission", "Gan Lai Soon (RM)"
     ], t3_rows))
     print()
 
     print("=== Table 4: Referral Fee ===")
     print(_render_table([
-        "Referral Name", "Agent Name", "Sales Price", "Rate %", "Referral Fee"
+        "Referral Name", "Agent Name", "Customer Name", "Invoice Number", "Invoice Date", "Full Payment Date", "Sales Price", "Rate %", "Referral Fee"
     ], t4_rows))
     print()
 
@@ -826,7 +922,7 @@ def main(argv: list[str]) -> int:
         w = csv.writer(f)
         w.writerow([
             "Agent name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date",
-            "Total Amount", "Epp", "Sales Price", "Rate %", "Basic Commission"
+            "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Basic Commission", "Gan Lai Soon (RM)"
         ])
         w.writerows(t2_rows)
         
@@ -835,7 +931,7 @@ def main(argv: list[str]) -> int:
         w = csv.writer(f)
         w.writerow([
             "Agent name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date",
-            "Total Amount", "Epp", "Sales Price", "Rate %", "Profit Sharing", "Basic Commission"
+            "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Profit Sharing", "Basic Commission", "Gan Lai Soon (RM)"
         ])
         w.writerows(t3_rows)
 
@@ -843,7 +939,7 @@ def main(argv: list[str]) -> int:
         csv_t4 = _OUTPUT_DIR / f"outsource_basic_commission_referral_{args.year}_{stamp}.csv"
         with open(csv_t4, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["Referral Name", "Agent Name", "Sales Price", "Rate %", "Referral Fee"])
+            w.writerow(["Referral Name", "Agent Name", "Customer Name", "Invoice Number", "Invoice Date", "Full Payment Date", "Sales Price", "Rate %", "Referral Fee"])
             w.writerows(t4_rows)
         
     print(f"CSV files saved to {_OUTPUT_DIR.resolve()}")
@@ -865,20 +961,20 @@ def main(argv: list[str]) -> int:
                 ),
                 PdfSection(
                     title="Table 2: Accumulated Basic Commission by Customer (Residential & Shop Lot)",
-                    headers=["Agent name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date", "Total Amount", "Epp", "Sales Price", "Rate %", "Basic Commission"],
+                    headers=["Agent name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date", "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Basic Commission", "Gan Lai Soon (RM)"],
                     rows=t2_rows,
                     landscape=True
                 ),
                 PdfSection(
                     title="Table 3: Accumulated Basic Commission by Customer (Factory)",
-                    headers=["Agent name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date", "Total Amount", "Epp", "Sales Price", "Rate %", "Profit Sharing", "Basic Commission"],
+                    headers=["Agent name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date", "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Profit Sharing", "Basic Commission", "Gan Lai Soon (RM)"],
                     rows=t3_rows,
                     landscape=True
                 ),
                 PdfSection(
                     title="Table 4: Referral Fee",
-                    headers=["Referral Name", "Agent Name", "Sales Price", "Rate %", "Referral Fee"],
-                    rows=t4_rows if t4_rows else [["No referral fee", "-", "-", "-", "-"]],
+                    headers=["Referral Name", "Agent Name", "Customer Name", "Invoice Number", "Invoice Date", "Full Payment Date", "Sales Price", "Rate %", "Referral Fee"],
+                    rows=t4_rows if t4_rows else [["No referral fee", "-", "-", "-", "-", "-", "-", "-", "-"]],
                 )
             ]
             write_commission_pdf(

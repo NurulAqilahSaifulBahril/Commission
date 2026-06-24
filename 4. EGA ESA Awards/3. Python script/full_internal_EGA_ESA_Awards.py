@@ -33,7 +33,7 @@ Eligibility -- Internal 2026:
 Filters:
   - EXTRACT(YEAR FROM i.invoice_date) = 2026
   - agent_type IN ('internal', 'full time')
-  - COALESCE(percent_of_total_amount, 0) >= 5.0   (at least 5% paid)
+  - i.1st_payment_date IS NOT NULL (first payment secured)
   - COALESCE(is_deleted, FALSE) IS NOT TRUE
   - Deduplication by bubble_id (avoids SEDA double-join duplicates)
 
@@ -150,7 +150,8 @@ def _get_token() -> str | None:
 # SQL
 # ---------------------------------------------------------------------------
 
-def _invoices_sql(year: int) -> str:
+def _invoices_sql(year: int, may_only: bool = False) -> str:
+    month_filter = "AND EXTRACT(MONTH FROM i.invoice_date)::int <= 5" if may_only else ""
     return f"""
 WITH candidates AS (
   SELECT
@@ -210,7 +211,19 @@ WITH candidates AS (
       ) AS epp_interest_amount
       FROM invoice_item ii
       WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
-      GROUP BY COALESCE(ii.description, '')
+      GROUP BY TRIM(
+        REGEXP_REPLACE(
+          REGEXP_REPLACE(
+            REGEXP_REPLACE(COALESCE(ii.description, ''), 'moths', 'months', 'gi'),
+            '(\\d+)\\s*months',
+            '\\1months',
+            'gi'
+          ),
+          '\\s+',
+          ' ',
+          'g'
+        )
+      )
     ) ii_dedup
   ) epp_items ON TRUE
   LEFT JOIN LATERAL (
@@ -220,9 +233,10 @@ WITH candidates AS (
   ) pay ON TRUE
   WHERE i.invoice_date IS NOT NULL
     AND EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
+    {month_filter}
     AND LOWER(TRIM(COALESCE(a.agent_type, ''))) IN ({AGENT_TYPES_SQL})
     AND COALESCE(i.is_deleted, FALSE) IS NOT TRUE
-    AND COALESCE(i.percent_of_total_amount, 0) >= 5.0
+    AND i."1st_payment_date" IS NOT NULL
 )
 SELECT
   bubble_id,
@@ -348,39 +362,9 @@ def calc_ep_points(
     panel_qty: int,
 ) -> Decimal:
     """
-    EP Points formula from Internal 2026 sheet:
-      Residential / Shop Lot / Commercial -> 1 pt per RM1 (always)
-      Factory, < 36 panels               -> follows Residential (1 pt per RM1)
-      Factory, >= 36 panels, before May 2026 -> 1 pt per RM1
-      Factory, >= 36 panels, from May 2026   -> first RM40,000 at 100%,
-                                               balance at 40%
-      Government / NGO / Corporate       -> same as Factory rule
+    Accumulate EP points directly by Sales Price (1 pt per RM1 of Sales Price).
     """
-    # Residential / Shop Lot / Commercial: always 1 pt per RM1
-    if prop_type in TABLE2_PACKAGES:
-        return sales_price
-
-    # Factory / Government / NGO / Corporate
-    # Fewer than 36 panels -> follows Residential rate
-    if panel_qty > 0 and panel_qty < FACTORY_MIN_PANELS:
-        return sales_price
-
-    # Determine date bracket (before or from May 2026)
-    inv_dt = _parse_invoice_date(invoice_date_val)
-    is_from_may_2026 = inv_dt is not None and inv_dt >= FACTORY_CUTOFF_DATE
-
-    if not is_from_may_2026:
-        # Before May 2026 -> 1 pt per RM1 (same as Residential)
-        return sales_price
-
-    # From May 2026 onward: tiered points
-    #   first RM40,000 -> 100% (= 1 pt per RM1, capped at RM40,000)
-    #   balance above RM40,000 -> 40%
-    if sales_price <= FACTORY_FIRST_BLOCK:
-        return sales_price
-    else:
-        balance = sales_price - FACTORY_FIRST_BLOCK
-        return FACTORY_FIRST_BLOCK + (balance * FACTORY_BALANCE_RATE)
+    return sales_price
 
 # ---------------------------------------------------------------------------
 # Eligibility -- Early Bird cumulative logic
@@ -478,6 +462,7 @@ class AwardLine:
     sales_price:    Decimal
     ep_points:      Decimal
     panel_qty:      int
+    accum_ep:       Decimal = Decimal("0")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -556,6 +541,18 @@ def build_report(rows: list[dict[str, Any]]) -> tuple[
             panel_qty=panel_qty,
         ))
 
+    # Calculate combined running total of EP points chronologically per agent
+    agent_lines = defaultdict(list)
+    for ln in lines:
+        agent_lines[ln.agent_name].append(ln)
+
+    for agent, ln_list in agent_lines.items():
+        ln_list.sort(key=lambda x: (x.invoice_date, x.invoice_number))
+        running_sum = Decimal("0")
+        for ln in ln_list:
+            running_sum += ln.ep_points
+            ln.accum_ep = running_sum
+
     # Determine eligibility per agent using cumulative early bird logic
     agent_eligibility: dict[str, str] = {
         agent: determine_eligibility(agent_invoice_ep[agent])
@@ -568,9 +565,9 @@ def build_report(rows: list[dict[str, Any]]) -> tuple[
 # Table builders
 # ---------------------------------------------------------------------------
 
-T1_HEADERS = ["Agent Name", "Total Sales", "EP Point", "Eligibility"]
+T1_HEADERS = ["Agent Name", "Total Sales", "Accumulated EP Point", "Eligibility"]
 T2_HEADERS = ["Agent Name", "Customer Name", "Invoice Number", "Package",
-              "Invoice Date", "Sales Price", "EP Point", "Eligibility"]
+              "Invoice Date", "Sales Price", "Accumulated EP Point", "Eligibility"]
 T3_HEADERS = T2_HEADERS   # identical columns
 
 
@@ -606,7 +603,7 @@ def build_table2(
             ln.prop_type,
             ln.invoice_date,
             _fmt_money(ln.sales_price),
-            _fmt_dec(ln.ep_points, 2),
+            _fmt_dec(ln.accum_ep, 2),
             agent_eligibility.get(ln.agent_name, "-"),
         ]
         for ln in filtered
@@ -627,7 +624,7 @@ def build_table3(
             ln.prop_type,
             ln.invoice_date,
             _fmt_money(ln.sales_price),
-            _fmt_dec(ln.ep_points, 2),
+            _fmt_dec(ln.accum_ep, 2),
             agent_eligibility.get(ln.agent_name, "-"),
         ]
         for ln in filtered
@@ -659,6 +656,8 @@ def main(argv: list[str]) -> int:
                         help="Invoice date year (default: 2026)")
     parser.add_argument("--no-csv", action="store_true",
                         help="Skip CSV output")
+    parser.add_argument("--May", "--may", action="store_true", dest="May",
+                        help="Limit report to January through May")
     args = parser.parse_args(argv)
 
     token = _get_token()
@@ -679,8 +678,8 @@ def main(argv: list[str]) -> int:
     if not os.environ.get("POSTGRES_PROXY_TOKEN"):
         os.environ["POSTGRES_PROXY_TOKEN"] = token
 
-    print(f"Fetching invoices for year {args.year}...")
-    rows = query_sql(_invoices_sql(args.year))
+    print(f"Fetching invoices for year {args.year} (May only: {args.May})...")
+    rows = query_sql(_invoices_sql(args.year, may_only=args.May))
     print(f"  {len(rows)} invoice rows fetched.\n")
 
     lines, agent_ep, agent_sales, agent_eligibility = build_report(rows)

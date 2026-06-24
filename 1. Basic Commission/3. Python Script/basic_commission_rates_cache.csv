@@ -1,0 +1,22 @@
+Agent Type,Hierarchy,,Rate,,,,,,,,
+,,Senior Override Rate %,Jan,Feb,Mac,Jun,Jul,Profit Sharing Rate % ,,,
+Internal,Senior,0.25 from Executive,3.25,3.25,3.25,4.25,,2 + x,,,
+,Executive,-,3,3,3,4,,2 + x,,,
+Outsource,OGM,"0.75 from OSA
+0.25 from OUM
+0.15 from OGM
+",5,5,5,6,,,,,
+,OUM,"0.5 from OSA
+0.25 from OUM",4.5,4.5,4.5,5.5,,2.5 + x,,,
+,OSA/OSA1,,4.5,4.5,4.5,5.5,,2.5 + x,,,
+,,,,,,,,,,,Formula:
+,,,,,,,,,,,Sales Price = Total Amount - EPP
+,,,,,,,,,,,Basic Commission = Sales Price x Rate %
+,,,,,,,,,,,
+,,,,,,,,,,,
+,,,,,,,,,,,Note:
+,,,,,,,,,,,1. x value to be inserted
+,,,,,,,,,,,2. From Jan to May Basic Commission given out to Agent once Payment = 100%
+,,,,,,,,,,,"3. From Jun Basic Commission given out to Agent once 
+i. Payment = 5% then Agent get RM300
+ii. Payment = 75% then Agent get Balance Basic Commission"

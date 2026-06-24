@@ -682,41 +682,179 @@ def build_matrix_table(
     header_style_nfp = ParagraphStyle("StackedHeaderMatrixNfp", parent=styles["Normal"], fontSize=7.0, leading=8.0, fontName=FONT_BOLD, textColor=colors.white, alignment=TA_CENTER)
     sub_header_style_nfp = ParagraphStyle("StackedSubHeaderMatrixNfp", parent=styles["Normal"], fontSize=5.8, leading=6.8, fontName=FONT_BOLD, textColor=colors.white, alignment=TA_CENTER)
 
+    rows = [list(r) for r in rows]
+    has_customer = False
+    if rows:
+        if len(rows[0]) == 15 or len(rows[0]) == 28:
+            has_customer = True
+        elif len(rows[0]) == 14 and comm_type == "ANP Commission" and "Customer" in title:
+            has_customer = True
+
+    if has_customer and rows:
+        current_agent = ""
+        span_count = 0
+        for r_idx in range(len(rows)):
+            val = rows[r_idx][0]
+            if val != "" and val is not None and val != "Total":
+                current_agent = val
+                span_count = 1
+            elif val == "Total":
+                current_agent = ""
+                span_count = 0
+            else:
+                span_count += 1
+                if span_count > 10:
+                    rows[r_idx][0] = current_agent
+                    span_count = 1
+
     if comm_type == "NFP Commission":
-        # 26 columns (System Price and Net Floor Price added for every month)
-        col_ratios = [1.8, 0.8] + [0.9, 0.9, 0.9, 0.9] * 6
-        total_ratio = sum(col_ratios)
-        col_widths = [page_width * r / total_ratio for r in col_ratios]
-        
-        row1 = [
-            Paragraph("Agent Name", header_style_nfp),
-            Paragraph("Commission Rate", header_style_nfp),
-            Paragraph("Jan", header_style_nfp), "", "", "",
-            Paragraph("Feb", header_style_nfp), "", "", "",
-            Paragraph("Mac", header_style_nfp), "", "", "",
-            Paragraph("Apr", header_style_nfp), "", "", "",
-            Paragraph("May", header_style_nfp), "", "", "",
-            Paragraph("Jun", header_style_nfp), "", "", ""
-        ]
-        row2 = [
-            "", "",
-            Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
-            Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
-            Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
-            Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
-            Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
-            Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp)
-        ]
-        t_styles = [
-            ("SPAN", (0, 0), (0, 1)),
-            ("SPAN", (1, 0), (1, 1)),
-            ("SPAN", (2, 0), (5, 0)),
-            ("SPAN", (6, 0), (9, 0)),
-            ("SPAN", (10, 0), (13, 0)),
-            ("SPAN", (14, 0), (17, 0)),
-            ("SPAN", (18, 0), (21, 0)),
-            ("SPAN", (22, 0), (25, 0)),
-        ]
+        if has_customer:
+            # 28 columns (Agent, Customer, Invoice Date, Commission Rate, and 6 months of 4 columns each)
+            col_ratios = [1.8, 1.8, 1.2, 0.8] + [0.9, 0.9, 0.9, 0.9] * 6
+            total_ratio = sum(col_ratios)
+            col_widths = [page_width * r / total_ratio for r in col_ratios]
+            
+            row1 = [
+                Paragraph("Agent", header_style_nfp),
+                Paragraph("Customer", header_style_nfp),
+                Paragraph("Invoice Date", header_style_nfp),
+                Paragraph("Commission Rate", header_style_nfp),
+                Paragraph("Jan", header_style_nfp), "", "", "",
+                Paragraph("Feb", header_style_nfp), "", "", "",
+                Paragraph("Mac", header_style_nfp), "", "", "",
+                Paragraph("Apr", header_style_nfp), "", "", "",
+                Paragraph("May", header_style_nfp), "", "", "",
+                Paragraph("Jun", header_style_nfp), "", "", ""
+            ]
+            row2 = [
+                "", "", "", "",
+                Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
+                Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
+                Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
+                Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
+                Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
+                Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp)
+            ]
+            t_styles = [
+                ("SPAN", (0, 0), (0, 1)),
+                ("SPAN", (1, 0), (1, 1)),
+                ("SPAN", (2, 0), (2, 1)),
+                ("SPAN", (3, 0), (3, 1)),
+                ("SPAN", (4, 0), (7, 0)),
+                ("SPAN", (8, 0), (11, 0)),
+                ("SPAN", (12, 0), (15, 0)),
+                ("SPAN", (16, 0), (19, 0)),
+                ("SPAN", (20, 0), (23, 0)),
+                ("SPAN", (24, 0), (27, 0)),
+            ]
+        else:
+            # 26 columns (System Price and Net Floor Price added for every month)
+            col_ratios = [1.8, 0.8] + [0.9, 0.9, 0.9, 0.9] * 6
+            total_ratio = sum(col_ratios)
+            col_widths = [page_width * r / total_ratio for r in col_ratios]
+            
+            row1 = [
+                Paragraph("Agent Name", header_style_nfp),
+                Paragraph("Commission Rate", header_style_nfp),
+                Paragraph("Jan", header_style_nfp), "", "", "",
+                Paragraph("Feb", header_style_nfp), "", "", "",
+                Paragraph("Mac", header_style_nfp), "", "", "",
+                Paragraph("Apr", header_style_nfp), "", "", "",
+                Paragraph("May", header_style_nfp), "", "", "",
+                Paragraph("Jun", header_style_nfp), "", "", ""
+            ]
+            row2 = [
+                "", "",
+                Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
+                Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
+                Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
+                Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
+                Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp),
+                Paragraph("Sales Price", sub_header_style_nfp), Paragraph("System Price", sub_header_style_nfp), Paragraph("Net Floor Price", sub_header_style_nfp), Paragraph("NFP Commission", sub_header_style_nfp)
+            ]
+            t_styles = [
+                ("SPAN", (0, 0), (0, 1)),
+                ("SPAN", (1, 0), (1, 1)),
+                ("SPAN", (2, 0), (5, 0)),
+                ("SPAN", (6, 0), (9, 0)),
+                ("SPAN", (10, 0), (13, 0)),
+                ("SPAN", (14, 0), (17, 0)),
+                ("SPAN", (18, 0), (21, 0)),
+                ("SPAN", (22, 0), (25, 0)),
+            ]
+    elif has_customer:
+        if comm_type == "ANP Commission":
+            # 14 columns: Agent, Customer, and 6 months of (Sales Price, ANP Commission)
+            col_ratios = [1.8, 2.7] + [1.1, 1.1] * 6
+            total_ratio = sum(col_ratios)
+            col_widths = [page_width * r / total_ratio for r in col_ratios]
+            
+            row1 = [
+                Paragraph("Agent", header_style),
+                Paragraph("Customer", header_style),
+                Paragraph("Jan", header_style), "",
+                Paragraph("Feb", header_style), "",
+                Paragraph("Mac", header_style), "",
+                Paragraph("Apr", header_style), "",
+                Paragraph("May", header_style), "",
+                Paragraph("Jun", header_style), ""
+            ]
+            row2 = [
+                "", "",
+                Paragraph("Sales Price", sub_header_style), Paragraph("ANP Commission", sub_header_style),
+                Paragraph("Sales Price", sub_header_style), Paragraph("ANP Commission", sub_header_style),
+                Paragraph("Sales Price", sub_header_style), Paragraph("ANP Commission", sub_header_style),
+                Paragraph("Sales Price", sub_header_style), Paragraph("ANP Commission", sub_header_style),
+                Paragraph("Sales Price", sub_header_style), Paragraph("ANP Commission", sub_header_style),
+                Paragraph("Sales Price", sub_header_style), Paragraph("ANP Commission", sub_header_style)
+            ]
+            t_styles = [
+                ("SPAN", (0, 0), (0, 1)),
+                ("SPAN", (1, 0), (1, 1)),
+                ("SPAN", (2, 0), (3, 0)),
+                ("SPAN", (4, 0), (5, 0)),
+                ("SPAN", (6, 0), (7, 0)),
+                ("SPAN", (8, 0), (9, 0)),
+                ("SPAN", (10, 0), (11, 0)),
+                ("SPAN", (12, 0), (13, 0)),
+            ]
+        else:
+            # Customer Basic Commission (15 columns)
+            col_ratios = [1.8, 1.8, 0.9] + [1.1, 1.1] * 6
+            total_ratio = sum(col_ratios)
+            col_widths = [page_width * r / total_ratio for r in col_ratios]
+            
+            row1 = [
+                Paragraph("Agent", header_style),
+                Paragraph("Customer", header_style),
+                Paragraph("Commission Rate", header_style),
+                Paragraph("Jan", header_style), "",
+                Paragraph("Feb", header_style), "",
+                Paragraph("Mac", header_style), "",
+                Paragraph("Apr", header_style), "",
+                Paragraph("May", header_style), "",
+                Paragraph("Jun", header_style), ""
+            ]
+            row2 = [
+                "", "", "",
+                Paragraph("Sales Price", sub_header_style), Paragraph(comm_type, sub_header_style),
+                Paragraph("Sales Price", sub_header_style), Paragraph(comm_type, sub_header_style),
+                Paragraph("Sales Price", sub_header_style), Paragraph(comm_type, sub_header_style),
+                Paragraph("Sales Price", sub_header_style), Paragraph(comm_type, sub_header_style),
+                Paragraph("Sales Price", sub_header_style), Paragraph(comm_type, sub_header_style),
+                Paragraph("Sales Price", sub_header_style), Paragraph(comm_type, sub_header_style)
+            ]
+            t_styles = [
+                ("SPAN", (0, 0), (0, 1)),
+                ("SPAN", (1, 0), (1, 1)),
+                ("SPAN", (2, 0), (2, 1)),
+                ("SPAN", (3, 0), (4, 0)),
+                ("SPAN", (5, 0), (6, 0)),
+                ("SPAN", (7, 0), (8, 0)),
+                ("SPAN", (9, 0), (10, 0)),
+                ("SPAN", (11, 0), (12, 0)),
+                ("SPAN", (13, 0), (14, 0)),
+            ]
     elif comm_type == "ANP Commission":
         # 13 columns (ANP Tier removed)
         col_ratios = [2.5] + [1.3, 1.3] * 6
@@ -792,25 +930,47 @@ def build_matrix_table(
         formatted_row = []
         is_total = (row[0] == "Total")
         for i, val in enumerate(row):
-            if comm_type == "ANP Commission" and i == 1:
+            if comm_type == "ANP Commission" and not has_customer and i == 1:
                 continue # Skip the ANP Tier column
             
             # Determine cell style based on comm_type and column index
             if comm_type == "NFP Commission":
-                if i == 0:
-                    style = ParagraphStyle("BoldLeftMatrixNfp", parent=cell_style_left_nfp, fontName=FONT_BOLD) if is_total else cell_style_left_nfp
-                elif i == 1:
-                    style = cell_style_center_nfp
+                if has_customer:
+                    if i in (0, 1):
+                        style = ParagraphStyle("BoldLeftMatrixNfpCust", parent=cell_style_left_nfp, fontName=FONT_BOLD) if is_total else cell_style_left_nfp
+                    elif i in (2, 3):
+                        style = cell_style_center_nfp
+                    else:
+                        style = ParagraphStyle("BoldRightMatrixNfpCust", parent=cell_style_right_nfp, fontName=FONT_BOLD) if is_total else cell_style_right_nfp
                 else:
-                    style = ParagraphStyle("BoldRightMatrixNfp", parent=cell_style_right_nfp, fontName=FONT_BOLD) if is_total else cell_style_right_nfp
+                    if i == 0:
+                        style = ParagraphStyle("BoldLeftMatrixNfp", parent=cell_style_left_nfp, fontName=FONT_BOLD) if is_total else cell_style_left_nfp
+                    elif i == 1:
+                        style = cell_style_center_nfp
+                    else:
+                        style = ParagraphStyle("BoldRightMatrixNfp", parent=cell_style_right_nfp, fontName=FONT_BOLD) if is_total else cell_style_right_nfp
             else:
-                if i == 0:
-                    style = ParagraphStyle("BoldLeftMatrix", parent=cell_style_left, fontName=FONT_BOLD) if is_total else cell_style_left
-                elif (comm_type != "ANP Commission" and i == 1):
-                    style = cell_style_center
+                if has_customer:
+                    if comm_type == "ANP Commission":
+                        if i in (0, 1):
+                            style = ParagraphStyle("BoldLeftMatrixCust", parent=cell_style_left, fontName=FONT_BOLD) if is_total else cell_style_left
+                        else:
+                            style = ParagraphStyle("BoldRightMatrixCust", parent=cell_style_right, fontName=FONT_BOLD) if is_total else cell_style_right
+                    else:
+                        if i in (0, 1):
+                            style = ParagraphStyle("BoldLeftMatrixCust", parent=cell_style_left, fontName=FONT_BOLD) if is_total else cell_style_left
+                        elif i == 2:
+                            style = cell_style_center
+                        else:
+                            style = ParagraphStyle("BoldRightMatrixCust", parent=cell_style_right, fontName=FONT_BOLD) if is_total else cell_style_right
                 else:
-                    style = ParagraphStyle("BoldRightMatrix", parent=cell_style_right, fontName=FONT_BOLD) if is_total else cell_style_right
-                    
+                    if i == 0:
+                        style = ParagraphStyle("BoldLeftMatrix", parent=cell_style_left, fontName=FONT_BOLD) if is_total else cell_style_left
+                    elif (comm_type != "ANP Commission" and i == 1):
+                        style = cell_style_center
+                    else:
+                        style = ParagraphStyle("BoldRightMatrix", parent=cell_style_right, fontName=FONT_BOLD) if is_total else cell_style_right
+            
             formatted_row.append(Paragraph(val, style))
         table_data.append(formatted_row)
         
@@ -828,6 +988,22 @@ def build_matrix_table(
         ("TOPPADDING", (0, 2), (-1, -1), 3),
         ("BOTTOMPADDING", (0, 2), (-1, -1), 3),
     ])
+    
+    if has_customer:
+        agent_start = 0
+        while agent_start < len(rows):
+            if rows[agent_start][0] == "Total":
+                break
+            agent_end = agent_start
+            while (agent_end + 1 < len(rows) and 
+                   (rows[agent_end + 1][0] == "" or rows[agent_end + 1][0] is None) and 
+                   rows[agent_end + 1][0] != "Total"):
+                agent_end += 1
+            if agent_end > agent_start:
+                # Add 2 for the header row offset
+                t_styles.append(("SPAN", (0, agent_start + 2), (0, agent_end + 2)))
+                t_styles.append(("VALIGN", (0, agent_start + 2), (0, agent_end + 2), "TOP"))
+            agent_start = agent_end + 1
     
     # Alternating row colors for data rows (excluding headers and Total row)
     for r in range(2, len(table_data) - 1):
@@ -891,7 +1067,10 @@ def build_nfp_matrix_tables(rows: list[list[str]], page_width: float) -> tuple[T
             formatted_row.append(Paragraph(row[0], style))
             
             # Commission Rate
-            formatted_row.append(Paragraph(row[1], cell_style_center))
+            rate_val = row[1]
+            if not is_total and all(val == "-" or val == "" for val in row[slice_start:slice_end]):
+                rate_val = "-"
+            formatted_row.append(Paragraph(rate_val, cell_style_center))
             
             # Month slices
             for val in row[slice_start:slice_end]:
@@ -929,6 +1108,142 @@ def build_nfp_matrix_tables(rows: list[list[str]], page_width: float) -> tuple[T
     t2 = make_table("Mac", "Apr", 10, 18)
     t3 = make_table("May", "Jun", 18, 26)
     return t1, t2, t3
+
+
+def build_nfp_customer_matrix_tables(rows: list[list[str]], page_width: float) -> tuple[Table, Table, Table]:
+    from reportlab.platypus import Table, TableStyle, Paragraph
+    from reportlab.lib import colors
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
+
+    styles = getSampleStyleSheet()
+    
+    cell_style_left = ParagraphStyle("NfpCustLeft", parent=styles["Normal"], fontSize=5.8, leading=6.8, alignment=TA_LEFT, fontName=FONT_REGULAR)
+    cell_style_center = ParagraphStyle("NfpCustCenter", parent=styles["Normal"], fontSize=5.8, leading=6.8, alignment=TA_CENTER, fontName=FONT_REGULAR)
+    cell_style_right = ParagraphStyle("NfpCustRight", parent=styles["Normal"], fontSize=5.8, leading=6.8, alignment=TA_RIGHT, fontName=FONT_REGULAR)
+    
+    header_style = ParagraphStyle("NfpCustHeader", parent=styles["Normal"], fontSize=7.0, leading=8.0, fontName=FONT_BOLD, textColor=colors.white, alignment=TA_CENTER)
+    sub_header_style = ParagraphStyle("NfpCustSubHeader", parent=styles["Normal"], fontSize=5.8, leading=6.8, fontName=FONT_BOLD, textColor=colors.white, alignment=TA_CENTER)
+
+    col_ratios = [1.8, 1.8, 1.2, 0.8] + [0.9, 0.9, 0.9, 0.9] * 2
+    total_ratio = sum(col_ratios)
+    col_widths = [page_width * r / total_ratio for r in col_ratios]
+
+    rows = [list(r) for r in rows]
+    if rows:
+        current_agent = ""
+        span_count = 0
+        for r_idx in range(len(rows)):
+            val = rows[r_idx][0]
+            if val != "" and val is not None and val != "Total":
+                current_agent = val
+                span_count = 1
+            elif val == "Total":
+                current_agent = ""
+                span_count = 0
+            else:
+                span_count += 1
+                if span_count > 10:
+                    rows[r_idx][0] = current_agent
+                    span_count = 1
+
+    def make_table(month1_name: str, month2_name: str, slice_start: int, slice_end: int) -> Table:
+        row1 = [
+            Paragraph("Agent", header_style),
+            Paragraph("Customer", header_style),
+            Paragraph("Invoice Date", header_style),
+            Paragraph("Commission Rate", header_style),
+            Paragraph(month1_name, header_style), "", "", "",
+            Paragraph(month2_name, header_style), "", "", ""
+        ]
+        row2 = [
+            "", "", "", "",
+            Paragraph("Sales Price", sub_header_style), Paragraph("System Price", sub_header_style), Paragraph("Net Floor Price", sub_header_style), Paragraph("NFP Commission", sub_header_style),
+            Paragraph("Sales Price", sub_header_style), Paragraph("System Price", sub_header_style), Paragraph("Net Floor Price", sub_header_style), Paragraph("NFP Commission", sub_header_style)
+        ]
+        
+        t_styles = [
+            ("SPAN", (0, 0), (0, 1)),
+            ("SPAN", (1, 0), (1, 1)),
+            ("SPAN", (2, 0), (2, 1)),
+            ("SPAN", (3, 0), (3, 1)),
+            ("SPAN", (4, 0), (7, 0)),
+            ("SPAN", (8, 0), (11, 0)),
+        ]
+        
+        table_data = [row1, row2]
+        for row in rows:
+            is_total = (row[0] == "Total")
+            formatted_row = []
+            
+            # Agent Name
+            style = ParagraphStyle("NfpCustBoldLeft", parent=cell_style_left, fontName=FONT_BOLD) if is_total else cell_style_left
+            formatted_row.append(Paragraph(row[0], style))
+            
+            # Customer Name
+            formatted_row.append(Paragraph(row[1], style))
+            
+            # Invoice Date
+            formatted_row.append(Paragraph(row[2], cell_style_center))
+            
+            # Commission Rate
+            rate_val = row[3]
+            if not is_total and all(val == "-" or val == "" for val in row[slice_start:slice_end]):
+                rate_val = "-"
+            formatted_row.append(Paragraph(rate_val, cell_style_center))
+            
+            # Month slices
+            for val in row[slice_start:slice_end]:
+                style = ParagraphStyle("NfpCustBoldRight", parent=cell_style_right, fontName=FONT_BOLD) if is_total else cell_style_right
+                formatted_row.append(Paragraph(val, style))
+                
+            table_data.append(formatted_row)
+            
+        t = Table(table_data, colWidths=col_widths, repeatRows=2)
+        
+        t_styles.extend([
+            ("BACKGROUND", (0, 0), (-1, 1), colors.HexColor("#1A365D")),
+            ("ALIGN", (0, 0), (-1, 1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CBD5E0")),
+            ("TOPPADDING", (0, 0), (-1, 1), 2.5),
+            ("BOTTOMPADDING", (0, 0), (-1, 1), 2.5),
+            
+            ("VALIGN", (0, 2), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 2), (-1, -1), 1.5),
+            ("BOTTOMPADDING", (0, 2), (-1, -1), 1.5),
+        ])
+        
+        # Agent Name vertical span
+        agent_start = 0
+        while agent_start < len(rows):
+            if rows[agent_start][0] == "Total":
+                break
+            agent_end = agent_start
+            while (agent_end + 1 < len(rows) and 
+                   (rows[agent_end + 1][0] == "" or rows[agent_end + 1][0] is None) and 
+                   rows[agent_end + 1][0] != "Total"):
+                agent_end += 1
+            if agent_end > agent_start:
+                t_styles.append(("SPAN", (0, agent_start + 2), (0, agent_end + 2)))
+                t_styles.append(("VALIGN", (0, agent_start + 2), (0, agent_end + 2), "TOP"))
+            agent_start = agent_end + 1
+
+        for r in range(2, len(table_data) - 1):
+            if r % 2 == 0:
+                t_styles.append(("BACKGROUND", (0, r), (-1, r), colors.HexColor("#F8FAFC")))
+                
+        t_styles.append(("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#EDF2F7")))
+        t_styles.append(("LINEABOVE", (0, -1), (-1, -1), 1.0, colors.HexColor("#1A365D")))
+        
+        t.setStyle(TableStyle(t_styles))
+        return t
+
+    t1 = make_table("Jan", "Feb", 4, 12)
+    t2 = make_table("Mac", "Apr", 12, 20)
+    t3 = make_table("May", "Jun", 20, 28)
+    return t1, t2, t3
+
 
 
 def _create_split_legend(width: float) -> Table:
@@ -1084,7 +1399,7 @@ def load_internal_hierarchy() -> list[dict[str, Any]]:
     # Fallback to hardcoded list if the Excel file is not found
     fallback = [
         {"senior": "Teng Kah Kent", "start_date": "01 Jul 2025", "executives": ["Louis Ng", "Anisah Najwa", "Najwa"]},
-        {"senior": "Sunny Tan", "start_date": "01 Jul 2025", "executives": ["Jia Keat", "Zul", "Denise", "Jia Xuan"]},
+        {"senior": "Sunny Tan", "start_date": "01 Jul 2025", "executives": ["Jia Keat", "Zulkarnain", "Denise", "Jia Xuan"]},
         {"senior": "Zhe Hang", "start_date": "01 May 2025", "executives": ["Joshua Yap Jia Hao"]},
         {"senior": "Martin Hing", "start_date": "01 Feb 2026", "executives": ["Js"]}
     ]
@@ -1422,16 +1737,16 @@ def write_finance_presentation_pdf(
     toc_left_style = ParagraphStyle(
         "TocLeft",
         parent=styles["Normal"],
-        fontSize=11,
-        leading=14,
+        fontSize=10,
+        leading=12,
         fontName=FONT_BOLD,
         textColor=colors.HexColor("#1a365d"),
     )
     toc_right_style = ParagraphStyle(
         "TocRight",
         parent=styles["Normal"],
-        fontSize=11,
-        leading=14,
+        fontSize=10,
+        leading=12,
         fontName=FONT_BOLD,
         textColor=colors.HexColor("#4a5568"),
         alignment=TA_RIGHT,
@@ -1439,11 +1754,20 @@ def write_finance_presentation_pdf(
     toc_sub_style = ParagraphStyle(
         "TocSub",
         parent=styles["Normal"],
-        fontSize=10,
-        leading=13,
+        fontSize=8.5,
+        leading=11,
         fontName=FONT_REGULAR,
         textColor=colors.HexColor("#4a5568"),
-        leftIndent=15,
+        leftIndent=24,
+    )
+    toc_group_style = ParagraphStyle(
+        "TocGroup",
+        parent=styles["Normal"],
+        fontSize=9.5,
+        leading=11.5,
+        fontName=FONT_BOLD,
+        textColor=colors.HexColor("#1a365d"),
+        leftIndent=12,
     )
 
     main_title_style = ParagraphStyle(
@@ -1577,7 +1901,7 @@ def write_finance_presentation_pdf(
     story.append(Paragraph(_escape(period_subtitle), cover_sub))
     story.append(Paragraph(_escape(display_date), cover_sub))
     story.append(Spacer(1, 0.3 * inch))
-    story.append(Paragraph("<b>Prepared for:</b> Eternalgy Finance Department", cover_meta_style))
+    story.append(Paragraph("<b>Prepared for:</b> Eternalgy HR and Finance Department", cover_meta_style))
     story.append(Paragraph("<b>Prepared by:</b> Nurul Aqilah", cover_meta_style))
     story.append(PageBreak())
 
@@ -1607,26 +1931,44 @@ def write_finance_presentation_pdf(
             [Paragraph("&bull;&nbsp;&nbsp;Basic Commission", toc_sub_style), Paragraph("Page 8", toc_right_style)],
             [Paragraph("&bull;&nbsp;&nbsp;Referral Fee", toc_sub_style), Paragraph("Page 9", toc_right_style)],
             [Paragraph("&bull;&nbsp;&nbsp;NFP Commission", toc_sub_style), Paragraph("Page 10", toc_right_style)],
-            [Paragraph("&bull;&nbsp;&nbsp;EGA/ESA Awards", toc_sub_style), Paragraph("Page 11", toc_right_style)],
-            [Paragraph("&bull;&nbsp;&nbsp;Production Bonus", toc_sub_style), Paragraph("Page 12", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;EGA/ESA Awards", toc_sub_style), Paragraph("Page 12", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;Production Bonus", toc_sub_style), Paragraph("Page 13", toc_right_style)],
         ])
     else:
         toc_data.extend([
             [Paragraph("Commission Details", toc_left_style), Paragraph("", toc_right_style)],
-            [Paragraph("&bull;&nbsp;&nbsp;Basic Commission", toc_sub_style), Paragraph("Page 8", toc_right_style)],
-            [Paragraph("&bull;&nbsp;&nbsp;Referral Fee", toc_sub_style), Paragraph("Page 9", toc_right_style)],
-            [Paragraph("&bull;&nbsp;&nbsp;NFP Commission", toc_sub_style), Paragraph("Page 10", toc_right_style)],
-            [Paragraph("&bull;&nbsp;&nbsp;ANP Commission", toc_sub_style), Paragraph("Page 11", toc_right_style)],
-            [Paragraph("&bull;&nbsp;&nbsp;EGA/ESA Awards", toc_sub_style), Paragraph("Page 12", toc_right_style)],
+            
+            [Paragraph("Basic Commission", toc_group_style), Paragraph("", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;Summary of Agent Basic Commission", toc_sub_style), Paragraph("Page 8", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;Basic Commission by Customer (Res & Shop)", toc_sub_style), Paragraph("Page 9", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;Basic Commission by Customer (Factory)", toc_sub_style), Paragraph("Page 11", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;Referral Fee", toc_sub_style), Paragraph("Page 12", toc_right_style)],
+            
+            [Paragraph("NFP Commission", toc_group_style), Paragraph("", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;Summary of Agent NFP Commission", toc_sub_style), Paragraph("Page 13", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;NFP Commission by Customer (Res & Shop)", toc_sub_style), Paragraph("Page 15", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;NFP Commission by Customer (Factory)", toc_sub_style), Paragraph("Page 18", toc_right_style)],
+            
+            [Paragraph("ANP Commission", toc_group_style), Paragraph("", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;Summary of Agent ANP Commission", toc_sub_style), Paragraph("Page 20", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;ANP Commission by Customer (Res & Shop)", toc_sub_style), Paragraph("Page 21", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;ANP Commission by Customer (Factory)", toc_sub_style), Paragraph("Page 25", toc_right_style)],
+            
+            [Paragraph("EGA/ESA Awards", toc_group_style), Paragraph("", toc_right_style)],
+            [Paragraph("&bull;&nbsp;&nbsp;EGA/ESA Awards Summary", toc_sub_style), Paragraph("Page 26", toc_right_style)],
         ])
+        if any("EGA" in s.title and "Factory" in s.title for s in sections):
+            toc_data.append(
+                [Paragraph("&bull;&nbsp;&nbsp;EGA/ESA Awards Factory", toc_sub_style), Paragraph("Page 27", toc_right_style)]
+            )
     
     toc_table = Table(toc_data, colWidths=[doc.width - 1.2 * inch, 1.2 * inch])
     toc_table.setStyle(
         TableStyle(
             [
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+                ("TOPPADDING", (0, 0), (-1, -1), 2.5),
                 ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
             ]
         )
@@ -1674,14 +2016,14 @@ def write_finance_presentation_pdf(
                 })
 
         # --- Styles ---
-        hdr_base = ParagraphStyle('OHdr', parent=styles['Normal'], fontSize=8.5,
-            leading=10, textColor=colors.white, fontName=FONT_BOLD, alignment=TA_CENTER)
-        name_style_tbl = ParagraphStyle('OName', parent=styles['Normal'], fontSize=9,
-            leading=12, textColor=colors.HexColor('#1A202C'), fontName=FONT_REGULAR)
-        name_bold_tbl = ParagraphStyle('ONameB', parent=styles['Normal'], fontSize=9,
-            leading=12, textColor=colors.HexColor('#1A202C'), fontName=FONT_BOLD)
-        sub_style_tbl = ParagraphStyle('OSub', parent=styles['Normal'], fontSize=8.5,
-            leading=11, textColor=colors.HexColor('#744210'), fontName=FONT_REGULAR)
+        hdr_base = ParagraphStyle('OHdr', parent=styles['Normal'], fontSize=8.0,
+            leading=9.5, textColor=colors.white, fontName=FONT_BOLD, alignment=TA_CENTER)
+        name_style_tbl = ParagraphStyle('OName', parent=styles['Normal'], fontSize=7.2,
+            leading=9.0, textColor=colors.HexColor('#1A202C'), fontName=FONT_REGULAR)
+        name_bold_tbl = ParagraphStyle('ONameB', parent=styles['Normal'], fontSize=7.2,
+            leading=9.0, textColor=colors.HexColor('#1A202C'), fontName=FONT_BOLD)
+        sub_style_tbl = ParagraphStyle('OSub', parent=styles['Normal'], fontSize=7.0,
+            leading=8.5, textColor=colors.HexColor('#744210'), fontName=FONT_REGULAR)
 
         HDR_COLORS = [
             colors.HexColor('#1A365D'),   # OGM - darkest navy
@@ -1718,8 +2060,8 @@ def write_finance_presentation_pdf(
             ('VALIGN', (0, 0), (-1, -1), 'TOP'),
             ('TOPPADDING', (0, 0), (-1, 0), 4),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 4),
-            ('TOPPADDING', (0, 1), (-1, -1), 2),
-            ('BOTTOMPADDING', (0, 1), (-1, -1), 2),
+            ('TOPPADDING', (0, 1), (-1, -1), 1),
+            ('BOTTOMPADDING', (0, 1), (-1, -1), 1),
             ('LEFTPADDING', (0, 0), (-1, -1), 4),
             ('RIGHTPADDING', (0, 0), (-1, -1), 4),
             # Very subtle row alternation
@@ -2025,7 +2367,21 @@ def write_finance_presentation_pdf(
     for section in sections:
         story.append(PageBreak())
 
-        story.append(Paragraph(_escape(section.title), section_style))
+        if " — " in section.title:
+            main_title, sub_title = section.title.split(" — ", 1)
+            story.append(Paragraph(_escape(main_title), section_style))
+            subtitle_style = ParagraphStyle(
+                "SectionSubTitle",
+                parent=styles["Normal"],
+                fontSize=9.5,
+                leading=11.5,
+                textColor=colors.HexColor("#319795"),
+                fontName=FONT_REGULAR,
+                spaceAfter=6,
+            )
+            story.append(Paragraph(_escape(sub_title), subtitle_style))
+        else:
+            story.append(Paragraph(_escape(section.title), section_style))
         
         if section.total_agents is not None or section.total_customers is not None:
             stats_style = ParagraphStyle(
@@ -2081,7 +2437,13 @@ def write_finance_presentation_pdf(
                 if section.landscape and "Details" in section.title:
                     comm_type = section.title.split("Details")[0].strip()
                     if comm_type == "NFP Commission":
-                        t1, t2, t3 = build_nfp_matrix_tables(section.rows, page_w)
+                        has_customer = False
+                        if section.rows and len(section.rows[0]) == 28:
+                            has_customer = True
+                        if has_customer:
+                            t1, t2, t3 = build_nfp_customer_matrix_tables(section.rows, page_w)
+                        else:
+                            t1, t2, t3 = build_nfp_matrix_tables(section.rows, page_w)
                         story.append(t1)
                         story.append(Spacer(1, 0.08 * inch))
                         story.append(t2)
@@ -2110,29 +2472,118 @@ def write_finance_presentation_pdf(
                         fontSize=8,
                         leading=11,
                         fontName=FONT_BOLD,
-                        textColor=colors.HexColor("#2d3748")
+                        textColor=colors.HexColor("#1A365D"),
+                        spaceAfter=4
                     )
                     
-                    if "Basic" in comm_type:
-                        story.append(Paragraph("<b>Note:</b>", note_title_style))
-                        story.append(Paragraph("- Basic Commission is for every Full Payment", note_style))
-                        story.append(Paragraph("- Total Amount - EPP Price (if applicable) = Sales Price", note_style))
-                        story.append(Paragraph("- Sales Price x Rate % = Basic Commission", note_style))
-                        story.append(Spacer(1, 4))
-                        # Redundant generic note panel removed per user request
-                        # Note card generation removed
-                    elif "ANP" in comm_type:
-                        story.append(Paragraph("<i>Reconciliation Note: Invoice 1005425 was issued in 2025 but fully paid in 2026. Consequently, it is excluded from H1 2026 ANP Commission Details (reconciling the section total to 138 invoices).</i>", note_style))
-                        story.append(Spacer(1, 4))
-                        story.append(Paragraph("<b>Note:</b>", note_title_style))
-                        story.append(Paragraph("- Requires a minimum 5% payment", note_style))
-                        story.append(Paragraph("- ANP Commission will be rewarded the next month of case issuance", note_style))
-                        story.append(Paragraph("- Total Sales (RM) between 0 - 59k qualifies for RM 0", note_style))
-                        story.append(Paragraph("- Total Sales (RM) between 60k - 179k qualifies for RM 500", note_style))
-                        story.append(Paragraph("- Total Sales (RM) between 180k - 359k qualifies for RM 1000", note_style))
-                        story.append(Paragraph("- Total Sales (RM) above 360k qualifies for RM 1500", note_style))
-                        story.append(Paragraph("- Total Sales (RM) above 720k qualifies for RM 2000", note_style))
-                    elif "NFP" in comm_type:
+                    cell_elements = []
+                    if "Basic" in comm_type and "Summary of Agent Basic Commission" in section.title:
+                        import sys
+                        # Ensure 1. Basic Commission/3. Python Script is in path to load basic_commission_rates
+                        script_dir = str(Path(__file__).resolve().parent / "1. Basic Commission" / "3. Python Script")
+                        if script_dir not in sys.path:
+                            sys.path.insert(0, script_dir)
+                        try:
+                            import basic_commission_rates
+                            # Jan-May rates (month 5)
+                            m5_exec = f"{basic_commission_rates.get_basic_rate('Internal', 'executive', 5)*100:.2f}%".replace(".00", "")
+                            m5_senior = f"{basic_commission_rates.get_basic_rate('Internal', 'senior', 5)*100:.2f}%".replace(".00", "")
+                            # June rates (month 6)
+                            m6_exec = f"{basic_commission_rates.get_basic_rate('Internal', 'executive', 6)*100:.2f}%".replace(".00", "")
+                            m6_senior = f"{basic_commission_rates.get_basic_rate('Internal', 'senior', 6)*100:.2f}%".replace(".00", "")
+                            
+                            # Outsource Jan-May
+                            m5_oum = f"{basic_commission_rates.get_basic_rate('Outsource', 'oum', 5)*100:.2f}%".replace(".00", "")
+                            m5_osa = f"{basic_commission_rates.get_basic_rate('Outsource', 'osa/osa1', 5)*100:.2f}%".replace(".00", "")
+                            # Outsource June
+                            m6_oum = f"{basic_commission_rates.get_basic_rate('Outsource', 'oum', 6)*100:.2f}%".replace(".00", "")
+                            m6_osa = f"{basic_commission_rates.get_basic_rate('Outsource', 'osa/osa1', 6)*100:.2f}%".replace(".00", "")
+                        except Exception:
+                            # Fallback if import fails
+                            m5_exec, m5_senior = "3%", "3.25%"
+                            m6_exec, m6_senior = "4%", "4.25%"
+                            m5_oum, m5_osa = "4.5%", "4.5%"
+                            m6_oum, m6_osa = "5.5%", "5.5%"
+
+                        run_month = None
+                        month_names_lower = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
+                        if meta_lines:
+                            for k, v in meta_lines:
+                                kl = str(k).lower()
+                                vl = str(v).lower()
+                                if "month" in kl:
+                                    for idx, mname in enumerate(month_names_lower, start=1):
+                                        if mname in vl or v == str(idx):
+                                            run_month = idx
+                                            break
+                                if run_month:
+                                    break
+                        if not run_month:
+                            for sec in sections:
+                                title_l = sec.title.lower()
+                                for idx, mname in enumerate(month_names_lower, start=1):
+                                    if mname in title_l:
+                                        run_month = idx
+                                        break
+                                if run_month:
+                                    break
+
+                        cell_elements.append(Paragraph("<b>Note:</b>", note_title_style))
+                        cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;Total Amount - EPP Price (if applicable) = Sales Price", note_style))
+                        cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;Sales Price x Rate % = Basic Commission", note_style))
+                        
+                        if run_month is not None and run_month >= 6:
+                            # June or later
+                            cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;Rate % :", note_style))
+                            if is_outsource:
+                                cell_elements.append(Paragraph(f"&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;OUM - {m6_oum}, OSA - {m6_osa}", note_style))
+                            else:
+                                cell_elements.append(Paragraph(f"&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;Executive - {m6_exec}, Senior - {m6_senior}", note_style))
+                                cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;Senior Override - 0.25%", note_style))
+                            cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;Basic Commission payout condition:", note_style))
+                            cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;Payment = 5% then Agent get RM300", note_style))
+                            cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;Payment = 75% then Agent get Balance Basic Commission", note_style))
+                        elif run_month is not None and run_month <= 5:
+                            # January to May
+                            cell_elements.insert(1, Paragraph("&bull;&nbsp;&nbsp;Basic Commission is for every Full Payment", note_style))
+                            cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;Rate % :", note_style))
+                            if is_outsource:
+                                cell_elements.append(Paragraph(f"&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;OUM - {m5_oum}, OSA - {m5_osa}", note_style))
+                            else:
+                                cell_elements.append(Paragraph(f"&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;Executive - {m5_exec}, Senior - {m5_senior}", note_style))
+                                cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;Senior Override - 0.25%", note_style))
+                            cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;Basic Commission payout condition: given out to Agent once Payment = 100%", note_style))
+                        else:
+                            # H1 / Annual (aggregate)
+                            cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;Rate % :", note_style))
+                            if is_outsource:
+                                cell_elements.append(Paragraph(f"&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;Jan - May: OUM - {m5_oum}, OSA - {m5_osa}", note_style))
+                                cell_elements.append(Paragraph(f"&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;From Jun: OUM - {m6_oum}, OSA - {m6_osa}", note_style))
+                            else:
+                                cell_elements.append(Paragraph(f"&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;Jan - May: Executive - {m5_exec}, Senior - {m5_senior}", note_style))
+                                cell_elements.append(Paragraph(f"&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;From Jun: Executive - {m6_exec}, Senior - {m6_senior}", note_style))
+                                cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;Senior Override - 0.25%", note_style))
+                            cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;Basic Commission payout condition:", note_style))
+                            cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;Jan - May: given out to Agent once Payment = 100%", note_style))
+                            cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;From Jun: i. Payment = 5% then Agent get RM300, ii. Payment = 75% then Agent get Balance Basic Commission", note_style))
+
+                    elif "ANP" in comm_type and "Summary" in section.title:
+                        cell_elements.append(Paragraph("<b>Note:</b>", note_title_style))
+                        cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;Requires a minimum 5% payment", note_style))
+                        cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;ANP Commission will be rewarded the next month of case issuance", note_style))
+                        cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;EP Point Recognition Structure:", note_style))
+                        cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;<b>Residence & Shop Lot:</b> 100% recognition rate", note_style))
+                        cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;<b>Factory:</b> Prior to May 2026: 100% recognition. Effective May 2026 onwards: 100% recognition for the first RM 40,000, 40% recognition for the balance amount (unless factory has less than 36pcs, in which case it follows residence rate).", note_style))
+                        cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;Commission Tiers based on Accumulated Total Sales:", note_style))
+                        cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;RM 0 - 59k qualifies for RM 0", note_style))
+                        cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;RM 60k - 179k qualifies for RM 500", note_style))
+                        cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;RM 180k - 359k qualifies for RM 1000", note_style))
+                        cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;Above RM 360k qualifies for RM 1500", note_style))
+                        cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;Above RM 720k qualifies for RM 2000", note_style))
+                        cell_elements.append(Spacer(1, 4))
+                        cell_elements.append(Paragraph("<i>Reconciliation Note: Invoice 1005425 was issued in 2025 but fully paid in 2026. Consequently, it is excluded from H1 2026 ANP Commission Details (reconciling the section total to 138 invoices).</i>", note_style))
+
+                    elif "NFP" in comm_type and "Summary" in section.title:
                         note_style_nfp = ParagraphStyle(
                             "DetailNoteNfp",
                             parent=styles["Normal"],
@@ -2147,32 +2598,77 @@ def write_finance_presentation_pdf(
                             fontSize=8.0,
                             leading=10.0,
                             fontName=FONT_BOLD,
-                            textColor=colors.HexColor("#2d3748")
+                            textColor=colors.HexColor("#1A365D"),
+                            spaceAfter=4
                         )
-                        story.append(Paragraph("- Effective October 1, 2025, NFP computations are applicable exclusively to invoices issued on or after this date. Invoices predating this period are structurally excluded from NFP allocations.", note_style_nfp))
-                        story.append(Spacer(1, 4))
-                        story.append(Paragraph("<b>Note:</b>", note_title_style_nfp))
-                        story.append(Paragraph("- NFP Commission distributions are contingent upon the receipt of 100% full payment.", note_style_nfp))
-                        story.append(Paragraph("- (Sales Price - System Price/ Net Floor Price) x Rate % = NFP Commission", note_style_nfp))
-                        story.append(Paragraph("- Three types of Net Floor Price Commission:", note_style_nfp))
-                        story.append(Paragraph("&nbsp;&nbsp;• <b>Sales above Net Floor Price:</b> Sales Price > Net Floor Price, agent qualifies for 100% Net Floor Price Commission", note_style_nfp))
-                        story.append(Paragraph("&nbsp;&nbsp;• <b>Sales above System Price:</b> Sales Price > System Price, agent qualifies for 100% Net Floor Price Commission", note_style_nfp))
-                        story.append(Paragraph("&nbsp;&nbsp;• <b>Sales below System Price:</b> Sales Price < Net Floor Price, agent bears 20% Net Floor Price Commission", note_style_nfp))
+                        cell_elements.append(Paragraph("<b>Note:</b>", note_title_style_nfp))
+                        cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;NFP Commission distributions are contingent upon the receipt of 100% full payment.", note_style_nfp))
+                        cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;Three types of Net Floor Price Commission:", note_style_nfp))
+                        cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;<b>Sales above Net Floor Price:</b> Sales Price > Net Floor Price. Formula: (Sales Price - Net Floor Price) x 25% = NFP Commission", note_style_nfp))
+                        cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;<b>Sales above System Price:</b> System Price > Net Floor Price. Formula: (System Price - Net Floor Price) x 100% = NFP Commission", note_style_nfp))
+                        cell_elements.append(Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;<b>Sales below Net Floor price:</b> Sales Price < Net Floor Price. Formula: (Sales Price - Net Floor Price) x bears 20% = NFP Commission", note_style_nfp))
+                        cell_elements.append(Spacer(1, 4))
+                        cell_elements.append(Paragraph("&bull;&nbsp;&nbsp;Effective October 1, 2025, NFP computations are applicable exclusively to invoices issued on or after this date. Invoices predating this period are structurally excluded from NFP allocations.", note_style_nfp))
+
+                    if cell_elements:
+                        note_table = Table([[cell_elements]], colWidths=[page_w])
+                        note_table.setStyle(TableStyle([
+                            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
+                            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#E2E8F0")),
+                            ("LINELEFT", (0, 0), (-1, -1), 3.0, colors.HexColor("#1A365D")),
+                            ("TOPPADDING", (0, 0), (-1, -1), 6),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ]))
+                        story.append(note_table)
                 else:
                     story.append(build_table(section, page_w))
 
                     if section.footer_text:
-                        story.append(Spacer(1, 0.12 * inch))
-                        note_style = ParagraphStyle(
-                            "DetailNote",
+                        story.append(Spacer(1, 6))
+                        note_title_style = ParagraphStyle(
+                            "NoteTitle",
+                            parent=styles["Normal"],
+                            fontSize=8,
+                            leading=10,
+                            fontName=FONT_BOLD,
+                            textColor=colors.HexColor("#1A365D"),
+                            spaceAfter=4
+                        )
+                        note_text_style = ParagraphStyle(
+                            "NoteText",
                             parent=styles["Normal"],
                             fontSize=7.5,
-                            leading=10.5,
+                            leading=9.5,
                             fontName=FONT_REGULAR,
-                            textColor=colors.HexColor("#4a5568")
+                            textColor=colors.HexColor("#4a5568"),
+                            spaceAfter=2
                         )
-                        for text in section.footer_text:
-                            story.append(Paragraph(text, note_style))
+                        cell_elements = []
+                        first = section.footer_text[0].strip() if section.footer_text else ""
+                        if first.lower() in ("<b>note:</b>", "note:", "<b>note</b>:"):
+                            cell_elements.append(Paragraph("<b>Note:</b>", note_title_style))
+                            lines_to_add = section.footer_text[1:]
+                        else:
+                            cell_elements.append(Paragraph("<b>Note:</b>", note_title_style))
+                            lines_to_add = section.footer_text
+                        for text in lines_to_add:
+                            cell_elements.append(Paragraph(text, note_text_style))
+                        
+                        note_table = Table([[cell_elements]], colWidths=[page_w - 72])
+                        note_table.setStyle(TableStyle([
+                            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
+                            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#E2E8F0")),
+                            ("LINELEFT", (0, 0), (-1, -1), 3.0, colors.HexColor("#1A365D")),
+                            ("TOPPADDING", (0, 0), (-1, -1), 6),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ]))
+                        story.append(note_table)
 
     doc.build(story)
     return path

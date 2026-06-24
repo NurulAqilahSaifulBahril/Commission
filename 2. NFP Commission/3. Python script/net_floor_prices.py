@@ -15,7 +15,9 @@ import pandas as pd
 from nfp_paths import get_620w_json_path, get_default_excel_path
 
 SHEET_BY_MONTH: Dict[Tuple[int, int], str] = {
-    (2026, 1): "FEB 2026",
+    (2025, 11): "NOV - DEC 2025",
+    (2025, 12): "NOV - DEC 2025",
+    (2026, 1): "JAN 2026",
     (2026, 2): "FEB 2026",
     (2026, 3): "MAC 2026",
     (2026, 4): "APR 2026",
@@ -29,7 +31,7 @@ MONTH_NAMES = {
 }
 
 NFP_CUTOFF = date(2025, 10, 1)
-SCHEDULE_650W_FROM = date(2026, 1, 1)
+SCHEDULE_650W_FROM = date(2025, 11, 1)
 
 
 @dataclass(frozen=True)
@@ -74,7 +76,9 @@ def round_nfp(value: float | int | str | Decimal) -> float:
     """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return 0.0
-    d = Decimal(str(value))
+    # First, round float inputs to 2 decimal places to avoid float precision loss (e.g. 31869.199999999997 -> 31869.20)
+    rounded_val = round(float(value), 2)
+    d = Decimal(str(rounded_val))
     truncated = d.quantize(Decimal("0.1"), rounding=ROUND_DOWN)
     hundredths = int((abs(d) * 100) % 10)
     if hundredths >= 5:
@@ -106,6 +110,7 @@ def _rebate_column_indices(
         "raya",
         "earth",
         "cny",
+        "地球",
     )
     skip = (
         "no.panels",
@@ -139,6 +144,149 @@ def _parse_sheet_tables(df: pd.DataFrame, sheet_name: str) -> List[Dict[int, Pri
             continue
 
         headers = [str(v).strip() if pd.notna(v) else "" for v in row]
+
+        # Side-by-side layout for Nov-Dec 2025 and Jan 2026 (Table 2 shares panels col with Table 1)
+        if sheet_name in ("NOV - DEC 2025", "JAN 2026"):
+            t1_after_max = 3
+            t1_rebate_cols = [4, 5, 6]
+            
+            t2_after_max = 17
+            t2_rebate_cols = [18, 19, 20]
+            
+            t1_rows: Dict[int, PriceRow] = {}
+            t2_rows: Dict[int, PriceRow] = {}
+            
+            i += 1
+            while i < n:
+                r = df.iloc[i]
+                if pd.isna(r.iloc[0]):
+                    break
+                try:
+                    panels = int(float(r.iloc[0]))
+                except (TypeError, ValueError):
+                    break
+                    
+                def rnd(v: float | int | str | Decimal) -> float:
+                    return schedule_amount_round(v, sheet_name)
+                    
+                if pd.notna(r.iloc[t1_after_max]):
+                    t1_after = rnd(r.iloc[t1_after_max])
+                    t1_rebs = sum(rnd(r.iloc[j]) for j in t1_rebate_cols if j < len(r) and pd.notna(r.iloc[j]))
+                    t1_price = rnd(t1_after - t1_rebs)
+                    t1_rows[panels] = PriceRow(panels, t1_price, None)
+                    
+                if pd.notna(r.iloc[t2_after_max]):
+                    t2_after = rnd(r.iloc[t2_after_max])
+                    t2_rebs = sum(rnd(r.iloc[j]) for j in t2_rebate_cols if j < len(r) and pd.notna(r.iloc[j]))
+                    t2_price = rnd(t2_after - t2_rebs)
+                    t2_rows[panels] = PriceRow(panels, t2_price, None)
+                    
+                i += 1
+                
+            if t1_rows:
+                tables.append(t1_rows)
+            if t2_rows:
+                tables.append(t2_rows)
+            continue
+
+        # Check for dynamic side-by-side layout (e.g. MAY 2026 which has a second 'no.panels' column)
+        col_panels_2 = None
+        for idx in range(10, len(headers)):
+            if "no.panels" in headers[idx].lower():
+                col_panels_2 = idx
+                break
+
+        if col_panels_2 is not None:
+            col_panels_1 = 0
+            col_after_max_1 = _header_index(headers[:col_panels_2], "price after max")
+            col_final_1 = _header_index(headers[:col_panels_2], "final price after discount", exclude=("tng", "with"))
+            col_tng_rebate_1 = _header_index(headers[:col_panels_2], "roadshow", "tng") or _header_index(headers[:col_panels_2], "tng rebate")
+            col_with_tng_1 = _header_index(headers[:col_panels_2], "with tng")
+            
+            rebate_cols_1 = []
+            if col_after_max_1 is not None and col_final_1 is not None:
+                rebate_cols_1 = _rebate_column_indices(headers[:col_panels_2], col_after_max_1, col_final_1)
+                
+            col_panels_2_rel = 0
+            col_after_max_2_rel = _header_index(headers[col_panels_2:], "price after max")
+            col_final_2_rel = _header_index(headers[col_panels_2:], "final price after discount", exclude=("tng", "with"))
+            col_tng_rebate_2_rel = _header_index(headers[col_panels_2:], "roadshow", "tng") or _header_index(headers[col_panels_2:], "tng rebate")
+            col_with_tng_2_rel = _header_index(headers[col_panels_2:], "with tng")
+            
+            rebate_cols_2_rel = []
+            if col_after_max_2_rel is not None and col_final_2_rel is not None:
+                rebate_cols_2_rel = _rebate_column_indices(headers[col_panels_2:], col_after_max_2_rel, col_final_2_rel)
+                
+            t1_rows: Dict[int, PriceRow] = {}
+            t2_rows: Dict[int, PriceRow] = {}
+            
+            def rnd(v: float | int | str | Decimal) -> float:
+                return schedule_amount_round(v, sheet_name)
+                
+            i += 1
+            while i < n:
+                r = df.iloc[i]
+                
+                p1_ok = False
+                p2_ok = False
+                
+                # Parse Table 1 row
+                try:
+                    if col_panels_1 < len(r) and pd.notna(r.iloc[col_panels_1]):
+                        panels_1 = int(float(r.iloc[col_panels_1]))
+                        p1_ok = True
+                        if col_after_max_1 is not None and col_after_max_1 < len(r) and pd.notna(r.iloc[col_after_max_1]):
+                            after_max_1 = rnd(r.iloc[col_after_max_1])
+                            rebs_1 = sum(rnd(r.iloc[j]) for j in rebate_cols_1 if j < len(r) and pd.notna(r.iloc[j]))
+                            final_price_1 = rnd(after_max_1 - rebs_1)
+                            
+                            final_with_tng_1 = None
+                            if col_tng_rebate_1 is not None and col_tng_rebate_1 < len(r) and pd.notna(r.iloc[col_tng_rebate_1]):
+                                final_with_tng_1 = rnd(final_price_1 - rnd(r.iloc[col_tng_rebate_1]))
+                            elif col_with_tng_1 is not None and col_with_tng_1 < len(r) and pd.notna(r.iloc[col_with_tng_1]):
+                                final_with_tng_1 = rnd(r.iloc[col_with_tng_1])
+                                
+                            t1_rows[panels_1] = PriceRow(panels_1, final_price_1, final_with_tng_1)
+                except (ValueError, TypeError):
+                    pass
+                        
+                # Parse Table 2 row
+                try:
+                    if col_panels_2 < len(r) and pd.notna(r.iloc[col_panels_2]):
+                        panels_2 = int(float(r.iloc[col_panels_2]))
+                        p2_ok = True
+                        if col_after_max_2_rel is not None:
+                            idx_after_max_2 = col_panels_2 + col_after_max_2_rel
+                            if idx_after_max_2 < len(r) and pd.notna(r.iloc[idx_after_max_2]):
+                                after_max_2 = rnd(r.iloc[idx_after_max_2])
+                                rebs_2 = sum(rnd(r.iloc[col_panels_2 + j]) for j in rebate_cols_2_rel if (col_panels_2 + j) < len(r) and pd.notna(r.iloc[col_panels_2 + j]))
+                                final_price_2 = rnd(after_max_2 - rebs_2)
+                                
+                                final_with_tng_2 = None
+                                if col_tng_rebate_2_rel is not None:
+                                    idx_tng_2 = col_panels_2 + col_tng_rebate_2_rel
+                                    if idx_tng_2 < len(r) and pd.notna(r.iloc[idx_tng_2]):
+                                        final_with_tng_2 = rnd(final_price_2 - rnd(r.iloc[idx_tng_2]))
+                                elif col_with_tng_2_rel is not None:
+                                    idx_wtng_2 = col_panels_2 + col_with_tng_2_rel
+                                    if idx_wtng_2 < len(r) and pd.notna(r.iloc[idx_wtng_2]):
+                                        final_with_tng_2 = rnd(r.iloc[idx_wtng_2])
+                                        
+                                t2_rows[panels_2] = PriceRow(panels_2, final_price_2, final_with_tng_2)
+                except (ValueError, TypeError):
+                    pass
+                
+                if not p1_ok and not p2_ok:
+                    break
+                    
+                i += 1
+                
+            if t1_rows:
+                tables.append(t1_rows)
+            if t2_rows:
+                tables.append(t2_rows)
+            continue
+
         col_panels = _header_index(headers, "no.panels") or 0
         col_after_max = _header_index(headers, "price after max")
         col_final = _header_index(
@@ -272,7 +420,15 @@ def lookup_net_floor_price(
             return None, f"no_650w_sheet_for_{invoice_date:%Y_%m}"
             
         tables = schedules_650.get(sheet, [])
-        table = pick_table_for_panels(tables, panel_qty, three_phase=three_phase)
+        if len(tables) > 1 and sheet in ("NOV - DEC 2025", "JAN 2026"):
+            # Side-by-side sheets: table 0 is 620W, table 1 is 590W.
+            if panel_rating and panel_rating < 600:
+                table = tables[1]
+            else:
+                table = tables[0]
+        else:
+            table = pick_table_for_panels(tables, panel_qty, three_phase=three_phase)
+
         if not table or panel_qty not in table:
             return None, f"650w_no_row_{sheet}_{panel_qty}_panels"
         row = table[panel_qty]

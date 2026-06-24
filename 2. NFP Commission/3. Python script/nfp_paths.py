@@ -20,7 +20,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # NFP Commission root (parent of Python script folder)
 PROJECT_ROOT = SCRIPT_DIR.parent
 
-EXCEL_FILE_NAME = "STRING 650W package STRING INVERTER.xlsx"
+EXCEL_FILE_NAME = "Net Floor Price String Inverter.xlsx"
 # Accept common spellings (Windows paths are case-insensitive; glob helps on copy/rename)
 SCHEDULE_620W_JSON_CANDIDATES = (
     "nfp_620w_schedule.json",

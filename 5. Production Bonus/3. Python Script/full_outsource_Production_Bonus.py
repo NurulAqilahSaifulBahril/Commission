@@ -120,11 +120,11 @@ def _try_read_excel(path: Path) -> pd.DataFrame | None:
 _FALLBACK_HIERARCHY: dict[str, str] = {
     # OUM
     "gan lai hock": "OUM",
-    "phil moo": "OUM", "moo wui kead": "OUM",
+    "phil moo": "OUM", "moo wui kead": "OUM", "philmoowuikead": "OUM",
     "kok shao hong": "OUM",
-    "wilson tan": "OUM", "tan wei sheng": "OUM",
-    "dean wai": "OUM", "wai leong yee": "OUM",
-    "oliver koh": "OUM", "koh chong lee": "OUM",
+    "wilson tan": "OUM", "tan wei sheng": "OUM", "wilsontanweisheng": "OUM",
+    "dean wai": "OUM", "wai leong yee": "OUM", "deanwaileongyee": "OUM",
+    "oliver koh": "OUM", "koh chong lee": "OUM", "olivierkohconglee": "OUM",
     "chan wing on": "OUM",
     "chan jia wei": "OUM",
     "ling liang kang": "OUM",
@@ -162,8 +162,8 @@ _FALLBACK_HIERARCHY: dict[str, str] = {
 }
 
 _FALLBACK_TEAM_MAP: dict[str, list[str]] = {
-    "dean wai/ wai leong yee": ["dean wai", "wai leong yee", "lam wai leng", "tee kok kian"],
-    "oliver koh/ koh chong lee": ["oliver koh", "koh chong lee", "koh yeong cherng", "ang kok xing", "tey zhi yun", "mohd azhar bin ibrahim", "lim chin seng", "mohd hanis bin marjian"],
+    "dean wai/ wai leong yee": ["dean wai", "wai leong yee", "deanwaileongyee", "lam wai leng", "tee kok kian"],
+    "oliver koh/ koh chong lee": ["oliver koh", "koh chong lee", "olivierkohconglee", "koh yeong cherng", "ang kok xing", "tey zhi yun", "mohd azhar bin ibrahim", "lim chin seng", "mohd hanis bin marjian"],
     "chan wing on": ["chan wing on", "kwong jun sheng", "lee yue peng", "too pok jen"],
     "chan jia wei": ["chan jia wei", "tay hock xiang", "ho wen lin", "ng zhee hao"],
     "ling liang kang": ["ling liang kang", "tan wei hung"],
@@ -280,6 +280,32 @@ def _build_hierarchy() -> tuple[dict[str, str], dict[str, list[str]], dict[str, 
         team_map = dict(_FALLBACK_TEAM_MAP)
         ogm_team_map = {}
 
+    # Explicit mapping for database names that combine parts of split Excel names
+    db_mapping = [
+        ("deanwaileongyee", "Dean Wai/ Wai Leong Yee", "OUM"),
+        ("philmoowuikead", "Phil Moo/ Moo Wui Kead", "OUM"),
+        ("wilsontanweisheng", "Wilson Tan/ Tan Wei Sheng", "OUM"),
+        ("olivierkohconglee", "Oliver Koh/ Koh Chong Lee", "OUM"),
+    ]
+    for db_norm, team_key, tier in db_mapping:
+        result[db_norm] = tier
+        # Add to OUM team map
+        if team_key in team_map:
+            if db_norm not in team_map[team_key]:
+                team_map[team_key].append(db_norm)
+        # Also check lowercase key (as in fallback map)
+        lower_key = team_key.lower().strip()
+        if lower_key in team_map:
+            if db_norm not in team_map[lower_key]:
+                team_map[lower_key].append(db_norm)
+
+        # Add to OGM team map
+        first_member = _norm_name(team_key.split("/")[0])
+        for ogm_key, ogm_members in ogm_team_map.items():
+            if first_member in ogm_members:
+                if db_norm not in ogm_members:
+                    ogm_members.append(db_norm)
+
     _HIERARCHY = result
     _TEAM_MAP = team_map
     _OGM_TEAM_MAP = ogm_team_map
@@ -323,7 +349,8 @@ def _get_token() -> str | None:
     return os.environ.get("PG_PROXY_TOKEN") or os.environ.get("POSTGRES_PROXY_TOKEN")
 
 
-def _invoices_sql(year: int) -> str:
+def _invoices_sql(year: int, upto_month: int | None = None) -> str:
+    month_filter = f"AND EXTRACT(MONTH FROM i.invoice_date)::int <= {upto_month}" if upto_month else ""
     return f"""
 WITH candidates AS (
   SELECT
@@ -372,7 +399,19 @@ WITH candidates AS (
       ) AS epp_interest_amount
       FROM invoice_item ii
       WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
-      GROUP BY COALESCE(ii.description, '')
+      GROUP BY TRIM(
+        REGEXP_REPLACE(
+          REGEXP_REPLACE(
+            REGEXP_REPLACE(COALESCE(ii.description, ''), 'moths', 'months', 'gi'),
+            '(\\d+)\\s*months',
+            '\\1months',
+            'gi'
+          ),
+          '\\s+',
+          ' ',
+          'g'
+        )
+      )
     ) ii_dedup
   ) epp_items ON TRUE
   LEFT JOIN LATERAL (
@@ -382,6 +421,7 @@ WITH candidates AS (
   ) pay ON TRUE
   WHERE i.invoice_date IS NOT NULL
     AND EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
+    {month_filter}
     AND COALESCE(i.is_deleted, FALSE) IS NOT TRUE
     AND COALESCE(i.percent_of_total_amount, 0) >= 100.0
 )
@@ -446,9 +486,12 @@ def _render_table(headers: list[str], rows: list[list[str]]) -> str:
 # ---------------------------------------------------------------------------
 # Main Logic
 # ---------------------------------------------------------------------------
-def build_report(year: int) -> dict | None:
+def build_report(year: int, upto_month: int | None = None, may_only: bool = False) -> dict | None:
+    # Support legacy may_only flag: treat it as upto_month=5
+    if may_only and upto_month is None:
+        upto_month = 5
     _load_dotenv()
-    
+
     token = _get_token()
     if not token:
         token_file = (_NFP_SCRIPT / ".." / "4. data" / "pg_proxy_token.txt").resolve()
@@ -465,8 +508,9 @@ def build_report(year: int) -> dict | None:
     print("Parsing Agent Hierarchy...")
     hier, team_map, ogm_team_map = _build_hierarchy()
 
-    print(f"Fetching 100% paid invoices for year {year}...")
-    rows = query_sql(_invoices_sql(year))
+    label = f"Jan–{['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][upto_month]}" if upto_month else "full year"
+    print(f"Fetching 100% paid invoices for year {year} ({label})...")
+    rows = query_sql(_invoices_sql(year, upto_month=upto_month))
     print(f"  {len(rows)} invoice rows fetched.\n")
 
     # Accumulate agent sales across ALL packages
@@ -552,15 +596,15 @@ def build_report(year: int) -> dict | None:
             for raw_name, details in agent_details.items():
                 if _norm_name(raw_name) == member_norm:
                     for d in details:
+                        row_bonus = (d["sales_price"] * OUM_BONUS_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if qualified == "Yes" else Decimal(0)
                         t2_rows.append([
-                            team_name,
                             raw_name,
-                            d["tier"],
                             d["customer_name"],
                             d["invoice_number"],
                             d["prop_type"],
                             d["invoice_date"],
-                            _fmt_money(d["sales_price"])
+                            _fmt_money(d["sales_price"]),
+                            _fmt_money(row_bonus)
                         ])
                         
     # OGM Bonus Calculation
@@ -594,12 +638,12 @@ def build_report(year: int) -> dict | None:
 
     T1_HEADERS = ["OUM Name", "Personal Sales", "Team Total Sales", "Qualified", "Production Bonus"]
     T1_OGM_HEADERS = ["OGM Name", "Team Total Sales", "OSA Sales", "OUM Sales", "Qualified", "Production Bonus"]
-    T2_HEADERS = ["OUM (Team)", "Agent Name", "Agent Tier", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Sales Price"]
+    T2_HEADERS = ["Agent Name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Sales Price", "Production Bonus"]
 
     oum_summary.sort(key=lambda x: str(x[0]).lower())
     ogm_summary.sort(key=lambda x: str(x[0]).lower())
-    # Sort Table 2 by OUM Team, Agent Name, then Invoice Date
-    t2_rows.sort(key=lambda x: (str(x[0]).lower(), str(x[1]).lower(), x[6]))
+    # Sort Table 2 by Agent Name, Customer Name, then Invoice Date
+    t2_rows.sort(key=lambda x: (str(x[0]).lower(), str(x[1]).lower(), x[4]))
 
     return {
         "oum_summary": oum_summary,
@@ -616,9 +660,13 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Production Bonus report for Outsource agents.")
     parser.add_argument("--year", type=int, default=2026, help="Invoice date year (default: 2026)")
     parser.add_argument("--no-csv", action="store_true", help="Skip CSV output")
+    parser.add_argument("--May", "--may", action="store_true", dest="May", help="Limit report to January through May")
+    parser.add_argument("--upto-month", type=int, default=None, choices=range(1, 13),
+                        help="Limit report to January through this month (1-12). Overrides --May.")
     args = parser.parse_args(argv)
 
-    report_data = build_report(args.year)
+    upto_month = args.upto_month if args.upto_month else (5 if args.May else None)
+    report_data = build_report(args.year, upto_month=upto_month)
     if report_data is None:
         return 2
         
