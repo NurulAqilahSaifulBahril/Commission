@@ -401,9 +401,8 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[InvoiceCo
         nfp_value: Optional[Decimal] = None
         nfp_source = "n/a"
 
-        if db_nfp > 0:
-            nfp_value = money(db_nfp)
-            nfp_source = "package.nett_price"
+        if inv_date and inv_date < NFP_CUTOFF:
+            nfp_source = "before_oct_2025_no_nfp"
         elif inv_date and panel_qty:
             nfp_raw, fallback_source = lookup_net_floor_price(
                 inv_date,
@@ -417,10 +416,14 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[InvoiceCo
             if nfp_raw is not None:
                 nfp_value = money(Decimal(str(nfp_raw)))
                 nfp_source = f"Excel fallback ({fallback_source})"
+            elif db_nfp > 0:
+                nfp_value = money(db_nfp)
+                nfp_source = "package.nett_price (fallback)"
             else:
                 nfp_source = "missing_in_excel"
-        elif inv_date and inv_date < NFP_CUTOFF:
-            nfp_source = "before_oct_2025_no_nfp"
+        elif db_nfp > 0:
+            nfp_value = money(db_nfp)
+            nfp_source = "package.nett_price"
         else:
             nfp_source = "missing_panel_qty_or_rating"
 
