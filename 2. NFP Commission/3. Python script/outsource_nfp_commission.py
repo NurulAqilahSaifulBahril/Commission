@@ -291,19 +291,37 @@ WITH candidates AS (
         ON i.bubble_id = ANY(sr_back.linked_invoice)
     LEFT JOIN LATERAL (
         SELECT COALESCE(
-            NULLIF(SUM(CASE WHEN COALESCE(ii.epp, 0) > 0 THEN ii.epp ELSE 0 END), 0),
-            SUM(
-                CASE
-                    WHEN COALESCE(ii.description, '') ILIKE '%%epp%%interest%%'
-                         OR COALESCE(ii.description, '') ILIKE '%%epp interest%%'
-                    THEN COALESCE(ii.amount, ii.unit_price, 0)
-                    ELSE 0
-                END
-            ),
+            NULLIF(SUM(CASE WHEN COALESCE(ii_dedup.epp_val, 0) > 0 THEN ii_dedup.epp_val ELSE 0 END), 0),
+            SUM(ii_dedup.epp_interest_amount),
             0
         ) AS epp_cost
-        FROM invoice_item ii
-        WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
+        FROM (
+            SELECT 
+                MAX(COALESCE(ii.epp, 0)) AS epp_val,
+                MAX(
+                    CASE
+                        WHEN COALESCE(ii.description, '') ILIKE '%%epp%%interest%%'
+                             OR COALESCE(ii.description, '') ILIKE '%%epp interest%%'
+                        THEN COALESCE(ii.amount, ii.unit_price, 0)
+                        ELSE 0
+                    END
+                ) AS epp_interest_amount
+            FROM invoice_item ii
+            WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
+            GROUP BY TRIM(
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        REGEXP_REPLACE(COALESCE(ii.description, ''), 'moths', 'months', 'gi'),
+                        '(\\d+)\\s*months',
+                        '\\1months',
+                        'gi'
+                    ),
+                    '\\s+',
+                    ' ',
+                    'g'
+                )
+            )
+        ) ii_dedup
     ) epp_items ON TRUE
     LEFT JOIN LATERAL (
         SELECT SUM(COALESCE(p.epp_cost, 0)) AS epp_sum
