@@ -528,7 +528,7 @@ def calc_commission(
     if system_price > net_floor:
         b = (system_price - net_floor) * Decimal("1.00")
     if sales_price < net_floor:
-        c = (net_floor - sales_price) * Decimal("0.20")
+        c = (net_floor - sales_price) * Decimal("0.25")
 
     nfp_total = a - c
     return a, b, c, nfp_total

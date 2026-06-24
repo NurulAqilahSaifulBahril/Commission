@@ -2150,6 +2150,7 @@ def _build_customer_summary_table_rl(title: str, headers: list[str], rows: list[
         "netfloor price": 1.4,
         "net floor price": 1.4,
         "sales price": 1.4,
+        "total amount": 1.4,
         "payment received": 1.4,
         "paid amount": 1.4,
         "commission": 1.8,
@@ -3137,7 +3138,7 @@ def build_commission_pdf(
             story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(customers)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#C3DAF2\" size=\"11\">&bull;</font> Senior &nbsp;&nbsp; <font color=\"#E9F2FA\" size=\"11\">&bull;</font> Executive", meta_style))
             _spacer(4)
 
-            int_anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Sales Price", "Commission Price", "Clawback"]
+            int_anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Commission Price", "Clawback"]
             t_anp = _build_customer_summary_table_rl(
                 f"ANP Commission by Customer — {month_name}",
                 int_anp_headers,
@@ -3414,7 +3415,7 @@ def build_commission_pdf(
                 "&bull;&nbsp;&nbsp;Three types of Net Floor Price Commission:",
                 "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales above Net Floor Price:</b> Sales Price > Net Floor Price. Formula: (Sales Price - Net Floor Price) x 25% = NFP Commission",
                 "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales above System Price:</b> System Price > Net Floor Price. Formula: (System Price - Net Floor Price) x 100% = NFP Commission",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales below Net Floor price:</b> Sales Price < Net Floor Price. Formula: (Sales Price - Net Floor Price) x Bears 20% = NFP Commission",
+                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales below Net Floor price:</b> Sales Price < Net Floor Price. Formula: (Sales Price - Net Floor Price) x Bears 25% = NFP Commission",
                 "&bull;&nbsp;&nbsp;Effective October 1, 2025, NFP computations are applicable exclusively to invoices issued on or after this date. Invoices predating this period are structurally excluded from NFP allocations."
             ])
             # _add_note_paragraphs(m_notes)
