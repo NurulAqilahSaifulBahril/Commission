@@ -52,6 +52,8 @@ PRESERVE_PATHS = [
     "8. Web Dashboard/dashboard.log",
     "8. Web Dashboard/special_cases.json",
     "8. Web Dashboard/factory_rates.json",
+    "shell",  # the packaged Electron shell — never part of an OTA package, but
+              # pinned here too so a future INCLUDE mistake can't wipe it out.
 ]
 
 _LOG_FILE = CURRENT_DIR / "dashboard.log"

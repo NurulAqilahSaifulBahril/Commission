@@ -27,6 +27,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DIST = REPO_ROOT / "dist"
 
+# Built by `npm run dist` in "10. Electron App/app". Copied into the installer
+# payload as <root>/shell/ but NEVER into the OTA zip — updates stay code-only,
+# and updater.py pins "shell" in PRESERVE_PATHS so they can't touch it either.
+SHELL_BUILD = REPO_ROOT / "10. Electron App" / "app" / "dist" / "win-unpacked"
+
 # Files/folders copied into the package, as glob patterns relative to the root.
 INCLUDE = [
     "version.json",
@@ -142,6 +147,16 @@ def build(version: str) -> Path:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
     print(f"payload: {len(files)} files -> {payload}")
+
+    if SHELL_BUILD.is_dir():
+        shutil.copytree(SHELL_BUILD, payload / "shell")
+        print(f"payload: Electron shell -> {payload / 'shell'}")
+    else:
+        print(
+            "WARNING: Electron shell build not found at "
+            f"{SHELL_BUILD} — run `npm run dist` in \"10. Electron App/app\" first. "
+            "Installer will fall back to Launch Dashboard.bat shortcuts."
+        )
 
     zip_path = DIST / f"CommissionDashboard-update-{version}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:

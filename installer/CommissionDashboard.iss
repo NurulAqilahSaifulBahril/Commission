@@ -15,6 +15,7 @@
 #define AppName "Finance Commission Dashboard"
 #define Publisher "Eternalgy"
 #define LaunchBat "Launch Dashboard.bat"
+#define ShellExe "shell\Commission Portal.exe"
 
 [Setup]
 AppId={{9C2F4B71-6D3E-4A55-9F80-3A17C6E2D5B4}
@@ -49,16 +50,18 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Source: "..\dist\payload\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\{#LaunchBat}"; WorkingDir: "{app}"; Comment: "Open the commission dashboard"
+; Shortcuts open the Commission Portal shell (native window). Launch
+; Dashboard.bat is still installed as a fallback launcher but gets no shortcut.
+Name: "{group}\{#AppName}"; Filename: "{app}\{#ShellExe}"; WorkingDir: "{app}"; Comment: "Open the commission dashboard"
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#LaunchBat}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#ShellExe}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 ; Builds .venv, installs dependencies, generates FLASK_SECRET_KEY and prompts
 ; for the first admin account. Shown in a console window so the user can see
 ; pip working and read the PG_PROXY_TOKEN reminder at the end.
 Filename: "{cmd}"; Parameters: "/c """"{app}\Setup Environment.bat"""""; WorkingDir: "{app}"; StatusMsg: "Setting up the Python environment (this can take a few minutes)..."; Flags: waituntilterminated
-Filename: "{app}\{#LaunchBat}"; Description: "Start the dashboard now"; WorkingDir: "{app}"; Flags: postinstall nowait shellexec skipifsilent
+Filename: "{app}\{#ShellExe}"; Description: "Start the dashboard now"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent
 
 [UninstallDelete]
 ; Created after install, so Inno does not track them.

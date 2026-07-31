@@ -45,6 +45,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build Electron shell
+        shell: pwsh
+        working-directory: 10. Electron App/app
+        run: |
+          npm ci
+          npm run dist
+
       - name: Build update package
         shell: pwsh
         run: python tools/build_package.py --version ${{ steps.ver.outputs.version }}

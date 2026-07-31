@@ -35,3 +35,10 @@
 **/4. data/reports/
 **/4. data/nfp_commission_report.*
 
+
+# Electron app (10. Electron App/app)
+**/node_modules/
+10. Electron App/app/dist/
+10. Electron App/app/renderer/supabase.js
+10. Electron App/app/config.json
+10. Electron App/sync/*.log

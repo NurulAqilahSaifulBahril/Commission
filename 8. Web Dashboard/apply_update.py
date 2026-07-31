@@ -33,6 +33,7 @@ PRESERVE_PATHS = {
     "8. Web Dashboard/dashboard.log",
     "8. Web Dashboard/special_cases.json",
     "8. Web Dashboard/factory_rates.json",
+    "shell",
 }
 
 SKIP_NAMES = {"__pycache__", ".git", ".venv"}

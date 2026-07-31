@@ -1,0 +1,30 @@
+{
+  "name": "commission-portal",
+  "version": "0.2.0",
+  "description": "Commission Portal — native window for the Finance Commission Dashboard",
+  "main": "main.js",
+  "author": "Nurul Aqilah Saiful Bahril",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win --dir"
+  },
+  "devDependencies": {
+    "electron": "^37.0.0",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "me.eternalgy.commission.portal",
+    "productName": "Commission Portal",
+    "files": [
+      "main.js",
+      "loading.html",
+      "assets/**/*"
+    ],
+    "win": {
+      "target": "dir",
+      "icon": "assets/icon.ico"
+    }
+  }
+}

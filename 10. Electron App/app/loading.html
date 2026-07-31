@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Commission Portal</title>
+  <style>
+    body {
+      margin: 0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.2rem;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: #f5f6f8;
+      color: #1a1a1a;
+    }
+    img { width: 72px; height: auto; }
+    .spinner {
+      width: 28px;
+      height: 28px;
+      border: 3px solid #d8dbe0;
+      border-top-color: #1f6f43;
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    p { color: #6b7079; font-size: 0.9rem; margin: 0; }
+  </style>
+</head>
+<body>
+  <img src="assets/logo-mark-black.png" alt="Eternalgy" />
+  <div class="spinner"></div>
+  <p>Starting the dashboard...</p>
+</body>
+</html>
