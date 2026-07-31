@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — Finance Commission Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+    <style>
+        .login-page {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-color: var(--bg-primary);
+            font-family: 'Inter', sans-serif;
+        }
+        .login-card {
+            width: 100%;
+            max-width: 360px;
+            background-color: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            box-shadow: var(--card-shadow);
+            padding: 32px;
+        }
+        .login-card h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.4rem;
+            margin: 0 0 4px;
+            color: var(--text-main);
+        }
+        .login-card p.subtitle {
+            color: var(--text-muted);
+            margin: 0 0 24px;
+            font-size: 0.9rem;
+        }
+        .login-field {
+            margin-bottom: 16px;
+        }
+        .login-field label {
+            display: block;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+        .login-field input {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            font-size: 0.95rem;
+            box-sizing: border-box;
+        }
+        .login-error {
+            color: #dc2626;
+            font-size: 0.85rem;
+            margin: -8px 0 16px;
+            min-height: 1em;
+        }
+        .login-submit {
+            width: 100%;
+            padding: 10px 12px;
+            border: none;
+            border-radius: 8px;
+            background-color: var(--accent-blue);
+            color: #fff;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+        .login-submit:hover {
+            background-color: var(--accent-blue-hover);
+        }
+        .login-submit:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-page">
+        <div class="login-card">
+            <h1>Commission Portal</h1>
+            <p class="subtitle">Sign in to continue</p>
+            <form id="loginForm">
+                <div class="login-field">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" name="username" autocomplete="username" required>
+                </div>
+                <div class="login-field">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" autocomplete="current-password" required>
+                </div>
+                <div class="login-error" id="loginError"></div>
+                <button type="submit" class="login-submit" id="loginSubmit">Sign in</button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById("loginForm");
+        const errorBox = document.getElementById("loginError");
+        const submitBtn = document.getElementById("loginSubmit");
+
+        function nextUrl() {
+            const params = new URLSearchParams(window.location.search);
+            const next = params.get("next");
+            return next && next.startsWith("/") ? next : "/";
+        }
+
+        form.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            errorBox.textContent = "";
+            submitBtn.disabled = true;
+            try {
+                const res = await fetch("/login", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        username: document.getElementById("username").value,
+                        password: document.getElementById("password").value
+                    })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    errorBox.textContent = data.error || "Login failed";
+                    submitBtn.disabled = false;
+                    return;
+                }
+                window.location.href = nextUrl();
+            } catch (err) {
+                errorBox.textContent = "Network error. Please try again.";
+                submitBtn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,47 @@
+[
+  {
+    "agent": "Caryn Dong",
+    "customer": "DURAPOWER SDN BHD (ATAP - Commercial)",
+    "pkg": "Factory",
+    "system": 374600,
+    "nfp": 0,
+    "sales": 374600,
+    "rate": 3.5,
+    "remarks": "Special Case",
+    "profitSharingPct": 2,
+    "caseType": "customer",
+    "year": "2026",
+    "month": "5",
+    "agent_type": "outsource"
+  },
+  {
+    "agent": "Sunny Tan",
+    "customer": "Ching Chin Min (Atap)",
+    "pkg": "Residential",
+    "system": 33221,
+    "nfp": 26782,
+    "sales": 28000,
+    "rate": 2.25,
+    "remarks": "Special Case",
+    "profitSharingPct": 0,
+    "caseType": "standard",
+    "year": "2026",
+    "month": "5",
+    "agent_type": "internal"
+  },
+  {
+    "agent": "Carol Siow",
+    "customer": "Chan Joon Fah (Atap)",
+    "pkg": "Shop Lot",
+    "system": 25225,
+    "nfp": 19563.6,
+    "sales": 19500,
+    "rate": 4,
+    "remarks": "",
+    "profitSharingPct": 0,
+    "caseType": "standard",
+    "year": "2026",
+    "month": "6",
+    "agent_type": "outsource"
+  }
+]

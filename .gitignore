@@ -4,6 +4,24 @@
 **/pg_proxy_token.txt
 **/.pg_proxy_token
 
+# Local dashboard database (password hashes, audit history).
+# The .backup-* copies hold exactly the same thing — this repo is public.
+**/dashboard.db
+**/dashboard.db.backup*
+**/dashboard.db-wal
+**/dashboard.db-shm
+
+# Logs — can contain agent names and payout figures from stack traces
+**/dashboard.log
+**/dashboard-*.log
+**/tunnel.log
+
+# Dashboard working directory: computed cache + generated commission packs
+8. Web Dashboard/data/
+
+# Release build output (recreated by tools/build_package.py)
+/dist/
+
 # Python
 **/.venv/
 **/__pycache__/

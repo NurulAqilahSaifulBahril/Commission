@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Finance Commission Dashboard</title>
+    <!-- Modern Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <img src="/static/logo.jpg" alt="Eternalgy" class="sidebar-logo">
+                <span class="portal-eyebrow neon-white">Commission Portal</span>
+            </div>
+            
+            <div class="sidebar-group">
+                <label class="group-label">Scope</label>
+                <div class="select-wrapper">
+                    <select id="yearSelect">
+                        <option value="2026" selected>Year 2026</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="sidebar-group">
+                <label class="group-label">Reporting Period</label>
+                <div class="select-wrapper">
+                    <select id="monthSelect">
+                        <option value="1">January 2026</option>
+                        <option value="2">February 2026</option>
+                        <option value="3">March 2026</option>
+                        <option value="4">April 2026</option>
+                        <option value="5" selected>May 2026</option>
+                        <option value="6">June 2026</option>
+                        <option value="7">July 2026</option>
+                        <option value="8">August 2026</option>
+                        <option value="9">September 2026</option>
+                        <option value="10">October 2026</option>
+                        <option value="11">November 2026</option>
+                        <option value="12">December 2026</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="sidebar-group">
+                <label class="group-label">Commission Section</label>
+                <ul class="nav-list" id="sectionList">
+                    <!-- Dynamic Sub-Tabs go here -->
+                </ul>
+            </div>
+            
+            <div class="sidebar-group" id="dataGroup">
+                <label class="group-label">Data Management</label>
+                <a href="/data" id="dataPageLink" class="btn btn-secondary" style="width: 100%; text-decoration: none; justify-content: center;">
+                    <span class="icon">🗂️</span> Data
+                </a>
+            </div>
+
+            <div class="sidebar-group" id="accountGroup">
+                <label class="group-label">Account</label>
+                <div class="status-text" id="accountWhoami" style="margin-bottom: 8px;"></div>
+                <button id="logoutBtn" class="btn btn-secondary" style="width: 100%;">Logout</button>
+                <a href="/admin" id="adminLink" class="btn btn-warning" style="display:none; text-decoration:none; width: 100%; margin-top: 8px; justify-content: center;">
+                    <span class="icon">⚙️</span> Admin
+                </a>
+            </div>
+
+            <div class="sidebar-group update-group" id="updateGroup" style="display:none;">
+                <label class="group-label">Software Update</label>
+                <div class="update-card" id="updateCard">
+                    <div class="update-headline" id="updateHeadline">Update available</div>
+                    <div class="update-sub" id="updateSub"></div>
+                    <div class="update-progress" id="updateProgress" style="display:none;">
+                        <div class="update-progress-bar" id="updateProgressBar"></div>
+                    </div>
+                    <button id="updateInstallBtn" class="btn btn-warning" style="width:100%; margin-top:10px; justify-content:center;">
+                        <span class="icon">⬇️</span> Install Update
+                    </button>
+                    <a href="#" id="updateNotesLink" class="update-notes-link" target="_blank" rel="noopener">Release notes</a>
+                </div>
+            </div>
+
+            <div class="sidebar-footer">
+                <span class="status-indicator online"></span>
+                <span class="status-text">Connected to PG Proxy</span>
+                <span class="app-version" id="appVersion" title="Installed version"></span>
+            </div>
+        </aside>
+
+        <!-- Main Dashboard View -->
+        <main class="main-content">
+            <header class="content-header">
+                <div class="header-title">
+                    <h2 id="tableTitle" class="section-title-header">Basic & Net Floor Price Commission</h2>
+                    <h1 id="monthHeader">May 2026</h1>
+                    <p id="subHeader">Internal Agents Commission Summary</p>
+                </div>
+
+                
+                <div class="header-actions">
+                    <button id="syncDataBtn" class="btn btn-secondary">
+                        <span class="icon">🔄</span> Sync Data
+                    </button>
+                    <button id="downloadPdfBtn" class="btn btn-secondary">
+                        <span class="icon">📄</span> Download PDF
+                    </button>
+                    <button id="downloadExcelBtn" class="btn btn-primary">
+                        <span class="icon">📊</span> Download Excel
+                    </button>
+                </div>
+            </header>
+
+            <!-- Cards Summary Row -->
+            <section class="metrics-row">
+                <div class="card metric-card">
+                    <div class="metric-details">
+                        <span class="metric-label">Total Agents</span>
+                        <span class="metric-value" id="totalAgents">0</span>
+                    </div>
+                </div>
+                <div class="card metric-card">
+                    <div class="metric-details">
+                        <span class="metric-label">Total Customers</span>
+                        <span class="metric-value" id="totalCustomers">0</span>
+                    </div>
+                </div>
+                <div id="rateCardsContainer" class="rate-cards-group"></div>
+            </section>
+
+            <!-- Live Filtering Panel -->
+            <section class="card filter-panel">
+                <div class="filter-group filter-group-narrow">
+                    <label for="agentTypeSelect">Agent Type</label>
+                    <select id="agentTypeSelect">
+                        <option value="all">All Agents</option>
+                        <option value="internal" selected>Internal Agents</option>
+                        <option value="outsource">Outsource Agents</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="searchFilter">Search Agent or Customer</label>
+                    <input type="text" id="searchFilter" placeholder="Type agent or customer name...">
+                </div>
+                <div class="rm300-filter-toggle" id="rm300FilterGroup" style="display:none;">
+                    <label for="rm300OnlyFilter">
+                        <input type="checkbox" id="rm300OnlyFilter"> RM300 rows only
+                    </label>
+                </div>
+                <button id="clearFiltersBtn" class="btn-clear" title="Clear search filter">Clear</button>
+            </section>
+
+            <!-- Table Block -->
+            <section class="card table-card">
+                <div class="card-header" style="justify-content: flex-end;">
+                    <div class="table-actions">
+                        <span class="row-count-badge" id="rowCount">0 rows</span>
+                    </div>
+                </div>
+                <div class="legend-card-inline" id="legendCard">
+                    <!-- Dynamic legend goes here -->
+                </div>
+                <div class="table-container">
+                    <table class="dashboard-table" id="dataTable">
+                        <thead>
+                            <tr id="tableHeaders">
+                                <!-- Headers go here -->
+                            </tr>
+                        </thead>
+                        <tbody id="tableBody">
+                            <!-- Body rows go here -->
+                        </tbody>
+                    </table>
+                    
+                    <div id="loader" class="loader-overlay hidden">
+                        <div class="spinner"></div>
+                        <p>Fetching PG Proxy data...</p>
+                    </div>
+
+                    <div id="noDataView" class="empty-state hidden">
+                        <div class="empty-icon">📁</div>
+                        <h4>No Commission Records Found</h4>
+                        <p>No matching details fit the active scope and search criteria.</p>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+    
+    <!-- Special Case Modal -->
+    <div id="specialCaseModal" class="modal hidden">
+        <div class="modal-content card">
+            <div class="modal-header">
+                <h3>Special Case</h3>
+                <button id="closeModalBtn" class="btn-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group-row" id="modalAgentCustomerDisplayRow">
+                    <div class="form-row">
+                        <label>Agent Name</label>
+                        <input type="text" id="modalAgentName" disabled>
+                    </div>
+                    <div class="form-row">
+                        <label>Customer Name</label>
+                        <input type="text" id="modalCustomerName" disabled>
+                    </div>
+                </div>
+                <div class="form-group-row hidden" id="modalSelectionGroupRow">
+                    <div class="form-row" id="modalAgentSelectRow">
+                        <label style="font-weight: 700; color: var(--accent-blue);">Select Agent</label>
+                        <select id="modalAgentSelect" style="width: 100%; max-width: 100%; box-sizing: border-box; padding: 9px 12px; border-radius: 6px; border: 1px solid var(--border-color); font-weight: 600; text-overflow: ellipsis;">
+                            <option value="">-- Choose Agent --</option>
+                        </select>
+                    </div>
+                    <div class="form-row" id="modalCustomerSelectRow">
+                        <label style="font-weight: 700; color: var(--accent-blue);">Select Customer</label>
+                        <select id="modalCustomerSelect" style="width: 100%; max-width: 100%; box-sizing: border-box; padding: 9px 12px; border-radius: 6px; border: 1px solid var(--border-color); font-weight: 600; text-overflow: ellipsis;">
+                            <option value="">-- Choose Customer --</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group-row">
+                    <div class="form-row">
+                        <label>Package Type</label>
+                        <input type="text" id="modalPackageType" disabled>
+                    </div>
+                    <div class="form-row">
+                        <label>Sales Price (RM)</label>
+                        <input type="number" id="modalSalesPrice" disabled>
+                    </div>
+                </div>
+                <div class="form-group-row">
+                    <div class="form-row">
+                        <label>System Price (RM)</label>
+                        <input type="number" id="modalSystemPrice" disabled>
+                    </div>
+                    <div class="form-row">
+                        <label>Baseline Rate (%)</label>
+                        <input type="number" id="modalBaselineRate" disabled>
+                    </div>
+                </div>
+                
+                <div class="form-group-row">
+                    <div class="form-row">
+                        <label>Original Basic Commission</label>
+                        <input type="text" id="modalOrigBasicComm" disabled value="-">
+                    </div>
+                    <div class="form-row">
+                        <label>Original NFP Commission</label>
+                        <input type="text" id="modalOrigNfpComm" disabled value="-">
+                    </div>
+                </div>
+
+                <!-- Type of Special Case Selection -->
+                <div class="form-row" style="margin-top: 10px;">
+                    <label style="font-weight: 700; color: var(--accent-blue);">Type of Special Case</label>
+                    <select id="modalCaseType" style="padding: 10px; border-radius: 6px; border: 1px solid var(--border-color); font-weight: 600;">
+                        <option value="adjusted_nfp">Adjusted Net Floor Price</option>
+                        <option value="fee_waiver">Net Floor Price Commission Fee Waiver</option>
+                        <option value="adjusted_rate">Adjusted Basic Commission Rate %</option>
+                        <option value="profit_sharing">Profit Sharing</option>
+                        <option value="adjusted_sales_price">Adjusted Sales Price</option>
+                    </select>
+                </div>
+
+                <!-- Dynamic Input Rows -->
+                <div class="form-row hidden" id="rowAdjustedSalesPrice">
+                    <label>Adjusted Sales Price (RM) <span style="font-size: 11px; color: #64748b; font-weight: normal;">(Management-adjusted amount to use instead of the auto-calculated sales price for this invoice)</span></label>
+                    <input type="number" id="modalAdjustedSalesPrice" placeholder="e.g. 25000.00" step="100">
+                </div>
+
+                <div class="form-row" id="rowAdjustedNfp">
+                    <label>New Net Floor Price (RM)</label>
+                    <input type="number" id="modalNetFloorPrice" placeholder="0.00" value="0.00" step="100">
+                </div>
+
+                <div class="form-row hidden" id="rowFeeWaiver">
+                    <label>Fee Waiver Amount (RM) <span style="font-size: 11px; color: #64748b; font-weight: normal;">(Positive amount to reduce/waive penalty)</span></label>
+                    <input type="number" id="modalFeeWaiver" placeholder="e.g. 200.00" value="0.00" step="50">
+                </div>
+
+                <div class="form-row hidden" id="rowAdjustedRate">
+                    <label>New Basic Commission Rate (%)</label>
+                    <input type="number" id="modalRatePct" placeholder="e.g. 4.0" value="3.0" step="0.05">
+                </div>
+
+                <div class="form-row hidden" id="rowProfitSharing">
+                    <label>Profit Sharing % <span id="profitSharingHint" style="font-size: 11px; color: #64748b; font-weight: normal;">(Applicable for Factory / NGO / Government)</span></label>
+                    <input type="number" id="modalProfitSharingPct" placeholder="e.g. 5.0" step="0.1" value="0">
+                </div>
+
+                <div class="form-row" style="margin-top: 8px;">
+                    <label>Remarks</label>
+                    <textarea id="modalRemarks" rows="2" placeholder="Enter remarks..."></textarea>
+                </div>
+                
+                <!-- Live Calculation Preview -->
+                <div class="preview-box">
+                    <h4>Calculated Commissions Preview</h4>
+                    <div class="preview-row hidden" id="rowRevisedSalesPrice">
+                        <span>Revised Sales Price:</span>
+                        <strong id="previewRevisedSalesPrice">RM 0.00</strong>
+                    </div>
+                    <div class="preview-row">
+                        <span>Revised Basic Commission:</span>
+                        <strong id="previewBasicComm">RM 0.00</strong>
+                    </div>
+                    <div class="preview-row">
+                        <span>Revised Net Floor Price Commission:</span>
+                        <strong id="previewNfpComm">RM 0.00</strong>
+                    </div>
+                    <div class="preview-row hidden" id="rowWaiverSummary">
+                        <span>Fee Waiver Adjustment:</span>
+                        <strong id="previewWaiverSummary" style="color: #10b981;">+RM 0.00</strong>
+                    </div>
+                    <div class="preview-row hidden" id="previewProfitSharingRow">
+                        <span>Profit Sharing Amount:</span>
+                        <strong id="previewProfitSharingComm">RM 0.00</strong>
+                    </div>
+                    <div class="preview-row" style="border-top: 1px dashed #cbd5e1; margin-top: 8px; padding-top: 8px; font-size: 15px;">
+                        <span>Total Net Commission:</span>
+                        <strong id="previewTotalNetComm" style="color: var(--accent-blue); font-size: 16px;">RM 0.00</strong>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="deleteModalBtn" class="btn btn-danger hidden">Delete Special Case</button>
+                <div class="modal-footer-actions">
+                    <button id="confirmModalBtn" class="btn btn-primary">Confirm & Add</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <!-- Section Note Modal -->
+    <div id="noteModal" class="modal hidden">
+        <div class="modal-content card note-modal-content">
+            <div class="modal-header">
+                <h3 id="noteModalTitle">Section Notes</h3>
+                <button id="closeNoteModalBtn" class="btn-close">&times;</button>
+            </div>
+            <div class="modal-body note-modal-body" id="noteModalBody">
+                <!-- Notes injected dynamically -->
+            </div>
+        </div>
+    </div>
+    <!-- Factory Rate Modal -->
+    <div id="factoryRateModal" class="modal hidden">
+        <div class="modal-content card">
+            <div class="modal-header">
+                <h3>Profit Sharing</h3>
+                <button id="closeFactoryModalBtn" class="btn-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group-row">
+                    <div class="form-row">
+                        <label>Agent Name</label>
+                        <input type="text" id="factoryAgentName" disabled>
+                    </div>
+                    <div class="form-row">
+                        <label>Customer Name</label>
+                        <input type="text" id="factoryCustomerName" disabled>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <label>Package Type</label>
+                    <input type="text" id="factoryPackageType" disabled>
+                </div>
+                <div class="form-group-row">
+                    <div class="form-row">
+                        <label>System Price (RM)</label>
+                        <input type="number" id="factorySystemPrice" disabled>
+                    </div>
+                    <div class="form-row">
+                        <label>Net Floor Price (RM)</label>
+                        <input type="number" id="factoryNetFloorPrice" disabled>
+                    </div>
+                </div>
+                <div class="form-group-row">
+                    <div class="form-row">
+                        <label>Sales Price (RM)</label>
+                        <input type="number" id="factorySalesPrice" disabled>
+                    </div>
+                    <div class="form-row">
+                        <label>Basic Commission Rate (%)</label>
+                        <input type="number" id="factoryBasicCommissionRate" disabled>
+                    </div>
+                </div>
+                
+                <div class="form-row">
+                    <label>Profit Sharing %</label>
+                    <input type="number" id="factoryProfitSharingRate" placeholder="e.g. 5.0" step="0.1">
+                </div>
+                
+                <!-- Live Calculation Preview -->
+                <div class="preview-box">
+                    <h4>Calculated Commissions Preview</h4>
+                    <div class="preview-row">
+                        <span><span id="factoryTargetLabel">Agent</span> Commission (<span id="factoryFormula">2.0% base + 0% sharing</span>):</span>
+                        <strong id="previewFactoryComm">RM 0.00</strong>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <div class="modal-footer-actions">
+                    <button id="saveFactoryModalBtn" class="btn btn-primary">Save Rates</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Monthly Commission Slip Modal -->
+    <div id="commissionSlipModal" class="modal hidden">
+        <div class="modal-content slip-modal-content">
+            <div class="modal-header slip-actions-bar" style="background-color: #f8fafc; border-bottom: 1px solid #e2e8f0;">
+                <div style="display: flex; align-items: center; gap: 12px;">
+                    <h3 style="margin: 0; font-size: 15px; color: #0f172a; font-weight: 700;">Monthly Commission Slip</h3>
+                    <button id="printSlipBtn" class="btn btn-primary" style="padding: 5px 14px; font-size: 12.5px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px;">
+                        <span>🖨️ Print / Save PDF</span>
+                    </button>
+                </div>
+                <button id="closeSlipModalBtn" class="btn-close">&times;</button>
+            </div>
+            <div class="slip-document-container" id="slipDocumentPrintArea">
+                <div class="slip-header-letterhead">
+                    <img src="/static/logo-mark-black.png" alt="Eternalgy" class="slip-logo">
+                    <div class="slip-company-name">ETERNALGY SDN. BHD.</div>
+                    <div style="font-size: 11px; font-weight: 700; color: #334155; margin-bottom: 2px;">(1523087-A)</div>
+                    <div class="slip-company-address">
+                        01-23, Jalan Mutiara Emas 10/19, Taman Mount Austin,<br>
+                        81100 Johor Bahru, Johor.
+                    </div>
+                    <div class="slip-title">MONTHLY COMMISSION SLIP</div>
+                </div>
+
+                <div class="slip-meta-grid">
+                    <div class="slip-agent-info-card">
+                        <div><b>Salesperson:</b> <span id="slipAgentName">-</span></div>
+                        <div><b>IC:</b> <span id="slipAgentNric" class="slip-ic">-</span><span id="slipIcStatus" class="slip-ic-status"></span></div>
+                        <div><b>Month:</b> <span id="slipMonthLabel">-</span></div>
+                    </div>
+                    <div class="slip-date-display">
+                        DATE: <span id="slipCurrentDate">-</span>
+                    </div>
+                </div>
+
+                <div class="slip-table-wrapper">
+                    <table class="slip-table" id="slipItemsTable">
+                        <thead>
+                            <tr>
+                                <th style="width: 35px;">No.</th>
+                                <th style="width: 170px;">Client Name</th>
+                                <th style="width: 100px;">System Price</th>
+                                <th style="width: 100px;">Sales Price</th>
+                                <th style="width: 80px;">Commission Rate %</th>
+                                <th style="width: 115px;">Commission Amount (RM)</th>
+                                <th style="width: 120px;">Referral Person</th>
+                                <th style="width: 80px;">Referral Rate %</th>
+                                <th style="width: 95px;">Referral Fee (RM)</th>
+                                <th style="width: 105px;">Other Commission (RM)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="slipItemsTableBody">
+                            <!-- Populated dynamically via app.js -->
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="slip-summary-footer">
+                    <div class="slip-notes-box">
+                        <div class="slip-notes-title">Notes:</div>
+                        <div id="slipNotesContent" style="color: #334155; line-height: 1.4;">Item No. 1 - FB lead</div>
+                    </div>
+                    <table class="slip-totals-table">
+                        <tr>
+                            <td class="label-cell">Total Commission Amount (RM)</td>
+                            <td class="value-cell" id="slipTotalComm">RM 0.00</td>
+                        </tr>
+                        <tr>
+                            <td class="label-cell" style="background-color: #0f172a; color: #ffffff; font-size: 13px; font-weight: 700;">Amount Payable (RM)</td>
+                            <td class="value-cell" id="slipAmountPayable" style="background-color: #f1f5f9; font-size: 14px; font-weight: 800; color: #0f172a; border: 2px solid #0f172a;">RM 0.00</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="/static/app.js?v=20260729-nfp-refetch-v1"></script>
+    <script src="/static/updater.js?v=20260731-ota-v1"></script>
+</body>
+</html>

@@ -1,0 +1,1048 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data — Finance Commission Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+    <style>
+        /* Small additions specific to the data page, layered on top of styles.css */
+        .data-content { display: flex; flex-direction: column; gap: 24px; }
+        .data-toolbar { display: flex; gap: 12px; align-items: center; padding: 16px 24px 0; flex-wrap: wrap; }
+        .data-toolbar select, .data-toolbar label, .dashboard-table input, .dashboard-table select {
+            font-size: 13px;
+        }
+        .data-toolbar select, .dashboard-table input, .dashboard-table select {
+            background-color: #f8fafc; border: 1px solid var(--border-color); border-radius: 8px;
+            padding: 8px 12px; color: var(--text-main); outline: none;
+        }
+        .dashboard-table input:focus, .dashboard-table select:focus {
+            border-color: var(--accent-blue); background-color: #ffffff;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+        .dashboard-table input[type="number"] { width: 90px; }
+        .dashboard-table input[type="month"] { width: 150px; }
+        .dashboard-table input.remarks-input { width: 100%; min-width: 140px; }
+        .table-footer-actions { display: flex; gap: 12px; padding: 16px 24px; align-items: center; }
+        .save-status { font-size: 13px; color: var(--text-muted); }
+        .save-status.ok { color: #16a34a; }
+        .save-status.err { color: #dc2626; }
+        /* One consistent control size across the whole edit grid, so the Role,
+           Agent Type and Override From boxes line up instead of each sizing to
+           its longest option. */
+        .unified-grid select,
+        .unified-grid input[type="text"],
+        .unified-grid input[type="number"],
+        .unified-grid input[type="month"] {
+            width: 100%;
+            min-width: 0;
+            box-sizing: border-box;
+            height: 30px;
+        }
+        .unified-grid td.sm-cell { min-width: 108px; }
+        .unified-grid td.sm-cell:has(.e-role),
+        .unified-grid td.sm-cell:has(.e-override-from),
+        .unified-grid td.sm-cell:has(.e-agent),
+        .unified-grid td.sm-cell:has(.e-month) { min-width: 150px; }
+        .unified-grid .ms { min-width: 150px; }
+
+        /* Properties Type tag picker — a rate often covers several types */
+        .ms { position: relative; min-width: 170px; }
+        .ms-box { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; cursor: pointer;
+                  border: 1px solid var(--border-color); border-radius: 6px; padding: 3px 6px;
+                  min-height: 30px; background: #fff; }
+        .ms-box:focus { outline: 2px solid #93c5fd; outline-offset: 1px; }
+        .ms-chip { display: inline-flex; align-items: center; gap: 3px; background: #e0e7ff;
+                   color: #3730a3; border-radius: 999px; padding: 1px 4px 1px 8px; font-size: 11px;
+                   font-weight: 600; white-space: nowrap; }
+        .ms-x { border: none; background: none; color: inherit; cursor: pointer; font-size: 13px;
+                line-height: 1; padding: 0 3px; }
+        .ms-empty { color: var(--text-muted); font-size: 12px; }
+        .ms-add { color: var(--text-muted); font-weight: 700; margin-left: auto; padding-left: 4px; }
+        .ms-menu { position: absolute; z-index: 999; top: calc(100% + 2px); left: 0; min-width: 190px;
+                   max-height: 220px; overflow-y: auto;
+                   background: #fff; border: 1px solid var(--border-color); border-radius: 6px;
+                   box-shadow: 0 6px 18px rgba(0,0,0,0.12); padding: 4px; }
+        .ms-opt { display: flex; align-items: center; gap: 6px; padding: 4px 6px; font-size: 12px;
+                  white-space: nowrap; cursor: pointer; border-radius: 4px; }
+        .ms-opt:hover { background: #f1f5f9; }
+        .btn-clear-date { border: 1px solid var(--border-color); background: #f8fafc; border-radius: 4px;
+                          font-size: 10px; color: var(--text-muted); cursor: pointer; padding: 1px 5px;
+                          margin-left: 3px; }
+        .btn-clear-date:hover:not(:disabled) { background: #e2e8f0; }
+
+        /* The popup has to survive a short laptop screen. .modal-content is not
+           a flex column by default, so a max-height on it would just clip the
+           lower half and .modal-body's overflow-y would have no bounded height
+           to scroll inside — leaving Fast Start and the Save button
+           unreachable. Making the content a column and letting the body be the
+           only flexible track puts the scrollbar on the body, so the header and
+           footer stay pinned however short the viewport gets. */
+        #contestModal .modal-content {
+            display: flex;
+            flex-direction: column;
+            width: 92%;
+            max-width: 1020px;
+            max-height: 92vh;
+            overflow: hidden;
+            /* .card contributes 24px of its own padding, which would double up
+               against the 24px gutter each section already has and cost ~48px
+               in both directions — real estate a 460px-tall screen cannot
+               spare. The header, body and footer span the full width instead. */
+            padding: 0;
+        }
+        #contestModal .modal-header,
+        #contestModal .modal-footer { flex: 0 0 auto; }
+        #contestModal .modal-body {
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+        /* The teams grid is the one wide thing here; it scrolls sideways on its
+           own rather than widening the popup. */
+        #contestModal .table-container { overflow-x: auto; }
+
+        @media (max-width: 900px) {
+            #contestModal .modal-content { width: 96%; }
+        }
+
+        /* Monthly Contest rules — a form of small labelled fields rather than an
+           editable grid, because these are single values per month, not a list. */
+        .contest-heading { font-size: 13px; font-weight: 600; color: var(--text-muted);
+                           text-transform: uppercase; letter-spacing: 0.04em;
+                           padding: 20px 24px 8px; margin: 0; }
+        .contest-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+                          gap: 12px 16px; padding: 0 24px; }
+        .contest-fields label { display: flex; flex-direction: column; gap: 5px;
+                                font-size: 12px; font-weight: 600; color: var(--text-muted); }
+        .contest-fields input, .contest-fields select {
+            background-color: #f8fafc; border: 1px solid var(--border-color); border-radius: 8px;
+            padding: 8px 12px; font-size: 13px; color: var(--text-main); outline: none;
+            font-weight: 400; width: 100%; box-sizing: border-box;
+        }
+        .contest-fields input:focus, .contest-fields select:focus {
+            border-color: var(--accent-blue); background-color: #ffffff;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+        .contest-check { padding: 12px 24px 0; }
+        .contest-check label { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+        .contest-check .section-hint { padding: 6px 0 0 26px; }
+        .contest-warn { margin: 12px 24px 0; padding: 10px 12px; border-radius: 8px;
+                        background: #fef3c7; color: #92400e; font-size: 12.5px; }
+        .baseline-cell { font-weight: 600; }
+        .baseline-cell.mismatch { color: #b45309; }
+
+        .source-badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+        /* Green = the value came from this page. Amber = a fallback answered,
+           so the row is not yet under Data page control. */
+        .source-badge.unified { background: #dcfce7; color: #166534; }
+        .source-badge.legacy, .source-badge.system { background: #fef3c7; color: #92400e; }
+        .source-badge.sheet, .source-badge.default { background: #fee2e2; color: #991b1b; }
+        .wire-badge { display: block; margin-top: 4px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+        .wire-badge.active { color: #16a34a; }
+        .wire-badge.pending { color: #b45309; }
+        .applies-to-cell { font-size: 13px; color: var(--text-muted); white-space: nowrap; }
+        .value-prefix { font-size: 12px; font-weight: 600; color: var(--text-muted); margin-right: 4px; }
+        .view-only-note { padding: 10px 24px; font-size: 13px; color: #b45309; background: #fffbeb; border-bottom: 1px solid var(--border-color); }
+        .section-hint { padding: 12px 24px 0; font-size: 13px; color: var(--text-muted); }
+        .rule-view-row td { background: #fafaf5; }
+        tr.na-cell-row .na-cell { background: #f8fafc; }
+        .filter-chip-label { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-muted); }
+        /* Compact identity columns, prominent rule/formula columns */
+        .nfp-group-title { padding: 16px 24px 4px; font-size: 13.5px; font-weight: 600; color: var(--text-main); }
+        #viewCard .dashboard-table th, #editCard .dashboard-table th,
+        #nfpListCard .dashboard-table th {
+            font-size: 12px; background: #e5e7eb; color: #111111; font-weight: 700;
+        }
+        #nfpListCard .dashboard-table td { font-size: 12px; }
+        .btn-remove-row, .btn-remove-rule { padding: 2px 7px; font-size: 11px; line-height: 1.3; }
+        td.sm-cell { font-size: 12px; }
+        td.sm-cell select, td.sm-cell input { font-size: 12px; padding: 6px 10px; }
+        .rule-cell, .formula-cell { font-size: 14px; color: var(--text-main); white-space: nowrap; }
+        .rule-lines { white-space: normal; font-size: 12px; color: var(--text-main); min-width: 220px; max-width: 340px; }
+        .rule-lines div { padding: 1px 0; }
+        #rulesPanel { padding: 12px 24px 16px; border-bottom: 1px solid var(--border-color); background: #fafbfc; }
+        #rulesPanel .rules-head { font-size: 13px; margin-bottom: 8px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+        #rulesPanel .rules-group-title { font-size: 12px; font-weight: 700; color: var(--text-muted); margin: 8px 0 2px; text-transform: uppercase; letter-spacing: 0.03em; }
+        #rulesPanel .rule-lines { max-width: none; }
+        #rulesPanel .wire-badge { display: inline; margin: 0; }
+        /* Keep the Commission Type column compact: long labels truncate inside the select */
+        #editCard select.e-type { max-width: 160px; text-overflow: ellipsis; }
+        #editCard .wire-badge { max-width: 160px; white-space: normal; }
+        .aligned-table { table-layout: fixed; width: 100%; }
+        .aligned-table td { overflow-wrap: break-word; }
+        .aligned-table .rule-cell, .aligned-table .formula-cell { white-space: normal; }
+        .rule-cell[title] { cursor: help; text-decoration: underline dotted; text-underline-offset: 3px; }
+        .formula-cell { font-family: ui-monospace, Consolas, monospace; }
+        .row-edit-btn { padding: 4px 10px; font-size: 12px; }
+
+        /* Data Edit Modal Styling */
+        #dataEditModal .modal-body {
+            overflow-y: auto;
+            max-height: calc(90vh - 130px);
+            padding: 24px;
+            gap: 18px;
+        }
+
+        /* Property Chip Skill Tags */
+        .prop-chips-box {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 6px;
+        }
+        .prop-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 5px 12px;
+            font-size: 12px;
+            font-weight: 500;
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            background-color: #f8fafc;
+            color: var(--text-main);
+            cursor: pointer;
+            user-select: none;
+            transition: all 0.2s ease;
+        }
+        .prop-chip:hover {
+            background-color: #eff6ff;
+            border-color: #93c5fd;
+            color: #1d4ed8;
+        }
+        .prop-chip.selected {
+            background-color: #2563eb;
+            border-color: #2563eb;
+            color: #ffffff;
+            box-shadow: 0 2px 6px rgba(37, 99, 235, 0.2);
+        }
+        /* The agent roster is long, so its chips scroll instead of pushing the
+           rest of the modal off screen. Selected ones sort to the top. */
+        .agent-chips-box {
+            max-height: 132px;
+            overflow-y: auto;
+            align-content: flex-start;
+            padding: 8px;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            background-color: #ffffff;
+        }
+        .agent-chips-empty {
+            font-size: 12px;
+            color: var(--text-muted);
+            padding: 2px 4px;
+        }
+
+        /* Payment Rules Adder */
+        .payment-rules-box {
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 10px;
+            background-color: #f8fafc;
+        }
+        .prule-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+            background: #ffffff;
+            padding: 8px 12px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+        }
+        .prule-row:last-child {
+            margin-bottom: 0;
+        }
+        #dataEditModal .form-row select,
+        #dataEditModal .form-row input {
+            width: 100%;
+            box-sizing: border-box;
+            font-size: 14px;
+            padding: 9px 12px;
+        }
+        #dataEditModal .form-group-row {
+            flex-wrap: wrap;
+            gap: 16px;
+        }
+
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <img src="/static/logo.jpg" alt="Eternalgy" class="sidebar-logo">
+                <span class="portal-eyebrow neon-white">Commission Portal</span>
+            </div>
+
+            <div class="sidebar-group">
+                <label class="group-label">Data Section</label>
+                <ul class="nav-list" id="dataSectionList">
+                    <li data-section="roles" class="active"><span class="bullet"></span> Agent Roles & Hierarchy</li>
+                    <li data-section="basic_nfp"><span class="bullet"></span> Basic & Net Floor Price Commission</li>
+                    <li data-section="anp"><span class="bullet"></span> ANP Commission</li>
+                    <li data-section="ega_esa"><span class="bullet"></span> EGA/ESA Award</li>
+                    <li data-section="production_bonus"><span class="bullet"></span> Production Bonus</li>
+                    <li data-section="monthly_contest"><span class="bullet"></span> Monthly Contest</li>
+                </ul>
+            </div>
+
+            <div class="sidebar-group" id="accountGroup">
+                <label class="group-label">Account</label>
+                <div class="status-text" id="accountWhoami" style="margin-bottom: 8px;"></div>
+                <button id="logoutBtn" class="btn btn-secondary" style="width: 100%;">Logout</button>
+            </div>
+
+            <div class="sidebar-footer">
+                <span class="status-indicator online"></span>
+                <span class="status-text">Connected to PG Proxy</span>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <header class="content-header">
+                <div class="header-title">
+                    <h2 id="pageTitle" class="section-title-header">Agent Roles & Hierarchy</h2>
+                    <p id="subHeader">System inputs for commission rates and calculation rules</p>
+                </div>
+                <div class="header-actions">
+                    <a href="/" class="btn btn-warning" style="text-decoration: none;">← Back to Dashboard</a>
+                </div>
+            </header>
+
+            <div class="view-only-note" id="viewOnlyNote" style="display:none;">
+                View only — your account can see these values but only an admin can change them.
+            </div>
+
+            <div class="data-content">
+                <!-- ── VIEW MODE ───────────────────────────────────────────── -->
+                <section class="card table-card" id="viewCard">
+                    <div class="card-header">
+                        <h3>Basic Commission</h3>
+                        <div style="display:flex; gap:12px;">
+                            <!-- Moved here when the Net Floor Price Commission
+                                 card was removed; this is now the only way to
+                                 open the price list on this page. -->
+                            <button class="btn btn-secondary" id="nfpListBtn">📋 View Net Floor Price List</button>
+                            <button class="btn btn-primary" id="editModeBtn" style="display:none;">➕ Add entry</button>
+                        </div>
+                    </div>
+                    <div class="section-hint">
+                        <strong>Variables:</strong>
+                        a = Total Amount &nbsp;·&nbsp; b = EPP Effective &nbsp;·&nbsp;
+                        c = Sales Price (a − b) &nbsp;·&nbsp; d = Net Floor Price &nbsp;·&nbsp; z = Rate %
+                        &nbsp;&nbsp;|&nbsp;&nbsp; <strong>Basic Commission</strong> = c × z
+                    </div>
+                    <div class="data-toolbar" style="flex-wrap:wrap; gap:16px; align-items:center;">
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <label for="previewYear" style="font-weight:600;">Year</label>
+                            <select id="previewYear" style="padding:6px 10px; border-radius:6px; border:1px solid var(--border-color);">
+                                <option value="">All Years</option>
+                                <option value="2026">2026</option>
+                                <option value="2025">2025</option>
+                            </select>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <label for="previewMonth" style="font-weight:600;">Month</label>
+                            <select id="previewMonth" style="padding:6px 10px; border-radius:6px; border:1px solid var(--border-color);">
+                                <option value="">All Months</option>
+                                <option value="01">Jan</option>
+                                <option value="02">Feb</option>
+                                <option value="03">Mar</option>
+                                <option value="04">Apr</option>
+                                <option value="05">May</option>
+                                <option value="06">Jun</option>
+                                <option value="07">Jul</option>
+                                <option value="08">Aug</option>
+                                <option value="09">Sep</option>
+                                <option value="10">Oct</option>
+                                <option value="11">Nov</option>
+                                <option value="12">Dec</option>
+                            </select>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <label for="previewAgentType" style="font-weight:600;">Agent Type</label>
+                            <select id="previewAgentType" style="padding:6px 10px; border-radius:6px; border:1px solid var(--border-color);">
+                                <option value="">All Agent Types</option>
+                                <option value="Internal">Internal</option>
+                                <option value="Outsource">Outsource</option>
+                            </select>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <label for="previewRole" style="font-weight:600;">Role</label>
+                            <select id="previewRole" style="padding:6px 10px; border-radius:6px; border:1px solid var(--border-color);">
+                                <option value="">All Roles</option>
+                            </select>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <label for="previewAgentName" style="font-weight:600;">Agent Name</label>
+                            <select id="previewAgentName" style="padding:6px 10px; border-radius:6px; border:1px solid var(--border-color); max-width:200px;">
+                                <option value="">All Agents</option>
+                            </select>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <label for="previewPropertyType" style="font-weight:600;">Property Type</label>
+                            <select id="previewPropertyType" style="padding:6px 10px; border-radius:6px; border:1px solid var(--border-color);">
+                                <option value="">All Property Types</option>
+                                <option value="Residential">Residential</option>
+                                <option value="Commercial">Commercial</option>
+                                <option value="Factory">Factory</option>
+                                <option value="NGO">NGO</option>
+                                <option value="Government">Government</option>
+                            </select>
+                        </div>
+                    </div>
+                    <!-- Payout mechanics apply to the whole scheme, not to any one
+                         rate row, so they are stated once here instead of being
+                         repeated against every entry. -->
+                    <div id="payoutPanel" style="display:none;"></div>
+                    <div class="table-container">
+                        <table class="dashboard-table aligned-table">
+                            <colgroup>
+                                <col style="width:12%"><col style="width:9%"><col style="width:8%"><col style="width:14%">
+                                <col style="width:12%"><col style="width:7%"><col style="width:15%"><col style="width:10%">
+                                <col style="width:8%"><col style="width:5%">
+                            </colgroup>
+                            <thead>
+                                <tr><th>Commission Type</th><th>Invoice Month</th><th>Agent Type</th><th>Role</th><th>Property Type</th><th>Rate %</th><th>Condition</th><th>Formula</th><th>Source</th><th></th></tr>
+                            </thead>
+                            <tbody id="previewBody"></tbody>
+                        </table>
+                    </div>
+                    <!-- Pagination -->
+                    <div id="previewPagination" style="display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:8px 0;"></div>
+                    <div class="section-hint" style="padding-bottom:16px;">
+                        <strong>Invoice Month</strong> is the month (or range) the value takes effect from, not
+                        the month selected above — a rate entered for Jan 2025 still governs July 2026 until
+                        something later replaces it.
+                        &nbsp;·&nbsp; <strong>Source:</strong> "Data page" = entered here.
+                        "Legacy table" / "Sheet fallback" / "Built-in default" = nothing has been
+                        entered for that row yet, so a fallback is supplying the number.
+                    </div>
+                </section>
+
+                <!-- ── NFP PRICE LIST (toggled) ────────────────────────────── -->
+                <section class="card table-card" id="nfpListCard" style="display:none;">
+                    <div class="card-header">
+                        <h3>Net Floor Price List</h3>
+                        <div style="display:flex; gap:12px;">
+                            <button class="btn btn-primary" id="nfpUploadBtn" style="display:none;">⬆️ Upload Net Floor Price List</button>
+                            <button class="btn btn-secondary" id="nfpListCloseBtn">✕ Close</button>
+                        </div>
+                    </div>
+                    <input type="file" id="nfpUploadInput" accept=".xlsx" style="display:none;">
+                    <div id="nfpUploadPreview" class="section-hint" style="display:none;"></div>
+                    <div class="section-hint">
+                        This list is what the NFP calculation reads (the old monthly Excel is only a
+                        fallback for months with no rows here). Admins add new months with the Upload
+                        button — same layout as the monthly schedule file; a preview is shown before
+                        anything is saved.
+                    </div>
+                    <div class="data-toolbar">
+                        <select id="nfpListMonth"></select>
+                        <select id="nfpListRating">
+                            <option value="">All Power Outputs</option>
+                            <option value="650">650W</option>
+                            <option value="620">620W</option>
+                            <option value="590">590W</option>
+                        </select>
+                        <select id="nfpListSystem">
+                            <option value="">All Power Systems</option>
+                            <option value="single">Single Phase</option>
+                            <option value="three">Three Phase</option>
+                        </select>
+                        <select id="nfpListInverter">
+                            <option value="">All Inverter Types</option>
+                            <option value="string">String Package</option>
+                            <option value="hybrid">Hybrid Package</option>
+                        </select>
+                        <span class="row-count-badge" id="nfpListCount">0 rows</span>
+                    </div>
+                    <h4 id="nfpListSubtitle" style="padding: 12px 24px 0; font-size: 15px;"></h4>
+                    <div id="nfpListTables"><p class="section-hint">Loading price list…</p></div>
+                </section>
+
+                <!-- ── ROLE HIERARCHY ──────────────────────────────────────── -->
+                <!-- Total Agents Card -->
+                <section id="rolesMetricsRow" style="display:flex; gap:16px; flex-wrap:wrap; padding: 0 0 4px 0;">
+                    <div class="card metric-card" style="min-width:180px; flex:0 0 auto;">
+                        <div class="metric-details">
+                            <span class="metric-label">Total Agents</span>
+                            <span class="metric-value" id="rolesTotalCount">—</span>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="card table-card" id="rolesCard">
+                    <div class="card-header">
+                        <h3>Agent Roles &amp; Hierarchy</h3>
+                        <span class="row-count-badge" id="rolesCount">0 agents</span>
+                    </div>
+                    <div class="section-hint">
+                        Who holds which role and who they report to — this drives the override
+                        attribution. Agent Name, Agent Type, Branch and (when a person's active
+                        tags resolve to exactly one role) Role can be pulled from Postgres;
+                        <strong>Reports To is never in Postgres</strong> and must always be entered
+                        here. A "⚠ needs split" Role means Postgres has conflicting old- and
+                        new-system tags at once (e.g. both "Sales Senior" and "Sales Development
+                        Manager") — add two rows by hand with the right effective months instead of
+                        guessing which applied when. Effective-dated like the rates: a promotion or
+                        a branch move is a new row, so recalculating an old month uses the hierarchy
+                        as it stood then. Until an agent is listed here the calculation falls back
+                        to the old hardcoded name matching.
+                    </div>
+
+                    <!-- Agent Type Filter + Search + Refresh -->
+                    <div style="display:flex; gap:12px; align-items:center; padding:12px 24px 0; flex-wrap:wrap;">
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <label for="rolesSearchInput" style="font-weight:600; font-size:13px;">Search Agent</label>
+                            <input type="text" id="rolesSearchInput" placeholder="Enter agent name..." style="padding:6px 12px; border-radius:8px; border:1px solid var(--border-color); font-size:13px; background:#f8fafc; color:var(--text-main); width:180px;">
+                        </div>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <label for="rolesAgentTypeFilter" style="font-weight:600; font-size:13px;">Agent Type</label>
+                            <select id="rolesAgentTypeFilter" style="padding:6px 12px; border-radius:8px; border:1px solid var(--border-color); font-size:13px; background:#f8fafc; color:var(--text-main);">
+                                <option value="">All Types</option>
+                                <option value="Internal">Internal</option>
+                                <option value="Outsource">Outsource</option>
+                                <option value="Sales">Sales</option>
+                            </select>
+                        </div>
+                        <button class="btn btn-secondary" id="refreshPgAgentsBtn" style="font-size:12.5px; padding:6px 14px;">🔄 Refresh from Postgres</button>
+                        <span class="save-status" id="pgAgentsStatus"></span>
+                    </div>
+
+                    <div class="table-footer-actions" style="padding-bottom:0;">
+                        <button class="btn btn-secondary" id="seedRolesBtn" style="display:none;">⬇ Pull agents from Postgres</button>
+                        <button class="btn btn-secondary" id="addRoleBtn" style="display:none;">+ Add agent</button>
+                        <button class="btn btn-primary" id="saveRolesBtn" style="display:none;">Save</button>
+                        <span class="save-status" id="rolesStatus"></span>
+                    </div>
+                    <div class="table-container">
+                        <table class="dashboard-table" style="table-layout:auto;">
+                            <thead>
+                                <tr><th>Effective Month</th><th>Agent Name (from eeAdmin)</th><th>Full Name</th><th>Nick Name</th><th>IC No.</th><th>Agent Type</th><th>Role</th><th>Reports To</th><th>Branch</th><th></th></tr>
+                            </thead>
+                            <tbody id="rolesBody"></tbody>
+                        </table>
+                    </div>
+                    <div id="rolesPagination" style="display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:8px 0;"></div>
+                </section>
+
+                <!-- ── MONTHLY CONTEST ─────────────────────────────────────── -->
+                <section class="card table-card" id="contestCard" style="display:none;">
+                    <div class="card-header">
+                        <h3>Monthly Contest</h3>
+                        <div style="display:flex; gap:12px; align-items:center;">
+                            <span class="save-status" id="contestListStatus"></span>
+                            <button class="btn btn-primary" id="contestNewBtn" style="display:none;">➕ New monthly contest</button>
+                        </div>
+                    </div>
+                    <div class="table-container">
+                        <table class="dashboard-table" style="table-layout:auto;">
+                            <thead>
+                                <tr>
+                                    <th>Month</th>
+                                    <th>Ranking Baseline</th>
+                                    <th>Activity Bonus</th>
+                                    <th>Target Bonus</th>
+                                    <th>Team Ranking Awards</th>
+                                    <th>Golden Boot</th>
+                                    <th>Fast Start</th>
+                                    <th>Last Updated</th>
+                                </tr>
+                            </thead>
+                            <tbody id="contestListBody"></tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- ── ANP COMMISSION RULES ────────────────────────────────── -->
+                <section class="card table-card" id="anpCard" style="display:none;">
+                    <div class="card-header">
+                        <h3>ANP Commission Rules</h3>
+                        <div style="display:flex; gap:12px; align-items:center;">
+                            <span class="source-badge" id="anpSavedBadge"></span>
+                            <span class="save-status" id="anpStatus"></span>
+                        </div>
+                    </div>
+                    <div class="data-toolbar">
+                        <label for="anpPeriod" style="font-weight:600; font-size:13px;">Effective from</label>
+                        <input type="month" id="anpPeriod">
+                        <button class="btn btn-secondary" id="anpAddTierBtn" style="display:none;">+ Add tier</button>
+                        <button class="btn btn-primary" id="anpSaveBtn" style="display:none;">Save</button>
+                    </div>
+                    <h4 class="contest-heading">Accumulated amount tiers</h4>
+                    <div class="table-container">
+                        <table class="dashboard-table unified-grid" style="table-layout:auto;">
+                            <thead><tr><th>From (RM)</th><th>To (RM) — blank = no limit</th><th>Commission (RM)</th><th></th></tr></thead>
+                            <tbody id="anpTiersBody"></tbody>
+                        </table>
+                    </div>
+                    <h4 class="contest-heading">Qualifying</h4>
+                    <div class="contest-fields">
+                        <label>Minimum paid (RM)<input type="text" id="anp_min_paid"></label>
+                        <label>Excluded payment IDs<input type="text" id="anp_excluded_payment_ids" placeholder="101334, 104412"></label>
+                        <label>Invoice month overrides<input type="text" id="anp_invoice_overrides" placeholder="INV-1008093, …"></label>
+                    </div>
+                    <p class="section-hint" style="padding:8px 24px 20px;">
+                        Overrides list invoices counted in their invoice-date month even when the 1st payment lands in another month.
+                    </p>
+                </section>
+
+                <!-- ── EGA / ESA AWARD RULES ───────────────────────────────── -->
+                <section class="card table-card" id="egaCard" style="display:none;">
+                    <div class="card-header">
+                        <h3>EGA / ESA Award Rules</h3>
+                        <div style="display:flex; gap:12px; align-items:center;">
+                            <span class="source-badge" id="egaSavedBadge"></span>
+                            <span class="save-status" id="egaStatus"></span>
+                        </div>
+                    </div>
+                    <div class="data-toolbar">
+                        <label for="egaYear" style="font-weight:600; font-size:13px;">Year</label>
+                        <input type="number" id="egaYear" style="width:100px;" min="2020" max="2099">
+                        <label for="egaAgentType" style="font-weight:600; font-size:13px;">Agent type</label>
+                        <select id="egaAgentType">
+                            <option value="internal">Internal</option>
+                            <option value="outsource">Outsource</option>
+                        </select>
+                        <button class="btn btn-secondary" id="egaAddMonthBtn" style="display:none;">+ Add month</button>
+                        <button class="btn btn-primary" id="egaSaveBtn" style="display:none;">Save</button>
+                    </div>
+                    <h4 class="contest-heading">Full-year thresholds</h4>
+                    <div class="contest-fields">
+                        <label>EGA threshold (EP)<input type="number" id="ega_ega_threshold"></label>
+                        <label>ESA threshold (EP)<input type="number" id="ega_esa_threshold"></label>
+                    </div>
+                    <h4 class="contest-heading">Month-by-month qualifying ladder</h4>
+                    <div class="table-container">
+                        <table class="dashboard-table unified-grid" style="table-layout:auto;">
+                            <thead><tr><th>Month</th><th>EP threshold</th><th>Label</th><th></th></tr></thead>
+                            <tbody id="egaMonthsBody"></tbody>
+                        </table>
+                    </div>
+                    <h4 class="contest-heading">Factory EP recognition</h4>
+                    <div class="contest-fields">
+                        <label>Applies from<input type="month" id="ega_factory_from"></label>
+                        <label>First block (RM)<input type="number" id="ega_factory_first_block"></label>
+                        <label>Balance rate (%)<input type="number" id="ega_factory_balance_rate"></label>
+                        <label>Minimum panels<input type="number" id="ega_factory_min_panels"></label>
+                    </div>
+                    <p class="section-hint" style="padding:8px 24px 20px;">
+                        Below the minimum panel count a factory case follows the Residential rules instead.
+                    </p>
+                </section>
+
+                <!-- ── PRODUCTION BONUS RULES ──────────────────────────────── -->
+                <section class="card table-card" id="pbCard" style="display:none;">
+                    <div class="card-header">
+                        <h3>Production Bonus Rules</h3>
+                        <div style="display:flex; gap:12px; align-items:center;">
+                            <span class="source-badge" id="pbSavedBadge"></span>
+                            <span class="save-status" id="pbStatus"></span>
+                        </div>
+                    </div>
+                    <div class="data-toolbar">
+                        <label for="pbPeriod" style="font-weight:600; font-size:13px;">Effective from</label>
+                        <input type="month" id="pbPeriod">
+                        <button class="btn btn-primary" id="pbSaveBtn" style="display:none;">Save</button>
+                    </div>
+                    <h4 class="contest-heading">Qualifying</h4>
+                    <div class="contest-fields">
+                        <label>Property types counted<input type="text" id="pb_property_types" placeholder="Shop Lot, Residential"></label>
+                        <label>Minimum paid (RM)<input type="text" id="pb_min_paid"></label>
+                    </div>
+                    <h4 class="contest-heading">OUM</h4>
+                    <div class="contest-fields">
+                        <label>Team target (RM)<input type="number" id="pb_oum_team_target"></label>
+                        <label>Personal target (RM)<input type="number" id="pb_oum_personal_target"></label>
+                        <label>Bonus rate (% of team sales)<input type="text" id="pb_oum_rate_pct"></label>
+                    </div>
+                    <h4 class="contest-heading">OGM</h4>
+                    <div class="contest-fields">
+                        <label>Team target (RM)<input type="number" id="pb_ogm_team_target"></label>
+                        <label>Rate on OSA sales (%)<input type="text" id="pb_ogm_osa_rate_pct"></label>
+                        <label>Rate on OUM sales (%)<input type="text" id="pb_ogm_oum_rate_pct"></label>
+                    </div>
+                    <h4 class="contest-heading">Payout staging</h4>
+                    <div class="contest-fields">
+                        <label>Year 1 (%)<input type="number" id="pb_stage1_pct"></label>
+                        <label>Year 2 (%)<input type="number" id="pb_stage2_pct"></label>
+                        <label>Year 3 (%)<input type="number" id="pb_stage3_pct"></label>
+                    </div>
+                    <div class="contest-warn" id="pbStageWarn" style="display:none;"></div>
+                    <p class="section-hint" style="padding:8px 24px 20px;">
+                        OSA earns no production bonus. Each agent's role comes from Agent Roles &amp; Hierarchy, not from this page.
+                    </p>
+                </section>
+
+                <!-- ── EDIT MODE ───────────────────────────────────────────── -->
+                <section class="card table-card" id="editCard" style="display:none;">
+                    <div class="card-header">
+                        <h3 id="editTitle">Edit Entries</h3>
+                        <span class="row-count-badge" id="entriesCountBadge">0 shown</span>
+                    </div>
+                    <div class="section-hint">
+                        Pick a month to see the values that apply in it. Each row carries its own
+                        Invoice Date, so you can enter a row for any month without switching the
+                        filter — the filter is only the default for new rows. A value takes effect
+                        from its Invoice Date onwards; earlier months keep their history. Rows dated
+                        after the filtered month are saved but won't show until you select that
+                        month. Leave Agent blank for the whole role; name an agent (exactly as in
+                        the commission data) to give that agent a different rate that beats the
+                        role rate.
+                        A row fills in only the columns it needs — a plain rate row leaves the rule
+                        columns blank, and a row may carry both a rate and a payment condition
+                        (e.g. a rate that only pays out at 100% payment).
+                    </div>
+                    <div class="table-footer-actions" style="padding-bottom: 0;">
+                        <button class="btn btn-secondary" id="addEntryBtn">+ Add row</button>
+                        <button class="btn btn-primary" id="saveEntriesBtn">Save</button>
+                        <button class="btn btn-secondary" id="cancelEditBtn">Cancel</button>
+                        <span class="save-status" id="saveStatus"></span>
+                    </div>
+                    <div class="data-toolbar">
+                        <select id="filterAgentType">
+                            <option value="">All agent types</option>
+                            <option value="Internal">Internal</option>
+                            <option value="Outsource">Outsource</option>
+                        </select>
+                        <select id="filterMonth"></select>
+                    </div>
+                    <div id="rulesHead"></div>
+                    <div class="table-container">
+                        <table class="dashboard-table unified-grid" style="table-layout: auto;">
+                            <thead>
+                                <tr>
+                                    <th>Invoice Date</th>
+                                    <th>Agent Type</th>
+                                    <th>Role</th>
+                                    <th>Agent Name</th>
+                                    <th>Rate (%)</th>
+                                    <th>Override Rate (%)</th>
+                                    <th>Override From</th>
+                                    <th>Profit Sharing Rate (%)</th>
+                                    <th>Sharing Mode</th>
+                                    <th>Property Type</th>
+                                    <th>Payment ≥ (%)</th>
+                                    <th>Payment Date <span style="font-weight:400; color:var(--text-muted);">(blank = all)</span></th>
+                                    <th class="rule-type-col">Rule Type</th>
+                                    <th class="rule-type-col">Amount (RM)</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody id="entriesBody"></tbody>
+                        </table>
+                    </div>
+                    <div id="editPagination" style="display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:8px 0;"></div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <!-- Data Edit Entry Modal Pop-Up -->
+    <!-- Monthly Contest rule set — one month's targets, handicaps and awards.
+         Opened by clicking a row on the Monthly Contest landing table, or by
+         "New monthly contest". -->
+    <div id="contestModal" class="modal hidden">
+        <div class="modal-content card">
+            <div class="modal-header">
+                <h3 id="contestModalTitle">Monthly Contest</h3>
+                <button id="contestModalCloseBtn" class="btn-close">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 0 0 12px; gap: 0; overflow-y: auto;">
+                <div class="data-toolbar">
+                    <label for="contestMonth" style="font-weight:600; font-size:13px;">Month</label>
+                    <input type="month" id="contestMonth">
+                    <select id="contestCopyFrom" style="display:none;"></select>
+                    <button class="btn btn-secondary" id="contestCopyBtn" style="display:none;">Copy from month</button>
+                    <span class="source-badge" id="contestSavedBadge"></span>
+                </div>
+
+                <h4 class="contest-heading">Teams, targets and handicaps</h4>
+                <div class="table-container">
+                    <table class="dashboard-table unified-grid" style="table-layout:auto;">
+                        <thead>
+                            <tr><th>Team</th><th>Branch</th><th>Captain</th><th>Original Target (RM)</th><th>Handicap (RM)</th><th>Ranking Baseline (RM)</th></tr>
+                        </thead>
+                        <tbody id="contestTeamsBody"></tbody>
+                    </table>
+                </div>
+                <div class="contest-warn" id="contestBaselineWarn" style="display:none;"></div>
+
+                <h4 class="contest-heading">Scoring</h4>
+                <div class="contest-fields">
+                    <label>Full-rate cap (RM)<input type="number" id="cr_full_rate_cap"></label>
+                    <label>Rate above cap (%)<input type="number" id="cr_above_cap_pct"></label>
+                    <label>Activity bonus (points)<input type="number" id="cr_activity_bonus_points"></label>
+                    <label>Target achievement bonus (points)<input type="number" id="cr_target_bonus_points"></label>
+                </div>
+                <div class="contest-check">
+                    <label><input type="checkbox" id="cr_activity_bonus_enabled"> Activity bonus applies this month</label>
+                    <p class="section-hint">Achievement test: actual + handicap + activity bonus ≥ ranking baseline. Turning the activity bonus on can therefore push a borderline team over its target.</p>
+                </div>
+
+                <h4 class="contest-heading">Team awards</h4>
+                <div class="contest-fields">
+                    <label>Ranking 1st (RM)<input type="number" id="cr_rank1_award"></label>
+                    <label>Ranking 2nd (RM)<input type="number" id="cr_rank2_award"></label>
+                    <label>Ranking 3rd (RM)<input type="number" id="cr_rank3_award"></label>
+                    <label>Achievement bonus, per team (RM)<input type="number" id="cr_achievement_bonus"></label>
+                </div>
+
+                <h4 class="contest-heading">Golden Boot</h4>
+                <div class="contest-fields">
+                    <label>1st (RM)<input type="number" id="cr_gb1_award"></label>
+                    <label>2nd (RM)<input type="number" id="cr_gb2_award"></label>
+                    <label>3rd (RM)<input type="number" id="cr_gb3_award"></label>
+                    <label>Minimum cases<input type="number" id="cr_gb_min_cases"></label>
+                    <label>Minimum sales (RM)<input type="number" id="cr_gb_min_sales"></label>
+                </div>
+
+                <h4 class="contest-heading">Fast Start</h4>
+                <div class="contest-fields">
+                    <label>Gift<input type="text" id="cr_fast_start_gift" placeholder="Adidas FIFA jersey (RM 320)"></label>
+                    <label>Winner slots<input type="number" id="cr_fast_start_slots" placeholder="e.g. 5"></label>
+                    <label>Unpaid cases
+                        <select id="cr_fast_start_unpaid">
+                            <option value="exclude">Excluded from race</option>
+                            <option value="last">Sort last</option>
+                        </select>
+                    </label>
+                </div>
+                <p class="section-hint" style="padding:8px 24px 0;">
+                    Fast Start ranks agents by the 1st payment date of their 2nd qualified case; the first N finishers win.
+                </p>
+
+                <h4 class="contest-heading">Eligible candidates
+                    <button class="btn btn-secondary" id="contestAddRosterBtn"
+                            style="display:none; float:right; font-size:11px; padding:3px 10px; text-transform:none; letter-spacing:0;">+ Add agent</button>
+                </h4>
+                <div class="table-container">
+                    <table class="dashboard-table unified-grid" style="table-layout:auto;">
+                        <thead><tr>
+                            <th style="width:150px;">Team</th>
+                            <th style="width:170px;">Agent</th>
+                            <th>Sales Price (RM)</th>
+                            <th style="width:56px;"></th>
+                        </tr></thead>
+                        <tbody id="contestRosterBody"></tbody>
+                    </table>
+                </div>
+                <p class="section-hint" style="padding:6px 24px 0;">
+                    Each amount is matched to an invoice in the database, exactly as the workbook figures are today.
+                    An agent with no amount still counts for the activity bonus denominator — a team qualifies only
+                    when every agent listed here closes at least one case.
+                </p>
+
+            </div>
+            <div class="modal-footer">
+                <div class="modal-footer-actions">
+                    <span class="save-status" id="contestStatus"></span>
+                    <button class="btn btn-secondary" id="contestCancelBtn">Cancel</button>
+                    <button class="btn btn-primary" id="contestSaveBtn" style="display:none;">Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="dataEditModal" class="modal hidden">
+        <div class="modal-content card" style="width: 90%; max-width: 880px; max-height: 90vh;">
+            <div class="modal-header">
+                <h3 id="dataModalTitle">Edit Entry — Basic Commission</h3>
+                <button id="closeDataEditModalBtn" class="btn-close">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 24px; gap: 18px; overflow-y: auto;">
+                
+                <!-- Row 1: Invoice Month -->
+                <div class="form-row">
+                    <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Invoice Month</label>
+                    <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+                        <select id="modalMonthMode" style="width:140px; padding:8px 10px; font-size:13px; border:1px solid var(--border-color); border-radius:6px;">
+                            <option value="single">Single Month</option>
+                            <option value="range">Month Range</option>
+                        </select>
+                        <div id="singleMonthBox" style="display:flex; align-items:center; gap:8px;">
+                            <input type="month" id="modalEffDate" style="padding:8px 12px; font-size:13.5px; width:160px; border:1px solid var(--border-color); border-radius:6px;">
+                        </div>
+                        <div id="rangeMonthBox" style="display:none; align-items:center; gap:8px;">
+                            <span style="font-size:12px; color:var(--text-muted); font-weight:600;">From</span>
+                            <input type="month" id="modalEffDateFrom" style="padding:8px 12px; font-size:13.5px; width:150px; border:1px solid var(--border-color); border-radius:6px;">
+                            <span style="font-size:12px; color:var(--text-muted); font-weight:600;">To</span>
+                            <input type="month" id="modalEffDateTo" style="padding:8px 12px; font-size:13.5px; width:150px; border:1px solid var(--border-color); border-radius:6px;">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Row 2: Agent type, Role, Property Type -->
+                <div class="form-group-row" style="display:flex; gap:14px; flex-wrap:wrap;">
+                    <div class="form-row" style="flex:1; min-width:160px;">
+                        <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Agent Type</label>
+                        <select id="modalAgentType" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px;">
+                            <option value="Internal">Internal</option>
+                            <option value="Outsource">Outsource</option>
+                        </select>
+                    </div>
+                    <div class="form-row" style="flex:1; min-width:160px;">
+                        <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Role</label>
+                        <select id="modalRole" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px;"></select>
+                    </div>
+                    <div class="form-row" style="flex:1.6; min-width:280px;">
+                        <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Property Type <span id="modalPropertySelectedText" style="font-weight:600; color:#2563eb; margin-left:8px; font-size:12px;"></span></label>
+                        <div id="modalPropertyChipsContainer" class="prop-chips-box">
+                            <span class="prop-chip" data-val="All Types">+ All Types</span>
+                            <span class="prop-chip" data-val="Residential">+ Residential</span>
+                            <span class="prop-chip" data-val="Commercial">+ Commercial</span>
+                            <span class="prop-chip" data-val="Shop Lot">+ Shop Lot</span>
+                            <span class="prop-chip" data-val="Factory">+ Factory</span>
+                            <span class="prop-chip" data-val="NGO Project">+ NGO Project</span>
+                            <span class="prop-chip" data-val="Government Project">+ Government Project</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Row 2b: Agent Name — multi-select, same chip picker as
+                     Property Type. Its own row because the agent list is long. -->
+                <div class="form-group-row">
+                    <div class="form-row">
+                        <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Agent Name <span style="font-weight:400;">(Optional — pick any number)</span> <span id="modalAgentSelectedText" style="font-weight:600; color:#2563eb; margin-left:8px; font-size:12px;"></span></label>
+                        <input type="text" id="modalAgentChipSearch" placeholder="Search agents…" style="padding:6px 12px; font-size:12.5px; border:1px solid var(--border-color); border-radius:6px; margin-top:6px;">
+                        <div id="modalAgentChipsContainer" class="prop-chips-box agent-chips-box"></div>
+                    </div>
+                </div>
+
+                <!-- Row 3: Rate % & Profit Sharing % -->
+                <div class="form-group-row" style="display:flex; gap:14px; flex-wrap:wrap;">
+                    <div class="form-row" style="flex:1; min-width:140px;">
+                        <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Rate (%)</label>
+                        <input type="number" id="modalRatePct" step="0.05" placeholder="e.g. 3.25" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px;">
+                    </div>
+                    <div class="form-row" style="flex:1; min-width:150px;">
+                        <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Profit Sharing (%)</label>
+                        <input type="text" id="modalProfitSharingRatePct" placeholder="— (or x)" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px;">
+                    </div>
+                </div>
+
+                <!-- Row 3.5: Override Rules (Override Rate % & Override From Adder) -->
+                <div class="form-row" style="margin-top:10px; padding:12px; background:#f8fafc; border:1px solid var(--border-color); border-radius:8px;">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+                        <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Override Rules <span style="font-weight:400; color:var(--text-muted);">(Optional - e.g. OUM overrides OSA & OUM)</span></label>
+                        <button type="button" id="addOverrideRuleBtn" class="btn btn-secondary" style="padding:3px 10px; font-size:11.5px;">+ Add Override Rule</button>
+                    </div>
+                    <div id="overrideRulesList" style="display:flex; flex-direction:column; gap:8px;"></div>
+                </div>
+
+                <!-- Row 4: Payment Rules (Payment ≥ % & Rule Adder) -->
+                <div class="form-row">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+                        <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Payment Rules (Payment ≥ %)</label>
+                        <button type="button" id="addPaymentRuleBtn" class="btn btn-secondary" style="padding:3px 10px; font-size:11.5px;">+ Add Payment Stage</button>
+                    </div>
+                    <div id="modalPaymentRulesBox" class="payment-rules-box">
+                        <div id="paymentRulesList"></div>
+                    </div>
+                </div>
+
+                <!-- Remarks -->
+                <div class="form-row">
+                    <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Remarks</label>
+                    <input type="text" id="modalRemarks" placeholder="Remarks..." style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px;">
+                </div>
+
+            </div>
+            <div class="modal-footer">
+                <button id="modalDeleteBtn" class="btn btn-danger">Delete Entry</button>
+                <div class="modal-footer-actions">
+                    <button id="modalCancelBtn" class="btn btn-secondary">Cancel</button>
+                    <button id="modalSaveBtn" class="btn btn-primary">Save Changes</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Agent Role Edit Modal Pop-Up -->
+    <div id="agentRoleModal" class="modal hidden">
+        <div class="modal-content card" style="width: 90%; max-width: 600px; max-height: 90vh;">
+            <div class="modal-header">
+                <h3 id="agentRoleModalTitle">Edit Agent Details</h3>
+                <button id="closeAgentRoleModalBtn" class="btn-close">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 24px; gap: 18px; overflow-y: auto;">
+                <!-- Agent Name -->
+                <div class="form-row">
+                    <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Agent Name (from eeAdmin)</label>
+                    <input type="text" id="roleModalAgent" readonly title="Fixed — sourced from eeAdmin (Postgres) and cannot be edited here. Use Full Name / Nick Name to customise what's displayed." style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box; background:var(--bg-muted, #f1f3f5); color:var(--text-muted); cursor:not-allowed;">
+                </div>
+
+                <!-- Full Name -->
+                <div class="form-row">
+                    <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Full Name</label>
+                    <input type="text" id="roleModalFullName" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;">
+                </div>
+
+                <!-- Nick Name -->
+                <div class="form-row">
+                    <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Nick Name</label>
+                    <input type="text" id="roleModalNickName" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;">
+                </div>
+
+                <!-- IC No. -->
+                <div class="form-row">
+                    <label style="font-weight:600; font-size:12px; color:var(--text-muted);">IC No.</label>
+                    <input type="text" id="roleModalIcNo" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;">
+                </div>
+
+                <!-- Agent Type -->
+                <div class="form-row">
+                    <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Agent Type</label>
+                    <select id="roleModalAgentType" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;">
+                        <option value="Internal">Internal</option>
+                        <option value="Outsource">Outsource</option>
+                        <option value="Sales">Sales</option>
+                    </select>
+                </div>
+
+                <!-- Effective Month -->
+                <div class="form-row">
+                    <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Effective Month</label>
+                    <input type="month" id="roleModalMonth" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;">
+                </div>
+
+                <!-- Role -->
+                <div class="form-row">
+                    <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Role</label>
+                    <select id="roleModalRole" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;">
+                        <option value="">(none)</option>
+                    </select>
+                </div>
+
+                <!-- Reports To -->
+                <div class="form-row">
+                    <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Reports To</label>
+                    <input type="text" id="roleModalReportsTo" list="agentNameList" placeholder="(nobody)" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;">
+                </div>
+
+                <!-- Branch -->
+                <div class="form-row">
+                    <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Branch</label>
+                    <input type="text" id="roleModalBranch" list="branchList" placeholder="—" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="roleModalDeleteBtn" class="btn btn-danger">Delete Agent</button>
+                <div class="modal-footer-actions">
+                    <button id="roleModalCancelBtn" class="btn btn-secondary">Cancel</button>
+                    <button id="roleModalSaveBtn" class="btn btn-primary">Save Changes</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/data.js?v=20260729_nfp_loading_v1"></script>
+</body>
+</html>

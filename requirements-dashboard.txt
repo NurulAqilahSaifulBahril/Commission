@@ -1,0 +1,3 @@
+# Everything the web dashboard needs at runtime.
+-r requirements-finance.txt
+flask>=3.0.0

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin — Finance Commission Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+    <style>
+        /* Small additions specific to the admin page, layered on top of styles.css */
+        .admin-content { display: flex; flex-direction: column; gap: 24px; }
+        .add-user-form { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; padding: 20px 24px; }
+        .add-user-form .filter-group { flex-grow: 0; min-width: 160px; }
+        .add-user-form input, .add-user-form select {
+            background-color: #f8fafc; border: 1px solid var(--border-color); border-radius: 8px;
+            padding: 10px 14px; font-size: 14px; outline: none; color: var(--text-main);
+        }
+        .add-user-form input:focus, .add-user-form select:focus {
+            border-color: var(--accent-blue); background-color: #ffffff;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+        .form-error { color: #dc2626; font-size: 13px; padding: 0 24px 16px; }
+        .row-actions { display: flex; gap: 8px; }
+        .row-actions .btn { padding: 6px 12px; font-size: 12px; }
+        tr.inactive-row td { opacity: 0.5; }
+        .audit-filters { padding: 20px 24px 0; }
+        .audit-filters select {
+            background-color: #f8fafc; border: 1px solid var(--border-color); border-radius: 8px;
+            padding: 8px 12px; font-size: 13px; color: var(--text-main);
+        }
+        .audit-detail-cell details summary { cursor: pointer; color: var(--accent-blue); font-size: 12px; }
+        .audit-detail-cell .audit-diff { font-size: 12px; color: var(--text-muted); white-space: pre-wrap; word-break: break-word; margin-top: 6px; max-width: 360px; }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <img src="/static/logo.jpg" alt="Eternalgy" class="sidebar-logo">
+                <span class="portal-eyebrow neon-white">Commission Portal</span>
+            </div>
+
+            <div class="sidebar-group">
+                <label class="group-label">Navigation</label>
+                <a href="/" class="btn btn-warning" style="width: 100%; text-decoration: none; justify-content: center;">← Back to Dashboard</a>
+            </div>
+
+            <div class="sidebar-group" id="accountGroup">
+                <label class="group-label">Account</label>
+                <div class="status-text" id="accountWhoami" style="margin-bottom: 8px;"></div>
+                <button id="logoutBtn" class="btn btn-secondary" style="width: 100%;">Logout</button>
+            </div>
+
+            <div class="sidebar-footer">
+                <span class="status-indicator online"></span>
+                <span class="status-text">Connected to PG Proxy</span>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <header class="content-header">
+                <div class="header-title">
+                    <h1>Admin</h1>
+                    <p id="subHeader">Manage accounts and review the audit log</p>
+                </div>
+            </header>
+
+            <div class="admin-content">
+                <section class="card table-card">
+                    <div class="card-header">
+                        <h3>Users</h3>
+                        <span class="row-count-badge" id="userCountBadge">0 users</span>
+                    </div>
+                    <div class="add-user-form">
+                        <div class="filter-group">
+                            <label for="newUsername">Username</label>
+                            <input type="text" id="newUsername" placeholder="e.g. Finance Executive">
+                        </div>
+                        <div class="filter-group">
+                            <label for="newPassword">Password</label>
+                            <input type="password" id="newPassword" placeholder="min 6 characters">
+                        </div>
+                        <div class="filter-group">
+                            <label for="newRole">Role</label>
+                            <select id="newRole">
+                                <option value="staff" selected>Staff</option>
+                                <option value="admin">Admin</option>
+                            </select>
+                        </div>
+                        <button class="btn btn-primary" id="addUserBtn">Add user</button>
+                    </div>
+                    <div class="form-error" id="userFormError"></div>
+                    <div class="table-container">
+                        <table class="dashboard-table" style="table-layout: auto;">
+                            <thead>
+                                <tr><th>Username</th><th>Role</th><th>Status</th><th>Created</th><th>Actions</th></tr>
+                            </thead>
+                            <tbody id="usersBody"></tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <section class="card table-card">
+                    <div class="card-header">
+                        <h3>Login Log</h3>
+                        <span class="row-count-badge" id="loginCountBadge">0 entries</span>
+                    </div>
+                    <div class="table-container">
+                        <table class="dashboard-table" style="table-layout: auto;">
+                            <thead>
+                                <tr><th>When</th><th>Who</th><th>Role</th><th>Link Used</th><th>IP Address</th></tr>
+                            </thead>
+                            <tbody id="loginLogBody"></tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <section class="card table-card">
+                    <div class="card-header">
+                        <h3>Audit Log</h3>
+                        <span class="row-count-badge" id="auditCountBadge">0 entries</span>
+                    </div>
+                    <div class="audit-filters">
+                        <select id="entityFilter">
+                            <option value="">All types</option>
+                            <option value="special_case">Special cases</option>
+                            <option value="factory_rate">Profit sharing rates</option>
+                            <option value="basic_rate">Basic commission rates</option>
+                            <option value="rule_setting">Commission rules</option>
+                            <option value="user">Users</option>
+                        </select>
+                    </div>
+                    <div class="table-container">
+                        <table class="dashboard-table" style="table-layout: auto;">
+                            <thead>
+                                <tr><th>When</th><th>Who</th><th>Action</th><th>Type</th><th>Summary</th><th>Details</th></tr>
+                            </thead>
+                            <tbody id="auditBody"></tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/admin.js"></script>
+</body>
+</html>

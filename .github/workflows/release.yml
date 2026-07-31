@@ -1,0 +1,96 @@
+name: Release
+
+# Push a version tag to cut a release:
+#   git tag v1.2.0 && git push origin v1.2.0
+#
+# Publishes two assets:
+#   CommissionDashboard-Setup-<ver>.exe    first-time Windows installer
+#   CommissionDashboard-update-<ver>.zip   OTA package the app downloads itself
+# plus SHA256SUMS.txt, which the in-app updater verifies the download against.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (e.g. 1.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $v = "${{ github.event.inputs.version }}".TrimStart("v")
+          } else {
+            $v = "${{ github.ref_name }}".TrimStart("v")
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "tag=v$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Building version $v"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build update package
+        shell: pwsh
+        run: python tools/build_package.py --version ${{ steps.ver.outputs.version }}
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { $iscc = "$env:ProgramFiles\Inno Setup 6\ISCC.exe" }
+          & $iscc `
+            /DAppVersion=${{ steps.ver.outputs.version }} `
+            "installer\CommissionDashboard.iss"
+
+      - name: Refresh checksums (now that the installer exists)
+        shell: pwsh
+        run: python tools/build_package.py --checksums-only
+
+      - name: Verify both assets were produced
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          foreach ($f in @("dist\CommissionDashboard-Setup-$v.exe",
+                           "dist\CommissionDashboard-update-$v.zip",
+                           "dist\SHA256SUMS.txt")) {
+            if (!(Test-Path $f)) { throw "Missing expected artifact: $f" }
+          }
+          Get-ChildItem dist -File | Format-Table Name, Length
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            ## Finance Commission Dashboard ${{ steps.ver.outputs.tag }}
+
+            **New here?** Download **CommissionDashboard-Setup-${{ steps.ver.outputs.version }}.exe** below and run it.
+
+            **Already installed?** Do nothing — the dashboard detects this release
+            on its own and shows an **Install Update** button in the sidebar.
+          files: |
+            dist/CommissionDashboard-Setup-${{ steps.ver.outputs.version }}.exe
+            dist/CommissionDashboard-update-${{ steps.ver.outputs.version }}.zip
+            dist/SHA256SUMS.txt
