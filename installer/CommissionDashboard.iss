@@ -82,8 +82,8 @@ begin
   begin
     if MsgBox('Python was not found on this computer.' + #13#10#13#10 +
               'The dashboard needs Python 3.10 or newer. Install it from ' +
-              'python.org (tick "Add python.exe to PATH"), then run this setup again.' +
-              #13#10#13#10 + 'Continue anyway?',
+              'python.org (tick "Add python.exe to PATH"), then run this setup again.' + #13#10#13#10 +
+              'Continue anyway?',
               mbConfirmation, MB_YESNO) = IDNO then
       Result := False;
   end;
