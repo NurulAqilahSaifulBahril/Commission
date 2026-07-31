@@ -162,9 +162,8 @@ def _find_checksum(release: dict, asset_name: str) -> str | None:
     for asset in release.get("assets") or []:
         if str(asset.get("name", "")).upper().startswith("SHA256SUMS"):
             try:
-                resp = requests.get(
-                    asset["browser_download_url"], headers=_github_headers(), timeout=30
-                )
+                url, headers = _asset_download(asset)
+                resp = requests.get(url, headers=headers, timeout=30)
                 resp.raise_for_status()
                 for line in resp.text.splitlines():
                     parts = line.split()
@@ -203,7 +202,15 @@ def check_for_update(force: bool = False) -> dict:
             timeout=20,
         )
         if resp.status_code == 404:
-            result["error"] = "No published release yet."
+            # A private repo also answers 404 when the request is unauthenticated,
+            # so say which of the two it is rather than guessing wrong.
+            if os.environ.get("GITHUB_TOKEN") or os.environ.get("UPDATE_GITHUB_TOKEN"):
+                result["error"] = "No published release yet."
+            else:
+                result["error"] = (
+                    "No release found. If the repository is private, add "
+                    "UPDATE_GITHUB_TOKEN=<token with Contents:read> to the .env file."
+                )
             return result
         resp.raise_for_status()
         release = resp.json()
@@ -233,8 +240,20 @@ def check_for_update(force: bool = False) -> dict:
 
 
 # ── Download + stage ──────────────────────────────────────────────────────────
-def _download(url: str, dest: Path, expected_size: int) -> None:
-    with requests.get(url, headers=_github_headers(), stream=True, timeout=60) as resp:
+def _asset_download(asset: dict) -> tuple[str, dict]:
+    """URL + headers for fetching a release asset.
+
+    Always goes through the asset API endpoint rather than browser_download_url:
+    that form works unauthenticated on a public repo *and* with a token on a
+    private one, so flipping the repo's visibility does not break updates.
+    """
+    headers = _github_headers()
+    headers["Accept"] = "application/octet-stream"
+    return asset.get("url") or asset["browser_download_url"], headers
+
+
+def _download(url: str, dest: Path, expected_size: int, headers: dict | None = None) -> None:
+    with requests.get(url, headers=headers or _github_headers(), stream=True, timeout=60) as resp:
         resp.raise_for_status()
         total = int(resp.headers.get("Content-Length") or expected_size or 0)
         done = 0
@@ -290,7 +309,8 @@ def _run_update(release: dict) -> None:
         zip_path = work_dir / asset_name
 
         _set_state(phase="downloading", progress=1, message="Contacting GitHub…")
-        _download(asset["browser_download_url"], zip_path, asset.get("size", 0))
+        url, headers = _asset_download(asset)
+        _download(url, zip_path, asset.get("size", 0), headers)
 
         expected = _find_checksum(release, asset_name)
         if expected:
