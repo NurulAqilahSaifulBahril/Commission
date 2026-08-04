@@ -11,10 +11,13 @@
 **/dashboard.db-wal
 **/dashboard.db-shm
 
+# Database backups — contain password hashes and full audit history
+/backups/
+
 # Logs — can contain agent names and payout figures from stack traces
 **/dashboard.log
 **/dashboard-*.log
-**/tunnel.log
+10. Electron App/sync/mirror.log
 
 # Dashboard working directory: computed cache + generated commission packs
 8. Web Dashboard/data/
