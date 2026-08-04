@@ -1,10 +1,18 @@
-"""Supabase (Postgres) storage for dashboard users, special cases, factory rates,
+"""Postgres storage for dashboard users, special cases, factory rates,
 and audit log.
 
 Replaces the old special_cases.json / factory_rates.json whole-file-overwrite
 storage with proper tables, atomic writes, and per-change audit history.
-Originally SQLite; ported to Postgres/Supabase so dashboard data lives in a
-hosted, shared database instead of a local file.
+Originally SQLite, then Supabase over psycopg2; now NUrul_DB, reached through
+the pg-proxy HTTP endpoint (there is no postgres:// route to it) via pgproxy.py.
+The tables live in that database's "dashboard" schema, keeping them clear of
+the ERP's own `users` and `audit_log` in public.
+
+Every call site below still reads as psycopg2 -- `with _connect() as conn`,
+conn.execute(...).fetchall(), %s placeholders -- because pgproxy.Connection
+implements that surface. See pgproxy.py for what the HTTP transport can and
+cannot do; the one behavioural difference is that buffered writes are sent
+when the block exits rather than statement by statement.
 """
 
 from __future__ import annotations
@@ -17,9 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import psycopg2
-import psycopg2.extras
-import psycopg2.pool
+import pgproxy
 
 CURRENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CURRENT_DIR.parent
@@ -36,67 +42,23 @@ try:
 except ImportError:
     pass
 
+# Kept only so a stale value in .env cannot silently send writes to the old
+# Supabase project; nothing in this module connects with it any more.
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 _lock = threading.Lock()
-_pool: psycopg2.pool.ThreadedConnectionPool | None = None
-_pool_lock = threading.Lock()
-
-
-def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
-    global _pool
-    if _pool is None:
-        with _pool_lock:
-            if _pool is None:
-                if not DATABASE_URL:
-                    raise RuntimeError(
-                        "DATABASE_URL not set. Add it to Commission/.env "
-                        "(Supabase Project Settings -> Database -> Connection string)."
-                    )
-                _pool = psycopg2.pool.ThreadedConnectionPool(
-                    1, 10, DATABASE_URL,
-                    cursor_factory=psycopg2.extras.RealDictCursor,
-                    sslmode="require",
-                )
-    return _pool
-
-
-class _ConnWrapper:
-    """Thin psycopg2 connection wrapper exposing sqlite3.Connection's
-    convenience .execute()/.executescript(), so the rest of this module
-    (originally written against sqlite3) needs no per-call-site changes."""
-
-    def __init__(self, conn):
-        self._conn = conn
-
-    def execute(self, sql: str, params=()):
-        cur = self._conn.cursor()
-        cur.execute(sql, params)
-        return cur
-
-    def executescript(self, sql: str):
-        cur = self._conn.cursor()
-        cur.execute(sql)
-        return cur
-
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
 
 
 @contextmanager
 def _connect():
-    """Checkout a pooled connection. Commits on a clean exit (matching
-    sqlite3.Connection's context-manager behavior), rolls back on error,
-    and always returns the connection to the pool."""
-    raw_conn = _get_pool().getconn()
-    try:
-        yield _ConnWrapper(raw_conn)
-        raw_conn.commit()
-    except Exception:
-        raw_conn.rollback()
-        raise
-    finally:
-        _get_pool().putconn(raw_conn)
+    """Open a proxy-backed transaction.
+
+    Same contract as the psycopg2 version it replaces: commits on a clean
+    exit, discards the pending writes on error. See pgproxy.Connection for how
+    reads and writes are sequenced over HTTP.
+    """
+    with pgproxy.connect() as conn:
+        yield conn
 
 
 SPECIAL_CASE_FIELDS = [
