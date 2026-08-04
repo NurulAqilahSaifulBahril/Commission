@@ -1194,6 +1194,28 @@ document.addEventListener("DOMContentLoaded", () => {
         updateSpecialCasePreview();
     }
 
+    // Gan Lai Soon's OGM override, mirroring _inject_special_case_rows() in
+    // app.py so a saved case can never render differently from its preview.
+    // He takes a cut of the sales price on outsource invoices only, and never
+    // on his own. The rate is negotiated per agent, so a case may carry its
+    // own; blank falls back to the standard 0.75%.
+    const DEFAULT_GAN_OVERRIDE_PCT = 0.75;
+
+    function ganOverrideApplies(agentName) {
+        const agent = String(agentName || "").trim();
+        if (!agent) return false;
+        const agentType = state.activeAgentType === "all"
+            ? String(state.rawData?.agentTypeMap?.[agent.toLowerCase()] || "")
+            : state.activeAgentType;
+        return agentType === "outsource" && getOutsourceAgentTier(agent) !== "OGM";
+    }
+
+    function ganOverridePctFor(rawValue) {
+        const pct = parseFloat(rawValue);
+        // 0 is a deliberate "no override"; only blank/garbage means "use default".
+        return isNaN(pct) ? DEFAULT_GAN_OVERRIDE_PCT : pct;
+    }
+
     function updateSpecialCasePreview() {
         const sales = parseFloat(modalSalesPrice?.value) || 0;
         const baselineRate = parseFloat(modalBaselineRate?.value) || parseFloat(modalRatePct?.value) || 3.0;
@@ -1239,7 +1261,22 @@ document.addEventListener("DOMContentLoaded", () => {
         if (previewNfpComm) previewNfpComm.textContent = nfp === 0 ? "TBC with Finance" : formatRM(nfpComm);
         if (previewProfitSharingComm) previewProfitSharingComm.textContent = formatRM(profitSharingComm);
         if (previewWaiverSummary) previewWaiverSummary.textContent = `+${formatRM(feeWaiver)}`;
-        
+
+        // Shown for information only: this is Gan Lai Soon's money, so it stays
+        // out of the agent's Total Net Commission below.
+        const ganApplies = ganOverrideApplies(state.selectedSpecialCaseAgent);
+        if (rowGanOverride) rowGanOverride.classList.toggle("hidden", !ganApplies);
+        if (previewGanOverrideRow) previewGanOverrideRow.classList.toggle("hidden", !ganApplies);
+        if (ganApplies) {
+            const ganPct = ganOverridePctFor(modalGanOverridePct?.value);
+            if (previewGanOverrideLabel) {
+                previewGanOverrideLabel.textContent = `Gan Lai Soon Override (${ganPct}%):`;
+            }
+            if (previewGanOverrideComm) {
+                previewGanOverrideComm.textContent = formatRM(salesForCalc * (ganPct / 100));
+            }
+        }
+
         const totalNetComm = basicComm + (nfp === 0 ? 0 : nfpComm);
         if (previewTotalNetComm) previewTotalNetComm.textContent = formatRM(totalNetComm);
     }
@@ -3808,6 +3845,11 @@ modalPackageType.value = defaults.pkg || "-";
     const previewNfpComm = document.getElementById("previewNfpComm");
     const previewProfitSharingRow = document.getElementById("previewProfitSharingRow");
     const previewProfitSharingComm = document.getElementById("previewProfitSharingComm");
+    const rowGanOverride = document.getElementById("rowGanOverride");
+    const modalGanOverridePct = document.getElementById("modalGanOverridePct");
+    const previewGanOverrideRow = document.getElementById("previewGanOverrideRow");
+    const previewGanOverrideLabel = document.getElementById("previewGanOverrideLabel");
+    const previewGanOverrideComm = document.getElementById("previewGanOverrideComm");
     const confirmModalBtn = document.getElementById("confirmModalBtn");
     const deleteModalBtn = document.getElementById("deleteModalBtn");
     const closeModalBtn = document.getElementById("closeModalBtn");
@@ -4029,6 +4071,9 @@ modalPackageType.value = defaults.pkg || "-";
         if (modalFeeWaiver) modalFeeWaiver.value = "0";
         if (modalProfitSharingPct) modalProfitSharingPct.value = "0";
         if (modalAdjustedSalesPrice) modalAdjustedSalesPrice.value = "";
+        // Blank, not "0.75": a new case tracks the standard rate until someone
+        // deliberately overrides it.
+        if (modalGanOverridePct) modalGanOverridePct.value = "";
         modalRemarks.value = "";
 
         onSpecialCaseTypeChange();
@@ -4070,6 +4115,9 @@ modalPackageType.value = defaults.pkg || "-";
         if (modalFeeWaiver) modalFeeWaiver.value = "0";
         if (modalProfitSharingPct) modalProfitSharingPct.value = "0";
         if (modalAdjustedSalesPrice) modalAdjustedSalesPrice.value = "";
+        // Blank, not "0.75": a new case tracks the standard rate until someone
+        // deliberately overrides it.
+        if (modalGanOverridePct) modalGanOverridePct.value = "";
         modalRemarks.value = "";
 
         confirmModalBtn.textContent = "Confirm & Add";
@@ -4123,6 +4171,9 @@ modalPackageType.value = defaults.pkg || "-";
         if (modalFeeWaiver) modalFeeWaiver.value = data.feeWaiver ?? 0;
         if (modalProfitSharingPct) modalProfitSharingPct.value = data.profitSharingPct ?? 0;
         if (modalAdjustedSalesPrice) modalAdjustedSalesPrice.value = data.adjustedSalesPrice ?? "";
+        // Blank for cases saved before this field existed, which is exactly the
+        // "use the standard rate" state they have always had.
+        if (modalGanOverridePct) modalGanOverridePct.value = data.ganOverridePct ?? "";
         modalRemarks.value = data.remarks || "";
         
         onSpecialCaseTypeChange();
@@ -4136,7 +4187,8 @@ modalPackageType.value = defaults.pkg || "-";
     }
 
     // Modal Input & Select Listeners
-    [modalSalesPrice, modalRatePct, modalSystemPrice, modalNetFloorPrice, modalFeeWaiver, modalAdjustedSalesPrice].forEach(input => {
+    [modalSalesPrice, modalRatePct, modalSystemPrice, modalNetFloorPrice, modalFeeWaiver,
+     modalAdjustedSalesPrice, modalGanOverridePct].forEach(input => {
         if (input) {
             input.addEventListener("input", updateSpecialCasePreview);
         }
@@ -4246,16 +4298,14 @@ modalPackageType.value = defaults.pkg || "-";
                 }
             }
 
-            // OGM override: Gan Lai Soon earns 0.75% of the sales price on every
+            // OGM override: Gan Lai Soon takes a cut of the sales price on every
             // OUM/OSA invoice (outsource_basic_commission.py), so a special case
-            // booked under one of his agents has to fill his column too. He earns
-            // nothing on his own invoices.
-            const caseAgentType = state.activeAgentType === "all"
-                ? String(state.rawData?.agentTypeMap?.[String(agent).toLowerCase()] || "")
-                : state.activeAgentType;
-            const ganLaiSoonComm = (caseAgentType === "outsource"
-                && getOutsourceAgentTier(agent) !== "OGM")
-                ? salesForCalc * 0.0075 : 0;
+            // booked under one of his agents has to fill his column too. The rate
+            // defaults to 0.75% but is negotiated per agent, so the case can carry
+            // its own. He earns nothing on his own invoices.
+            const ganOverridePct = ganOverridePctFor(modalGanOverridePct?.value);
+            const ganLaiSoonComm = ganOverrideApplies(agent)
+                ? salesForCalc * (ganOverridePct / 100) : 0;
             const ganLaiSoonStr = ganLaiSoonComm
                 ? `RM ${ganLaiSoonComm.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`
                 : "-";
@@ -4321,10 +4371,16 @@ modalPackageType.value = defaults.pkg || "-";
             const wantsBasic = affectsBothCommissions || rowKind === "basic" || rowKind === "all";
             const wantsNfp = affectsBothCommissions || rowKind === "nfp" || rowKind === "all";
 
+            // Stored as typed, so a blank stays blank and keeps tracking the
+            // standard rate rather than freezing today's 0.75% into the case.
+            const ganOverridePctRaw = ganOverrideApplies(agent)
+                ? String(modalGanOverridePct?.value ?? "").trim() : "";
+
             const dataObject = {
                 agent, customer, pkg, system, nfp, sales, rate, remarks,
                 profitSharingPct, specialCaseType, feeWaiver, adjustedSalesPrice,
-                caseType: state.specialCaseMode, rowKind
+                caseType: state.specialCaseMode, rowKind,
+                ganOverridePct: ganOverridePctRaw
             };
 
             if (state.editingPair) {

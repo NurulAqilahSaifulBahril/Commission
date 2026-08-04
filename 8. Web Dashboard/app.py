@@ -358,6 +358,17 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
             adjusted_sales_price = case.get("adjustedSalesPrice")
             adjusted_sales_price = float(adjusted_sales_price) if adjusted_sales_price else 0.0
             remarks = str(case.get("remarks") or "").strip() or "-"
+            # Blank means "use the standard rate", which is not the same as 0.
+            # Anything unparseable falls back to the standard rate rather than
+            # raising: the enclosing except would drop the whole case, making a
+            # special case vanish from the report over one bad rate. This also
+            # keeps it in step with ganOverridePctFor() in app.js.
+            try:
+                raw_gan_pct = str(case.get("ganOverridePct") or "").strip()
+                gan_override_pct = (float(raw_gan_pct) if raw_gan_pct
+                                    else db.DEFAULT_GAN_OVERRIDE_PCT)
+            except (TypeError, ValueError):
+                gan_override_pct = db.DEFAULT_GAN_OVERRIDE_PCT
         except (TypeError, ValueError):
             continue
         if not agent or not customer:
@@ -393,10 +404,13 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
         else:
             nfp_comm_str = "-"
 
-        # OGM override: Gan Lai Soon earns 0.75% of the sales price on every
+        # OGM override: Gan Lai Soon takes a cut of the sales price on every
         # OUM/OSA invoice (outsource_basic_commission.py), so a special case
-        # booked under one of his agents credits his column too.
-        gan_comm = sales_for_calc * 0.0075 if (agent_type == "outsource" and not _is_ogm(agent)) else 0.0
+        # booked under one of his agents credits his column too. The rate is
+        # 0.75% by default but negotiated per agent, so the case may carry its
+        # own. He still earns nothing on his own invoices.
+        gan_comm = (sales_for_calc * (gan_override_pct / 100)
+                    if (agent_type == "outsource" and not _is_ogm(agent)) else 0.0)
 
         data_json = json.dumps({k: case.get(k) for k in db.SPECIAL_CASE_FIELDS})
 

@@ -69,7 +69,16 @@ SPECIAL_CASE_FIELDS = [
     # (a whole new customer). Only that row is rebuilt — a case added from the
     # Net Floor Price row must not also restate the Basic Commission.
     "rowKind",
+    # Gan Lai Soon's OGM override rate for this case, as a percent. His cut is
+    # 0.75% of sales on most outsource invoices, but it is negotiated per agent,
+    # so a case can carry its own. Blank/absent means the 0.75% default, which
+    # is what every case saved before this field existed relies on.
+    "ganOverridePct",
 ]
+
+# Gan Lai Soon's OGM override when a case does not name its own rate. Defined
+# here so app.py and the JS preview cannot drift to different defaults.
+DEFAULT_GAN_OVERRIDE_PCT = 0.75
 
 
 def _now() -> str:
