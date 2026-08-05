@@ -4,6 +4,7 @@ import sys
 import tempfile
 import traceback
 import logging
+import html
 import json
 import uuid
 from pathlib import Path
@@ -293,6 +294,54 @@ def _special_case_money(v: float) -> str:
     return f"RM {v:,.2f}" if v else "-"
 
 
+def _annotate_gan_override(rows: list, headers: list, agent_i: int, customer_i: int,
+                           comm_i: int, gan_i: int, agent: str, customer: str,
+                           gan_comm: float, data_json: str = "") -> None:
+    """Show a revised OGM override on the invoice's existing Basic row.
+
+    A case raised from Gan Lai Soon's column changes his cut and nothing else,
+    so no row is restated. The old figure stays on top with the new one in red
+    beneath it, the same shape the Net Floor Price cell uses for a revised
+    floor price. The markup is emitted here rather than client-side because
+    this path also feeds a fresh page load, where the browser has no memory of
+    the edit; the table writes cell values with innerHTML, as it already does
+    for the factory profit-sharing cell.
+    """
+    want_agent = agent.strip().lower()
+    want_customer = customer.strip().lower()
+
+    for row in rows:
+        if agent_i != -1 and str(row[agent_i] or "").strip().lower() != want_agent:
+            continue
+        if customer_i != -1 and str(row[customer_i] or "").strip().lower() != want_customer:
+            continue
+        if "basic" not in str(row[comm_i] or "").lower():
+            continue
+
+        original = str(row[gan_i] or "-").strip()
+        # Already annotated (two cases for one invoice, or a repeat render), or
+        # an invoice he earns nothing on: leave the cell alone either way.
+        if original.startswith("<") or original == "-":
+            return
+
+        new_value = _special_case_money(gan_comm)
+        if new_value == original:
+            return
+        row[gan_i] = (
+            '<div class="special-case-merge-stack">'
+            f'<span class="special-case-primary-value">{html.escape(original)}</span>'
+            f'<span class="special-case-secondary-value">{html.escape(new_value)}</span>'
+            "</div>"
+        )
+        # The browser recognises a stored case by the extra element on the row,
+        # and needs it here so re-opening this cell loads the rate that was
+        # saved instead of an empty box. It reads rowKind to know this one
+        # restated nothing, so the row keeps its ordinary styling.
+        if data_json and len(row) == len(headers):
+            row.append(data_json)
+        return
+
+
 def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, agent_type: str) -> None:
     """Overlay special cases (added via the "Add Special Case" / "Add Special
     Case Customer" modal) onto the commission rows returned to the browser.
@@ -337,11 +386,86 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
     price_i = idx("Commission Price")
     gan_i = idx("Gan Lai Soon", "Gan Lai Soon (RM)")
     remarks_i = idx("Remarks")
+    inv_date_i = idx("Invoice Date")
+    first_pay_i = idx("1st Payment Date")
+    # July 2026+ months title this column "75% Payment Date".
+    full_pay_i = idx("Full Payment Date", "75% Payment Date")
+    date_cols = [i for i in (inv_date_i, first_pay_i, full_pay_i) if i != -1]
 
     # Mirrors getOutsourceAgentTier() in app.js: Gan Lai Soon is the sole OGM
     # and takes no override on his own invoices.
     def _is_ogm(name: str) -> bool:
         return name.lower().strip() == "gan lai soon"
+
+    def _organic_dates(agent_name: str, customer_name: str) -> dict:
+        """Date cells ('basic'/'nfp' -> {col: value}) of the customer's own rows
+        already in the table, so a special case keeps showing the invoice's
+        Invoice Date / 1st Payment Date / Full Payment Date instead of "-".
+
+        The Agent column names the agent only on the first row of their block,
+        so the scan carries it forward exactly like the client does. Rows with
+        the special-case JSON tail are other cases — never a date source."""
+        want_agent = agent_name.lower().strip()
+        want_cust = customer_name.lower().strip()
+        found: dict = {}
+        if not date_cols or customer_i == -1:
+            return found
+        cur_agent = ""
+        for r in rows:
+            if len(r) > len(headers):
+                continue
+            cell_agent = str(r[agent_i] or "").strip() if agent_i != -1 else ""
+            if cell_agent and cell_agent != "-":
+                cur_agent = cell_agent
+            if cur_agent.lower().strip() != want_agent:
+                continue
+            if str(r[customer_i] or "").strip().lower() != want_cust:
+                continue
+            kind = str(r[comm_i] or "").lower() if comm_i != -1 else ""
+            key = "nfp" if ("net floor" in kind or "netfloor" in kind) else "basic"
+            dates = {i: r[i] for i in date_cols
+                     if str(r[i] or "").strip() not in ("", "-")}
+            if dates and key not in found:
+                found[key] = dates
+        return found
+
+    def _lines_dates(customer_name: str) -> dict:
+        """Fallback for a hand-added customer with no rows in this month's
+        table: their invoice dates from the cached commission lines (any month
+        of the year), formatted the way get_dates_for_invoices renders them."""
+        out: dict = {}
+        if not date_cols:
+            return out
+        try:
+            bundle = get_cached_data(year, agent_type) or {}
+            basic_tuple = bundle.get("basic") or ()
+            lines = basic_tuple[-1] if basic_tuple else []
+            want = customer_name.lower().strip()
+            inv_dates, first_dates, full_dates = set(), set(), set()
+            for ln in lines:
+                if str(getattr(ln, "customer_name", "") or "").strip().lower() != want:
+                    continue
+                d = str(getattr(ln, "invoice_date", "") or "")[:10]
+                if d:
+                    inv_dates.add(d)
+                d = str(getattr(ln, "first_payment_date", "") or "")[:10]
+                if d:
+                    first_dates.add(d)
+                d = str(getattr(ln, "full_payment_date", "") or "")[:10]
+                if d:
+                    full_dates.add(d)
+            cells = {}
+            if inv_date_i != -1 and inv_dates:
+                cells[inv_date_i] = "<br/>".join(sorted(inv_dates))
+            if first_pay_i != -1 and first_dates:
+                cells[first_pay_i] = "<br/>".join(sorted(first_dates))
+            if full_pay_i != -1 and full_dates:
+                cells[full_pay_i] = "<br/>".join(sorted(full_dates))
+            if cells:
+                out["basic"] = cells
+        except Exception:
+            pass
+        return out
 
     for case in cases:
         try:
@@ -414,6 +538,11 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
 
         data_json = json.dumps({k: case.get(k) for k in db.SPECIAL_CASE_FIELDS})
 
+        # Invoice/payment dates for this case's customer: their rows already in
+        # the table first, else the cached commission lines (a hand-added
+        # customer has no rows this month). A customer with neither keeps "-".
+        organic_dates = _organic_dates(agent, customer) or _lines_dates(customer)
+
         def build_row(comm_type: str, price_val: str, sales_val: str) -> list:
             row = ["-"] * len(headers)
             if agent_i != -1: row[agent_i] = agent
@@ -428,6 +557,13 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
             if gan_i != -1:
                 row[gan_i] = _special_case_money(gan_comm) if "basic" in comm_type.lower() else "-"
             if remarks_i != -1: row[remarks_i] = remarks
+            # Each restated row takes the dates of the commission row it
+            # replaces, falling back to the other side of the pair.
+            date_src = (organic_dates.get("nfp" if "net floor" in comm_type.lower() else "basic")
+                        or organic_dates.get("basic") or organic_dates.get("nfp"))
+            if date_src:
+                for _ci, _val in date_src.items():
+                    row[_ci] = _val
             row.append(data_json)
             return row
 
@@ -435,8 +571,19 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
         # added from the Net Floor Price row leaves Basic Commission alone, and
         # vice versa; "all" (a brand-new customer) still produces both.
         row_kind = str(case.get("rowKind") or "all").strip().lower()
-        if row_kind not in ("basic", "nfp"):
+        if row_kind not in ("basic", "nfp", "gan"):
             row_kind = "all"
+
+        # "gan" is the odd one out: raised from Gan Lai Soon's column, it changes
+        # only his override and must leave the agent's own commissions exactly as
+        # they were. So it restates nothing — no New Basic Commission row, no New
+        # Net Floor Price row — and instead annotates the existing Basic row so
+        # its override cell shows the old figure above the new one.
+        if row_kind == "gan":
+            if gan_i != -1 and comm_i != -1:
+                _annotate_gan_override(rows, headers, agent_i, customer_i, comm_i,
+                                       gan_i, agent, customer, gan_comm, data_json)
+            continue
         # Exception, mirroring app.js: Adjusted Sales Price changes the figure
         # BOTH commissions are derived from, so it always restates both.
         if special_case_type == "adjusted_sales_price":
@@ -763,7 +910,8 @@ def api_update_status():
 @app.route("/api/agent-name-map")
 def agent_name_map():
     """Nickname -> canonical full-name lookup so the frontend can display full
-    agent names (Title Case) in every table. Sourced from the Agent Name List."""
+    agent names (Title Case) in every table. Sourced from the Agent Roles &
+    Hierarchy page (agent_roles table)."""
     try:
         return jsonify({"map": agent_names.get_map()})
     except Exception:
@@ -1931,8 +2079,23 @@ def agent_roles_pg_list_api():
 
 # Query Postgres with a schema-correct single query that joins user and agent tables,
         # filters status from access_level, and excludes blocked users.
+        # One row per PERSON. Merged primarily by link_key -- an agent row's own
+        # linked_user_login, resolved through the join below -- because that is
+        # the one signal a typo cannot break: eeAdmin's own foreign key, not a
+        # name comparison. A name mismatch on an otherwise-linked pair (e.g. the
+        # user account spelled "Chong Lee", the agent record spelled "Cong Lee")
+        # used to produce two rows for one person, the agent-table typo
+        # unnoticed because eeAdmin's own UI reads the user record. Falling back
+        # to the normalized name only when link_key is NULL (no linked_user_login
+        # at all) keeps today's behaviour for agent records with no user account
+        # to link to -- matching on whitespace-collapsed name still catches
+        # "KOH YEONG CHERNG" vs "KOH  YEONG CHERNG" for those.
+        #
+        # role_rank decides which record survives the merge first, then whichever
+        # side actually carries a non-blank agent_type (a blank must never beat
+        # a real one merely because it belongs to the row ranked first), then pri.
         user_rows, err_sql = _try_users_sql("""
-            SELECT DISTINCT ON (LOWER(BTRIM(au.name)))
+            SELECT DISTINCT ON (COALESCE(au.link_key, LOWER(regexp_replace(BTRIM(au.name), '[[:space:]]+', ' ', 'g'))))
                    au.bubble_id,
                    au.name,
                    au.agent_type,
@@ -1943,13 +2106,17 @@ def agent_roles_pg_list_api():
             FROM (
               -- Users
               SELECT u.bubble_id,
+                     u.bubble_id AS link_key,
                      u.name,
                      u.agent_type,
                      u.access_level,
                      CASE WHEN 'pending' = ANY(u.access_level) THEN 'Pending' ELSE 'Active' END AS status,
                      u.main_department AS branch,
                      u.created_at AS start_date,
-                     1 AS pri
+                     1 AS pri,
+                     CASE WHEN LOWER(COALESCE(u.access_level::text, '')) ~
+                       '(oum|osa|ogm|senior|executive|consultant|manager|director)'
+                       THEN 0 ELSE 1 END AS role_rank
               FROM "user" u
               WHERE COALESCE(BTRIM(u.name), '') <> ''
                 AND (u.access_level IS NULL OR NOT ('blocked' = ANY(u.access_level)))
@@ -1957,18 +2124,25 @@ def agent_roles_pg_list_api():
                   LOWER(COALESCE(u.agent_type, '')) ~ '(internal|outsource|sales)'
                   OR LOWER(COALESCE(u.access_level::text, '')) ~ '(internal|outsource|sales)'
                 )
-                
+
               UNION ALL
-              
-              -- Agents joined with users
+
+              -- Agents joined with users. link_key is the linked user's own
+              -- bubble_id (NULL when linked_user_login names no real user), so
+              -- a linked agent row merges with its user row above regardless of
+              -- whether the two name fields agree.
               SELECT ag.bubble_id,
+                     u.bubble_id AS link_key,
                      ag.name,
                      COALESCE(ag.agent_type, u.agent_type) AS agent_type,
                      u.access_level,
                      CASE WHEN u.access_level IS NOT NULL AND 'pending' = ANY(u.access_level) THEN 'Pending' ELSE 'Active' END AS status,
                      u.main_department AS branch,
                      COALESCE(ag.created_date, u.created_at) AS start_date,
-                     2 AS pri
+                     2 AS pri,
+                     CASE WHEN LOWER(COALESCE(u.access_level::text, '')) ~
+                       '(oum|osa|ogm|senior|executive|consultant|manager|director)'
+                       THEN 0 ELSE 1 END AS role_rank
               FROM agent ag
               LEFT JOIN "user" u ON u.bubble_id = ag.linked_user_login
               WHERE COALESCE(BTRIM(ag.name), '') <> ''
@@ -1979,7 +2153,10 @@ def agent_roles_pg_list_api():
                   OR LOWER(COALESCE(u.access_level::text, '')) ~ '(internal|outsource|sales)'
                 )
             ) au
-            ORDER BY LOWER(BTRIM(au.name)), au.pri
+            ORDER BY COALESCE(au.link_key, LOWER(regexp_replace(BTRIM(au.name), '[[:space:]]+', ' ', 'g'))),
+                     au.role_rank,
+                     CASE WHEN COALESCE(au.agent_type, '') = '' THEN 1 ELSE 0 END,
+                     au.pri
         """)
 
         # If it failed, log the error
@@ -2037,25 +2214,49 @@ def agent_roles_pg_list_api():
         # unrelated ID sequences (matching by linked_user_login can miss).
         ic_photo_by_name = {}
 
-        def _try_ic_query(sql_str):
+        def _try_optional_query(sql_str, label="OPTIONAL"):
+            """Run a query whose failure must not take the whole page down."""
             try:
                 r = mod._proxy_sql(proxy_url=proxy_url, db_name=db_name, token=token,
                                    sql=sql_str, params=[])
                 return r.get("rows") or r.get("data") or []
             except Exception as ex:
-                _log(f"[IC PHOTO QUERY SKIPPED] {ex}")
+                _log(f"[{label} QUERY SKIPPED] {ex}")
                 return []
 
-        ic_photo_rows = _try_ic_query("""
+        ic_photo_rows = _try_optional_query("""
             SELECT LOWER(BTRIM(name)) AS name_key, ic_front FROM agent WHERE ic_front IS NOT NULL
             UNION ALL
             SELECT LOWER(BTRIM(name)) AS name_key, ic_front FROM "user" WHERE ic_front IS NOT NULL
-        """)
+        """, "IC PHOTO")
         for row in ic_photo_rows:
             key = str(row.get("name_key") or "").strip()
             url = str(row.get("ic_front") or "").strip()
             if key and url and key not in ic_photo_by_name:
                 ic_photo_by_name[key] = url
+
+        # ── Blocked accounts ─────────────────────────────────────────────────
+        # The main query already leaves blocked accounts out of the pull, but
+        # that alone does not keep them off the page: a row saved before someone
+        # was blocked is still drawn by the "agent not in Postgres" path, which
+        # exists for Excel-only entries and for people deleted from eeAdmin.
+        # Naming the blocked ids is what lets the page tell those cases apart —
+        # deleted from eeAdmin means keep the row, blocked means drop it.
+        #
+        # Matching is by bubble_id only. Names are not unique here (one person
+        # can hold several eeAdmin records under different spellings), so a
+        # name match could hide the wrong agent's hierarchy.
+        blocked_ids = []
+        for row in _try_optional_query("""
+            SELECT u.bubble_id FROM "user" u WHERE 'blocked' = ANY(u.access_level)
+            UNION ALL
+            SELECT ag.bubble_id FROM agent ag
+              JOIN "user" u2 ON u2.bubble_id = ag.linked_user_login
+             WHERE 'blocked' = ANY(u2.access_level)
+        """, "BLOCKED IDS"):
+            bid = str(row.get("bubble_id") or "").strip()
+            if bid:
+                blocked_ids.append(bid)
 
         # ── Build response ───────────────────────────────────────────────────
         def to_sentence_case(name):
@@ -2074,99 +2275,119 @@ def agent_roles_pg_list_api():
             re.IGNORECASE,
         )
 
+        # ── Role vocabulary ──────────────────────────────────────────────────
+        # Outsource tiers, most senior first — checked before the Internal tiers
+        # so an outsource agent's tags never fall through to an Internal label.
+        # The acronyms are matched on a word boundary, never as a bare substring:
+        # "osa" inside a nickname tag like "Rosa" is not a role.
+        _OUTSOURCE_TIER_PATTERNS = [
+            # OGM is retired — kept only so the handful of agents still carrying
+            # the tag keep resolving instead of silently losing their role.
+            (re.compile(r"\bogm\b", re.IGNORECASE), "OGM"),
+            (re.compile(r"\boum\b", re.IGNORECASE), "OUM"),
+            (re.compile(r"\bosa\b", re.IGNORECASE), "OSA"),
+        ]
+        # Internal tiers, most senior first. The specific multi-word titles have
+        # to precede the two loose entries at the bottom: "senior sales
+        # consultant" and "senior branch director" both contain "senior", and
+        # the looser rule would otherwise swallow them.
+        _INTERNAL_TIER_PATTERNS = [
+            # Retired like OGM, and kept for the same reason.
+            (re.compile(r"regional\s+sales\s+director", re.IGNORECASE), "Regional Sales Director"),
+            (re.compile(r"senior\s+branch\s+director", re.IGNORECASE), "Senior Branch Director"),
+            (re.compile(r"branch\s+sales\s+manager", re.IGNORECASE), "Branch Sales Manager"),
+            (re.compile(r"sales\s+development\s+manager", re.IGNORECASE), "Sales Development Manager"),
+            (re.compile(r"sales\s+team\s+manager", re.IGNORECASE), "Sales Team Manager"),
+            (re.compile(r"senior\s+sales\s+consultant", re.IGNORECASE), "Senior Sales Consultant"),
+            (re.compile(r"sales\s+consultant", re.IGNORECASE), "Sales Consultant"),
+            # Deliberately loose: any leftover tag carrying "senior" or
+            # "executive" is that tier, whether or not it spells out the full
+            # "sales senior" / "sales executive". eeAdmin tags are typed by hand
+            # and both spellings are in use.
+            (re.compile(r"senior", re.IGNORECASE), "Sales Senior"),
+            (re.compile(r"executive", re.IGNORECASE), "Sales Executive"),
+        ]
+
+        def _classify_role_tag(tag):
+            """(agent_type, Role) for one tag, or None. Each tag is classified on
+            its own rather than against a joined blob, so a phrase like "senior
+            sales consultant" can never bleed into a separate "senior" tag."""
+            for pat, role in _OUTSOURCE_TIER_PATTERNS:
+                if pat.search(tag):
+                    return ("Outsource", role)
+            for pat, role in _INTERNAL_TIER_PATTERNS:
+                if pat.search(tag):
+                    return ("Internal", role)
+            return None
+
         def extract_nick_name(access_level):
-            """The one access_level tag that isn't a known role/branch/permission
-            label is treated as the agent's nickname (e.g. 'jerry', 'lk')."""
+            """The one access_level tag that is neither a known
+            role/branch/permission label nor a role title is treated as the
+            agent's nickname (e.g. 'jerry', 'lk'). Role tags have to be excluded
+            explicitly as well as by _KNOWN_TAG_RE: a bare "senior" or
+            "executive" tag names a role under the loose matching above but
+            carries none of the words that pattern looks for."""
             for tag in (access_level or []):
                 tag = str(tag).strip()
-                if tag and not _KNOWN_TAG_RE.search(tag):
+                if tag and not _KNOWN_TAG_RE.search(tag) and not _classify_role_tag(tag):
                     return to_sentence_case(tag)
             return ""
 
-        # Outsource tiers, most senior first — checked before Internal tiers so
-        # an outsource agent's tags never fall through to an Internal label.
-        _OUTSOURCE_TIER_KEYWORDS = [("ogm", "OGM"), ("oum", "OUM"), ("osa", "OSA/OSA1")]
-        # The 7-tier structure that replaced Senior/Executive from July 2026,
-        # most senior first. Checked before the old tiers so a tag like "senior
-        # sales consultant" or "senior branch director" is never miscategorised
-        # as the old plain "Senior".
-        _NEW_TIER_KEYWORDS = [
-            ("regional sales director", "Regional Sales Director"),
-            ("senior branch director", "Senior Branch Director"),
-            ("branch sales manager", "Branch Sales Manager"),
-            ("sales development manager", "Sales Development Manager"),
-            ("sales team manager", "Sales Team Manager"),
-            ("senior sales consultant", "Senior Sales Consultant"),
-            ("sales consultant", "Sales Consultant"),
-        ]
-        _OLD_TIER_KEYWORDS = [("senior", "Senior"), ("executive", "Executive")]
+        def extract_roles(access_level):
+            """Every distinct role the agent's tags name, most senior first, as
+            [{"hierarchy": ..., "agent_type": ...}].
 
-        def _classify_role_tag(tag):
-            """('outsource'|'new'|'old', Role) for one tag, or None. Checked as a
-            whole tag (not a joined blob) so a phrase like "senior sales
-            consultant" can never bleed into a separate "senior" tag elsewhere
-            and manufacture a false old-vs-new conflict."""
-            low = tag.lower()
-            for kw, role in _OUTSOURCE_TIER_KEYWORDS:
-                if kw in low:
-                    return ("outsource", role)
-            for kw, role in _NEW_TIER_KEYWORDS:
-                if kw in low:
-                    return ("new", role)
-            for kw, role in _OLD_TIER_KEYWORDS:
-                if kw in low:
-                    return ("old", role)
-            return None
-
-        def _pick_highest(matches, priority_list):
-            """First (highest-ranked) role in priority_list order that appears
-            in matches (a set of role strings)."""
-            for _, role in priority_list:
-                if role in matches:
-                    return role
-            return None
-
-        def extract_role(access_level):
-            """(role, conflict) — role is '' when nothing matched or the tags
-            span more than one of the three role systems at once (outsource /
-            new 7-tier / old Senior-Executive). That's a real ambiguity
-            Postgres can't resolve by itself, since tags carry no timestamp of
-            when each applied — a human needs to either split it into dated
-            rows (old system tag vs new system tag) or resolve a genuine
-            outsource-vs-internal mismatch (a messier case than a same-system
-            promotion)."""
-            by_bucket = {"outsource": set(), "new": set(), "old": set()}
+            An agent routinely holds several at once — a promotion adds the new
+            tag without removing the old one, and a transfer can leave an
+            Internal and an Outsource tag side by side. The tags carry no dates,
+            so Postgres cannot say which period each covers and this must not
+            guess: every role is returned and the page turns each into its own
+            row for a human to date. Collapsing them to one role (or refusing
+            to pick, as the old "needs split" flag did) either invented history
+            or hid it."""
+            seen, out = set(), []
+            classified = set()
             for tag in (access_level or []):
-                classified = _classify_role_tag(str(tag).strip())
-                if classified:
-                    bucket, role = classified
-                    by_bucket[bucket].add(role)
+                hit = _classify_role_tag(str(tag).strip())
+                if hit:
+                    classified.add(hit)
+            # Emit in seniority order rather than tag order, so the row a reader
+            # sees first is the agent's most senior title.
+            for pat_list, want_type in ((_OUTSOURCE_TIER_PATTERNS, "Outsource"),
+                                        (_INTERNAL_TIER_PATTERNS, "Internal")):
+                for _, role in pat_list:
+                    if (want_type, role) in classified and role not in seen:
+                        seen.add(role)
+                        out.append({"hierarchy": role, "agent_type": want_type})
+            return out
 
-            categories_present = [k for k in ("outsource", "new", "old") if by_bucket[k]]
-            if len(categories_present) >= 2:
-                return "", True  # conflict — needs a human to resolve
-            if by_bucket["outsource"]:
-                return _pick_highest(by_bucket["outsource"], _OUTSOURCE_TIER_KEYWORDS) or "", False
-            if by_bucket["new"]:
-                return _pick_highest(by_bucket["new"], _NEW_TIER_KEYWORDS) or "", False
-            if by_bucket["old"]:
-                return _pick_highest(by_bucket["old"], _OLD_TIER_KEYWORDS) or "", False
-            return "", False
-
+        # "tam-" is a misspelling of "team-" that a handful of eeAdmin records
+        # carry. _KNOWN_TAG_RE above already allows for it so those tags are not
+        # mistaken for nicknames; matching it here too is what stops the same
+        # agents silently showing no branch at all.
+        # Named after the eeAdmin tag they come from, so the value on screen and
+        # the tag an admin sees in eeAdmin are the same word. Anything not on
+        # this list is not a branch.
         _BRANCH_TAG_KEYWORDS = [
-            ("team-jb", "JB Sales Branch"),
-            ("team-kluang", "Kluang Sales Branch"),
-            ("team-klang", "Klang Sales Branch"),
-            ("team-seremban", "Seremban Sales Branch"),
+            ("jb", "Team-JB"),
+            ("kluang", "Team-Kluang"),
+            ("klang", "Team-Klang"),
+            ("seremban", "Team-Seremban"),
         ]
+        _BRANCH_TAG_PREFIX_RE = re.compile(r"^t(?:e)?am-", re.IGNORECASE)
 
         def extract_branch(access_level):
             """A 'team-xxx' active tag names the branch far more reliably than
-            main_department, which is blank for most agents."""
+            main_department, which is blank for most agents. Only the part after
+            the prefix is compared, so "klang" can never match inside
+            "team-kluang" — the two branch names differ by one letter."""
             for tag in (access_level or []):
                 low = str(tag).strip().lower()
+                if not _BRANCH_TAG_PREFIX_RE.match(low):
+                    continue
+                suffix = _BRANCH_TAG_PREFIX_RE.sub("", low, count=1).strip()
                 for kw, branch in _BRANCH_TAG_KEYWORDS:
-                    if kw in low:
+                    if suffix == kw:
                         return branch
             return ""
 
@@ -2182,21 +2403,42 @@ def agent_roles_pg_list_api():
             access_text = " ".join(access_level).lower()
             combined_text = f"{low_type} {access_text}"
             
+            # Only "internal" and "outsource" name a rate table. A bare "sales"
+            # tag (or no matching tag at all) does not, so it must not resolve to
+            # one silently: agent_type picks which RATE_ROLES table prices the
+            # commission, and "Sales" was landing on the Internal list by way of
+            # a missing key rather than by anyone's decision. Leave it blank and
+            # let the page ask for a human call instead.
+            type_unknown = False
             if "outsource" in combined_text:
                 agent_type = "Outsource"
             elif "internal" in combined_text:
                 agent_type = "Internal"
-            elif "sales" in combined_text:
-                agent_type = "Sales"
             else:
-                agent_type = "Internal" # fallback
+                agent_type = ""
+                type_unknown = True
                 
             status = str(r.get("status") or "Active").strip().title()
-            branch = extract_branch(access_level) or str(r.get("branch") or "").strip()
+            # Only the four sales branches are branches. main_department is NOT
+            # a fallback for them — it holds things like "Sales Dept",
+            # "Engineering Dept" or "Strategy & Partnership; C&I Project",
+            # which are departments, not the branch this page means. Letting it
+            # through is how 38 rows ended up with a Branch that is not one.
+            branch = extract_branch(access_level)
             ic_no = ""
             ic_photo_url = ic_photo_by_name.get(name.strip().lower(), "")
             nick_name = extract_nick_name(access_level)
-            hierarchy, role_conflict = extract_role(access_level)
+            roles = extract_roles(access_level)
+            # `hierarchy` stays in the payload for any reader that predates the
+            # split and expects one role — it names the most senior. The page
+            # itself reads `roles` and draws a row per entry.
+            hierarchy = roles[0]["hierarchy"] if roles else ""
+            # An agent whose tags name only outsource (or only internal) roles
+            # settles the agent type that the tag blob left unknown.
+            role_types = {r["agent_type"] for r in roles}
+            if type_unknown and len(role_types) == 1:
+                agent_type = next(iter(role_types))
+                type_unknown = False
 
             start_date_raw = r.get("start_date")
             start_date = ""
@@ -2210,18 +2452,23 @@ def agent_roles_pg_list_api():
                 "bubble_id": bid,
                 "name": name,
                 "agent_type": agent_type,
+                "type_unknown": type_unknown,
                 "status": status,
                 "branch": branch,
                 "ic_no": ic_no,
                 "ic_photo_url": ic_photo_url,
                 "nick_name": nick_name,
                 "hierarchy": hierarchy,
-                "role_conflict": role_conflict,
+                "roles": roles,
+                # Retired: several role tags at once is the normal case now and
+                # produces one row each, not an error a human has to unpick.
+                "role_conflict": False,
                 "start_date": start_date,
             })
 
         result.sort(key=lambda x: x.get("name", "").lower())
-        return jsonify({"agents": result, "total": len(result)})
+        return jsonify({"agents": result, "total": len(result),
+                        "blocked_ids": sorted(set(blocked_ids))})
     except Exception as e:
         _log("[AGENT PG LIST ERROR]\n" + traceback.format_exc())
         return jsonify({"error": _public_error_message(e, "Failed to load agent list from Postgres")}), 500
@@ -2535,11 +2782,12 @@ def agent_roles_seed_api():
         # Query Postgres with a schema-correct single query that joins user and agent tables,
         # filters status from access_level, and excludes blocked users.
         sql = """
-            SELECT DISTINCT ON (LOWER(BTRIM(au.name)))
+            SELECT DISTINCT ON (COALESCE(au.link_key, LOWER(BTRIM(au.name))))
                    au.name, au.agent_type, au.access_level, au.branch, au.start_date
             FROM (
               -- Users
-              SELECT u.name,
+              SELECT u.bubble_id AS link_key,
+                     u.name,
                      u.agent_type,
                      u.access_level,
                      u.main_department AS branch,
@@ -2554,11 +2802,15 @@ def agent_roles_seed_api():
                   LOWER(COALESCE(u.agent_type, '')) ~ '(internal|outsource|sales)'
                   OR LOWER(COALESCE(u.access_level::text, '')) ~ '(internal|outsource|sales)'
                 )
-                
+
               UNION ALL
-              
-              -- Agents joined with users
-              SELECT ag.name,
+
+              -- Agents joined with users. Same link_key trick as the pg-list
+              -- query above: merge with the linked user's row by bubble_id
+              -- when linked_user_login resolves to one, so a name typo on
+              -- either side can no longer seed a duplicate agent.
+              SELECT u.bubble_id AS link_key,
+                     ag.name,
                      COALESCE(ag.agent_type, u.agent_type) AS agent_type,
                      u.access_level,
                      u.main_department AS branch,
@@ -2576,7 +2828,9 @@ def agent_roles_seed_api():
                   OR LOWER(COALESCE(u.access_level::text, '')) ~ '(internal|outsource|sales)'
                 )
             ) au
-            ORDER BY LOWER(BTRIM(au.name)), au.pri
+            ORDER BY COALESCE(au.link_key, LOWER(BTRIM(au.name))),
+                     CASE WHEN COALESCE(au.agent_type, '') = '' THEN 1 ELSE 0 END,
+                     au.pri
         """
         res = mod._proxy_sql(proxy_url=proxy_url, db_name=db_name, token=token,
                              sql=sql, params=[])
@@ -2591,7 +2845,14 @@ def agent_roles_seed_api():
             ex_name = str(ex.get("agent") or "").strip().lower()
             ex_hier = str(ex.get("hierarchy") or "").strip()
             ex_rep = str(ex.get("reports_to") or "").strip()
-            if not ex_hier and not ex_rep and ex_name not in valid_pg_names:
+            # A hidden row is a deliberate exclusion made through the roles
+            # grid's Delete button, not an unfilled placeholder. It must
+            # survive this prune even after the agent drops out of Postgres
+            # entirely — otherwise the exclusion is erased the moment they
+            # leave, and silently undone if they are ever re-tagged again
+            # later under the same name.
+            if (not ex.get("hidden") and not ex_hier and not ex_rep
+                    and ex_name not in valid_pg_names):
                 continue
             merged.append(ex)
 
@@ -2610,14 +2871,17 @@ def agent_roles_seed_api():
             access_text = " ".join(access_level).lower()
             combined_text = f"{low_type} {access_text}"
             
+            # Same rule as the pg-list endpoint: only "internal" and "outsource"
+            # name a rate table. Seeding is the worse place to guess, because the
+            # guess is written to SQLite and then outranks Postgres forever after
+            # (a saved type is treated as a human decision), so a bare "sales"
+            # tag is stored blank and shown as needing review instead.
             if "outsource" in combined_text:
                 atype = "Outsource"
             elif "internal" in combined_text:
                 atype = "Internal"
-            elif "sales" in combined_text:
-                atype = "Sales"
             else:
-                atype = "Internal" # fallback
+                atype = ""
                 
             branch = str(r.get("branch") or "").strip()
             if "branch" not in branch.lower():
@@ -2633,7 +2897,7 @@ def agent_roles_seed_api():
                     
             merged.append({
                 "effective_from": month, "agent": name,
-                "agent_type": atype if atype in ("Internal", "Outsource") else "Internal",
+                "agent_type": atype,
                 "hierarchy": "", "reports_to": "", "branch": branch,
                 "remarks": "seeded from Postgres",
                 "start_date": start_date,
