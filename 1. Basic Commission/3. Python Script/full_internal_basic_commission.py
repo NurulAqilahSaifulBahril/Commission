@@ -95,6 +95,7 @@ def _write_basic_pdf(
                     "Sales Price",
                     "Rate %",
                     "Basic Commission",
+                    "Senior Override",
                 ],
                 rows=table2,
                 landscape=True,
@@ -146,8 +147,93 @@ SENIOR_OVERRIDE_RATE = Decimal("0.0025")
 AGENT_TYPES_SQL = "'internal', 'full time'"
 
 
+def _rates_module():
+    """basic_commission_rates, or None when it cannot be imported. Routing must
+    never be the thing that breaks a report, so every caller falls back to the
+    Postgres-only behaviour this module had before."""
+    try:
+        import basic_commission_rates as _bcr
+        return _bcr
+    except Exception:
+        return None
+
+
+def _agent_type_override_sql() -> str:
+    """Names the Agent Roles & Hierarchy page routes explicitly, as a SQL list.
+    Postgres' agent_type is blank for several internal agents, so filtering on
+    it alone drops them here and hands them to the outsource report. Widening
+    the filter with these names lets _process_invoices() decide per invoice —
+    it can see the invoice date, which is what the roles page is dated by."""
+    bcr = _rates_module()
+    names = bcr.agent_type_override_names() if bcr else []
+    if not names:
+        return "''"
+    return ", ".join("'" + n.replace("'", "''") + "'" for n in names)
+
+
+def _internal_hierarchy(agent_name: str, month: int, year: int, property_type: str,
+                        is_agent_senior: bool) -> str:
+    """The role to price this invoice under. The Agent Roles & Hierarchy page is
+    asked first, so Data page rows entered against an internal role like
+    "Branch Sales Manager" can actually be reached — is_senior() only ever
+    produced "Senior" or "Executive", which left every other internal role's
+    row dead.
+
+    A role with no rate row entered against it falls back to the old
+    Senior/Executive answer rather than dropping through to the hardcoded
+    default. Roles are renamed on that page more often than rates are entered
+    (Executive -> "Sales Consultant" in 2026-07), and a rename must not quietly
+    cut an agent's rate."""
+    bcr = _rates_module()
+    fallback = "Senior" if is_agent_senior else "Executive"
+    if bcr is None:
+        return fallback
+    role = bcr.get_agent_role(agent_name, month, year=year, agent_type="Internal")
+    if not role:
+        return fallback
+    _rate, source, _eff = bcr.get_basic_rate_detail(
+        "Internal", role, month, agent=agent_name, property_type=property_type,
+        year=year)
+    return role if source in ("unified", "legacy") else fallback
+
+
+def _is_internal_invoice(agent_name: str, pg_agent_type: str, invoice_date: str) -> bool:
+    """Whether this invoice belongs to the internal report. The Agent Roles &
+    Hierarchy page wins over Postgres; without it an agent whose agent_type was
+    never set in Bubble is treated as outsource and paid the outsource rate."""
+    bcr = _rates_module()
+    if bcr is None:
+        return str(pg_agent_type or "").strip().lower() in ("internal", "full time")
+    parsed = _parse_invoice_date(invoice_date)
+    return bcr.resolve_agent_type(
+        agent_name, pg_agent_type,
+        month=parsed.month if parsed else None,
+        year=parsed.year if parsed else None,
+    ) == "internal"
+
+
 def classify_property_type(row: dict[str, Any]) -> str:
-    # 1. Check SEDA Registration nem_type
+    # 1. Check customer name for explicit company or property type hints
+    cust_name = ""
+    for k in ("customer_name", "customer_name_snapshot", "db_customer_name"):
+        if row.get(k):
+            cust_name += " " + str(row.get(k))
+    cust_name = cust_name.upper().strip()
+    if cust_name:
+        comm_keywords = (
+            "SDN BHD", "SDN. BHD.", "BHD", "PRIVATE LIMITED", "LIMITED", "LTD",
+            "ENTERPRISE", "COMMERCIAL", "SHOP", "TRADING", "INDUSTRIES", "INDUSTRY",
+            "ENGINEERING", "CONSTRUCTION", "SERVICES", "SERVICE", "MARKET", "MART",
+            "BUSINESS", "CORP", "CORPORATION"
+        )
+        if any(kw in cust_name for kw in comm_keywords):
+            if "FACTORY" in cust_name or "EDGING" in cust_name:
+                return "Factory"
+            return "Shop Lot"
+        if "FACTORY" in cust_name or "EDGING" in cust_name:
+            return "Factory"
+
+    # 2. Check SEDA Registration nem_type
     nem = str(row.get("seda_nem_type") or "").upper().strip()
     if "RAKYAT" in nem:
         return "Residential"
@@ -156,7 +242,7 @@ def classify_property_type(row: dict[str, Any]) -> str:
     if "FACTORY" in nem:
         return "Factory"
 
-    # 2. Check Referral project_type
+    # 3. Check Referral project_type
     ref = str(row.get("referral_project_type") or "").upper().strip()
     if "RESIDENTIAL" in ref:
         return "Residential"
@@ -165,32 +251,19 @@ def classify_property_type(row: dict[str, Any]) -> str:
     if "FACTORY" in ref:
         return "Factory"
 
-    # 3. Check invoice package_type or package_name_snapshot
-    pkg_type = str(row.get("package_type") or "").upper().strip()
-    if "RESIDENTIAL" in pkg_type:
-        return "Residential"
-        
-    pkg_name = str(row.get("package_name_snapshot") or "").upper().strip()
-    if "FACTORY" in pkg_name:
-        return "Factory"
-    if "SHOP" in pkg_name or "COMMERCIAL" in pkg_name:
-        return "Shop Lot"
-    if "RESIDENTIAL" in pkg_name:
-        return "Residential"
+    # 4. Check package_type, package_name_snapshot, description
+    for field in ("package_type", "package_name_snapshot", "description"):
+        val = str(row.get(field) or "").upper().strip()
+        if not val:
+            continue
+        if "FACTORY" in val:
+            return "Factory"
+        if "RESIDENTIAL" in val:
+            return "Residential"
+        if "SHOP" in val or "COMMERCIAL" in val:
+            return "Shop Lot"
 
-    # 4. Check description or item descriptions
-    desc = str(row.get("description") or "").upper().strip()
-    if "FACTORY" in desc:
-        return "Factory"
-    if "SHOP" in desc or "COMMERCIAL" in desc:
-        return "Shop Lot"
-    if "RESIDENTIAL" in desc:
-        return "Residential"
-
-    if row.get("package_type") == "Residential":
-        return "Residential"
-        
-    return "Shop Lot"
+    return "Residential"
 
 
 def is_senior(agent_name: str) -> bool:
@@ -198,11 +271,26 @@ def is_senior(agent_name: str) -> bool:
     return any(s in n for s in ["sunny", "martin", "kent", "zhe hang"])
 
 
-def get_reporting_senior(agent_name: str) -> str | None:
+def _table_reporting_senior(agent_name: str, month: int | None = None):
+    """(listed, reports_to) from the dashboard role table. Being listed is
+    authoritative even when Reports To is blank — that means "reports to
+    nobody", not "guess"."""
+    try:
+        import basic_commission_rates as _bcr
+        return _bcr.get_reporting_senior_from_table(agent_name, month or 7)
+    except Exception:
+        return False, None
+
+
+def get_reporting_senior(agent_name: str, month: int | None = None) -> str | None:
+    listed, senior = _table_reporting_senior(agent_name, month)
+    if listed:
+        return senior
+
     n = agent_name.lower().strip()
     if is_senior(agent_name):
         return None
-        
+
     # Louis Ng, Anisah Najwa and Anisah are under Teng Kah Kent
     if any(tok in n for tok in ["louis ng", "anisah najwa", "anisah"]):
         return "Teng Kah Kent"
@@ -361,14 +449,42 @@ def _render_table(headers: list[str], rows: list[list[str]]) -> str:
 
 
 def _invoices_sql(*, year: int, customer_filter_sql: str) -> str:
+    # Milestone thresholds and the multi-stage cutover come from the Data page
+    # (see basic_commission_rates.milestone_sql_parts); they used to be
+    # 0.05/0.75/1.0 literals here, which made the payout triggers entered on
+    # that page inert.
+    from basic_commission_rates import (milestone_sql_parts, milestone_column,
+                                        multi_stage_cutover, payout_thresholds_in_use)
+    from decimal import Decimal as _D
+    milestone_ctes, milestone_selects, milestone_joins = milestone_sql_parts()
+    milestone_out_selects = "\n".join(
+        f"  {milestone_column(t)}," for t in payout_thresholds_in_use())
+    full_col = milestone_column(_D("100"))
+    cutover = multi_stage_cutover(year)
+    cutover_month = cutover[0] if cutover else 13
+    advance_col = milestone_column(
+        cutover[1].advance_trigger if cutover else _D("100"))
     return f"""
-WITH candidates AS (
+WITH target_invoices AS (
+  SELECT *
+  FROM invoice
+  WHERE total_amount > 0 
+    AND (
+      extract(year from invoice_date) = {int(year)} 
+      OR bubble_id IN (SELECT linked_invoice FROM payment WHERE extract(year from payment_date) = {int(year)})
+    )
+),
+{milestone_ctes},
+candidates AS (
   SELECT
     i.invoice_number,
     i.invoice_date,
-    i.full_payment_date,
+    i.bubble_id AS invoice_bubble_id,
+    i."1st_payment_date" AS first_payment_date,
+    i.full_payment_date AS real_full_payment_date,
+{milestone_selects}
     COALESCE(i.total_amount, 0)::numeric AS total_amount,
-    COALESCE((SELECT SUM(p.amount) FROM payment p WHERE p.linked_invoice = i.bubble_id), 0)::numeric AS paid_amount,
+    COALESCE((SELECT SUM(p.amount) FROM payment p WHERE p.linked_invoice = i.bubble_id AND p.id NOT IN (101334, 104412, 101333, 104413, 4899)), 0)::numeric AS paid_amount,
     COALESCE(
       NULLIF(epp_items.epp_interest, 0),
       NULLIF(pay.epp_sum, 0),
@@ -397,9 +513,27 @@ WITH candidates AS (
                i.full_payment_date DESC NULLS LAST,
                i.id DESC
     ) AS rn
-  FROM invoice i
-  INNER JOIN agent a ON a.bubble_id = i.linked_agent
+  FROM target_invoices i
+  -- Agents live in BOTH the agent table and the user table since the
+  -- 2026-07-20 "agent retirement" migration moved most agent rows into
+  -- "user" (same bubble_id). Resolve from either, preferring the row that
+  -- actually carries an agent_type.
+  INNER JOIN (
+    SELECT DISTINCT ON (au.bubble_id) au.bubble_id, au.name, au.agent_type
+    FROM (
+      SELECT u.bubble_id, u.name, u.agent_type, 1 AS pri FROM "user" u
+       WHERE u.bubble_id IS NOT NULL AND COALESCE(BTRIM(u.agent_type), '') <> ''
+      UNION ALL
+      SELECT ag.bubble_id, ag.name, ag.agent_type, 2 FROM agent ag
+       WHERE ag.bubble_id IS NOT NULL
+      UNION ALL
+      SELECT u2.bubble_id, u2.name, u2.agent_type, 3 FROM "user" u2
+       WHERE u2.bubble_id IS NOT NULL
+    ) au
+    ORDER BY au.bubble_id, au.pri
+  ) a ON a.bubble_id = i.linked_agent
   LEFT JOIN customer c ON c.customer_id = i.linked_customer
+{milestone_joins}
   LEFT JOIN SEDA_registration sr_link ON sr_link.bubble_id = i.linked_seda_registration
   LEFT JOIN SEDA_registration sr_back ON i.bubble_id = ANY(sr_back.linked_invoice)
   LEFT JOIN customer c_ref ON LOWER(TRIM(c_ref.name)) = LOWER(TRIM(COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name)))
@@ -414,7 +548,11 @@ WITH candidates AS (
       OR ref.linked_customer_profile = c_ref.customer_id
     )
     AND EXISTS (
-      SELECT 1 FROM agent a_ref
+      SELECT 1 FROM (
+        SELECT id, bubble_id, name FROM agent
+        UNION ALL
+        SELECT id, bubble_id, name FROM "user"
+      ) a_ref
       WHERE (
         CASE
           WHEN ref.linked_agent ~ '^[0-9]+$' THEN a_ref.id = CAST(ref.linked_agent AS integer)
@@ -459,21 +597,37 @@ WITH candidates AS (
     SELECT SUM(COALESCE(p.epp_cost, 0)) AS epp_sum
     FROM payment p
     WHERE p.linked_invoice = i.bubble_id
+      AND p.id NOT IN (101334, 104412, 101333, 104413, 4899)
   ) pay ON TRUE
-  WHERE i.paid IS TRUE
-    AND i.full_payment_date IS NOT NULL
+  WHERE (
+    -- Before the multi-stage cutover: recognised only at full payment.
+    ({full_col} IS NOT NULL
+     AND EXTRACT(YEAR FROM {full_col})::int = {int(year)}
+     AND EXTRACT(MONTH FROM {full_col})::int BETWEEN 1 AND {cutover_month - 1})
+    OR
+    -- From the cutover: reaching the advance trigger is already reportable.
+    ({advance_col} IS NOT NULL
+     AND EXTRACT(YEAR FROM {advance_col})::int = {int(year)}
+     AND EXTRACT(MONTH FROM {advance_col})::int BETWEEN {cutover_month} AND 12)
+    OR
+    -- July onwards: 100% payment also valid
+    ({full_col} IS NOT NULL
+     AND EXTRACT(YEAR FROM {full_col})::int = {int(year)}
+     AND EXTRACT(MONTH FROM {full_col})::int BETWEEN {cutover_month} AND 12)
+  )
     AND (
-      EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
-      OR EXTRACT(YEAR FROM i.full_payment_date)::int = {int(year)}
+      LOWER(btrim(COALESCE(a.agent_type, ''))) IN ({AGENT_TYPES_SQL})
+      OR LOWER(btrim(COALESCE(a.name, ''))) IN ({_agent_type_override_sql()})
     )
-    AND LOWER(btrim(COALESCE(a.agent_type, ''))) IN ({AGENT_TYPES_SQL})
-    AND (COALESCE(i.percent_of_total_amount, 0) >= 1.0 OR i.paid IS TRUE)
+    AND LOWER(btrim(COALESCE(a.name, ''))) != 'gan lai soon'
     {customer_filter_sql}
 )
 SELECT
   invoice_number,
   invoice_date,
-  full_payment_date,
+  first_payment_date,
+  real_full_payment_date,
+{milestone_out_selects}
   total_amount,
   paid_amount,
   epp_interest,
@@ -488,7 +642,7 @@ SELECT
   referral_name
 FROM candidates
 WHERE rn = 1
-ORDER BY agent_name ASC, full_payment_date ASC NULLS LAST, invoice_number ASC NULLS LAST
+ORDER BY agent_name ASC, real_full_payment_date ASC NULLS LAST, invoice_number ASC NULLS LAST
 """.strip()
 
 
@@ -508,6 +662,15 @@ class InvoiceLine:
     profit_sharing: Decimal
     basic_commission: Decimal
     referral_name: str | None = None
+    gan_lai_soon: Decimal = Decimal("0")
+    senior_override: Decimal = Decimal("0")
+    first_payment_date: str = ""
+    pct100_date: str = ""
+    pct75_date: str = ""
+    pct5_date: str = ""
+    # The Data page payout condition this invoice was recognised under, so the
+    # month-bucketing in build_commission_pack does not have to re-derive it.
+    payout_policy: object = None
 
     @property
     def net_base(self) -> Decimal:
@@ -548,6 +711,69 @@ def _is_valid_referral(ref_name: str | None) -> bool:
     return name_clean not in ("", "none", "no", "client", "(unknown)", "referrer")
 
 
+def _cutover_ym(year: int = 2026) -> tuple[int, int] | None:
+    """(year, month) the multi-stage payout starts, per the Data page."""
+    from basic_commission_rates import multi_stage_cutover
+    hit = multi_stage_cutover(year)
+    return (year, hit[0]) if hit else None
+
+
+def _get_effective_payment_date(real_full_pay_str: str, pct75_str: str, pct100_str: str = "", pct5_str: str = "",
+                                cutover: tuple[int, int] | None = None) -> str:
+    # If 100% payment date exists, use it
+    if pct100_str:
+        return pct100_str
+
+    if cutover is None:
+        cutover = _cutover_ym()
+    if cutover is None:
+        return real_full_pay_str
+    cut_y, cut_m = cutover
+
+    pct75_m = None
+    pct75_y = None
+    if pct75_str:
+        parts = pct75_str.split("-")
+        if len(parts) >= 2:
+            try:
+                pct75_y = int(parts[0])
+                pct75_m = int(parts[1])
+            except ValueError:
+                pass
+
+    real_fp_m = None
+    real_fp_y = None
+    if real_full_pay_str:
+        parts = real_full_pay_str.split("-")
+        if len(parts) >= 2:
+            try:
+                real_fp_y = int(parts[0])
+                real_fp_m = int(parts[1])
+            except ValueError:
+                pass
+
+    if pct75_y is not None and pct75_m is not None:
+        if (pct75_y, pct75_m) >= (cut_y, cut_m):
+            return pct75_str
+
+        # The balance milestone landed before the cutover.
+        is_paid_before_cutover = False
+        if real_fp_y is not None and real_fp_m is not None:
+            if (real_fp_y, real_fp_m) < (cut_y, cut_m):
+                is_paid_before_cutover = True
+
+        if not is_paid_before_cutover:
+            return f"{cut_y:04d}-{cut_m:02d}-01"
+
+        return real_full_pay_str
+
+    # June forward 5% booking fee
+    if pct5_str:
+        return pct5_str
+
+    return ""
+
+
 def _process_invoices(
     rows: list[dict[str, Any]],
     factory_rates: dict[str, Decimal] | None = None
@@ -559,7 +785,13 @@ def _process_invoices(
         agent_name = str(row.get("agent_name") or "(unknown)").strip()
         customer_name = str(row.get("customer_name") or "(unknown)").strip()
         invoice_num = str(row.get("invoice_number") or "").strip()
-        
+
+        # The SQL filter is deliberately wide (it cannot date-match the roles
+        # page), so drop anything that resolves to the outsource report here.
+        if not _is_internal_invoice(agent_name, row.get("agent_type"),
+                                    row.get("invoice_date")):
+            continue
+
         prop_type = classify_property_type(row)
         
         total = _to_decimal(row.get("total_amount"))
@@ -569,6 +801,35 @@ def _process_invoices(
         
         is_agent_senior = is_senior(agent_name)
         sharing = Decimal("0")
+        
+        real_full_pay_str = str(row.get("real_full_payment_date") or "")[:10]
+
+        # Which payment milestones govern this invoice comes from the Data page
+        # row that also priced it, so pct5_str/pct75_str mean "advance due" and
+        # "balance due" whatever percentages happen to back them.
+        inv_dt = str(row.get("invoice_date") or "")[:10]
+        _inv_parsed = _parse_invoice_date(inv_dt)
+        _inv_month = _inv_parsed.month if _inv_parsed else 5
+        _inv_year = _inv_parsed.year if _inv_parsed else 2026
+        _hierarchy = _internal_hierarchy(agent_name, _inv_month, _inv_year,
+                                         prop_type, is_agent_senior)
+        from basic_commission_rates import invoice_milestones as _milestones
+        policy, pct5_str, pct75_str, pct100_str = _milestones(
+            row, "Internal", _hierarchy, _inv_month, year=_inv_year,
+            agent=agent_name, property_type=prop_type)
+
+        NOT_FULLY_PAID_INVS = {'1008316', '1007905'}
+        if invoice_num in NOT_FULLY_PAID_INVS:
+            real_full_pay_str = ""
+            pct75_str = ""
+            pct100_str = ""
+
+        if policy.is_multi_stage:
+            pay_dt = pct75_str
+            first_pay_dt = pct5_str if pct5_str else str(row.get("first_payment_date") or "")[:10]
+        else:
+            pay_dt = _get_effective_payment_date(real_full_pay_str, pct75_str, pct100_str, pct5_str)
+            first_pay_dt = str(row.get("first_payment_date") or "")[:10]
         
         if prop_type == "Factory":
             rate = Decimal("0.02")
@@ -581,19 +842,40 @@ def _process_invoices(
                 safwan_sharing = sharing_tuple
             comm = sales_price * (rate + sharing)
         else:
-            from basic_commission_rates import get_basic_rate
-            pay_date_parsed = _parse_invoice_date(row.get("full_payment_date"))
-            pay_month = pay_date_parsed.month if pay_date_parsed else 5
-            hierarchy = "Senior" if is_agent_senior else "Executive"
-            rate = get_basic_rate("Internal", hierarchy, pay_month)
+            from basic_commission_rates import get_basic_rate, get_rule_amount
+            # Rates and rules are based on Invoice Date (inv_month/inv_year), not
+            # Payment Date. Pass the deal's property type so rows scoped on the
+            # Data page can match, and the year so a range like "2025-01 to
+            # 2025-09" isn't matched against the wrong calendar year. The
+            # hierarchy is the one the payout policy above already resolved, so
+            # rate and payout condition can never come from different roles.
+            inv_month, inv_year, hierarchy = _inv_month, _inv_year, _hierarchy
+            rate = get_basic_rate("Internal", hierarchy, inv_month, agent=agent_name,
+                                  property_type=prop_type, year=inv_year)
             comm = sales_price * rate
+
+            # Only the advance has been reached: cap the commission at the
+            # advance amount. That amount comes from the Data page row's own
+            # Amount (RM) column, falling back to the legacy
+            # 'basic_commission_cap' rule and then to RM 300.
+            if not pct75_str and pct5_str:
+                cap = (policy.advance_amount if policy.advance_amount is not None
+                       else get_rule_amount("basic_commission_cap", inv_month,
+                                            year=inv_year, default=Decimal("300")))
+                comm = min(comm, cap)
             
-        inv_dt = str(row.get("invoice_date") or "")[:10]
-        pay_dt = str(row.get("full_payment_date") or "")[:10]
-        
+        pay_dt = str(pay_dt or "")[:10]
+        first_pay_dt = str(first_pay_dt or "")[:10]
+
         # Determine referral name: default to database values
         ref_name = row.get("referral_name")
-        
+
+        # Calculate senior override per invoice (based on sales_price)
+        senior_ovr = sales_price * SENIOR_OVERRIDE_RATE
+        senior = get_reporting_senior(agent_name)
+        if senior:
+            senior_ovr = sales_price * SENIOR_OVERRIDE_RATE
+
         lines.append(
             InvoiceLine(
                 agent_name=agent_name,
@@ -610,6 +892,13 @@ def _process_invoices(
                 profit_sharing=sharing,
                 basic_commission=comm,
                 referral_name=ref_name,
+                gan_lai_soon=Decimal("0"),
+                senior_override=senior_ovr,
+                first_payment_date=first_pay_dt,
+                pct100_date=pct100_str,
+                pct75_date=pct75_str,
+                pct5_date=pct5_str,
+                payout_policy=policy,
             )
         )
         
@@ -632,6 +921,13 @@ def _process_invoices(
                     profit_sharing=safwan_sharing,
                     basic_commission=safwan_comm,
                     referral_name=ref_name,
+                    first_payment_date=first_pay_dt,
+                    # Milestone dates deliberately not set: this share has never
+                    # appeared in the monthly buckets (no dates to bucket by),
+                    # and wiring the payout policy must not change that. The
+                    # policy still rides along so the line is classified like
+                    # its parent instead of falling back to the July rule.
+                    payout_policy=policy,
                 )
             )
             
@@ -694,6 +990,7 @@ def _table2_rows(lines: list[InvoiceLine]) -> list[list[str]]:
             _fmt_money(ln.sales_price),
             _fmt_rate(ln.commission_rate),
             _fmt_money(ln.basic_commission),
+            _fmt_money(ln.senior_override),
         ]
         for ln in raw_lines
     ]
@@ -878,10 +1175,17 @@ def main(argv: list[str]) -> int:
     raw_rows = list(payload.get("rows") or [])
 
     if args.month is not None:
+        from basic_commission_rates import multi_stage_cutover, milestone_date
+        _cut = multi_stage_cutover(args.year)
+        _bal_t = _cut[1].balance_trigger if _cut else Decimal("100")
         filtered_rows = []
         for r in raw_rows:
             inv_dt = _parse_invoice_date(r.get("invoice_date"))
-            pay_dt = _parse_invoice_date(r.get("full_payment_date"))
+            real_fp = str(r.get("real_full_payment_date") or "")[:10]
+            pct75 = milestone_date(r, _bal_t)
+            pct100 = milestone_date(r, Decimal("100"))
+            eff_pay = _get_effective_payment_date(real_fp, pct75, pct100)
+            pay_dt = _parse_invoice_date(eff_pay)
             inv_match = inv_dt and inv_dt.year == args.year and inv_dt.month == args.month
             pay_match = pay_dt and pay_dt.year == args.year and pay_dt.month == args.month
             if inv_match or pay_match:
@@ -963,6 +1267,7 @@ def main(argv: list[str]) -> int:
                 "Sales Price",
                 "Rate %",
                 "Basic Commission",
+                "Senior Override",
             ],
             table2,
         )
@@ -1025,7 +1330,7 @@ def main(argv: list[str]) -> int:
         w = csv.writer(f)
         w.writerow([
             "Agent Name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date",
-            "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Basic Commission"
+            "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Basic Commission", "Senior Override"
         ])
         w.writerows(table2)
         

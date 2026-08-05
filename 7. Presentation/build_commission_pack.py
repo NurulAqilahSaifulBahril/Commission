@@ -29,10 +29,13 @@ import importlib.util
 import os
 import sys
 import re
+import copy as _copy
 from collections import defaultdict
+from dataclasses import replace as _dc_replace, is_dataclass as _is_dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -152,6 +155,8 @@ def _token_help_message() -> str:
 # ---------------------------------------------------------------------------
 
 def _load_module(name: str, path: Path):
+    if name in sys.modules:
+        return sys.modules[name]
     script_dir = str(path.resolve().parent)
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
@@ -183,6 +188,184 @@ def _parse_month(date_val: Any) -> int | None:
     return None
 
 
+def _year_month(date_val: Any) -> tuple[int, int] | None:
+    if not date_val:
+        return None
+    if isinstance(date_val, (date, datetime)):
+        return (date_val.year, date_val.month)
+    s = str(date_val).strip()
+    m = re.match(r'^(\d{4})[-/](\d{2})', s)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def _is_new_policy_line(ln) -> bool:
+    """True when this line is paid in two stages (an advance, then the balance).
+
+    The Data page row that priced the invoice decides; the July-2026 invoice-date
+    test is only the fallback for lines built before the policy was attached.
+    """
+    policy = getattr(ln, "payout_policy", None)
+    if policy is not None:
+        return policy.is_multi_stage
+    inv_ym = _year_month(getattr(ln, "invoice_date", ""))
+    return inv_ym is not None and inv_ym >= (2026, 7)
+
+
+def _line_advance_amount(ln) -> float:
+    policy = getattr(ln, "payout_policy", None)
+    if policy is not None and policy.advance_amount is not None:
+        return float(policy.advance_amount)
+    return 300.0
+
+
+def _rm300_column_display(cust_basic_lines: list) -> str:
+    """Advance-tranche cell for a customer row (multi-stage invoices).
+
+    - Multi-stage invoices show the advance actually payable this month (capped
+      at the Data page's advance amount, and only for the first-milestone /
+      combined line, never the balance line via ``_show_rm300``).
+    - Single-stage invoices have no advance tranche at all -- they pay the full
+      Basic Commission at their payout trigger -- so the cell reads
+      "invoice before july".
+    """
+    if not any(_is_new_policy_line(ln) for ln in cust_basic_lines):
+        return "invoice before july"
+    rm300_total = sum(
+        min(float(ln.basic_commission), _line_advance_amount(ln))
+        for ln in cust_basic_lines
+        if _is_new_policy_line(ln)
+        and getattr(ln, "pct5_date", "")
+        and getattr(ln, "_show_rm300", True)
+    )
+    if rm300_total != 0:
+        return ensure_rm_prefix(f"{rm300_total:,.2f}")
+    # No RM300 tranche recognized this month: either the 5% milestone hasn't
+    # been reached yet (genuinely pending), or it was already paid out and
+    # shown in an earlier month (this line is balance-only, _show_rm300=False).
+    still_pending = any(
+        _is_new_policy_line(ln) and not getattr(ln, "pct5_date", "")
+        for ln in cust_basic_lines
+    )
+    if still_pending:
+        return "pending"
+    return "-"
+
+
+def _replace_line(ln, **changes):
+    """Return a shallow copy of a basic-commission line with ``changes`` applied.
+
+    The internal path uses frozen-ish dataclasses (``dataclasses.replace``); the
+    outsource path uses lightweight ``SimpleNamespace`` line objects that
+    ``dataclasses.replace`` cannot handle, so fall back to copy + setattr.
+    """
+    if _is_dataclass(ln):
+        return _dc_replace(ln, **changes)
+    new = _copy.copy(ln)
+    for k, v in changes.items():
+        setattr(new, k, v)
+    return new
+
+
+def _expand_basic_lines_for_month(basic_lines: list, m: int) -> list:
+    """
+    July 2026 onwards, Basic Commission pays out in two milestones: a flat
+    RM300 (or less, if the full rate would be less) once an invoice reaches
+    >=5% payment, and the remaining balance once it reaches >=75% payment.
+
+    When both milestones fall in the same month (or for pre-policy invoices,
+    i.e. invoice_date before July 2026), nothing changes here: the line is
+    returned as-is and contributes a single combined row with overrides/
+    referral fee attributed normally.
+
+    When the two milestones fall in different months, the invoice
+    contributes to TWO separate months' reports: an RM300-only line in the
+    5%-month (marked to skip override/referral attribution and to not show
+    a "75% Payment Date", since the sale isn't finalized yet) and a
+    balance-only line in the 75%-month (override/referral attributed there
+    as usual, RM300 marked not to be re-shown so it isn't double counted).
+    """
+    result = []
+    for ln in basic_lines:
+        policy = getattr(ln, "payout_policy", None)
+        if policy is not None:
+            is_new_policy = policy.is_multi_stage
+        else:
+            inv_ym = _year_month(ln.invoice_date)
+            is_new_policy = inv_ym is not None and inv_ym >= (2026, 7)
+
+        if not is_new_policy:
+            # Single-stage invoices: the full Basic Commission is recognized
+            # only when the invoice reaches its payout trigger (100% payment
+            # unless the Data page says otherwise). Bucket strictly by that
+            # date and drop the invoice from every month until then -- e.g. a
+            # May invoice only partially paid does NOT appear in July.
+            pct100_str = getattr(ln, "pct100_date", "") or ""
+            if pct100_str and _parse_month(pct100_str) == m:
+                result.append(ln)
+            continue
+
+        pct5_str = getattr(ln, "pct5_date", "") or ""
+        pct75_str = getattr(ln, "pct75_date", "") or ""
+        pct5_m = _parse_month(pct5_str) if pct5_str else None
+        pct75_m = _parse_month(pct75_str) if pct75_str else None
+        if pct5_m is None:
+            continue
+
+        full_amt = ln.basic_commission
+        advance_rm = policy.advance_amount if policy is not None else 300
+        rm300_amt = min(full_amt, full_amt.__class__(str(advance_rm)))
+
+        if pct75_m is not None and pct5_m == pct75_m:
+            if pct75_m == m:
+                result.append(ln)
+        elif pct75_m is not None and pct5_m != pct75_m:
+            if pct5_m == m:
+                rm300_ln = _replace_line(ln, basic_commission=rm300_amt)
+                rm300_ln._skip_override = True
+                result.append(rm300_ln)
+            if pct75_m == m:
+                balance_ln = _replace_line(ln, basic_commission=full_amt - rm300_amt)
+                balance_ln._show_rm300 = False
+                result.append(balance_ln)
+        else:
+            # Only the 5% milestone has been reached so far.
+            if pct5_m == m:
+                rm300_ln = _replace_line(ln, basic_commission=rm300_amt)
+                rm300_ln._skip_override = True
+                result.append(rm300_ln)
+    return result
+
+
+def _effective_recognition_date(r: dict, year: int = 2026) -> str:
+    """The date an invoice should be recognized/bucketed by for reporting.
+
+    Mirrors the eligibility SQL's own payment-percentage rule (full payment
+    before the multi-stage cutover, the advance trigger after it) instead of the
+    invoice's stored full_payment_date, which can be stale — e.g. set to an early
+    partial-payment date rather than the date the invoice actually crossed the
+    threshold. The cutover month and the trigger percentages both come from the
+    Data page, so this stays in step with the query that selected the rows.
+    """
+    from decimal import Decimal as _D
+    import basic_commission_rates as _bcr
+
+    cutover = _bcr.multi_stage_cutover(year)
+    cut_m = cutover[0] if cutover else 13
+    full = _bcr.milestone_date(r, _D("100"))
+    advance = _bcr.milestone_date(r, cutover[1].advance_trigger) if cutover else ""
+    m_full = _parse_month(full) if full else None
+    m_adv = _parse_month(advance) if advance else None
+    if m_full and 1 <= m_full < cut_m:
+        return full
+    if m_adv and cut_m <= m_adv <= 12:
+        return advance
+    if m_full and cut_m <= m_full <= 12:
+        return full
+    return str(r.get("real_full_payment_date") or "")[:10]
+
+
 def _parse_rm(val: Any) -> Decimal:
     try:
         return Decimal(str(val).replace(",", "").replace("RM", "").strip())
@@ -208,6 +391,24 @@ def to_title_case(name: Any) -> str:
             else:
                 capitalized.append(w[0].upper() + w[1:].lower() if len(w) > 1 else w.upper())
     return " ".join(capitalized)
+
+
+# Shared agent full-name resolver (nickname -> canonical full name, Title Case),
+# sourced from the dashboard's Agent Roles & Hierarchy page (agent_roles table).
+# Applied to Agent columns at render time so tier/hierarchy logic (which keys
+# on nicknames) is unaffected.
+import agent_names as _agent_names
+
+
+def to_full_name(name: Any) -> str:
+    """Resolve an agent name to its canonical full name for display."""
+    if not name:
+        return ""
+    return _agent_names.resolve(str(name).strip())
+
+
+def is_agent_header(header: Any) -> bool:
+    return isinstance(header, str) and "agent" in header.lower()
 
 
 def ensure_rm_prefix(val: Any) -> str:
@@ -363,6 +564,18 @@ def format_senior_override_cell(breakdown_dict: dict[str, float]) -> str:
     return "<br/>".join(parts) if parts else "-"
 
 
+def format_other_commission_for_customer(breakdown_dict: dict[str, float]) -> str:
+    """Per-customer counterpart to format_senior_override_cell: shown on the
+    SOURCE agent's own customer row, naming who the override is credited to."""
+    if not breakdown_dict:
+        return "-"
+    parts = []
+    for recipient, amount in sorted(breakdown_dict.items()):
+        if amount > 0:
+            parts.append(f"RM {amount:,.2f} ({recipient})")
+    return "<br/>".join(parts) if parts else "-"
+
+
 invoice_package_map = {}
 
 
@@ -384,6 +597,31 @@ def get_invoice_package(invoice_number: str, invoice_obj: Any = None) -> str:
             return "Residential"
         if "SHOP" in desc_upper or "COMMERCIAL" in desc_upper:
             return "Shop Lot"
+
+        # Fallback: infer from customer name when the description text gives no
+        # signal (e.g. NFP rows whose package_description only lists panel specs,
+        # never the property-type keyword itself). Mirrors classify_property_type's
+        # customer-name check and default in outsource_basic_commission.py: most
+        # customers are individual homeowners, so "Residential" is the default
+        # unless the name itself signals a registered business.
+        cust_name = ""
+        if hasattr(invoice_obj, "customer_name") and getattr(invoice_obj, "customer_name"):
+            cust_name = str(getattr(invoice_obj, "customer_name"))
+        elif isinstance(invoice_obj, dict) and invoice_obj.get("customer_name"):
+            cust_name = str(invoice_obj.get("customer_name"))
+        cust_name_upper = cust_name.upper()
+        if cust_name_upper:
+            comm_keywords = (
+                "SDN BHD", "SDN. BHD.", "BHD", "PRIVATE LIMITED", "LIMITED", "LTD",
+                "ENTERPRISE", "COMMERCIAL", "SHOP", "TRADING", "INDUSTRIES", "INDUSTRY",
+                "ENGINEERING", "CONSTRUCTION", "SERVICES", "SERVICE", "MARKET", "MART",
+                "BUSINESS", "CORP", "CORPORATION",
+            )
+            if any(kw in cust_name_upper for kw in comm_keywords):
+                if "FACTORY" in cust_name_upper or "EDGING" in cust_name_upper:
+                    return "Factory"
+                return "Shop Lot"
+        return "Residential"
     return "Shop Lot"
 
 
@@ -434,7 +672,21 @@ def get_outsource_agent_tier(agent_name: str) -> str:
 # Internal hierarchy helpers (mirrors build_finance_commission_pack.py)
 # ---------------------------------------------------------------------------
 
-def _int_get_reporting_senior(agent_name: str) -> str | None:
+def _role_table_senior(agent_name: str, month: int | None = None):
+    """(listed, reports_to) from the dashboard role table. Same precedence as
+    the calculation engine, so the pack and the dashboard can never disagree
+    about the hierarchy. Listed with a blank Reports To means "nobody"."""
+    try:
+        import basic_commission_rates as _bcr
+        return _bcr.get_reporting_senior_from_table(agent_name, month or 7)
+    except Exception:
+        return False, None
+
+
+def _int_get_reporting_senior(agent_name: str, month: int | None = None) -> str | None:
+    listed, senior = _role_table_senior(agent_name, month)
+    if listed:
+        return senior
     n = agent_name.lower().strip()
     seniors = ["sunny", "martin", "kent", "zhe hang"]
     if any(s in n for s in seniors):
@@ -528,8 +780,8 @@ def fetch_internal_basic(year: int, h1_only: bool = True, month: int | None = No
     raw_rows = list(payload.get("rows") or [])
     if month is not None:
         h1_only = False
-        raw_rows = [r for r in raw_rows if _parse_month(r.get("full_payment_date")) == month]
-    factory_rates = basic.get_factory_rates(raw_rows)
+        raw_rows = [r for r in raw_rows if _parse_month(r.get("real_full_payment_date")) == month]
+    factory_rates = basic.get_factory_rates(raw_rows, default_profit_sharing=(Decimal("0"), Decimal("0")))
     lines = basic._process_invoices(raw_rows, factory_rates)
     if h1_only:
         lines = [ln for ln in lines if _parse_month(ln.full_payment_date) in range(1, 7)]
@@ -595,7 +847,12 @@ def fetch_internal_anp(year: int, h1_only: bool = True):
 
 
 def fetch_internal_nfp(year: int, h1_only: bool = True):
-    """Returns (agent_rows, detail_rows, meta, nfp_rows)."""
+    """Returns (agent_rows, detail_rows, meta, nfp_rows, nfp_by_inv_all).
+
+    ``nfp_by_inv_all`` maps every invoice_number to its NFP row regardless of
+    payment status, for System Price/Net Floor Price lookups on invoices that
+    haven't reached full payment yet (``nfp_rows`` only has fully-paid ones).
+    """
     nfp_dir = REPO_ROOT / "2. NFP Commission" / "3. Python script"
     nfp = _load_module("int_nfp_commission", nfp_dir / "nfp_commission.py")
     nfp_paths = _load_module("int_nfp_paths", nfp_dir / "nfp_paths.py")
@@ -603,6 +860,7 @@ def fetch_internal_nfp(year: int, h1_only: bool = True):
     if not token:
         raise RuntimeError(nfp_paths.proxy_token_help())
     rows, summary = nfp.build_report(year)
+    nfp_by_inv_all = {r.invoice_number.strip(): r for r in rows if r.invoice_number}
     rows = [r for r in rows if r.full_payment_date]
     if h1_only:
         rows = [r for r in rows if _parse_month(r.full_payment_date) in range(1, 7)]
@@ -637,10 +895,10 @@ def fetch_internal_nfp(year: int, h1_only: bool = True):
         "total_commission": Decimal(str(summary.get("total_nfp_commission", 0))),
         "filter": "payment 100%; invoice_date year; internal/full time" + (" (H1)" if h1_only else ""),
     }
-    return agent_rows, detail_rows, meta, rows
+    return agent_rows, detail_rows, meta, rows, nfp_by_inv_all
 
 
-def fetch_internal_ega_esa(year: int, may_only: bool = False):
+def fetch_internal_ega_esa(year: int, may_only: bool = False, upto_month: int | None = None):
     """Returns (t1, t2, t3, h1, h2, h3)."""
     ega_dir = REPO_ROOT / "4. EGA ESA Awards" / "3. Python script"
     ega = _load_module("int_ega_esa", ega_dir / "full_internal_EGA_ESA_Awards.py")
@@ -657,13 +915,36 @@ def fetch_internal_ega_esa(year: int, may_only: bool = False):
         api_client_path = nfp_dir / "api_client.py"
     _load_module("api_client", api_client_path)
     from api_client import query_sql
-    sql = ega._invoices_sql(year, may_only=may_only)
+    
+    if upto_month is None:
+        upto_month = 5 if may_only else None
+        
+    sql = ega._invoices_sql(year, upto_month=upto_month)
     rows = query_sql(sql)
     lines, agent_ep, agent_sales, agent_eligibility = ega.build_report(rows)
     t1 = ega.build_table1(agent_ep, agent_sales, agent_eligibility)
     t2 = ega.build_table2(lines, agent_eligibility)
     t3 = ega.build_table3(lines, agent_eligibility)
     return t1, t2, t3, ega.T1_HEADERS, ega.T2_HEADERS, ega.T3_HEADERS
+
+
+def fetch_internal_ega_raw(year: int):
+    """Returns raw invoices for internal agents from the database."""
+    ega_dir = REPO_ROOT / "4. EGA ESA Awards" / "3. Python script"
+    ega = _load_module("int_ega_esa", ega_dir / "full_internal_EGA_ESA_Awards.py")
+    nfp_dir = REPO_ROOT / "2. NFP Commission" / "3. Python script"
+    nfp_paths = _load_module("int_nfp_paths2", nfp_dir / "nfp_paths.py")
+    token = os.environ.get("PG_PROXY_TOKEN", "").strip() or nfp_paths.get_proxy_token()
+    if not token:
+        raise RuntimeError(nfp_paths.proxy_token_help())
+    os.environ["POSTGRES_PROXY_TOKEN"] = token
+    api_client_path = ega_dir / "api_client.py"
+    if not api_client_path.is_file():
+        api_client_path = nfp_dir / "api_client.py"
+    _load_module("api_client", api_client_path)
+    from api_client import query_sql
+    sql = ega._invoices_sql(year, upto_month=None)
+    return query_sql(sql)
 
 
 def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = None):
@@ -680,7 +961,7 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
     raw_rows = list(payload.get("rows") or [])
     if month is not None:
         h1_only = False
-        raw_rows = [r for r in raw_rows if _parse_month(r.get("full_payment_date")) == month]
+        raw_rows = [r for r in raw_rows if _parse_month(_effective_recognition_date(r)) == month]
 
     processed_invoices = []
     processed_factory = []
@@ -693,8 +974,9 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
         agent_name = str(r.get("agent_name") or "(unknown)").strip()
         agent_comm_field = r.get("agent_comm_field")
         info = basic.get_agent_hierarchy_info(agent_name)
-        is_db_outsource = "outsource" in str(r.get("agent_type") or "").lower()
-        if not info and not is_db_outsource:
+        # Agent Roles & Hierarchy page first, then Postgres' agent_type — see
+        # outsource_basic_commission.is_outsource_agent().
+        if not basic.is_outsource_agent(agent_name, r.get("agent_type"), r.get("invoice_date")):
             continue
         if not info:
             info = {"canonical_name": agent_name, "tier": "OSA", "osa_parent": None, "oum_parent": None}
@@ -709,7 +991,23 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
         sales_price = total - epp
 
         inv_dt = str(r.get("invoice_date") or "")[:10]
-        pay_dt = str(r.get("full_payment_date") or "")[:10]
+        pay_dt = _effective_recognition_date(r)
+
+        # Payment-milestone dates carried through so the summary builder can
+        # apply the multi-stage rule (an advance at the first trigger, the
+        # balance at the second) via _expand_basic_lines_for_month(). Which
+        # percentages those are is whatever the Data page row that priced this
+        # invoice says — see basic_commission_rates.invoice_milestones.
+        _inv_parsed = basic._parse_invoice_date(r.get("invoice_date"))
+        policy, pct5_str, pct75_str, pct100_str = basic._invoice_milestones(
+            r,
+            hierarchy=basic._outsource_hierarchy_for(info, _inv_parsed),
+            month=_inv_parsed.month if _inv_parsed else 5,
+            year=_inv_parsed.year if _inv_parsed else year,
+            agent=canonical_name,
+            property_type=prop_type,
+        )
+        first_pay_str = str(r.get("first_payment_date") or r.get("1st_payment_date") or "")[:10]
 
         if h1_only:
             m = _parse_month(pay_dt)
@@ -747,22 +1045,35 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
             safwan_override = sales_price * (Decimal("0.005") + sharing)
             override_commissions[canonical_name] += safwan_override
 
-            obj = type("FactoryLine", (), {
-                "agent_name": canonical_name,
-                "customer_name": customer_name,
-                "invoice_number": invoice_num,
-                "invoice_date": inv_dt,
-                "full_payment_date": pay_dt,
-                "sales_price": float(sales_price),
-                "rate": float(rate),
-                "profit_sharing": float(sharing),
-                "basic_commission": float(own_comm),
-                "is_factory": True,
-                "gan_lai_soon": float(ogm_comm),
-            })()
+            obj = SimpleNamespace(
+                agent_name=canonical_name,
+                customer_name=customer_name,
+                invoice_number=invoice_num,
+                invoice_date=inv_dt,
+                full_payment_date=pay_dt,
+                sales_price=float(sales_price),
+                rate=float(rate),
+                profit_sharing=float(sharing),
+                basic_commission=float(own_comm),
+                is_factory=True,
+                gan_lai_soon=float(ogm_comm),
+                package=prop_type,
+                pct5_date=pct5_str,
+                pct75_date=pct75_str,
+                pct100_date=pct100_str,
+                first_payment_date=first_pay_str,
+                payout_policy=policy,
+            )
             processed_factory.append(obj)
         else:
-            rate = basic.get_own_commission_rate(info, agent_comm_field, pay_dt)
+            # property_type must be passed — without it a Data-page row scoped
+            # to a specific property type (e.g. "Factory") is invisible to the
+            # matcher, and get_unified_basic_rate_row() currently degrades to
+            # picking an arbitrary same-effective-date row instead of erroring.
+            # Rate (and the Role it's looked up against) are based on Invoice
+            # Date, not Payment Date — a sale invoiced in September still gets
+            # September's rate/role even if payment completes months later.
+            rate = basic.get_own_commission_rate(info, agent_comm_field, inv_dt, property_type=prop_type)
             own_comm = sales_price * rate
             agent_own_commissions[canonical_name] += own_comm
             agent_sales_totals[canonical_name] += total
@@ -781,19 +1092,25 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
                 if internal_senior:
                     override_commissions[internal_senior] += total * Decimal("0.005")
 
-            obj = type("InvoiceLine", (), {
-                "agent_name": canonical_name,
-                "customer_name": customer_name,
-                "invoice_number": invoice_num,
-                "invoice_date": inv_dt,
-                "full_payment_date": pay_dt,
-                "sales_price": float(sales_price),
-                "rate": float(rate),
-                "profit_sharing": 0.0,
-                "basic_commission": float(own_comm),
-                "is_factory": False,
-                "gan_lai_soon": float(ogm_comm),
-            })()
+            obj = SimpleNamespace(
+                agent_name=canonical_name,
+                customer_name=customer_name,
+                invoice_number=invoice_num,
+                invoice_date=inv_dt,
+                full_payment_date=pay_dt,
+                sales_price=float(sales_price),
+                rate=float(rate),
+                profit_sharing=0.0,
+                basic_commission=float(own_comm),
+                is_factory=False,
+                gan_lai_soon=float(ogm_comm),
+                package=prop_type,
+                pct5_date=pct5_str,
+                pct75_date=pct75_str,
+                pct100_date=pct100_str,
+                first_payment_date=first_pay_str,
+                payout_policy=policy,
+            )
             processed_invoices.append(obj)
 
     all_lines = processed_invoices + processed_factory
@@ -823,7 +1140,12 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
 
 
 def fetch_outsource_nfp(year: int, h1_only: bool = True):
-    """Returns (agent_rows, detail_rows, meta, nfp_rows)."""
+    """Returns (agent_rows, detail_rows, meta, nfp_rows, nfp_by_inv_all).
+
+    ``nfp_by_inv_all`` maps every invoice_number to its NFP row regardless of
+    payment status, for System Price/Net Floor Price lookups on invoices that
+    haven't reached full payment yet (``nfp_rows`` only has fully-paid ones).
+    """
     nfp_dir = REPO_ROOT / "2. NFP Commission" / "3. Python script"
     nfp = _load_module("out_nfp_commission", nfp_dir / "outsource_nfp_commission.py")
     nfp_paths = _load_module("out_nfp_paths", nfp_dir / "nfp_paths.py")
@@ -831,6 +1153,7 @@ def fetch_outsource_nfp(year: int, h1_only: bool = True):
     if not token:
         raise RuntimeError(nfp_paths.proxy_token_help())
     rows, summary = nfp.build_report(year)
+    nfp_by_inv_all = {r.invoice_number.strip(): r for r in rows if r.invoice_number}
     rows = [r for r in rows if r.full_payment_date]
     if h1_only:
         rows = [r for r in rows if _parse_month(r.full_payment_date) in range(1, 7)]
@@ -863,7 +1186,7 @@ def fetch_outsource_nfp(year: int, h1_only: bool = True):
         "total_commission": Decimal(str(summary.get("total_nfp_commission", 0))),
         "filter": "payment 100%; invoice_date year; outsource" + (" (H1)" if h1_only else ""),
     }
-    return agent_rows, detail_rows, meta, rows
+    return agent_rows, detail_rows, meta, rows, nfp_by_inv_all
 
 
 def fetch_outsource_anp(year: int, h1_only: bool = True):
@@ -903,7 +1226,34 @@ def fetch_outsource_anp(year: int, h1_only: bool = True):
     return summary_rows, detail_rows, meta
 
 
-def fetch_outsource_ega_esa(year: int, may_only: bool = False):
+def fetch_monthly_contest(month: int | None = None, year: int | None = None):
+    """Returns (t1_headers, t1_rows, t2_headers, t2_rows, t3_headers, t3_rows).
+
+    Company-wide data (Team Championship / Golden Boot / Cases-and-Awards) — not
+    split by internal/outsource agent type. ``month`` selects the contest sheet
+    (defaults to the current calendar month inside calculate_monthly_contest).
+    """
+    try:
+        contest_path = REPO_ROOT / "6. Monthly Contest" / "3. Python Script" / "monthly_contest.py"
+        contest_mod = _load_module("monthly_contest", contest_path)
+        token, _, _ = _resolve_proxy_credentials()
+        df_t1, df_t2, df_t3, *_ = contest_mod.calculate_monthly_contest(
+            token=token, base_path=REPO_ROOT / "6. Monthly Contest", month=month, year=year
+        )
+        df_t1 = df_t1.fillna("-")
+        df_t2 = df_t2.fillna("-")
+        df_t3 = df_t3.fillna("-")
+        return (
+            list(df_t1.columns), [list(r) for r in df_t1.values],
+            list(df_t2.columns), [list(r) for r in df_t2.values],
+            list(df_t3.columns), [list(r) for r in df_t3.values],
+        )
+    except Exception as e:
+        print(f"  Warning: Monthly Contest fetch failed: {e}")
+        return [], [], [], [], [], []
+
+
+def fetch_outsource_ega_esa(year: int, may_only: bool = False, upto_month: int | None = None):
     """Returns (t1, t2, t3, h1, h2, h3)."""
     ega_dir = REPO_ROOT / "4. EGA ESA Awards" / "3. Python script"
     ega = _load_module("out_ega_esa", ega_dir / "outsource_EGA_ESA_Awards.py")
@@ -919,7 +1269,11 @@ def fetch_outsource_ega_esa(year: int, may_only: bool = False):
     _load_module("api_client_out", api_client_path)
     sys.modules["api_client"] = sys.modules["api_client_out"]
     from api_client import query_sql
-    sql = ega._invoices_sql(year, may_only=may_only)
+    
+    if upto_month is None:
+        upto_month = 5 if may_only else None
+        
+    sql = ega._invoices_sql(year, upto_month=upto_month)
     rows = query_sql(sql)
     lines, agent_ep, agent_sales, agent_eligibility = ega.build_report(rows)
     t1 = ega.build_table1(agent_ep, agent_sales, agent_eligibility)
@@ -928,21 +1282,39 @@ def fetch_outsource_ega_esa(year: int, may_only: bool = False):
     return t1, t2, t3, ega.T1_HEADERS, ega.T2_HEADERS, ega.T3_HEADERS
 
 
-def fetch_production_bonus(year: int, upto_month: int | None = None, may_only: bool = False):
+def fetch_outsource_ega_raw(year: int):
+    """Returns raw invoices for outsource agents from the database."""
+    ega_dir = REPO_ROOT / "4. EGA ESA Awards" / "3. Python script"
+    ega = _load_module("out_ega_esa", ega_dir / "outsource_EGA_ESA_Awards.py")
+    nfp_dir = REPO_ROOT / "2. NFP Commission" / "3. Python script"
+    nfp_paths = _load_module("out_nfp_paths2", nfp_dir / "nfp_paths.py")
+    token = os.environ.get("PG_PROXY_TOKEN", "").strip() or nfp_paths.get_proxy_token()
+    if not token:
+        raise RuntimeError(nfp_paths.proxy_token_help())
+    os.environ["POSTGRES_PROXY_TOKEN"] = token
+    api_client_path = ega_dir / "api_client.py"
+    if not api_client_path.is_file():
+        api_client_path = nfp_dir / "api_client.py"
+    _load_module("api_client_out", api_client_path)
+    sys.modules["api_client"] = sys.modules["api_client_out"]
+    from api_client import query_sql
+    sql = ega._invoices_sql(year, upto_month=None)
+    return query_sql(sql)
+
+
+def fetch_production_bonus(year: int):
     """Returns prod_data dict with oum_summary, ogm_summary, team_detail, headers.
-    
-    upto_month: include invoices from Jan up to and including this month (e.g. 5 = Jan-May).
-    may_only: legacy flag, treated as upto_month=5 if upto_month is not set.
-    """
-    if may_only and upto_month is None:
-        upto_month = 5
+
+    Always covers Jan 1 of `year` through today (real payments received so
+    far) — there's no month cutoff to pass in; the report is always
+    up to date."""
     pb_path = REPO_ROOT / "5. Production Bonus" / "3. Python Script" / "full_outsource_Production_Bonus.py"
     if not pb_path.is_file():
         print(f"  Production Bonus script not found: {pb_path}")
         return None
     try:
         pb = _load_module("out_production_bonus", pb_path)
-        result = pb.build_report(year, upto_month=upto_month)
+        result = pb.build_report(year)
         return result
     except Exception as e:
         print(f"  Warning: Production Bonus fetch failed: {e}")
@@ -1011,6 +1383,31 @@ def get_dates_for_invoices(inv_nums: list[str], dates_map: dict) -> tuple[str, s
     return inv_date_str, first_pay_str, full_pay_str
 
 
+def _full_payment_display(dates: tuple) -> str:
+    """Full/75% Payment Date cell: once an invoice exists but hasn't reached
+    that payment milestone yet, show "pending" instead of "-"."""
+    inv_date, _, full_pay = dates
+    if full_pay and full_pay != "-":
+        return full_pay
+    if inv_date and inv_date != "-":
+        return "pending"
+    return full_pay
+
+
+def _is_cleaning_inspection_service(r_nfp) -> bool:
+    """True when the NFP row's item is a standalone cleaning/inspection service
+    call (e.g. "Cleaning And Inspection Service") rather than an actual solar
+    panel sale -- such invoices have no panel data, so Net Floor Price is not
+    a meaningful figure for them."""
+    if r_nfp is None:
+        return False
+    text = " ".join(
+        str(getattr(r_nfp, attr, "") or "")
+        for attr in ("package_description", "all_item_text")
+    ).lower()
+    return "cleaning" in text and "inspection" in text
+
+
 def is_before_october_2025(date_str: str) -> bool:
     if not date_str or date_str == "-":
         return False
@@ -1024,6 +1421,19 @@ def is_before_october_2025(date_str: str) -> bool:
                     return True
             except ValueError:
                 pass
+    return False
+
+
+def _has_jinko_power_output(pkg_str: str, panel_ratings: list = None) -> bool:
+    if panel_ratings:
+        for r in panel_ratings:
+            if r is not None and str(r).isdigit() and int(r) in (590, 620, 650):
+                return True
+    if not pkg_str or pkg_str == "-":
+        return False
+    s = str(pkg_str).lower()
+    if any(w in s for w in ["590", "620", "650", "66hl4"]):
+        return True
     return False
 
 
@@ -1069,6 +1479,11 @@ def build_agent_summary_rows(
     a_inv, a_p1, a_p2 = anp_dates
 
     is_before_oct_25 = is_before_october_2025(b_inv) or is_before_october_2025(n_inv)
+    has_power_out = (
+        nfp_comm_rm != 0 or nfp_nfp_rm != 0 or nfp_sales_rm != 0 or basic_nfp_rm != 0 or
+        _has_jinko_power_output(nfp_packages) or _has_jinko_power_output(basic_packages) or
+        (not nfp_packages or nfp_packages == "-")
+    )
 
     def _fmt(v):
         if isinstance(v, str):
@@ -1087,13 +1502,24 @@ def build_agent_summary_rows(
     def _fmt_nfp_comm(v, date_str):
         if isinstance(v, str):
             return v
+        if is_before_oct_25:
+            return "invoice before Oct 25"
+        if not has_power_out:
+            return "JinkoSolar package not included"
         if v != 0:
             return f"RM {v:,.2f}"
         if date_str and "2026" in str(date_str):
             return "pending full payment"
+        return "-"
+
+    def _fmt_nfp_cell(v):
+        if isinstance(v, str):
+            return v
         if is_before_oct_25:
             return "invoice before Oct 25"
-        return "-"
+        if not has_power_out:
+            return "JinkoSolar package not included"
+        return f"RM {v:,.2f}" if v != 0 else "-"
 
     # If override is a string, use directly, otherwise format
     if isinstance(basic_override_rm, str):
@@ -1101,21 +1527,34 @@ def build_agent_summary_rows(
     else:
         override_str = _fmt(basic_override_rm)
 
-    if is_outsource:
-        rows = [
-            [agent, str(total_invoices), basic_packages, _fmt(basic_system_rm), _fmt(basic_nfp_rm), _fmt(basic_sales_rm), "Basic Commission", _fmt_comm(basic_comm_rm, b_inv), override_str],
-            ["",    "",                  nfp_packages,   _fmt(nfp_system_rm),   _fmt(nfp_nfp_rm),   _fmt(nfp_sales_rm),   "Net Floor Price Commission", _fmt_nfp_comm(nfp_comm_rm, n_inv), "-"],
-        ]
-        if include_anp:
-            rows.append(["",    "", anp_packages, _fmt(anp_system_rm), _fmt(anp_nfp_rm), "-", "ANP Commission", _fmt(anp_comm_rm), "-"])
-    else:
-        rows = [
-            [agent, str(total_invoices), basic_packages, _fmt(basic_system_rm), _fmt(basic_nfp_rm), _fmt(basic_sales_rm), "Basic Commission", _fmt_comm(basic_comm_rm, b_inv), override_str],
-            ["",    "",                  nfp_packages,   _fmt(nfp_system_rm),   _fmt(nfp_nfp_rm),   _fmt(nfp_sales_rm),   "Net Floor Price Commission", _fmt_nfp_comm(nfp_comm_rm, n_inv), "-"],
-        ]
-        if include_anp:
-            rows.append(["",    "", anp_packages, _fmt(anp_system_rm), _fmt(anp_nfp_rm), "-", "ANP Commission", _fmt(anp_comm_rm), "-"])
-    return rows
+    pkgs = []
+    if basic_packages and basic_packages != "-":
+        pkgs.append(basic_packages)
+    if nfp_packages and nfp_packages != "-" and nfp_packages not in pkgs:
+        pkgs.append(nfp_packages)
+    combined_pkgs = "<br/>".join(pkgs) if pkgs else "-"
+
+    tot_system = max(basic_system_rm, nfp_system_rm)
+    tot_nfp = max(basic_nfp_rm, nfp_nfp_rm)
+    tot_sales = max(basic_sales_rm, nfp_sales_rm)
+
+    b_val = basic_comm_rm if isinstance(basic_comm_rm, (int, float)) else 0.0
+    n_val = nfp_comm_rm if isinstance(nfp_comm_rm, (int, float)) else 0.0
+    tot_comm = b_val + n_val
+
+    comm_str = _fmt_comm(tot_comm, b_inv or n_inv)
+
+    merged_row = [
+        agent,
+        str(total_invoices),
+        combined_pkgs,
+        _fmt(tot_system),
+        _fmt_nfp_cell(tot_nfp),
+        _fmt(tot_sales),
+        comm_str,
+        override_str
+    ]
+    return [merged_row]
 
 
 def build_customer_summary_rows(
@@ -1202,7 +1641,8 @@ def build_internal_summary_tables(
     anp_detail: list,
     year: int,
     invoice_dates_map: dict,
-    month: int | None = None) -> tuple[dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]]]:
+    month: int | None = None,
+    nfp_by_inv_all: dict | None = None) -> tuple[dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]]]:
     """
     Returns:
       agent_summary_by_month - dict of month -> rows for "Summary Internal Agent Commission"
@@ -1210,6 +1650,7 @@ def build_internal_summary_tables(
       agent_anp_by_month - dict of month -> rows for agent ANP Commission
       customer_anp_by_month - dict of month -> rows for agent ANP Commission by Customer
     """
+    nfp_by_inv_all = nfp_by_inv_all or {}
     basic_path = REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "full_internal_basic_commission.py"
     basic = _load_module("int_basic_commission", basic_path)
 
@@ -1233,20 +1674,26 @@ def build_internal_summary_tables(
     customer_anp_by_month = {}
     nfp_by_inv = {r.invoice_number.strip(): r for r in nfp_rows if r.invoice_number}
 
-    for m in range(1, 7):
+    for m in range(1, 13):
         if month is not None and m != month:
             continue
         basic_comm_by_agent = {}
         basic_override_by_agent = {}
         basic_override_breakdown = defaultdict(lambda: defaultdict(float))
+        # Same contributions as basic_override_breakdown, but split by the
+        # SOURCE (executive)'s customer too, so the customer-level table can
+        # show exactly which of the executive's own sales generated each
+        # amount (instead of lumping the whole month's total onto the senior's row).
+        basic_override_by_customer = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
         basic_rate_by_agent = {}
         referral_by_agent = {}
         referral_name_by_agent = {}
         safwan_rate_by_agent = {}
 
-        month_basic_lines = [ln for ln in basic_lines if _parse_month(ln.full_payment_date) == m]
+        month_basic_lines = _expand_basic_lines_for_month(basic_lines, m)
         for ln in month_basic_lines:
             agent = ln.agent_name.strip()
+            customer = ln.customer_name.strip()
             comm = float(ln.basic_commission)
             basic_comm_by_agent[agent] = basic_comm_by_agent.get(agent, 0.0) + comm
 
@@ -1259,6 +1706,13 @@ def build_internal_summary_tables(
             if rate_str not in existing:
                 basic_rate_by_agent[agent] = (existing + "<br/>" + rate_str).lstrip("<br/>")
 
+            # RM300-only contributions (invoice has only reached >=5% payment,
+            # balance not finalized yet) don't attribute overrides/referral
+            # fee -- those are recognized once, in the month the balance
+            # (>=75% payment) lands. See _expand_basic_lines_for_month().
+            if getattr(ln, "_skip_override", False):
+                continue
+
             # Senior override
             senior = _int_get_reporting_senior(ln.agent_name)
             if senior:
@@ -1267,6 +1721,7 @@ def build_internal_summary_tables(
                 exec_name = to_title_case(ln.agent_name)
                 basic_override_breakdown[senior][exec_name] += override
                 basic_override_by_agent[senior] = basic_override_by_agent.get(senior, 0.0) + override
+                basic_override_by_customer[agent][customer][senior] += override
 
             # Referral fee
             if basic._is_valid_referral(ln.referral_name):
@@ -1371,6 +1826,19 @@ def build_internal_summary_tables(
             # Detailed senior override breakdown cell
             basic_override_val = format_senior_override_cell(basic_override_breakdown[agent])
 
+            # Skip pure placeholder rows: no invoices this month AND nothing
+            # payable (no basic/NFP commission, referral fee or override).
+            # Agents with 0 invoices but real amounts (e.g. override-only
+            # seniors) are kept. The ANP row below is appended regardless.
+            if total_invoices_count == 0 and not (
+                basic_total or nfp_comm or referral_rm or safwan_rm
+                or basic_override_val != "-"
+            ):
+                if anp_comm != 0:
+                    a_inv, a_p1, a_p2 = anp_dates
+                    agent_anp_rows.append([agent, a_inv, a_p1, a_p2, anp_packages, "ANP Commission", ensure_rm_prefix(f"{anp_comm:,.2f}"), "-", "-"])
+                continue
+
             rows = build_agent_summary_rows(
                 agent=agent,
                 basic_dates=basic_dates,
@@ -1412,20 +1880,22 @@ def build_internal_summary_tables(
             agent_anp_by_month[m] = agent_anp_rows
 
         # Customer summary
-        basic_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0})
+        basic_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False})
         for ln in month_basic_lines:
             key = (ln.agent_name.strip(), ln.customer_name.strip())
             basic_by_cust[key]["comm"] += float(ln.basic_commission)
             basic_by_cust[key]["sales"] += float(ln.sales_price)
             inv_num = ln.invoice_number.strip()
-            r_nfp = nfp_by_inv.get(inv_num)
+            r_nfp = nfp_by_inv.get(inv_num) or nfp_by_inv_all.get(inv_num)
             if r_nfp:
                 basic_by_cust[key]["system_price"] += float(r_nfp.system_price)
                 basic_by_cust[key]["net_floor_price"] += float(r_nfp.net_floor_price or 0.0)
+                if _is_cleaning_inspection_service(r_nfp):
+                    basic_by_cust[key]["is_cleaning_service"] = True
             rate_str = f"{float(ln.commission_rate) * 100:g}%"
             basic_by_cust[key]["rate"].add(rate_str)
 
-        nfp_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0})
+        nfp_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False})
         for r in month_nfp_rows:
             key = (r.agent_name.strip(), r.customer_name.strip())
             nfp_by_cust[key]["comm"] += float(r.nfp_commission)
@@ -1433,6 +1903,8 @@ def build_internal_summary_tables(
             nfp_by_cust[key]["rate"].add(determine_nfp_rate([r]))
             nfp_by_cust[key]["system_price"] += float(r.system_price)
             nfp_by_cust[key]["net_floor_price"] += float(r.net_floor_price or 0.0)
+            if _is_cleaning_inspection_service(r):
+                nfp_by_cust[key]["is_cleaning_service"] = True
 
         customer_rows = []
         customer_anp_rows = []
@@ -1463,6 +1935,12 @@ def build_internal_summary_tables(
                     basic_invs = [ln.invoice_number for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer]
                     nfp_invs = [r.invoice_number for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer]
 
+                    # RM300 tranche: paid once a July 2026+ invoice reaches >=5%
+                    # payment; pre-July invoices show "invoice before july"
+                    # instead (their Basic Commission pays in full at 100%).
+                    cust_basic_lines = [ln for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer]
+                    rm300_display = _rm300_column_display(cust_basic_lines)
+
                     basic_dates = get_dates_for_invoices(basic_invs, invoice_dates_map)
                     nfp_dates = get_dates_for_invoices(nfp_invs, invoice_dates_map)
 
@@ -1470,6 +1948,8 @@ def build_internal_summary_tables(
                     cust_referral_names = []
                     cust_referral_rm = 0.0
                     for ln in month_basic_lines:
+                        if getattr(ln, "_skip_override", False):
+                            continue
                         if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer:
                             if basic._is_valid_referral(ln.referral_name):
                                 sales_price = float(ln.sales_price)
@@ -1496,30 +1976,79 @@ def build_internal_summary_tables(
                     cust_nfp_pkg_str = "<br/>".join(sorted(cust_nfp_pkgs)) if cust_nfp_pkgs else "-"
 
                     basic_comm_val = f"{basic_info['comm']:,.2f}" if basic_info['comm'] != 0 else ("pending full payment" if basic_dates[0] and "2026" in str(basic_dates[0]) else "-")
-                    customer_rows.append([
-                        show_agent, customer, basic_dates[0], basic_dates[1], basic_dates[2],
+                    row_other_commission = format_other_commission_for_customer(basic_override_by_customer[agent].get(customer, {}))
+
+                    is_before_oct_25 = is_before_october_2025(basic_dates[0]) or is_before_october_2025(nfp_dates[0])
+                    cust_all_pkg_text = " ".join(filter(None, [
+                        cust_basic_pkg_str,
+                        cust_nfp_pkg_str,
+                        *[getattr(ln, 'package_description', '') for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer],
+                        *[getattr(ln, 'all_item_text', '') for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer],
+                        *[getattr(r, 'package_description', '') for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer],
+                        *[getattr(r, 'all_item_text', '') for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer],
+                    ]))
+                    cust_panel_ratings = [
+                        *[getattr(ln, 'panel_rating', None) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer],
+                        *[getattr(r, 'panel_rating', None) for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer],
+                    ]
+                    has_power_out = (
+                        nfp_info['net_floor_price'] != 0 or nfp_info['comm'] != 0 or nfp_info['sales'] != 0 or
+                        basic_info['net_floor_price'] != 0 or
+                        _has_jinko_power_output(cust_all_pkg_text, cust_panel_ratings)
+                    )
+
+                    if is_before_oct_25:
+                        basic_nfp_cell = "invoice before Oct 25"
+                        nfp_nfp_cell = "invoice before Oct 25"
+                        nfp_comm_val = "invoice before Oct 25"
+                    elif not has_power_out:
+                        basic_nfp_cell = "JinkoSolar package not included"
+                        nfp_nfp_cell = "JinkoSolar package not included"
+                        nfp_comm_val = "JinkoSolar package not included"
+                    else:
+                        basic_nfp_cell = (
+                            "cleaning and inspection service" if basic_info['net_floor_price'] == 0 and basic_info.get('is_cleaning_service')
+                            else ensure_rm_prefix(f"{basic_info['net_floor_price']:,.2f}" if basic_info['net_floor_price'] != 0 else "-")
+                        )
+                        nfp_nfp_cell = (
+                            "cleaning and inspection service" if nfp_info['net_floor_price'] == 0 and nfp_info.get('is_cleaning_service')
+                            else ensure_rm_prefix(f"{nfp_info['net_floor_price']:,.2f}" if nfp_info['net_floor_price'] != 0 else "-")
+                        )
+                        nfp_comm_val = ensure_rm_prefix(
+                            f"{nfp_info['comm']:,.2f}" if nfp_info['comm'] != 0
+                            else ("pending full payment" if nfp_dates[0] and "2026" in str(nfp_dates[0]) else "-")
+                        )
+
+                    basic_row = [show_agent, customer, basic_dates[0], basic_dates[1]]
+                    if m >= 7:
+                        basic_row.append(rm300_display)
+                    basic_row.extend([
+                        _full_payment_display(basic_dates),
                         cust_basic_pkg_str,
                         ensure_rm_prefix(f"{basic_info['system_price']:,.2f}" if basic_info['system_price'] != 0 else "-"),
-                        ensure_rm_prefix(f"{basic_info['net_floor_price']:,.2f}" if basic_info['net_floor_price'] != 0 else "-"),
+                        basic_nfp_cell,
                         ensure_rm_prefix(f"{basic_info['sales']:,.2f}" if basic_info['sales'] != 0 else "-"),
                         "Basic Commission", ensure_rm_prefix(basic_comm_val),
+                        row_other_commission,
                         to_title_case(row_referral_label), ensure_rm_prefix(f"{cust_referral_rm:,.2f}" if cust_referral_rm != 0 else "-"),
                         ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-")
                     ])
+                    customer_rows.append(basic_row)
                     show_agent = ""
 
-                    is_before_oct_25 = is_before_october_2025(basic_dates[0]) or is_before_october_2025(nfp_dates[0])
-                    nfp_comm_val = f"{nfp_info['comm']:,.2f}" if nfp_info['comm'] != 0 else ("pending full payment" if nfp_dates[0] and "2026" in str(nfp_dates[0]) else ("invoice before Oct 25" if is_before_oct_25 else "-"))
-
-                    customer_rows.append([
-                        show_agent, customer, nfp_dates[0], nfp_dates[1], nfp_dates[2],
+                    nfp_row = [show_agent, customer, nfp_dates[0], nfp_dates[1]]
+                    if m >= 7:
+                        nfp_row.append("-")
+                    nfp_row.extend([
+                        nfp_dates[2],
                         cust_nfp_pkg_str,
                         ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
-                        ensure_rm_prefix(f"{nfp_info['net_floor_price']:,.2f}" if nfp_info['net_floor_price'] != 0 else "-"),
+                        nfp_nfp_cell,
                         ensure_rm_prefix(f"{nfp_info['sales']:,.2f}" if nfp_info['sales'] != 0 else "-"),
-                        "Net Floor Price Commission", ensure_rm_prefix(nfp_comm_val),
-                        "-", "-", "-"
+                        "Net Floor Price Commission", nfp_comm_val,
+                        "-", "-", "-", "-"
                     ])
+                    customer_rows.append(nfp_row)
 
         # Build ANP customer rows: one row per customer per agent (from int_anp_detail)
         anp_by_cust = defaultdict(float)  # (agent, customer) -> max accumulated commission
@@ -1599,12 +2128,15 @@ def build_outsource_summary_tables(
     year: int,
     invoice_dates_map: dict,
     month: int | None = None,
-) -> tuple[dict[int, list[list[str]]], dict[int, list[list[str]]]]:
+    nfp_by_inv_all: dict | None = None,
+) -> tuple[dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]]]:
     """
     Returns:
       agent_summary_by_month - dict of month -> rows for "Summary Outsource Agent Commission"
       customer_summary_by_month - dict of month -> rows for "Summary Outsource Agent Commission by Customer"
+      customer_anp_by_month - dict of month -> rows for "ANP Commission by Customer" (outsource)
     """
+    nfp_by_inv_all = nfp_by_inv_all or {}
     out_path = REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "outsource_basic_commission.py"
     basic = _load_module("out_basic_commission", out_path)
 
@@ -1618,20 +2150,33 @@ def build_outsource_summary_tables(
 
     agent_summary_by_month = {}
     customer_summary_by_month = {}
+    customer_anp_by_month = {}
     nfp_by_inv = {r.invoice_number.strip(): r for r in nfp_rows if r.invoice_number}
 
-    for m in range(1, 7):
+    for m in range(1, 13):
         if month is not None and m != month:
             continue
         basic_comm_by_agent = {}
         basic_override_by_agent = {}
         out_override_breakdown = defaultdict(lambda: defaultdict(float))
+        # Same contributions as out_override_breakdown, but split by the
+        # SOURCE agent's customer too, so the customer-level table can show
+        # exactly which of the source agent's own sales generated each amount
+        # (instead of lumping the whole month's total onto the recipient's row).
+        out_override_by_customer = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
         gan_lai_soon_by_agent = {}
 
-        month_basic_lines = [ln for ln in basic_lines if _parse_month(ln.full_payment_date) == m]
+        month_basic_lines = _expand_basic_lines_for_month(basic_lines, m)
         for ln in month_basic_lines:
             agent = ln.agent_name.strip()
+            customer = ln.customer_name.strip()
             basic_comm_by_agent[agent] = basic_comm_by_agent.get(agent, 0.0) + ln.basic_commission
+
+            # RM300-only tranche lines (invoice reached >=5% but not yet 75%)
+            # don't attribute overrides/referral -- those are recognized once,
+            # in the month the balance (75%) is reached.
+            if getattr(ln, "_skip_override", False):
+                continue
 
             info = basic.get_agent_hierarchy_info(agent)
             if not info:
@@ -1643,6 +2188,7 @@ def build_outsource_summary_tables(
             if gls_comm > 0:
                 basic_override_by_agent["Gan Lai Soon"] = basic_override_by_agent.get("Gan Lai Soon", 0.0) + gls_comm
                 gan_lai_soon_by_agent[agent] = gan_lai_soon_by_agent.get(agent, 0.0) + gls_comm
+                out_override_breakdown["Gan Lai Soon"][agent] += gls_comm
 
             if getattr(ln, "is_factory", False) or getattr(ln, "package", "") == "Factory":
                 sales_price = float(ln.sales_price)
@@ -1652,6 +2198,7 @@ def build_outsource_summary_tables(
                     safwan_override = sales_price * (0.005 + sharing)
                     basic_override_by_agent[canonical_name] = basic_override_by_agent.get(canonical_name, 0.0) + safwan_override
                     out_override_breakdown[canonical_name]["Safwan"] += safwan_override
+                    out_override_by_customer[agent][customer]["Safwan"] += safwan_override
 
                     if info.get("tier") in ("OSA", "OSA 1") and sharing > 0:
                         oum_p = info.get("oum_parent")
@@ -1660,17 +2207,20 @@ def build_outsource_summary_tables(
                             oum_override_fac = sales_price * sharing * 0.20
                             basic_override_by_agent[oum_p] = basic_override_by_agent.get(oum_p, 0.0) + oum_override_fac
                             out_override_breakdown[oum_p][agent] += oum_override_fac
+                            out_override_by_customer[agent][customer][oum_p] += oum_override_fac
                         ogm_override_fac = sales_price * sharing * 0.10
                         basic_override_by_agent["OGM Pool"] = basic_override_by_agent.get("OGM Pool", 0.0) + ogm_override_fac
                         out_override_breakdown["OGM Pool"][agent] += ogm_override_fac
+                        out_override_by_customer[agent][customer]["OGM Pool"] += ogm_override_fac
             else:
                 oum_parent = info.get("oum_parent")
                 if oum_parent:
                     oum_parent = to_title_case(oum_parent)
-                    own_comm = float(ln.basic_commission)
-                    oum_override = own_comm * 0.005
+                    sales_price = float(ln.sales_price)
+                    oum_override = sales_price * 0.005
                     out_override_breakdown[oum_parent][agent] += oum_override
                     basic_override_by_agent[oum_parent] = basic_override_by_agent.get(oum_parent, 0.0) + oum_override
+                    out_override_by_customer[agent][customer][oum_parent] += oum_override
 
         # NFP commission
         nfp_comm_by_agent = {}
@@ -1717,7 +2267,19 @@ def build_outsource_summary_tables(
             nfp_pkgs_set = set(get_invoice_package(r.invoice_number, r) for r in month_nfp_rows if r.agent_name.strip() == agent)
             nfp_packages = "<br/>".join(sorted(nfp_pkgs_set)) if nfp_pkgs_set else "-"
 
-            basic_override_val = format_senior_override_cell(out_override_breakdown[agent])
+            if agent.strip().lower() == "gan lai soon":
+                _gls_total = sum(out_override_breakdown[agent].values())
+                basic_override_val = f"RM {_gls_total:,.2f} override from all outsource agent" if _gls_total > 0 else "-"
+            else:
+                basic_override_val = format_senior_override_cell(out_override_breakdown[agent])
+
+            # Skip pure placeholder rows: no invoices this month AND nothing
+            # payable. Override-only rows (e.g. Gan Lai Soon OGM) are kept.
+            if total_invoices_count == 0 and not (
+                basic_total or nfp_comm or gan_lai_soon
+                or basic_override_val != "-"
+            ):
+                continue
 
             rows = build_agent_summary_rows(
                 agent=agent,
@@ -1755,22 +2317,24 @@ def build_outsource_summary_tables(
             agent_summary_by_month[m] = agent_rows
 
         # Customer summary
-        basic_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0})
+        basic_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False})
         for ln in month_basic_lines:
             key = (ln.agent_name.strip(), ln.customer_name.strip())
             basic_by_cust[key]["comm"] += ln.basic_commission
             basic_by_cust[key]["sales"] += float(ln.sales_price)
             inv_num = ln.invoice_number.strip()
-            r_nfp = nfp_by_inv.get(inv_num)
+            r_nfp = nfp_by_inv.get(inv_num) or nfp_by_inv_all.get(inv_num)
             if r_nfp:
                 basic_by_cust[key]["system_price"] += float(r_nfp.system_price)
                 basic_by_cust[key]["net_floor_price"] += float(r_nfp.net_floor_price or 0.0)
+                if _is_cleaning_inspection_service(r_nfp):
+                    basic_by_cust[key]["is_cleaning_service"] = True
             rate_str = f"{ln.rate * 100:.2g}%"
             if hasattr(ln, "profit_sharing") and ln.profit_sharing > 0:
                 rate_str += f" + {ln.profit_sharing * 100:.2g}%"
             basic_by_cust[key]["rate"].add(rate_str)
 
-        nfp_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0})
+        nfp_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False})
         for r in month_nfp_rows:
             key = (r.agent_name.strip(), r.customer_name.strip())
             nfp_by_cust[key]["comm"] += float(r.nfp_commission)
@@ -1778,6 +2342,8 @@ def build_outsource_summary_tables(
             nfp_by_cust[key]["rate"].add(determine_nfp_rate([r]))
             nfp_by_cust[key]["system_price"] += float(r.system_price)
             nfp_by_cust[key]["net_floor_price"] += float(r.net_floor_price or 0.0)
+            if _is_cleaning_inspection_service(r):
+                nfp_by_cust[key]["is_cleaning_service"] = True
 
         customer_rows = []
         for agent in month_agents:
@@ -1799,14 +2365,22 @@ def build_outsource_summary_tables(
                     basic_invs = [ln.invoice_number for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer]
                     nfp_invs = [r.invoice_number for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer]
 
+                    # RM300 tranche: paid once a July 2026+ invoice reaches >=5%
+                    # payment; pre-July invoices show "invoice before july"
+                    # instead (their Basic Commission pays in full at 100%).
+                    cust_basic_lines = [ln for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer]
+                    rm300_display = _rm300_column_display(cust_basic_lines)
+
                     basic_dates = get_dates_for_invoices(basic_invs, invoice_dates_map)
                     nfp_dates = get_dates_for_invoices(nfp_invs, invoice_dates_map)
 
-                    row_gan_lai_soon = sum(getattr(ln, "gan_lai_soon", 0.0) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer)
+                    row_gan_lai_soon = sum(getattr(ln, "gan_lai_soon", 0.0) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer and not getattr(ln, "_skip_override", False))
 
                     # Safwan override for this customer in outsource
                     row_safwan_rm = 0.0
                     for ln in month_basic_lines:
+                        if getattr(ln, "_skip_override", False):
+                            continue
                         if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer:
                             if getattr(ln, "is_factory", False) or getattr(ln, "package", "") == "Factory":
                                 sales_price = float(ln.sales_price)
@@ -1820,35 +2394,177 @@ def build_outsource_summary_tables(
                     cust_nfp_pkgs = set(get_invoice_package(r.invoice_number, r) for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer)
                     cust_nfp_pkg_str = "<br/>".join(sorted(cust_nfp_pkgs)) if cust_nfp_pkgs else "-"
 
-                    basic_comm_val = f"{basic_info['comm']:,.2f}" if basic_info['comm'] != 0 else ("pending full payment" if basic_dates[0] and "2026" in str(basic_dates[0]) else "-")
-                    customer_rows.append([
-                        show_agent, customer, basic_dates[0], basic_dates[1], basic_dates[2],
-                        cust_basic_pkg_str,
-                        ensure_rm_prefix(f"{basic_info['system_price']:,.2f}" if basic_info['system_price'] != 0 else "-"),
-                        ensure_rm_prefix(f"{basic_info['net_floor_price']:,.2f}" if basic_info['net_floor_price'] != 0 else "-"),
-                        ensure_rm_prefix(f"{basic_info['sales']:,.2f}" if basic_info['sales'] != 0 else "-"),
-                        "Basic Commission", ensure_rm_prefix(basic_comm_val),
-                        "-", "-", ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"), ensure_rm_prefix(f"{row_gan_lai_soon:,.2f}" if row_gan_lai_soon != 0 else "-")
-                    ])
-                    show_agent = ""
+                    basic_has_source = bool(basic_invs)
+                    nfp_has_source = bool(nfp_invs)
+                    if basic_has_source:
+                        basic_display_dates = basic_dates
+                        basic_display_pkg = cust_basic_pkg_str
+                        basic_display_system = basic_info["system_price"]
+                        basic_display_nfp = basic_info["net_floor_price"]
+                        basic_display_sales = basic_info["sales"]
+                        basic_display_is_cleaning = basic_info.get("is_cleaning_service", False)
+                    elif nfp_has_source:
+                        # Some outsource customers only have NFP source rows. Backfill the
+                        # shared columns onto the paired Basic row so the dashboard and
+                        # exports do not render an empty first row.
+                        basic_display_dates = nfp_dates
+                        basic_display_pkg = cust_nfp_pkg_str
+                        basic_display_system = nfp_info["system_price"]
+                        basic_display_nfp = nfp_info["net_floor_price"]
+                        basic_display_sales = nfp_info["sales"]
+                        basic_display_is_cleaning = nfp_info.get("is_cleaning_service", False)
+                    else:
+                        basic_display_dates = basic_dates
+                        basic_display_pkg = cust_basic_pkg_str
+                        basic_display_system = basic_info["system_price"]
+                        basic_display_nfp = basic_info["net_floor_price"]
+                        basic_display_sales = basic_info["sales"]
+                        basic_display_is_cleaning = basic_info.get("is_cleaning_service", False)
 
                     is_before_oct_25 = is_before_october_2025(basic_dates[0]) or is_before_october_2025(nfp_dates[0])
-                    nfp_comm_val = f"{nfp_info['comm']:,.2f}" if nfp_info['comm'] != 0 else ("pending full payment" if nfp_dates[0] and "2026" in str(nfp_dates[0]) else ("invoice before Oct 25" if is_before_oct_25 else "-"))
+                    cust_all_pkg_text = " ".join(filter(None, [
+                        cust_basic_pkg_str,
+                        cust_nfp_pkg_str,
+                        *[getattr(ln, 'package_description', '') for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer],
+                        *[getattr(ln, 'all_item_text', '') for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer],
+                        *[getattr(r, 'package_description', '') for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer],
+                        *[getattr(r, 'all_item_text', '') for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer],
+                    ]))
+                    cust_panel_ratings = [
+                        *[getattr(ln, 'panel_rating', None) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer],
+                        *[getattr(r, 'panel_rating', None) for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer],
+                    ]
+                    has_power_out = (
+                        nfp_info['net_floor_price'] != 0 or nfp_info['comm'] != 0 or nfp_info['sales'] != 0 or
+                        basic_display_nfp != 0 or
+                        _has_jinko_power_output(cust_all_pkg_text, cust_panel_ratings)
+                    )
 
-                    customer_rows.append([
-                        show_agent, customer, nfp_dates[0], nfp_dates[1], nfp_dates[2],
+                    if is_before_oct_25:
+                        basic_nfp_cell = "invoice before Oct 25"
+                        nfp_nfp_cell = "invoice before Oct 25"
+                        nfp_comm_val = "invoice before Oct 25"
+                    elif not has_power_out:
+                        basic_nfp_cell = "JinkoSolar package not included"
+                        nfp_nfp_cell = "JinkoSolar package not included"
+                        nfp_comm_val = "JinkoSolar package not included"
+                    else:
+                        basic_nfp_cell = (
+                            "cleaning and inspection service" if basic_display_nfp == 0 and basic_display_is_cleaning
+                            else ensure_rm_prefix(f"{basic_display_nfp:,.2f}" if basic_display_nfp != 0 else "-")
+                        )
+                        nfp_nfp_cell = (
+                            "cleaning and inspection service" if nfp_info['net_floor_price'] == 0 and nfp_info.get('is_cleaning_service')
+                            else ensure_rm_prefix(f"{nfp_info['net_floor_price']:,.2f}" if nfp_info['net_floor_price'] != 0 else "-")
+                        )
+                        nfp_comm_val = ensure_rm_prefix(
+                            f"{nfp_info['comm']:,.2f}" if nfp_info['comm'] != 0
+                            else ("pending full payment" if nfp_dates[0] and "2026" in str(nfp_dates[0]) else "-")
+                        )
+
+                    basic_comm_val = f"{basic_info['comm']:,.2f}" if basic_info['comm'] != 0 else ("pending full payment" if basic_dates[0] and "2026" in str(basic_dates[0]) else "-")
+                    row_other_commission = format_other_commission_for_customer(out_override_by_customer[agent].get(customer, {}))
+                    basic_row = [show_agent, customer, basic_display_dates[0], basic_display_dates[1]]
+                    if m >= 7:
+                        basic_row.append(rm300_display)
+                    basic_row.extend([
+                        _full_payment_display(basic_display_dates),
+                        basic_display_pkg,
+                        ensure_rm_prefix(f"{basic_display_system:,.2f}" if basic_display_system != 0 else "-"),
+                        basic_nfp_cell,
+                        ensure_rm_prefix(f"{basic_display_sales:,.2f}" if basic_display_sales != 0 else "-"),
+                        "Basic Commission", ensure_rm_prefix(basic_comm_val),
+                        row_other_commission,
+                        "-", "-", ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"), ensure_rm_prefix(f"{row_gan_lai_soon:,.2f}" if row_gan_lai_soon != 0 else "-")
+                    ])
+                    customer_rows.append(basic_row)
+                    show_agent = ""
+
+                    nfp_row = [show_agent, customer, nfp_dates[0], nfp_dates[1]]
+                    if m >= 7:
+                        nfp_row.append("-")
+                    nfp_row.extend([
+                        nfp_dates[2],
                         cust_nfp_pkg_str,
                         ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
-                        ensure_rm_prefix(f"{nfp_info['net_floor_price']:,.2f}" if nfp_info['net_floor_price'] != 0 else "-"),
+                        nfp_nfp_cell,
                         ensure_rm_prefix(f"{nfp_info['sales']:,.2f}" if nfp_info['sales'] != 0 else "-"),
-                        "Net Floor Price Commission", ensure_rm_prefix(nfp_comm_val),
-                        "-", "-", "-", "-"
+                        "Net Floor Price Commission", nfp_comm_val,
+                        "-", "-", "-", "-", "-"
                     ])
+                    customer_rows.append(nfp_row)
 
         if customer_rows:
             customer_summary_by_month[m] = customer_rows
 
-    return agent_summary_by_month, customer_summary_by_month
+        # Build ANP customer rows: one row per customer per agent (from anp_detail)
+        month_anp_detail = [r for r in anp_detail if _parse_month(r.get("invoice_date")) == m]
+        anp_comm_by_agent = {}
+        anp_agent_monthly = defaultdict(float)
+        for r in month_anp_detail:
+            agent = str(r.get("agent_name", "")).strip()
+            comm = float(r.get("anp_commission_accumulated_tier", 0.0))
+            if comm > anp_agent_monthly[agent]:
+                anp_agent_monthly[agent] = comm
+        for agent, comm in anp_agent_monthly.items():
+            anp_comm_by_agent[agent] = comm
+
+        anp_by_cust = defaultdict(float)  # (agent, customer) -> max accumulated commission
+        anp_cust_inv = defaultdict(list)   # (agent, customer) -> invoice numbers
+        anp_sales_by_cust = defaultdict(float) # (agent, customer) -> sum of sales price
+        anp_clawback_by_cust = defaultdict(float) # (agent, customer) -> sum of clawbacks
+        for r in month_anp_detail:
+            ag = str(r.get("agent_name", "")).strip()
+            cu = str(r.get("customer_name", "") or "").strip()
+            if not cu:
+                cu = "(unknown)"
+            key = (ag, cu)
+            comm = float(r.get("anp_commission_accumulated_tier", 0.0))
+            if comm > anp_by_cust[key]:
+                anp_by_cust[key] = comm
+            inv = r.get("invoice_number")
+            if inv and inv not in anp_cust_inv[key]:
+                anp_cust_inv[key].append(inv)
+            anp_sales_by_cust[key] += float(r.get("invoice_total_amount", 0.0))
+            anp_clawback_by_cust[key] += float(r.get("clawback", 0.0))
+
+        customer_anp_rows = []
+        anp_agents_seen = []
+        for (ag, cu) in sorted(anp_by_cust.keys(), key=lambda k: (outsource_agent_sort_key(k[0]), k[1])):
+            if ag not in anp_agents_seen:
+                anp_agents_seen.append(ag)
+        for ag in anp_agents_seen:
+            cust_keys = sorted([(ag, cu) for (a, cu) in anp_by_cust.keys() if a == ag])
+            show_ag = ag
+            first_row = True
+            final_anp_comm = anp_comm_by_agent.get(ag, 0.0)
+            final_anp_comm_str = f"{final_anp_comm:,.2f}" if final_anp_comm != 0 else "-"
+            for key in cust_keys:
+                cu = key[1]
+                inv_list = anp_cust_inv[key]
+                if not inv_list:
+                    continue
+                cust_dates = get_dates_for_invoices(inv_list, invoice_dates_map)
+
+                row_comm_str = final_anp_comm_str if first_row else "-"
+                first_row = False
+
+                cust_anp_pkgs = set(get_invoice_package(inv, r) for r in month_anp_detail if str(r.get("agent_name", "")).strip() == ag and (r.get("customer_name") or "").strip() == cu for inv in [r.get("invoice_number")] if inv)
+                cust_anp_pkg_str = "<br/>".join(sorted(cust_anp_pkgs)) if cust_anp_pkgs else "-"
+
+                customer_anp_rows.append([
+                    show_ag, cu, cust_dates[0], cust_dates[1],
+                    cust_anp_pkg_str,
+                    ensure_rm_prefix(f"{anp_sales_by_cust[key]:,.2f}" if anp_sales_by_cust[key] != 0 else "-"),
+                    ensure_rm_prefix(row_comm_str),
+                    ensure_rm_prefix(f"{anp_clawback_by_cust[key]:,.2f}" if anp_clawback_by_cust[key] != 0 else "-")
+                ])
+                show_ag = ""
+
+        if customer_anp_rows:
+            customer_anp_by_month[m] = customer_anp_rows
+
+    return agent_summary_by_month, customer_summary_by_month, customer_anp_by_month
 
 # ---------------------------------------------------------------------------
 
@@ -2145,6 +2861,8 @@ def _build_customer_summary_table_rl(title: str, headers: list[str], rows: list[
         "invoice date": 1.2,
         "1st payment date": 1.2,
         "full payment date": 1.2,
+        "75% payment date": 1.2,
+        "basic commission (rm300)": 1.3,
         "package type": 1.4,
         "system price": 1.4,
         "netfloor price": 1.4,
@@ -2155,6 +2873,7 @@ def _build_customer_summary_table_rl(title: str, headers: list[str], rows: list[
         "paid amount": 1.4,
         "commission": 1.8,
         "commission price": 1.3,
+        "senior override": 1.6,
         "referral name": 1.1,
         "referral fee": 1.1,
         "safwan (rm)": 1.1,
@@ -2186,7 +2905,9 @@ def _build_customer_summary_table_rl(title: str, headers: list[str], rows: list[
                 formatted.append(Paragraph(s, cell_center))
             elif "package" in hdr:
                 formatted.append(Paragraph(s, cell_left))
-            elif "sales price" in hdr or "system price" in hdr or "netfloor price" in hdr or "net floor price" in hdr or "payment received" in hdr or "paid amount" in hdr or "commission price" in hdr or "referral fee" in hdr or "safwan" in hdr or "gan lai soon" in hdr or "override" in hdr or "clawback" in hdr:
+            elif "gan lai soon" in hdr:
+                formatted.append(Paragraph(s, cell_center))
+            elif "sales price" in hdr or "system price" in hdr or "netfloor price" in hdr or "net floor price" in hdr or "payment received" in hdr or "paid amount" in hdr or "commission price" in hdr or "referral fee" in hdr or "safwan" in hdr or "override" in hdr or "clawback" in hdr:
                 formatted.append(Paragraph(s, cell_right))
             elif "referral name" in hdr:
                 formatted.append(Paragraph(s, cell_center))
@@ -2479,6 +3200,7 @@ def build_commission_pdf(
     output_path: Path,
     year: int,
     *,
+    invoice_dates_map: dict = None,
     # Internal data
     int_basic_t1, int_basic_lines, int_basic_t4,
     int_nfp_agent, int_nfp_rows,
@@ -2494,7 +3216,11 @@ def build_commission_pdf(
     out_nfp_meta,
     out_ega_t1, out_ega_h1, out_ega_t2, out_ega_t3, out_ega_h3,
     out_agent_summary_rows, out_customer_summary_rows,
-    out_prod_data,
+    out_customer_anp_rows=None,
+    out_prod_data=None,
+    contest_t1_headers=None, contest_t1_rows=None,
+    contest_t2_headers=None, contest_t2_rows=None,
+    contest_t3_headers=None, contest_t3_rows=None,
     page_nums_dict: dict[str, int] = None,
     page_registry: dict[str, int] = None,
     month: int | None = None,
@@ -2838,8 +3564,12 @@ def build_commission_pdf(
     # ----------------------------------------------------------------
     # Cover Page  (design: commission_pdf.py Page 1)
     # ----------------------------------------------------------------
-    MONTH_NAMES = {1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June"}
+    MONTH_NAMES = {
+        1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
+        7: "July", 8: "August", 9: "September", 10: "October", 11: "November", 12: "December"
+    }
     sub_title_text = f"{MONTH_NAMES[month]} {year}" if month is not None else "H1 — January to June"
+    contest_title = f"{MONTH_NAMES[month]} Monthly Contest" if month is not None else "Monthly Contest"
     story.append(Spacer(1, int(1.2 * inch)))
     story.append(Paragraph(f"Commission Report {year}", title_style))
     story.append(Paragraph("Internal &amp; Outsource Agent Commission Summary", sub_title_style))
@@ -2875,36 +3605,58 @@ def build_commission_pdf(
     page_out_ega = page_nums_dict.get("out_ega", 8)
     page_out_agent = page_nums_dict.get("out_agent", 9)
     page_out_prod = page_nums_dict.get("out_prod", 10)
+    page_out_anp = page_nums_dict.get("out_anp", 11)
+    page_contest = page_nums_dict.get("contest", 12)
 
     toc_data = [
         [Paragraph("Internal", toc_left_style),
          Paragraph("", toc_right_style)],
         [Paragraph("&bull;&nbsp;&nbsp;<b>Basic commission and Net Floor Price Commission</b>", toc_sub_style),
          Paragraph("", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Internal Agent Commission", toc_sub_style),
+        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Commission", toc_sub_style),
          Paragraph(f"Page {page_int_agent}", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Internal Agent Commission by Customer", toc_sub_style),
+        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Commission by Customer", toc_sub_style),
          Paragraph(f"Page {page_int_cust}", toc_right_style)],
         [Paragraph("&bull;&nbsp;&nbsp;<b>ANP Commission</b>", toc_sub_style),
          Paragraph("", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Internal Agent Commission by Customer", toc_sub_style),
+        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;ANP Commission by Customer", toc_sub_style),
          Paragraph(f"Page {page_int_anp}", toc_right_style)],
         [Paragraph("&bull;&nbsp;&nbsp;<b>EGA/ESA Awards</b>", toc_sub_style),
+         Paragraph("", toc_right_style)],
+        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Award", toc_sub_style),
          Paragraph(f"Page {page_int_ega}", toc_right_style)],
+        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Award by Customer", toc_sub_style),
+         Paragraph("", toc_right_style)],
         [Paragraph("Outsource", toc_left_style),
          Paragraph("", toc_right_style)],
         [Paragraph("&bull;&nbsp;&nbsp;<b>Basic commission and Net Floor Price Commission</b>", toc_sub_style),
          Paragraph("", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Outsource Agent Commission", toc_sub_style),
+        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Commission", toc_sub_style),
          Paragraph(f"Page {page_out_agent}", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Outsource Agent Commission by Customer", toc_sub_style),
+        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Commission by Customer", toc_sub_style),
          Paragraph(f"Page {page_out_cust}", toc_right_style)],
+        [Paragraph("&bull;&nbsp;&nbsp;<b>ANP Commission</b>", toc_sub_style),
+         Paragraph("", toc_right_style)],
+        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;ANP Commission by Customer", toc_sub_style),
+         Paragraph(f"Page {page_out_anp}", toc_right_style)],
         [Paragraph("&bull;&nbsp;&nbsp;<b>EGA/ESA Awards</b>", toc_sub_style),
+         Paragraph("", toc_right_style)],
+        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Award", toc_sub_style),
          Paragraph(f"Page {page_out_ega}", toc_right_style)],
+        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Award by Customer", toc_sub_style),
+         Paragraph("", toc_right_style)],
         [Paragraph("&bull;&nbsp;&nbsp;<b>Production Bonus</b>", toc_sub_style),
          Paragraph("", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary of OUM Bonus", toc_sub_style),
+        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Production Bonus Summary", toc_sub_style),
          Paragraph(f"Page {page_out_prod}", toc_right_style)],
+        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Production Bonus Summary by customer", toc_sub_style),
+         Paragraph("", toc_right_style)],
+        [Paragraph(contest_title, toc_left_style),
+         Paragraph(f"Page {page_contest}", toc_right_style)],
+        [Paragraph("&bull;&nbsp;&nbsp;<b>Team Championship and Team Achievement Bonus</b>", toc_sub_style),
+         Paragraph("", toc_right_style)],
+        [Paragraph("&bull;&nbsp;&nbsp;<b>Summary of Cases and Awards by Agent</b>", toc_sub_style),
+         Paragraph("", toc_right_style)],
     ]
     toc_table = Table(toc_data, colWidths=[CONTENT_W - int(1.2 * inch), int(1.2 * inch)])
     toc_table.setStyle(TableStyle([
@@ -2920,13 +3672,16 @@ def build_commission_pdf(
     # i. Summary Internal Agent Commission (Basic + NFP) — comes FIRST
     # ----------------------------------------------------------------
     int_agent_headers = ["Agent", "Total Invoice", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override"]
-    MONTH_NAMES = {1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June"}
+    MONTH_NAMES = {
+        1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
+        7: "July", 8: "August", 9: "September", 10: "October", 11: "November", 12: "December"
+    }
     group_label_style = ParagraphStyle("GroupLabel", parent=styles["Normal"],
                                         fontSize=12, leading=15, fontName=FONT_BOLD,
                                         textColor=_rl_color("#1A365D"), spaceBefore=8, spaceAfter=4)
 
     has_int_agent_data = False
-    for m in range(1, 7):
+    for m in range(1, 13):
         if month is not None and m != month:
             continue
         month_name = MONTH_NAMES[m]
@@ -2938,12 +3693,12 @@ def build_commission_pdf(
             story.append(Paragraph("Internal", group_label_style))
             story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
             _spacer(4)
-            story.append(Paragraph("Summary Internal Agent Commission", sub_section_style))
+            story.append(Paragraph("Summary Agent Commission", sub_section_style))
             _spacer(6)
             story.append(Paragraph(f"<b>{month_name} 2026</b>", ParagraphStyle("MonthHdr", parent=styles["Normal"], fontSize=9.5, fontName=FONT_BOLD, textColor=_rl_color("#1A365D"), spaceBefore=6, spaceAfter=4)))
 
             # Metadata block
-            month_basic_lines = [ln for ln in int_basic_lines if _parse_month(ln.full_payment_date) == m]
+            month_basic_lines = _expand_basic_lines_for_month(int_basic_lines, m)
             month_nfp_rows = [r for r in int_nfp_rows if _parse_month(r.full_payment_date) == m]
             agents = set(ln.agent_name.strip() for ln in month_basic_lines) | set(r.agent_name.strip() for r in month_nfp_rows)
             customers = set(ln.customer_name.strip() for ln in month_basic_lines) | set(r.customer_name.strip() for r in month_nfp_rows)
@@ -2952,60 +3707,19 @@ def build_commission_pdf(
 
             trimmed_rows = rows
             t = _build_summary_table_rl(
-                f"Summary Internal Agent Commission — {month_name}",
+                f"Summary Agent Commission — {month_name}",
                 int_agent_headers,
                 trimmed_rows,
                 CONTENT_W
             )
             story.append(t)
-            # Resolve rates and notes dynamically for month m
-            try:
-                import basic_commission_rates
-                m_exec_val = basic_commission_rates.get_basic_rate("Internal", "executive", m)
-                m_senior_val = basic_commission_rates.get_basic_rate("Internal", "senior", m)
-                m_exec_str = f"{m_exec_val * 100:.2f}%".replace(".00", "")
-                m_senior_str = f"{m_senior_val * 100:.2f}%".replace(".00", "")
-            except Exception:
-                m_exec_str = "4%" if m >= 6 else "3%"
-                m_senior_str = "4.25%" if m >= 6 else "3.25%"
-
-            m_notes = ["<b>Basic Commission:</b>"]
-            if m <= 5:
-                m_notes.extend([
-                    "&bull;&nbsp;&nbsp;Basic Commission is for every Full Payment",
-                    "&bull;&nbsp;&nbsp;Total Amount - EPP Price (if applicable) = Sales Price",
-                    "&bull;&nbsp;&nbsp;Sales Price x Rate % = Basic Commission",
-                    "&bull;&nbsp;&nbsp;Rate % :",
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Executive - {m_exec_str}",
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Senior - {m_senior_str}",
-                    "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Senior Override - 0.25%",
-                    "&bull;&nbsp;&nbsp;Basic Commission payout condition: given out to Agent once Payment = 100%"
-                ])
-            else:
-                m_notes.extend([
-                    "&bull;&nbsp;&nbsp;Total Amount - EPP Price (if applicable) = Sales Price",
-                    "&bull;&nbsp;&nbsp;Sales Price x Rate % = Basic Commission",
-                    "&bull;&nbsp;&nbsp;Rate % :",
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Executive - {m_exec_str}",
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Senior - {m_senior_str}",
-                    "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Senior Override - 0.25%",
-                    "&bull;&nbsp;&nbsp;Basic Commission payout condition:",
-                    "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* Payment = 5% then Agent get RM300",
-                    "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* Payment = 75% then Agent get Balance Basic Commission"
-                ])
-            m_notes.extend([
-                "<b>Referral Fee:</b>",
-                "&bull;&nbsp;&nbsp;All Residential and non-residential: 1% (Before Mar 2026), 2% (From Mar 2026), Additional 0.5% (Mar Specials 2026)",
-                "&bull;&nbsp;&nbsp;Referral fee eligibility excludes spouses"
-            ])
-            _add_note_paragraphs(m_notes)
             story.append(PageBreak())
     if not has_int_agent_data:
         story.append(PageTracker("int_agent", page_registry))
         story.append(Paragraph("Internal", group_label_style))
         story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
         _spacer(4)
-        story.append(Paragraph("Summary Internal Agent Commission", sub_section_style))
+        story.append(Paragraph("Summary Agent Commission", sub_section_style))
         _spacer(6)
         story.append(Paragraph("No internal commission data available.", body_style))
         story.append(PageBreak())
@@ -3014,10 +3728,14 @@ def build_commission_pdf(
     # ii. Summary Internal Agent Commission by Customer (Basic + NFP)
     # ----------------------------------------------------------------
     int_cust_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price",
-                         "Referral Name", "Referral Fee", "Safwan (RM)"]
+                         "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)"]
+    # July 2026 onwards the builder emits an extra "Basic Commission (RM300)"
+    # column and replaces "Full Payment Date" with "75% Payment Date".
+    int_cust_headers_july = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price",
+                              "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)"]
 
     has_int_cust_data = False
-    for m in range(1, 7):
+    for m in range(1, 13):
         if month is not None and m != month:
             continue
         month_name = MONTH_NAMES[m]
@@ -3029,7 +3747,7 @@ def build_commission_pdf(
             story.append(Paragraph("Internal", group_label_style))
             story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
             _spacer(4)
-            story.append(Paragraph("Summary Internal Agent Commission by Customer", sub_section_style))
+            story.append(Paragraph("Summary Agent Commission by Customer", sub_section_style))
             _spacer(6)
             story.append(Paragraph(f"<b>{month_name} 2026</b>", ParagraphStyle("MonthHdr", parent=styles["Normal"], fontSize=9.5, fontName=FONT_BOLD, textColor=_rl_color("#1A365D"), spaceBefore=6, spaceAfter=4)))
 
@@ -3043,9 +3761,10 @@ def build_commission_pdf(
             _spacer(4)
 
             # Check if Safwan column should be kept or removed
-            local_headers = list(int_cust_headers)
+            local_headers = list(int_cust_headers_july if m >= 7 else int_cust_headers)
+            _pkg_idx = 6 if m >= 7 else 5
             local_rows = [list(r) for r in rows]
-            has_factory = any("factory" in str(r[5]).lower() for r in local_rows if len(r) > 5)
+            has_factory = any("factory" in str(r[_pkg_idx]).lower() for r in local_rows if len(r) > _pkg_idx)
             if not has_factory:
                 lower_hdrs = [h.lower().strip() for h in local_headers]
                 if "safwan (rm)" in lower_hdrs:
@@ -3100,14 +3819,14 @@ def build_commission_pdf(
                 "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales below Net Floor price:</b> Sales Price < Net Floor Price. Formula: (Sales Price - Net Floor Price) x Bears 20% = NFP Commission",
                 "&bull;&nbsp;&nbsp;Effective October 1, 2025, NFP computations are applicable exclusively to invoices issued on or after this date. Invoices predating this period are structurally excluded from NFP allocations."
             ])
-            # _add_note_paragraphs(m_notes)
+            _add_note_paragraphs(m_notes)
             story.append(PageBreak())
     if not has_int_cust_data:
         story.append(PageTracker("int_cust", page_registry))
         story.append(Paragraph("Internal", group_label_style))
         story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
         _spacer(4)
-        story.append(Paragraph("Summary Internal Agent Commission by Customer", sub_section_style))
+        story.append(Paragraph("Summary Agent Commission by Customer", sub_section_style))
         _spacer(6)
         story.append(Paragraph("No internal customer commission data available.", body_style))
         story.append(PageBreak())
@@ -3116,7 +3835,7 @@ def build_commission_pdf(
     # iii. ANP Commission (Internal) by Customer — comes AFTER Basic/NFP
     # ----------------------------------------------------------------
     has_int_anp_data = False
-    for m in range(1, 7):
+    for m in range(1, 13):
         if month is not None and m != month:
             continue
         month_name = MONTH_NAMES[m]
@@ -3128,7 +3847,7 @@ def build_commission_pdf(
             story.append(Paragraph("Internal", group_label_style))
             story.append(Paragraph("ANP Commission", section_title_style))
             _spacer(6)
-            story.append(Paragraph("Summary Internal Agent Commission by Customer", sub_section_style))
+            story.append(Paragraph("ANP Commission by Customer", sub_section_style))
             _spacer(6)
             story.append(Paragraph(f"<b>{month_name} 2026</b>", ParagraphStyle("MonthHdr", parent=styles["Normal"], fontSize=9.5, fontName=FONT_BOLD, textColor=_rl_color("#1A365D"), spaceBefore=6, spaceAfter=4)))
 
@@ -3147,7 +3866,8 @@ def build_commission_pdf(
             )
             story.append(t_anp)
             _add_note_paragraphs([
-                "&bull;&nbsp;&nbsp;Requires a minimum 5% payment",
+                "&bull;&nbsp;&nbsp;Internal agents only",
+                "&bull;&nbsp;&nbsp;Requires at least RM0.01 paid",
                 "&bull;&nbsp;&nbsp;ANP Commission will be rewarded the next month of case issuance",
                 "&bull;&nbsp;&nbsp;EP Point Recognition Structure:",
                 "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- <b>Residence &amp; Shop Lot:</b> 100% recognition rate",
@@ -3183,14 +3903,13 @@ def build_commission_pdf(
         story.append(Paragraph("Internal", group_label_style))
         story.append(Paragraph("EGA / ESA Awards", section_title_style))
         _spacer(6)
-        story.append(Paragraph("Summary by Agent", sub_section_style))
+        story.append(Paragraph("Summary Agent Award", sub_section_style))
         _spacer(4)
         agents = set(r[0] for r in int_ega_t1 if r[0])
         story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#C3DAF2\" size=\"11\">&bull;</font> Senior &nbsp;&nbsp; <font color=\"#E9F2FA\" size=\"11\">&bull;</font> Executive", meta_style))
         _spacer(4)
         t = _build_ega_table_rl(int_ega_h1, int_ega_t1, CONTENT_W)
         story.append(t)
-        _add_note_paragraphs(_ega_notes)
         story.append(PageBreak())
     else:
         story.append(Paragraph("Internal", group_label_style))
@@ -3202,14 +3921,19 @@ def build_commission_pdf(
     # EGA/ESA Awards (YTD) by Customer — all invoice types, separate page
     _int_ega_all = (int_ega_t2 or []) + (int_ega_t3 or [])
     if _int_ega_all:
-        _int_ega_ytd_headers = ["Agent", "Customer", "Invoice Date", "Package", "Sales Price", "Accumulated EP", "Eligibility"]
+        _int_ega_ytd_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package", "Sales Price", "Accumulated EP", "Eligibility"]
         _int_ega_ytd_rows = []
         for _er in sorted(_int_ega_all, key=lambda x: (str(x[0]).lower() if x else "", str(x[4]) if len(x) > 4 else "")):
             if len(_er) >= 8:
+                inv_key = str(_er[2]).strip()
+                dates = invoice_dates_map.get(inv_key) if invoice_dates_map else None
+                inv_date = dates[0] if dates else str(_er[4]).strip()
+                first_pay_dt = dates[1] if dates else ""
                 _int_ega_ytd_rows.append([
                     to_title_case(str(_er[0]).strip()),  # agent
                     to_title_case(str(_er[1]).strip()),  # customer
-                    str(_er[4]).strip(),                  # invoice_date
+                    inv_date,                             # invoice_date
+                    first_pay_dt,                         # 1st payment date
                     str(_er[3]).strip(),                  # package
                     str(_er[5]).strip(),                  # sales_price
                     str(_er[6]).strip(),                  # accum_ep
@@ -3219,7 +3943,7 @@ def build_commission_pdf(
             story.append(Paragraph("Internal", group_label_style))
             story.append(Paragraph("EGA / ESA Awards", section_title_style))
             _spacer(6)
-            story.append(Paragraph("EGA / ESA Awards (YTD) by Customer", sub_section_style))
+            story.append(Paragraph("Summary Agent Award by Customer", sub_section_style))
             _spacer(4)
             _ytd_agents = set(r[0] for r in _int_ega_ytd_rows)
             _ytd_customers = set(r[1] for r in _int_ega_ytd_rows)
@@ -3227,7 +3951,7 @@ def build_commission_pdf(
             _spacer(4)
             t_ytd = _build_ega_table_rl(_int_ega_ytd_headers, _int_ega_ytd_rows, CONTENT_W)
             story.append(t_ytd)
-            # _add_note_paragraphs(_ega_notes)
+            _add_note_paragraphs(_ega_notes)
             story.append(PageBreak())
 
     # ----------------------------------------------------------------
@@ -3237,7 +3961,7 @@ def build_commission_pdf(
     _out_agent_keep = [0, 1, 2, 3, 4, 5, 6, 7, 8]  # column indices to keep
 
     has_out_agent_data = False
-    for m in range(1, 7):
+    for m in range(1, 13):
         if month is not None and m != month:
             continue
         month_name = MONTH_NAMES[m]
@@ -3249,11 +3973,11 @@ def build_commission_pdf(
             story.append(Paragraph("Outsource", group_label_style))
             story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
             _spacer(4)
-            story.append(Paragraph("Summary Outsource Agent Commission", sub_section_style))
+            story.append(Paragraph("Summary Agent Commission", sub_section_style))
             _spacer(6)
             story.append(Paragraph(f"<b>{month_name} 2026</b>", ParagraphStyle("MonthHdr", parent=styles["Normal"], fontSize=9.5, fontName=FONT_BOLD, textColor=_rl_color("#1A365D"), spaceBefore=6, spaceAfter=4)))
 
-            month_basic_lines = [ln for ln in out_basic_lines if _parse_month(ln.full_payment_date) == m]
+            month_basic_lines = _expand_basic_lines_for_month(out_basic_lines, m)
             month_nfp_rows = [r for r in out_nfp_rows if _parse_month(r.full_payment_date) == m]
             agents = set(ln.agent_name.strip() for ln in month_basic_lines) | set(r.agent_name.strip() for r in month_nfp_rows)
             customers = set(ln.customer_name.strip() for ln in month_basic_lines) | set(r.customer_name.strip() for r in month_nfp_rows)
@@ -3268,54 +3992,20 @@ def build_commission_pdf(
 
             trimmed_rows = rows
             t = _build_summary_table_rl(
-                f"Summary Outsource Agent Commission — {month_name}",
+                f"Summary Agent Commission — {month_name}",
                 out_agent_headers,
                 trimmed_rows,
                 CONTENT_W,
                 is_outsource=True
             )
             story.append(t)
-            # Resolve rates and notes dynamically for month m
-            try:
-                import basic_commission_rates
-                m_oum_val = basic_commission_rates.get_basic_rate("Outsource", "oum", m)
-                m_osa_val = basic_commission_rates.get_basic_rate("Outsource", "osa/osa1", m)
-                m_oum_str = f"{m_oum_val * 100:.2f}%".replace(".00", "")
-                m_osa_str = f"{m_osa_val * 100:.2f}%".replace(".00", "")
-            except Exception:
-                m_oum_str = "5.5%" if m >= 6 else "5%"
-                m_osa_str = "5.5%" if m >= 6 else "4.5%"
-
-            m_notes = []
-            if m <= 5:
-                m_notes.extend([
-                    "&bull;&nbsp;&nbsp;Basic Commission is for every Full Payment",
-                    "&bull;&nbsp;&nbsp;Total Amount - EPP Price (if applicable) = Sales Price",
-                    "&bull;&nbsp;&nbsp;Sales Price x Rate % = Basic Commission",
-                    "&bull;&nbsp;&nbsp;Rate % :",
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;OUM - {m_oum_str}",
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;OSA - {m_osa_str}",
-                    "&bull;&nbsp;&nbsp;Basic Commission payout condition: given out to Agent once Payment = 100%"
-                ])
-            else:
-                m_notes.extend([
-                    "&bull;&nbsp;&nbsp;Total Amount - EPP Price (if applicable) = Sales Price",
-                    "&bull;&nbsp;&nbsp;Sales Price x Rate % = Basic Commission",
-                    "&bull;&nbsp;&nbsp;Rate % :",
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;OUM - {m_oum_str}",
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;OSA - {m_osa_str}",
-                    "&bull;&nbsp;&nbsp;Basic Commission payout condition:",
-                    "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* Payment = 5% then Agent get RM300",
-                    "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* Payment = 75% then Agent get Balance Basic Commission"
-                ])
-            _add_note_paragraphs(m_notes)
             story.append(PageBreak())
     if not has_out_agent_data:
         story.append(PageTracker("out_agent", page_registry))
         story.append(Paragraph("Outsource", group_label_style))
         story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
         _spacer(4)
-        story.append(Paragraph("Summary Outsource Agent Commission", sub_section_style))
+        story.append(Paragraph("Summary Agent Commission", sub_section_style))
         _spacer(6)
         story.append(Paragraph("No outsource commission data available.", body_style))
         story.append(PageBreak())
@@ -3324,10 +4014,14 @@ def build_commission_pdf(
     # i. Summary Outsource Agent Commission by Customer
     # ----------------------------------------------------------------
     out_cust_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price",
-                         "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
+                         "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
+    # July 2026 onwards: extra "Basic Commission (RM300)" column, and
+    # "75% Payment Date" instead of "Full Payment Date" (see internal section).
+    out_cust_headers_july = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price",
+                              "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
 
     has_out_cust_data = False
-    for m in range(1, 7):
+    for m in range(1, 13):
         if month is not None and m != month:
             continue
         month_name = MONTH_NAMES[m]
@@ -3339,7 +4033,7 @@ def build_commission_pdf(
             story.append(Paragraph("Outsource", group_label_style))
             story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
             _spacer(4)
-            story.append(Paragraph("Summary Outsource Agent Commission by Customer", sub_section_style))
+            story.append(Paragraph("Summary Agent Commission by Customer", sub_section_style))
             _spacer(6)
             story.append(Paragraph(f"<b>{month_name} 2026</b>", ParagraphStyle("MonthHdr", parent=styles["Normal"], fontSize=9.5, fontName=FONT_BOLD, textColor=_rl_color("#1A365D"), spaceBefore=6, spaceAfter=4)))
 
@@ -3360,9 +4054,10 @@ def build_commission_pdf(
                 _spacer(4)
 
             # Check if Safwan column should be kept or removed
-            local_headers = list(out_cust_headers)
+            local_headers = list(out_cust_headers_july if m >= 7 else out_cust_headers)
+            _pkg_idx = 6 if m >= 7 else 5
             local_rows = [list(r) for r in rows]
-            has_factory = any("factory" in str(r[5]).lower() for r in local_rows if len(r) > 5)
+            has_factory = any("factory" in str(r[_pkg_idx]).lower() for r in local_rows if len(r) > _pkg_idx)
             if not has_factory:
                 lower_hdrs = [h.lower().strip() for h in local_headers]
                 if "safwan (rm)" in lower_hdrs:
@@ -3418,17 +4113,70 @@ def build_commission_pdf(
                 "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales below Net Floor price:</b> Sales Price < Net Floor Price. Formula: (Sales Price - Net Floor Price) x Bears 25% = NFP Commission",
                 "&bull;&nbsp;&nbsp;Effective October 1, 2025, NFP computations are applicable exclusively to invoices issued on or after this date. Invoices predating this period are structurally excluded from NFP allocations."
             ])
-            # _add_note_paragraphs(m_notes)
+            _add_note_paragraphs(m_notes)
             story.append(PageBreak())
     if not has_out_cust_data:
         story.append(PageTracker("out_cust", page_registry))
         story.append(Paragraph("Outsource", group_label_style))
         story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
         _spacer(4)
-        story.append(Paragraph("Summary Outsource Agent Commission by Customer", sub_section_style))
+        story.append(Paragraph("Summary Agent Commission by Customer", sub_section_style))
         _spacer(6)
         story.append(Paragraph("No outsource customer commission data available.", body_style))
         story.append(PageBreak())
+
+    # ----------------------------------------------------------------
+    # ANP Commission (Outsource) by Customer — comes AFTER Basic/NFP
+    # ----------------------------------------------------------------
+    has_out_anp_data = False
+    for m in range(1, 13):
+        if month is not None and m != month:
+            continue
+        month_name = MONTH_NAMES[m]
+        anp_cust_rows = out_customer_anp_rows.get(m, []) if out_customer_anp_rows else []
+        if anp_cust_rows:
+            if not has_out_anp_data:
+                story.append(PageTracker("out_anp", page_registry))
+            has_out_anp_data = True
+            story.append(Paragraph("Outsource", group_label_style))
+            story.append(Paragraph("ANP Commission", section_title_style))
+            _spacer(6)
+            story.append(Paragraph("ANP Commission by Customer", sub_section_style))
+            _spacer(6)
+            story.append(Paragraph(f"<b>{month_name} 2026</b>", ParagraphStyle("MonthHdr", parent=styles["Normal"], fontSize=9.5, fontName=FONT_BOLD, textColor=_rl_color("#1A365D"), spaceBefore=6, spaceAfter=4)))
+
+            month_anp_detail = [r for r in out_anp_detail if _parse_month(r.get("invoice_date")) == m]
+            agents = set(r.get("agent_name", "").strip() for r in month_anp_detail if r.get("agent_name"))
+            customers = set((r.get("customer_name") or "").strip() for r in month_anp_detail if r.get("customer_name"))
+            story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(customers)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#CBD5E0\" size=\"11\">&bull;</font> OGM &nbsp;&nbsp; <font color=\"#E2E8F0\" size=\"11\">&bull;</font> OUM &nbsp;&nbsp; <font color=\"#F7FAFC\" size=\"11\">&bull;</font> OSA", meta_style))
+            _spacer(4)
+
+            out_anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Commission Price", "Clawback"]
+            t_anp = _build_customer_summary_table_rl(
+                f"ANP Commission by Customer — {month_name}",
+                out_anp_headers,
+                anp_cust_rows,
+                CONTENT_W,
+                is_outsource=True
+            )
+            story.append(t_anp)
+            _add_note_paragraphs([
+                "&bull;&nbsp;&nbsp;Internal agents only",
+                "&bull;&nbsp;&nbsp;Requires at least RM0.01 paid",
+                "&bull;&nbsp;&nbsp;ANP Commission will be rewarded the next month of case issuance",
+                "&bull;&nbsp;&nbsp;EP Point Recognition Structure:",
+                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- <b>Residence &amp; Shop Lot:</b> 100% recognition rate",
+                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- <b>Factory:</b> Prior to May 2026: 100% recognition. Effective May 2026 onwards: 100% recognition for the first RM 40,000, 40% recognition for the balance amount (unless factory has less than 36pcs, in which case it follows Residence rate).",
+                "&bull;&nbsp;&nbsp;Commission Tiers based on Accumulated Total Sales:",
+                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- RM 0 - 59k qualifies for RM 0",
+                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- RM 60k - 179k qualifies for RM 500",
+                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- RM 180k - 359k qualifies for RM 1000",
+                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Above RM 360k qualifies for RM 1500",
+                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Above RM 720k qualifies for RM 2000",
+            ])
+            story.append(PageBreak())
+    if not has_out_anp_data:
+        story.append(PageTracker("out_anp", page_registry))
 
     # ----------------------------------------------------------------
     # ii. EGA/ESA Awards (Outsource) — Summary by Agent, then YTD by Customer on next page
@@ -3449,14 +4197,13 @@ def build_commission_pdf(
         story.append(Paragraph("Outsource", group_label_style))
         story.append(Paragraph("EGA / ESA Awards", section_title_style))
         _spacer(6)
-        story.append(Paragraph("Summary by Agent", sub_section_style))
+        story.append(Paragraph("Summary Agent Award", sub_section_style))
         _spacer(4)
         agents = set(r[0] for r in out_ega_t1 if r[0])
         story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#CBD5E0\" size=\"11\">&bull;</font> OGM &nbsp;&nbsp; <font color=\"#E2E8F0\" size=\"11\">&bull;</font> OUM &nbsp;&nbsp; <font color=\"#F7FAFC\" size=\"11\">&bull;</font> OSA", meta_style))
         _spacer(4)
         t = _build_ega_table_rl(out_ega_h1, out_ega_t1, CONTENT_W)
         story.append(t)
-        _add_note_paragraphs(_out_ega_notes)
         story.append(PageBreak())
     else:
         story.append(Paragraph("Outsource", group_label_style))
@@ -3468,14 +4215,19 @@ def build_commission_pdf(
     # EGA/ESA Awards (YTD) by Customer — all invoice types, separate page
     _out_ega_all = (out_ega_t2 or []) + (out_ega_t3 or [])
     if _out_ega_all:
-        _out_ega_ytd_headers = ["Agent", "Customer", "Invoice Date", "Package", "Sales Price", "Accumulated EP", "Eligibility"]
+        _out_ega_ytd_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package", "Sales Price", "Accumulated EP", "Eligibility"]
         _out_ega_ytd_rows = []
         for _er in sorted(_out_ega_all, key=lambda x: (str(x[0]).lower() if x else "", str(x[4]) if len(x) > 4 else "")):
             if len(_er) >= 8:
+                inv_key = str(_er[2]).strip()
+                dates = invoice_dates_map.get(inv_key) if invoice_dates_map else None
+                inv_date = dates[0] if dates else str(_er[4]).strip()
+                first_pay_dt = dates[1] if dates else ""
                 _out_ega_ytd_rows.append([
                     to_title_case(str(_er[0]).strip()),  # agent
                     to_title_case(str(_er[1]).strip()),  # customer
-                    str(_er[4]).strip(),                  # invoice_date
+                    inv_date,                             # invoice_date
+                    first_pay_dt,                         # 1st payment date
                     str(_er[3]).strip(),                  # package
                     str(_er[5]).strip(),                  # sales_price
                     str(_er[6]).strip(),                  # accum_ep
@@ -3485,7 +4237,7 @@ def build_commission_pdf(
             story.append(Paragraph("Outsource", group_label_style))
             story.append(Paragraph("EGA / ESA Awards", section_title_style))
             _spacer(6)
-            story.append(Paragraph("EGA / ESA Awards (YTD) by Customer", sub_section_style))
+            story.append(Paragraph("Summary Agent Award by Customer", sub_section_style))
             _spacer(4)
             _ytd_agents = set(r[0] for r in _out_ega_ytd_rows)
             _ytd_customers = set(r[1] for r in _out_ega_ytd_rows)
@@ -3493,7 +4245,7 @@ def build_commission_pdf(
             _spacer(4)
             t_ytd = _build_ega_table_rl(_out_ega_ytd_headers, _out_ega_ytd_rows, CONTENT_W)
             story.append(t_ytd)
-            # _add_note_paragraphs(_out_ega_notes)
+            _add_note_paragraphs(_out_ega_notes)
             story.append(PageBreak())
 
     # ----------------------------------------------------------------
@@ -3519,7 +4271,7 @@ def build_commission_pdf(
             story.append(Paragraph("Outsource", group_label_style))
             story.append(Paragraph("Production Bonus", section_title_style))
             _spacer(6)
-            story.append(Paragraph("Summary of OUM Bonus", sub_section_style))
+            story.append(Paragraph("Production Bonus Summary", sub_section_style))
             _spacer(4)
 
             agents = set(r[0] for r in oum_summary if r[0])
@@ -3530,7 +4282,6 @@ def build_commission_pdf(
 
             t = _build_ega_table_rl(pb_headers["oum"], oum_summary, CONTENT_W)
             story.append(t)
-            _add_note_paragraphs(_pb_notes)
             story.append(PageBreak())
 
         if ogm_summary and pb_headers.get("ogm"):
@@ -3548,14 +4299,13 @@ def build_commission_pdf(
 
             t = _build_ega_table_rl(pb_headers["ogm"], ogm_summary, CONTENT_W)
             story.append(t)
-            _add_note_paragraphs(_pb_notes)
             story.append(PageBreak())
 
         if team_detail and pb_headers.get("detail"):
             story.append(Paragraph("Outsource", group_label_style))
             story.append(Paragraph("Production Bonus", section_title_style))
             _spacer(6)
-            story.append(Paragraph("Summary of OUM Bonus by Customer", sub_section_style))
+            story.append(Paragraph("Production Bonus Summary by customer", sub_section_style))
             _spacer(4)
 
             agents = set(r[0] for r in team_detail if len(r) > 0 and r[0])
@@ -3565,13 +4315,49 @@ def build_commission_pdf(
 
             t = _build_ega_table_rl(pb_headers["detail"], team_detail, CONTENT_W)
             story.append(t)
-            # _add_note_paragraphs(_pb_notes)
+            _add_note_paragraphs(_pb_notes)
             story.append(PageBreak())
     else:
         story.append(Paragraph("Outsource", group_label_style))
         story.append(Paragraph("Production Bonus", section_title_style))
         _spacer(6)
         story.append(Paragraph("No production bonus data available.", body_style))
+        story.append(PageBreak())
+
+    # ----------------------------------------------------------------
+    # June Monthly Contest (company-wide — not agent-type specific)
+    # ----------------------------------------------------------------
+    story.append(PageTracker("contest", page_registry))
+
+    _contest_notes = [
+        "&bull;&nbsp;&nbsp;<b>Team Ranking Rewards:</b> Champion = RM 5,000 | Runner-up = RM 3,000 | Third Place = RM 2,000",
+        "&bull;&nbsp;&nbsp;<b>Golden Boot Award</b> (Top 3 Individuals): Champion = RM 3,000 | Runner-up = RM 2,000 | Third Place = RM 1,000",
+        "&bull;&nbsp;&nbsp;<b>Eligibility:</b> At least 3 cases completed, Monthly sales &ge; RM 150,000, Meets company performance recognition standards",
+        "&bull;&nbsp;&nbsp;<b>Team Achievement Bonus:</b> Team target achieved, every member completes at least 1 deal &mdash; Reward for all qualified members: RM 2,000",
+        "&bull;&nbsp;&nbsp;<b>Fast Start Award:</b> Complete 2 deals &mdash; Reward: Xiaomi Smart Watch (RM 250)",
+    ]
+
+    if contest_t1_headers and contest_t1_rows:
+        story.append(Paragraph(contest_title, section_title_style))
+        _spacer(6)
+        story.append(Paragraph("Team Championship and Team Achievement Bonus", sub_section_style))
+        _spacer(4)
+        t1 = _build_ega_table_rl(contest_t1_headers, contest_t1_rows, CONTENT_W)
+        story.append(t1)
+        story.append(PageBreak())
+
+        story.append(Paragraph(contest_title, section_title_style))
+        _spacer(6)
+        story.append(Paragraph("Summary of Cases and Awards by Agent", sub_section_style))
+        _spacer(4)
+        t3 = _build_ega_table_rl(contest_t3_headers, contest_t3_rows, CONTENT_W)
+        story.append(t3)
+        _add_note_paragraphs(_contest_notes)
+        story.append(PageBreak())
+    else:
+        story.append(Paragraph(contest_title, section_title_style))
+        _spacer(6)
+        story.append(Paragraph("No monthly contest data available.", body_style))
         story.append(PageBreak())
 
     # ----------------------------------------------------------------
@@ -3587,6 +4373,7 @@ def build_commission_excel(
     year: int,
     month: int | None = None,
     *,
+    invoice_dates_map: dict = None,
     int_agent_summary_rows,
     int_customer_summary_rows,
     int_customer_anp_rows,
@@ -3603,6 +4390,9 @@ def build_commission_excel(
     out_ega_t3,
     out_ega_h3,
     out_prod_data,
+    contest_t1_headers=None, contest_t1_rows=None,
+    contest_t2_headers=None, contest_t2_rows=None,
+    contest_t3_headers=None, contest_t3_rows=None,
 ) -> Path:
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -3634,6 +4424,12 @@ def build_commission_excel(
 
         if isinstance(val, str):
             val = re.sub(r'<[^>]*>', ' ', val).strip()
+
+        # Agent columns: display the canonical full name (Title Case).
+        if isinstance(val, str) and val and val != "-" and is_agent_header(header_name):
+            cell.value = to_full_name(val)
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+            return
 
         # If it's a date or invoice/number column, keep as text and center
         if isinstance(val, str) and any(w in header_name.lower() for w in ["date", "invoice", "number", "no."]):
@@ -3751,7 +4547,9 @@ def build_commission_excel(
                 if col_idx < len(headers):
                     c = ws.cell(row=start_row, column=col_idx + 1)
                     clean_and_format_cell(c, val, headers[col_idx], is_total_row=is_total)
-            
+                    if headers[col_idx].strip().lower() == "gan lai soon":
+                        c.alignment = Alignment(horizontal="center", vertical="center")
+
             if sys_col and nfp_col:
                 val1 = str(ws.cell(row=start_row, column=sys_col).value).strip()
                 val2 = str(ws.cell(row=start_row, column=nfp_col).value).strip()
@@ -3778,35 +4576,27 @@ def build_commission_excel(
                     max_len = len(val_str)
             ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
 
-    MONTH_NAMES = {1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June"}
-    months_to_export = [month] if month is not None else [1, 2, 3, 4, 5, 6]
+    MONTH_NAMES = {
+        1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
+        7: "July", 8: "August", 9: "September", 10: "October", 11: "November", 12: "December"
+    }
+    months_to_export = [month] if month is not None else list(range(1, 13))
 
-    # 1. Int Agent Summary
+    # 1. Int Basic & NFP by Customer
     ws = wb.active
-    ws.title = "Int Agent Summary"
-    int_agent_headers = ["Agent", "Total Invoice", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override"]
-    curr_row = 1
-    for m in months_to_export:
-        rows = int_agent_summary_rows.get(m, [])
-        if rows:
-            curr_row = write_block(ws, curr_row, f"{MONTH_NAMES[m]} 2026 - Summary Internal Agent Commission", int_agent_headers, rows)
-    if curr_row == 1:
-        curr_row = write_block(ws, curr_row, "Summary Internal Agent Commission", int_agent_headers, [])
-    autofit_cols(ws)
-
-    # 2. Int Customer Summary
-    ws = wb.create_sheet("Int Customer Summary")
-    int_cust_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Referral Name", "Referral Fee", "Safwan (RM)"]
+    ws.title = "Int Basic & NFP by Customer"
+    int_cust_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)"]
+    int_cust_headers_july = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)"]
     curr_row = 1
     for m in months_to_export:
         rows = int_customer_summary_rows.get(m, [])
         if rows:
-            curr_row = write_block(ws, curr_row, f"{MONTH_NAMES[m]} 2026 - Summary Internal Agent Commission by Customer", int_cust_headers, rows)
+            curr_row = write_block(ws, curr_row, f"{MONTH_NAMES[m]} 2026 - Summary Internal Agent Commission by Customer", int_cust_headers_july if m >= 7 else int_cust_headers, rows)
     if curr_row == 1:
         curr_row = write_block(ws, curr_row, "Summary Internal Agent Commission by Customer", int_cust_headers, [])
     autofit_cols(ws)
 
-    # 3. Int ANP Details
+    # 2. Int ANP Details
     ws = wb.create_sheet("Int ANP Details")
     int_anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Sales Price", "Commission Price", "Clawback"]
     curr_row = 1
@@ -3818,28 +4608,18 @@ def build_commission_excel(
         curr_row = write_block(ws, curr_row, "ANP Commission by Customer", int_anp_headers, [])
     autofit_cols(ws)
 
-    # 4. Out Agent Summary
-    ws = wb.create_sheet("Out Agent Summary")
-    out_agent_headers = ["Agent", "Total Invoice", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OUM Override"]
-    curr_row = 1
-    for m in months_to_export:
-        rows = out_agent_summary_rows.get(m, [])
-        if rows:
-            curr_row = write_block(ws, curr_row, f"{MONTH_NAMES[m]} 2026 - Summary Outsource Agent Commission", out_agent_headers, rows)
-    if curr_row == 1:
-        curr_row = write_block(ws, curr_row, "Summary Outsource Agent Commission", out_agent_headers, [])
-    autofit_cols(ws)
-
-    # 5. Out Customer Summary
-    ws = wb.create_sheet("Out Customer Summary")
-    out_cust_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
+    # 3. Out Basic & NFP by Customer
+    ws = wb.create_sheet("Out Basic & NFP by Customer")
+    out_cust_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
+    out_cust_headers_july = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
     curr_row = 1
     for m in months_to_export:
         rows = out_customer_summary_rows.get(m, [])
         if rows:
-            local_headers = list(out_cust_headers)
+            local_headers = list(out_cust_headers_july if m >= 7 else out_cust_headers)
+            _pkg_idx = 6 if m >= 7 else 5
             local_rows = [list(r) for r in rows]
-            has_factory = any("factory" in str(r[5]).lower() for r in local_rows if len(r) > 5)
+            has_factory = any("factory" in str(r[_pkg_idx]).lower() for r in local_rows if len(r) > _pkg_idx)
             if not has_factory:
                 lower_hdrs = [h.lower().strip() for h in local_headers]
                 if "safwan (rm)" in lower_hdrs:
@@ -3853,20 +4633,25 @@ def build_commission_excel(
         curr_row = write_block(ws, curr_row, "Summary Outsource Agent Commission by Customer", out_cust_headers, [])
     autofit_cols(ws)
 
-    # 6. Int EGA ESA Details
+    # 4. Int EGA ESA Details
     ws = wb.create_sheet("Int EGA ESA Details")
     curr_row = 1
     curr_row = write_block(ws, curr_row, "Internal EGA / ESA Awards - Summary by Agent", int_ega_h1 or ["Agent", "EP Point Status", "Qualifying Status"], int_ega_t1)
     _int_ega_all = (int_ega_t2 or []) + (int_ega_t3 or [])
-    _int_ega_ytd_headers = ["Agent", "Customer", "Invoice Date", "Package", "Sales Price", "Accumulated EP", "Eligibility"]
+    _int_ega_ytd_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package", "Sales Price", "Accumulated EP", "Eligibility"]
     _int_ega_ytd_rows = []
     if _int_ega_all:
         for _er in sorted(_int_ega_all, key=lambda x: (str(x[0]).lower() if x else "", str(x[4]) if len(x) > 4 else "")):
             if len(_er) >= 8:
+                inv_key = str(_er[2]).strip()
+                dates = invoice_dates_map.get(inv_key) if invoice_dates_map else None
+                inv_date = dates[0] if dates else str(_er[4]).strip()
+                first_pay_dt = dates[1] if dates else ""
                 _int_ega_ytd_rows.append([
                     to_title_case(str(_er[0]).strip()),
                     to_title_case(str(_er[1]).strip()),
-                    str(_er[4]).strip(),
+                    inv_date,
+                    first_pay_dt,
                     str(_er[3]).strip(),
                     str(_er[5]).strip(),
                     str(_er[6]).strip(),
@@ -3875,20 +4660,25 @@ def build_commission_excel(
     curr_row = write_block(ws, curr_row, "Internal EGA / ESA Awards (YTD) - Detail by Customer", _int_ega_ytd_headers, _int_ega_ytd_rows)
     autofit_cols(ws)
 
-    # 7. Out EGA ESA Details
+    # 5. Out EGA ESA Details
     ws = wb.create_sheet("Out EGA ESA Details")
     curr_row = 1
     curr_row = write_block(ws, curr_row, "Outsource EGA / ESA Awards - Summary by Agent", out_ega_h1 or ["Agent", "EP Point Status", "Qualifying Status"], out_ega_t1)
     _out_ega_all = (out_ega_t2 or []) + (out_ega_t3 or [])
-    _out_ega_ytd_headers = ["Agent", "Customer", "Invoice Date", "Package", "Sales Price", "Accumulated EP", "Eligibility"]
+    _out_ega_ytd_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package", "Sales Price", "Accumulated EP", "Eligibility"]
     _out_ega_ytd_rows = []
     if _out_ega_all:
         for _er in sorted(_out_ega_all, key=lambda x: (str(x[0]).lower() if x else "", str(x[4]) if len(x) > 4 else "")):
             if len(_er) >= 8:
+                inv_key = str(_er[2]).strip()
+                dates = invoice_dates_map.get(inv_key) if invoice_dates_map else None
+                inv_date = dates[0] if dates else str(_er[4]).strip()
+                first_pay_dt = dates[1] if dates else ""
                 _out_ega_ytd_rows.append([
                     to_title_case(str(_er[0]).strip()),
                     to_title_case(str(_er[1]).strip()),
-                    str(_er[4]).strip(),
+                    inv_date,
+                    first_pay_dt,
                     str(_er[3]).strip(),
                     str(_er[5]).strip(),
                     str(_er[6]).strip(),
@@ -3897,7 +4687,7 @@ def build_commission_excel(
     curr_row = write_block(ws, curr_row, "Outsource EGA / ESA Awards (YTD) - Detail by Customer", _out_ega_ytd_headers, _out_ega_ytd_rows)
     autofit_cols(ws)
 
-    # 8. Outsource Production Bonus
+    # 6. Outsource Production Bonus
     ws = wb.create_sheet("Outsource Production Bonus")
     curr_row = 1
     if out_prod_data:
@@ -3915,6 +4705,21 @@ def build_commission_excel(
         curr_row = write_block(ws, curr_row, "Summary of OUM Bonus by Customer", ["Agent", "Customer", "Sales Price"], [])
     autofit_cols(ws)
 
+    # 7. June Monthly Contest
+    ws = wb.create_sheet("Team Championship")
+    curr_row = 1
+    curr_row = write_block(ws, curr_row, "Team Championship and Team Achievement Bonus",
+                            contest_t1_headers or ["Team Name", "Accumulated System Price (RM)", "Accumulated Sales Price (RM)", "Rank", "Team Ranking Award (RM)", "Team Achievement Bonus (RM)"],
+                            contest_t1_rows or [])
+    autofit_cols(ws)
+
+    ws = wb.create_sheet("Cases and Awards by Agent")
+    curr_row = 1
+    curr_row = write_block(ws, curr_row, "Summary of Cases and Awards by Agent",
+                            contest_t3_headers or ["Agent Name", "Team Name", "Customer Name", "Invoice Date", "1st Payment Date", "System Price (RM)", "Sales Price (RM)", "Golden Boot Award (Top Individual Performance) (RM)", "Fast Start Award"],
+                            contest_t3_rows or [])
+    autofit_cols(ws)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
     return output_path
@@ -3926,31 +4731,99 @@ def build_commission_excel(
 
 def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: bool = False) -> Path:
     print(f"\nBuilding Commission PDF for year {year}...")
+    # Resolve proxy credentials once, up front: _resolve_proxy_credentials()
+    # pops/re-sets PG_PROXY_TOKEN in os.environ, so letting the concurrent
+    # fetches below each resolve on their own thread can race and make one of
+    # them see "missing token" mid-swap.
+    _resolve_proxy_credentials()
 
-    # --- Fetch Internal data ---
-    print("\n[Internal]")
-    print("  Fetching Basic Commission...")
-    int_basic_t1, int_basic_t2, int_basic_t3, int_basic_t4, int_basic_meta, int_basic_lines = fetch_internal_basic(year, month=month)
-    print(f"    {int_basic_meta['agents']} agents, {int_basic_meta['invoices']} invoices")
-    
-    print("  Fetching ANP Commission...")
-    int_anp_summary, int_anp_detail, int_anp_meta = fetch_internal_anp(year)
-    print(f"    {int_anp_meta['agents']} agents, {int_anp_meta['invoices']} invoices")
+    # Month packs fetch the FULL year and let build_*_summary_tables() bucket
+    # rows into the requested month (same as the web dashboard). Pre-filtering
+    # by real_full_payment_date/full_payment_date drops July-2026-policy
+    # invoices, which are recognized by their 5%/75% payment-milestone dates.
+    h1_only = month is None
 
-    print("  Fetching NFP Commission...")
-    int_nfp_agent, int_nfp_detail, int_nfp_meta, int_nfp_rows = fetch_internal_nfp(year)
-    print(f"    {int_nfp_meta['agents']} agents, {int_nfp_meta['invoices']} invoices")
+    # --- Fetch all data concurrently ---
+    # All fetches below are independent network round-trips to the same PG proxy
+    # (previously ~65s run sequentially). Running them concurrently cuts total
+    # fetch time down to roughly the slowest single call.
+    from concurrent.futures import ThreadPoolExecutor
+    ega_upto_month = month if month is not None else (5 if may_only else None)
 
-    print("  Fetching EGA/ESA Awards...")
-    # EGA/ESA is always Jan-through-month (YTD) — auto-derive from --month if not explicitly set
-    ega_may_only = may_only or (month is not None and month >= 1)
-    try:
-        int_ega_t1, int_ega_t2, int_ega_t3, int_ega_h1, int_ega_h2, int_ega_h3 = fetch_internal_ega_esa(year, may_only=ega_may_only)
-        print(f"    {len(int_ega_t1)} rows")
-    except Exception as e:
-        print(f"    Warning: {e}")
-        int_ega_t1, int_ega_t2, int_ega_t3 = [], [], []
-        int_ega_h1, int_ega_h2, int_ega_h3 = [], [], []
+    print("\nFetching all commission data concurrently...")
+    with ThreadPoolExecutor(max_workers=10) as _executor:
+        _f_int_basic = _executor.submit(fetch_internal_basic, year, h1_only=h1_only)
+        _f_int_anp = _executor.submit(fetch_internal_anp, year, h1_only=h1_only)
+        _f_int_nfp = _executor.submit(fetch_internal_nfp, year, h1_only=h1_only)
+        _f_int_ega = _executor.submit(fetch_internal_ega_esa, year, upto_month=ega_upto_month)
+        _f_out_basic = _executor.submit(fetch_outsource_basic, year, h1_only=h1_only)
+        _f_out_anp = _executor.submit(fetch_outsource_anp, year, h1_only=h1_only)
+        _f_out_nfp = _executor.submit(fetch_outsource_nfp, year, h1_only=h1_only)
+        _f_out_ega = _executor.submit(fetch_outsource_ega_esa, year, upto_month=ega_upto_month)
+        _f_prod = _executor.submit(fetch_production_bonus, year)
+        _f_contest = _executor.submit(fetch_monthly_contest, month, year)
+
+        print("  Fetching Basic Commission (Internal)...")
+        int_basic_t1, int_basic_t2, int_basic_t3, int_basic_t4, int_basic_meta, int_basic_lines = _f_int_basic.result()
+
+        print("  Fetching ANP Commission (Internal)...")
+        int_anp_summary, int_anp_detail, int_anp_meta = _f_int_anp.result()
+
+        print("  Fetching NFP Commission (Internal)...")
+        int_nfp_agent, int_nfp_detail, int_nfp_meta, int_nfp_rows, int_nfp_by_inv_all = _f_int_nfp.result()
+        print(f"    {int_nfp_meta['agents']} agents, {int_nfp_meta['invoices']} invoices")
+
+        print("  Fetching EGA/ESA Awards (Internal)...")
+        try:
+            int_ega_t1, int_ega_t2, int_ega_t3, int_ega_h1, int_ega_h2, int_ega_h3 = _f_int_ega.result()
+            print(f"    {len(int_ega_t1)} rows")
+        except Exception as e:
+            print(f"    Warning: {e}")
+            int_ega_t1, int_ega_t2, int_ega_t3 = [], [], []
+            int_ega_h1, int_ega_h2, int_ega_h3 = [], [], []
+
+        print("  Fetching Basic Commission (Outsource)...")
+        out_basic_t1, out_basic_invoices, out_basic_factory, out_basic_meta, out_basic_lines = _f_out_basic.result()
+        print(f"    {out_basic_meta['agents']} agents, {out_basic_meta['invoices']} invoices")
+
+        print("  Fetching ANP Commission (Outsource)...")
+        try:
+            out_anp_summary, out_anp_detail, out_anp_meta = _f_out_anp.result()
+            print(f"    {out_anp_meta['agents']} agents, {out_anp_meta['invoices']} invoices")
+        except Exception as e:
+            print(f"    Warning: {e}")
+            out_anp_summary, out_anp_detail = [], []
+            out_anp_meta = {"agents": 0, "invoices": 0, "total_commission": Decimal("0"), "filter": "error"}
+
+        print("  Fetching NFP Commission (Outsource)...")
+        try:
+            out_nfp_agent, out_nfp_detail, out_nfp_meta, out_nfp_rows, out_nfp_by_inv_all = _f_out_nfp.result()
+            print(f"    {out_nfp_meta['agents']} agents, {out_nfp_meta['invoices']} invoices")
+        except Exception as e:
+            print(f"    Warning: {e}")
+            out_nfp_agent, out_nfp_detail, out_nfp_rows = [], [], []
+            out_nfp_by_inv_all = {}
+            out_nfp_meta = {"agents": 0, "invoices": 0, "total_commission": Decimal("0"), "filter": "error"}
+
+        print("  Fetching EGA/ESA Awards (Outsource)...")
+        try:
+            out_ega_t1, out_ega_t2, out_ega_t3, out_ega_h1, out_ega_h2, out_ega_h3 = _f_out_ega.result()
+            print(f"    {len(out_ega_t1)} rows")
+        except Exception as e:
+            print(f"    Warning: {e}")
+            out_ega_t1, out_ega_t2, out_ega_t3 = [], [], []
+            out_ega_h1, out_ega_h2, out_ega_h3 = [], [], []
+
+        print("  Fetching Production Bonus...")
+        out_prod_data = _f_prod.result()
+        if out_prod_data:
+            print(f"    OUM: {len(out_prod_data.get('oum_summary', []))} rows")
+        else:
+            print("    No data")
+
+        print("  Fetching Monthly Contest...")
+        (contest_t1_headers, contest_t1_rows, contest_t2_headers, contest_t2_rows,
+         contest_t3_headers, contest_t3_rows) = _f_contest.result()
 
     # Build internal summary tables
     global invoice_package_map
@@ -3973,11 +4846,23 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         basic_mod = _load_module("int_basic_commission", basic_path)
     invoice_dates_map = fetch_invoice_dates(year, basic_mod)
 
-    # If a specific month is requested, filter the raw data lines
+    # If a specific month is requested, keep ANP detail for that month only and
+    # re-scope the highlight metas. Basic/NFP lines intentionally stay
+    # full-year: build_internal_summary_tables() buckets them per month via
+    # _expand_basic_lines_for_month() (payment milestones), so pre-filtering by
+    # full_payment_date here would empty the July-policy months.
     if month is not None:
-        int_basic_lines = [ln for ln in int_basic_lines if _parse_month(ln.full_payment_date) == month]
-        int_nfp_rows = [r for r in int_nfp_rows if _parse_month(r.full_payment_date) == month]
         int_anp_detail = [r for r in int_anp_detail if _parse_month(r.get("invoice_date")) == month]
+        _m_lines = _expand_basic_lines_for_month(int_basic_lines, month)
+        _m_nfp = [r for r in int_nfp_rows if _parse_month(r.full_payment_date) == month]
+        int_basic_meta = {**int_basic_meta,
+                          "agents": len({ln.agent_name.strip() for ln in _m_lines}),
+                          "invoices": len(_m_lines),
+                          "total_commission": Decimal(str(round(sum(float(ln.basic_commission) for ln in _m_lines), 2)))}
+        int_nfp_meta = {**int_nfp_meta,
+                        "agents": len({r.agent_name.strip() for r in _m_nfp if r.agent_name}),
+                        "invoices": len(_m_nfp),
+                        "total_commission": Decimal(str(round(sum(float(r.nfp_commission) for r in _m_nfp), 2)))}
 
     int_agent_summary_rows, int_customer_summary_rows, int_agent_anp_rows, int_customer_anp_rows = build_internal_summary_tables(
         basic_t1=int_basic_t1,
@@ -3985,6 +4870,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         basic_t4=int_basic_t4,
         nfp_agent_rows=int_nfp_agent,
         nfp_rows=int_nfp_rows,
+        nfp_by_inv_all=int_nfp_by_inv_all,
         anp_summary_rows=int_anp_summary_for_table,
         anp_detail=int_anp_detail,
         year=year,
@@ -3993,49 +4879,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     )
     print(f"    Agent summary: {len(int_agent_summary_rows)} rows")
     print(f"    Customer summary: {len(int_customer_summary_rows)} rows")
-    # --- Fetch Outsource data ---
     print("\n[Outsource]")
-    print("  Fetching Basic Commission...")
-    out_basic_t1, out_basic_invoices, out_basic_factory, out_basic_meta, out_basic_lines = fetch_outsource_basic(year, month=month)
-    print(f"    {out_basic_meta['agents']} agents, {out_basic_meta['invoices']} invoices")
-
-    print("  Fetching ANP Commission...")
-    try:
-        out_anp_summary, out_anp_detail, out_anp_meta = fetch_outsource_anp(year)
-        print(f"    {out_anp_meta['agents']} agents, {out_anp_meta['invoices']} invoices")
-    except Exception as e:
-        print(f"    Warning: {e}")
-        out_anp_summary, out_anp_detail = [], []
-        out_anp_meta = {"agents": 0, "invoices": 0, "total_commission": Decimal("0"), "filter": "error"}
-
-    print("  Fetching NFP Commission...")
-    try:
-        out_nfp_agent, out_nfp_detail, out_nfp_meta, out_nfp_rows = fetch_outsource_nfp(year)
-        print(f"    {out_nfp_meta['agents']} agents, {out_nfp_meta['invoices']} invoices")
-    except Exception as e:
-        print(f"    Warning: {e}")
-        out_nfp_agent, out_nfp_detail, out_nfp_rows = [], [], []
-        out_nfp_meta = {"agents": 0, "invoices": 0, "total_commission": Decimal("0"), "filter": "error"}
-
-    print("  Fetching EGA/ESA Awards...")
-    try:
-        out_ega_t1, out_ega_t2, out_ega_t3, out_ega_h1, out_ega_h2, out_ega_h3 = fetch_outsource_ega_esa(year, may_only=ega_may_only)
-        print(f"    {len(out_ega_t1)} rows")
-    except Exception as e:
-        print(f"    Warning: {e}")
-        out_ega_t1, out_ega_t2, out_ega_t3 = [], [], []
-        out_ega_h1, out_ega_h2, out_ega_h3 = [], [], []
-
-    print("  Fetching Production Bonus...")
-    # Production Bonus is always cumulative YTD: Jan through the report month.
-    # If a specific month is requested via --month N, use that as the upper bound.
-    # If only --May was passed (no --month), fall back to upto_month=5.
-    pb_upto_month = month if month is not None else (5 if may_only else None)
-    out_prod_data = fetch_production_bonus(year, upto_month=pb_upto_month)
-    if out_prod_data:
-        print(f"    OUM: {len(out_prod_data.get('oum_summary', []))} rows")
-    else:
-        print("    No data")
 
     # Populate outsource package mapping before filtering
     for ln in out_basic_lines:
@@ -4043,21 +4887,31 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         if inv_num:
             invoice_package_map[inv_num] = get_invoice_package(inv_num, ln)
 
-    # If a specific month is requested, filter the raw data lines
+    # Same month handling as the internal side above: only ANP detail is
+    # pre-filtered; Basic/NFP lines stay full-year for milestone bucketing.
     if month is not None:
-        out_basic_lines = [ln for ln in out_basic_lines if _parse_month(ln.full_payment_date) == month]
-        out_nfp_rows = [r for r in out_nfp_rows if _parse_month(r.full_payment_date) == month]
         out_anp_detail = [r for r in out_anp_detail if _parse_month(r.get("invoice_date")) == month]
+        _m_out_lines = _expand_basic_lines_for_month(out_basic_lines, month)
+        _m_out_nfp = [r for r in out_nfp_rows if _parse_month(r.full_payment_date) == month]
+        out_basic_meta = {**out_basic_meta,
+                          "agents": len({ln.agent_name.strip() for ln in _m_out_lines}),
+                          "invoices": len(_m_out_lines),
+                          "total_commission": Decimal(str(round(sum(float(ln.basic_commission) for ln in _m_out_lines), 2)))}
+        out_nfp_meta = {**out_nfp_meta,
+                        "agents": len({r.agent_name.strip() for r in _m_out_nfp if r.agent_name}),
+                        "invoices": len(_m_out_nfp),
+                        "total_commission": Decimal(str(round(sum(float(r.nfp_commission) for r in _m_out_nfp), 2)))}
 
     # Build outsource summary tables
 
     print("  Building outsource summary tables...")
-    out_agent_summary_rows, out_customer_summary_rows = build_outsource_summary_tables(
+    out_agent_summary_rows, out_customer_summary_rows, out_customer_anp_rows = build_outsource_summary_tables(
         basic_t1=out_basic_t1,
         basic_lines=out_basic_lines,
         basic_meta=out_basic_meta,
         nfp_agent_rows=out_nfp_agent,
         nfp_rows=out_nfp_rows,
+        nfp_by_inv_all=out_nfp_by_inv_all,
         anp_summary_rows=[],
         anp_detail=out_anp_detail,
         year=year,
@@ -4074,6 +4928,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
             output_path=output_path,
             year=year,
             month=month,
+            invoice_dates_map=invoice_dates_map,
             int_agent_summary_rows=int_agent_summary_rows,
             int_customer_summary_rows=int_customer_summary_rows,
             int_customer_anp_rows=int_customer_anp_rows,
@@ -4090,6 +4945,9 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
             out_ega_t3=out_ega_t3,
             out_ega_h3=out_ega_h3,
             out_prod_data=out_prod_data,
+            contest_t1_headers=contest_t1_headers, contest_t1_rows=contest_t1_rows,
+            contest_t2_headers=contest_t2_headers, contest_t2_rows=contest_t2_rows,
+            contest_t3_headers=contest_t3_headers, contest_t3_rows=contest_t3_rows,
         )
 
     # --- Build PDF ---
@@ -4098,6 +4956,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     build_commission_pdf(
         output_path=output_path,
         year=year,
+        invoice_dates_map=invoice_dates_map,
         int_basic_t1=int_basic_t1,
         int_basic_lines=int_basic_lines,
         int_basic_t4=int_basic_t4,
@@ -4133,7 +4992,11 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         out_ega_h3=out_ega_h3,
         out_agent_summary_rows=out_agent_summary_rows,
         out_customer_summary_rows=out_customer_summary_rows,
+        out_customer_anp_rows=out_customer_anp_rows,
         out_prod_data=out_prod_data,
+        contest_t1_headers=contest_t1_headers, contest_t1_rows=contest_t1_rows,
+        contest_t2_headers=contest_t2_headers, contest_t2_rows=contest_t2_rows,
+        contest_t3_headers=contest_t3_headers, contest_t3_rows=contest_t3_rows,
         page_nums_dict=None,
         page_registry=page_registry,
         month=month,
@@ -4144,6 +5007,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     return build_commission_pdf(
         output_path=output_path,
         year=year,
+        invoice_dates_map=invoice_dates_map,
         int_basic_t1=int_basic_t1,
         int_basic_lines=int_basic_lines,
         int_basic_t4=int_basic_t4,
@@ -4179,7 +5043,11 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         out_ega_h3=out_ega_h3,
         out_agent_summary_rows=out_agent_summary_rows,
         out_customer_summary_rows=out_customer_summary_rows,
+        out_customer_anp_rows=out_customer_anp_rows,
         out_prod_data=out_prod_data,
+        contest_t1_headers=contest_t1_headers, contest_t1_rows=contest_t1_rows,
+        contest_t2_headers=contest_t2_headers, contest_t2_rows=contest_t2_rows,
+        contest_t3_headers=contest_t3_headers, contest_t3_rows=contest_t3_rows,
         page_nums_dict=page_registry,
         page_registry=None,
         month=month,
@@ -4252,3 +5120,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

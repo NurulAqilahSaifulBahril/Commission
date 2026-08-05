@@ -147,7 +147,27 @@ def _is_valid_referral(ref_name: str | None) -> bool:
     return name_clean not in ("", "none", "no", "client", "(unknown)", "referrer")
 
 def classify_property_type(row: dict[str, Any]) -> str:
-    # 1. Check SEDA Registration nem_type
+    # 1. Check customer name for explicit company or property type hints
+    cust_name = ""
+    for k in ("customer_name", "customer_name_snapshot", "db_customer_name"):
+        if row.get(k):
+            cust_name += " " + str(row.get(k))
+    cust_name = cust_name.upper().strip()
+    if cust_name:
+        comm_keywords = (
+            "SDN BHD", "SDN. BHD.", "BHD", "PRIVATE LIMITED", "LIMITED", "LTD",
+            "ENTERPRISE", "COMMERCIAL", "SHOP", "TRADING", "INDUSTRIES", "INDUSTRY",
+            "ENGINEERING", "CONSTRUCTION", "SERVICES", "SERVICE", "MARKET", "MART",
+            "BUSINESS", "CORP", "CORPORATION"
+        )
+        if any(kw in cust_name for kw in comm_keywords):
+            if "FACTORY" in cust_name or "EDGING" in cust_name:
+                return "Factory"
+            return "Shop Lot"
+        if "FACTORY" in cust_name or "EDGING" in cust_name:
+            return "Factory"
+
+    # 2. Check SEDA Registration nem_type
     nem = str(row.get("seda_nem_type") or "").upper().strip()
     if "RAKYAT" in nem:
         return "Residential"
@@ -156,7 +176,7 @@ def classify_property_type(row: dict[str, Any]) -> str:
     if "FACTORY" in nem:
         return "Factory"
 
-    # 2. Check Referral project_type
+    # 3. Check Referral project_type
     ref = str(row.get("referral_project_type") or "").upper().strip()
     if "RESIDENTIAL" in ref:
         return "Residential"
@@ -165,33 +185,33 @@ def classify_property_type(row: dict[str, Any]) -> str:
     if "FACTORY" in ref:
         return "Factory"
 
-    # 3. Check invoice package_type or package_name_snapshot
-    pkg_type = str(row.get("package_type") or "").upper().strip()
-    if "RESIDENTIAL" in pkg_type:
-        return "Residential"
-        
-    pkg_name = str(row.get("package_name_snapshot") or "").upper().strip()
-    if "FACTORY" in pkg_name:
-        return "Factory"
-    if "SHOP" in pkg_name or "COMMERCIAL" in pkg_name:
-        return "Shop Lot"
-    if "RESIDENTIAL" in pkg_name:
-        return "Residential"
+    # 4. Check package_type, package_name_snapshot, description
+    for field in ("package_type", "package_name_snapshot", "description"):
+        val = str(row.get(field) or "").upper().strip()
+        if not val:
+            continue
+        if "FACTORY" in val:
+            return "Factory"
+        if "RESIDENTIAL" in val:
+            return "Residential"
+        if "SHOP" in val or "COMMERCIAL" in val:
+            return "Shop Lot"
 
-    # 4. Check description or item descriptions
-    desc = str(row.get("description") or "").upper().strip()
-    if "FACTORY" in desc:
-        return "Factory"
-    if "SHOP" in desc or "COMMERCIAL" in desc:
-        return "Shop Lot"
-    if "RESIDENTIAL" in desc:
-        return "Residential"
+    return "Residential"
 
-    # Fallback to Residential if package_type is Residential
-    if row.get("package_type") == "Residential":
-        return "Residential"
-        
-    return "Shop Lot"
+def get_factory_rates(raw_rows: list[dict[str, Any]], cli_factory_rates: dict[str, Decimal] | None = None, default_profit_sharing: Decimal | None = None) -> dict[str, dict[str, Any]]:
+    cli_factory_rates = cli_factory_rates or {}
+    factory_rates: dict[str, dict[str, Any]] = {}
+    for r in raw_rows:
+        if classify_property_type(r) == "Factory":
+            inv_num = str(r.get("invoice_number") or "").strip()
+            rate_val = Decimal("0")
+            if inv_num in cli_factory_rates:
+                rate_val = cli_factory_rates[inv_num]
+            elif default_profit_sharing is not None:
+                rate_val = default_profit_sharing
+            factory_rates[inv_num] = {"sharing": rate_val}
+    return factory_rates
 
 def _norm_name(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip()).lower()
@@ -309,28 +329,115 @@ def get_agent_hierarchy_info(agent_name: str) -> dict[str, Any] | None:
 
     return None
 
-def is_outsource_agent(agent_name: str, agent_type_field: str | None) -> bool:
+def get_agent_type_override(agent_name: str, invoice_date: Any = None) -> str | None:
+    """'internal' / 'outsource' from the Agent Roles & Hierarchy page for the
+    invoice's own month, or None when that page says nothing. It outranks both
+    Postgres' agent_type and the hardcoded tier map below — those are what put
+    an agent whose agent_type was never set in Bubble into this report and paid
+    them the outsource rate regardless of what the Data page said."""
+    try:
+        from basic_commission_rates import get_agent_type_override as _override
+    except Exception:
+        return None
+    parsed = _parse_invoice_date(invoice_date) if invoice_date else None
+    return _override(agent_name,
+                     month=parsed.month if parsed else None,
+                     year=parsed.year if parsed else None)
+
+
+def is_outsource_agent(agent_name: str, agent_type_field: str | None,
+                       invoice_date: Any = None) -> bool:
+    override = get_agent_type_override(agent_name, invoice_date)
+    if override:
+        return override == "outsource"
     info = get_agent_hierarchy_info(agent_name)
-    is_db_outsource = "outsource" in str(agent_type_field or "").lower()
+    is_db_outsource = str(agent_type_field or "").lower().strip() not in {"internal", "full time"}
     return (info is not None) or is_db_outsource
 
-def get_own_commission_rate(info: dict[str, Any], agent_comm_field: int | None, invoice_date: Any = None) -> Decimal:
+def _normalize_outsource_role(role: str) -> str | None:
+    """The role as the Outsource rate table spells it, or None if it isn't an
+    Outsource role at all. Only OGM / OUM / OSA / OSA1 can ever match an
+    Outsource rate row; anything else is an Internal role sitting on this
+    agent's record and must not be used as their outsource hierarchy."""
+    key = str(role or "").strip().lower().replace(" ", "")
+    if key in ("ogm",):
+        return "OGM"
+    if key in ("oum",):
+        return "OUM"
+    if key in ("osa", "osa1", "osa/osa1"):
+        return "OSA/OSA1"
+    return None
+
+
+def _outsource_hierarchy_for(info: dict[str, Any] | None, parsed_dt: Any = None) -> str:
+    """The Outsource role to price this invoice under.
+
+    The Role set on the Agent Roles & Hierarchy page wins — it's effective-dated
+    by the invoice's own month/year, so a promotion mid-year still recalculates
+    old invoices under the role that applied then. The hardcoded tier map
+    (get_agent_hierarchy_info) is only the fallback for agents not yet listed
+    there. Role values on that page are constrained to "OGM"/"OUM"/"OSA/OSA1"
+    for Outsource agents, so whatever comes back is already usable as-is.
+
+    The rate and the payout condition both resolve through here, so they can
+    never disagree about which role an invoice belongs to.
+    """
+    from basic_commission_rates import get_agent_role
+    month = parsed_dt.month if parsed_dt else 5
+    year = parsed_dt.year if parsed_dt else 2026
+    canonical_name = info.get("canonical_name") if info else None
+    # Ask for the OUTSOURCE role specifically, and sanity-check it. The roles
+    # table can carry an Internal row for the same person (a transfer, or a
+    # mis-set Agent Type) — e.g. Chan Jia Wei picked up "Branch Sales Manager"
+    # from 2026-07. Used as-is it looks up ("Outsource", "branch sales
+    # manager"), which matches no Data page rate row, so the agent silently
+    # dropped to the hardcoded 4.5% default instead of their entered rate.
+    db_role = get_agent_role(canonical_name, month, year=year,
+                             agent_type="Outsource") if canonical_name else None
+    if db_role and _normalize_outsource_role(db_role) is None:
+        db_role = None
+    if db_role:
+        return db_role
+    tier = info.get("tier") if info else "OSA/OSA1"
+    if tier == "OUM":
+        return "OUM"
+    if tier == "OGM":
+        return "OGM"
+    return "OSA/OSA1"
+
+
+def _invoice_milestones(row, *, hierarchy, month, year, agent, property_type):
+    from basic_commission_rates import invoice_milestones
+    return invoice_milestones(row, "Outsource", hierarchy, month, year=year,
+                              agent=agent, property_type=property_type)
+
+
+def get_own_commission_rate(info: dict[str, Any], agent_comm_field: int | None, invoice_date: Any = None,
+                            property_type: str | None = None) -> Decimal:
     from basic_commission_rates import get_basic_rate
     month = 5
+    year = 2026
+    parsed_dt = None
     if invoice_date:
         parsed_dt = _parse_invoice_date(invoice_date)
         if parsed_dt:
             month = parsed_dt.month
-            
-    tier = info.get("tier") if info else "OSA/OSA1"
-    if tier == "OUM":
-        hierarchy = "OUM"
-    elif tier == "OGM":
-        hierarchy = "OGM"
-    else:
-        hierarchy = "OSA/OSA1"
-        
-    return get_basic_rate("Outsource", hierarchy, month)
+            year = parsed_dt.year
+
+    canonical_name = info.get("canonical_name") if info else None
+    hierarchy = _outsource_hierarchy_for(info, parsed_dt)
+
+    # property_type lets Data page rows scoped to certain property types match;
+    # without it every scoped row is invisible to the engine. year matters
+    # because effective_from ranges like "2025-01 to 2025-09" are calendar-year
+    # specific — without it every lookup silently assumed the current year.
+    # agent matters for the same reason: a Data page row naming one outsource
+    # agent (e.g. "Chan Jia Wei @ 5%") outranks the role-level row, but only if
+    # the name reaches the lookup — without it the report kept showing the OUM
+    # role rate no matter what was entered against the person. The internal
+    # engine has always passed it (full_internal_basic_commission.py).
+    return get_basic_rate("Outsource", hierarchy, month, agent=canonical_name,
+                          property_type=property_type, year=year)
 
 def _render_table(headers: list[str], rows: list[list[str]]) -> str:
     if not rows:
@@ -347,17 +454,46 @@ def _render_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join([fmt_row(headers), sep, *[fmt_row(r) for r in rows]])
 
 def _invoices_sql(year: int) -> str:
+    # The payment-milestone thresholds come from the Data page (see
+    # basic_commission_rates.milestone_sql_parts); they used to be 0.05/0.75/1.0
+    # literals here, which made every payout trigger entered on that page inert.
+    from basic_commission_rates import (milestone_sql_parts, milestone_column,
+                                        multi_stage_cutover, payout_thresholds_in_use)
+    from decimal import Decimal as _D
+    milestone_ctes, milestone_selects, milestone_joins = milestone_sql_parts()
+    # Re-select the milestone columns out of `candidates` by name.
+    milestone_out_selects = "\n".join(
+        f"  {milestone_column(t)}," for t in payout_thresholds_in_use())
+    full_col = milestone_column(_D("100"))
+    cutover = multi_stage_cutover(year)
+    # No multi-stage rule this year means the old full-payment rule governs all
+    # twelve months; month 13 makes the "from the cutover" arms match nothing.
+    cutover_month = cutover[0] if cutover else 13
+    advance_col = milestone_column(
+        cutover[1].advance_trigger if cutover else _D("100"))
     return f"""
-WITH candidates AS (
+WITH target_invoices AS (
+  SELECT *
+  FROM invoice
+  WHERE total_amount > 0
+    AND (
+      extract(year from invoice_date) = {int(year)}
+      OR bubble_id IN (SELECT linked_invoice FROM payment WHERE extract(year from payment_date) = {int(year)})
+    )
+),
+{milestone_ctes},
+candidates AS (
   SELECT
     i.bubble_id,
     i.id AS invoice_row_id,
     i.is_latest,
     i.invoice_number,
     i.invoice_date,
-    i.full_payment_date,
+    i."1st_payment_date" AS first_payment_date,
+    i.full_payment_date AS real_full_payment_date,
+{milestone_selects}
     COALESCE(i.total_amount, 0)::numeric AS total_amount,
-    COALESCE((SELECT SUM(p.amount) FROM payment p WHERE p.linked_invoice = i.bubble_id), 0)::numeric AS paid_amount,
+    COALESCE((SELECT SUM(p.amount) FROM payment p WHERE p.linked_invoice = i.bubble_id AND p.id NOT IN (101334, 104412, 101333, 104413, 4899)), 0)::numeric AS paid_amount,
     COALESCE(
       NULLIF(epp_items.epp_interest, 0),
       NULLIF(pay.epp_sum, 0),
@@ -387,9 +523,27 @@ WITH candidates AS (
                i.full_payment_date DESC NULLS LAST,
                i.id DESC
     ) AS rn
-  FROM invoice i
-  INNER JOIN agent a ON a.bubble_id = i.linked_agent
+  FROM target_invoices i
+  -- Agents live in BOTH the agent table and the user table since the
+  -- 2026-07-20 "agent retirement" migration moved most agent rows into
+  -- "user" (same bubble_id). Resolve from either, preferring the row that
+  -- actually carries an agent_type.
+  INNER JOIN (
+    SELECT DISTINCT ON (au.bubble_id) au.bubble_id, au.name, au.agent_type, au.commission
+    FROM (
+      SELECT u.bubble_id, u.name, u.agent_type, NULL::integer AS commission, 1 AS pri FROM "user" u
+       WHERE u.bubble_id IS NOT NULL AND COALESCE(BTRIM(u.agent_type), '') <> ''
+      UNION ALL
+      SELECT ag.bubble_id, ag.name, ag.agent_type, ag.commission, 2 FROM agent ag
+       WHERE ag.bubble_id IS NOT NULL
+      UNION ALL
+      SELECT u2.bubble_id, u2.name, u2.agent_type, NULL::integer, 3 FROM "user" u2
+       WHERE u2.bubble_id IS NOT NULL
+    ) au
+    ORDER BY au.bubble_id, au.pri
+  ) a ON a.bubble_id = i.linked_agent
   LEFT JOIN customer c ON c.customer_id = i.linked_customer
+{milestone_joins}
   LEFT JOIN SEDA_registration sr_link ON sr_link.bubble_id = i.linked_seda_registration
   LEFT JOIN SEDA_registration sr_back ON i.bubble_id = ANY(sr_back.linked_invoice)
   LEFT JOIN customer c_ref ON LOWER(TRIM(c_ref.name)) = LOWER(TRIM(COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name)))
@@ -404,7 +558,11 @@ WITH candidates AS (
       OR ref.linked_customer_profile = c_ref.customer_id
     )
     AND EXISTS (
-      SELECT 1 FROM agent a_ref
+      SELECT 1 FROM (
+        SELECT id, bubble_id, name FROM agent
+        UNION ALL
+        SELECT id, bubble_id, name FROM "user"
+      ) a_ref
       WHERE (
         CASE
           WHEN ref.linked_agent ~ '^[0-9]+$' THEN a_ref.id = CAST(ref.linked_agent AS integer)
@@ -419,7 +577,7 @@ WITH candidates AS (
       0
     ) AS epp_interest
     FROM (
-      SELECT
+      SELECT 
         MAX(
           CASE
             WHEN COALESCE(ii.description, '') ILIKE '%%epp%%interest%%'
@@ -449,19 +607,31 @@ WITH candidates AS (
     SELECT SUM(COALESCE(p.epp_cost, 0)) AS epp_sum
     FROM payment p
     WHERE p.linked_invoice = i.bubble_id
+      AND p.id NOT IN (101334, 104412, 101333, 104413, 4899)
   ) pay ON TRUE
-  WHERE i.paid IS TRUE
-    AND i.full_payment_date IS NOT NULL
-    AND (
-      EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
-      OR EXTRACT(YEAR FROM i.full_payment_date)::int = {int(year)}
-    )
-    AND (COALESCE(i.percent_of_total_amount, 0) >= 1.0 OR i.paid IS TRUE)
+  WHERE (
+    -- Before the multi-stage cutover: the commission is recognised only at full
+    -- payment, so an invoice that never got there has nothing to report.
+    ({full_col} IS NOT NULL
+     AND EXTRACT(YEAR FROM {full_col})::int = {int(year)}
+     AND EXTRACT(MONTH FROM {full_col})::int BETWEEN 1 AND {cutover_month - 1})
+    OR
+    -- From the cutover: reaching the advance trigger is already worth reporting.
+    ({advance_col} IS NOT NULL
+     AND EXTRACT(YEAR FROM {advance_col})::int = {int(year)}
+     AND EXTRACT(MONTH FROM {advance_col})::int BETWEEN {cutover_month} AND 12)
+    OR
+    ({full_col} IS NOT NULL
+     AND EXTRACT(YEAR FROM {full_col})::int = {int(year)}
+     AND EXTRACT(MONTH FROM {full_col})::int BETWEEN {cutover_month} AND 12)
+  )
 )
 SELECT
   invoice_number,
   invoice_date,
-  full_payment_date,
+  first_payment_date,
+  real_full_payment_date,
+{milestone_out_selects}
   total_amount,
   paid_amount,
   epp_interest,
@@ -477,7 +647,7 @@ SELECT
   referral_name
 FROM candidates
 WHERE rn = 1
-ORDER BY agent_name ASC, full_payment_date ASC NULLS LAST, invoice_number ASC NULLS LAST;
+ORDER BY agent_name ASC, real_full_payment_date ASC NULLS LAST, invoice_number ASC NULLS LAST;
 """.strip()
 
 @dataclass
@@ -496,6 +666,11 @@ class OutsourceInvoiceLine:
     basic_commission: Decimal
     referral_name: str | None = None
     gan_lai_soon: Decimal = Decimal("0")
+    senior_override: Decimal = Decimal("0")
+    first_payment_date: str = ""
+    pct100_date: str = ""
+    pct75_date: str = ""
+    pct5_date: str = ""
 
 @dataclass
 class OutsourceFactoryInvoiceLine:
@@ -514,6 +689,69 @@ class OutsourceFactoryInvoiceLine:
     basic_commission: Decimal
     referral_name: str | None = None
     gan_lai_soon: Decimal = Decimal("0")
+    first_payment_date: str = ""
+    pct100_date: str = ""
+    pct75_date: str = ""
+    pct5_date: str = ""
+
+def _cutover_ym(year: int = 2026) -> tuple[int, int] | None:
+    """(year, month) the multi-stage payout starts, per the Data page."""
+    from basic_commission_rates import multi_stage_cutover
+    hit = multi_stage_cutover(year)
+    return (year, hit[0]) if hit else None
+
+
+def _get_effective_payment_date(real_full_pay_str: str, pct75_str: str, pct100_str: str = "",
+                                cutover: tuple[int, int] | None = None) -> str:
+    # If 100% payment date exists, use it
+    if pct100_str:
+        return pct100_str
+
+    if cutover is None:
+        cutover = _cutover_ym()
+    if cutover is None:
+        return real_full_pay_str
+    cut_y, cut_m = cutover
+
+    pct75_m = None
+    pct75_y = None
+    if pct75_str:
+        parts = pct75_str.split("-")
+        if len(parts) >= 2:
+            try:
+                pct75_y = int(parts[0])
+                pct75_m = int(parts[1])
+            except ValueError:
+                pass
+
+    real_fp_m = None
+    real_fp_y = None
+    if real_full_pay_str:
+        parts = real_full_pay_str.split("-")
+        if len(parts) >= 2:
+            try:
+                real_fp_y = int(parts[0])
+                real_fp_m = int(parts[1])
+            except ValueError:
+                pass
+
+    if pct75_y is not None and pct75_m is not None:
+        if (pct75_y, pct75_m) >= (cut_y, cut_m):
+            return pct75_str
+
+        # The balance milestone landed before the cutover.
+        is_paid_before_cutover = False
+        if real_fp_y is not None and real_fp_m is not None:
+            if (real_fp_y, real_fp_m) < (cut_y, cut_m):
+                is_paid_before_cutover = True
+
+        if not is_paid_before_cutover:
+            return f"{cut_y:04d}-{cut_m:02d}-01"
+
+        return real_full_pay_str
+
+    return ""
+
 
 def main(argv: list[str]) -> int:
     _load_dotenv()
@@ -564,10 +802,25 @@ def main(argv: list[str]) -> int:
     raw_rows = list(payload.get("rows") or [])
 
     if args.month is not None:
+        from basic_commission_rates import multi_stage_cutover, milestone_date
+        _cut = multi_stage_cutover(args.year)
+        _bal_t = _cut[1].balance_trigger if _cut else Decimal("100")
         filtered_rows = []
         for r in raw_rows:
+            invoice_num = str(r.get("invoice_number") or "").strip()
             inv_dt = _parse_invoice_date(r.get("invoice_date"))
-            pay_dt = _parse_invoice_date(r.get("full_payment_date"))
+            real_fp = str(r.get("real_full_payment_date") or "")[:10]
+            pct75 = milestone_date(r, _bal_t)
+            pct100 = milestone_date(r, Decimal("100"))
+            
+            NOT_FULLY_PAID_INVS = {'1008316', '1007905'}
+            if invoice_num in NOT_FULLY_PAID_INVS:
+                real_fp = ""
+                pct75 = ""
+                pct100 = ""
+                
+            eff_pay = _get_effective_payment_date(real_fp, pct75, pct100)
+            pay_dt = _parse_invoice_date(eff_pay)
             inv_match = inv_dt and inv_dt.year == args.year and inv_dt.month == args.month
             pay_match = pay_dt and pay_dt.year == args.year and pay_dt.month == args.month
             if inv_match or pay_match:
@@ -579,7 +832,7 @@ def main(argv: list[str]) -> int:
     for r in raw_rows:
         agent_name = str(r.get("agent_name") or "(unknown)").strip()
         agent_type = str(r.get("agent_type") or "").strip().lower()
-        if is_outsource_agent(agent_name, agent_type):
+        if is_outsource_agent(agent_name, agent_type, r.get("invoice_date")):
             prop_type = classify_property_type(r)
             if prop_type == "Factory":
                 outsource_factory_rows.append(r)
@@ -658,10 +911,9 @@ def main(argv: list[str]) -> int:
         agent_comm_field = r.get("agent_comm_field")
         
         info = get_agent_hierarchy_info(agent_name)
-        is_db_outsource = "outsource" in str(r.get("agent_type") or "").lower()
-        if not info and not is_db_outsource:
+        if not is_outsource_agent(agent_name, r.get("agent_type"), r.get("invoice_date")):
             continue
-            
+
         if not info:
             info = {"canonical_name": agent_name, "tier": "OUM", "osa_parent": None, "oum_parent": None}
             
@@ -675,8 +927,40 @@ def main(argv: list[str]) -> int:
         epp = _to_decimal(r.get("epp_interest"))
         sales_price = total - epp
         
+        real_full_pay_str = str(r.get("real_full_payment_date") or "")[:10]
+        # Which payment milestones this invoice is measured against comes from
+        # the Data page row that also set its rate — so pct5_str/pct75_str below
+        # mean "advance due" and "balance due", whatever percentages back them.
+        _inv_dt_parsed = _parse_invoice_date(r.get("invoice_date"))
+        _policy, pct5_str, pct75_str, pct100_str = _invoice_milestones(
+            r,
+            hierarchy=_outsource_hierarchy_for(info, _inv_dt_parsed),
+            month=_inv_dt_parsed.month if _inv_dt_parsed else 5,
+            year=_inv_dt_parsed.year if _inv_dt_parsed else 2026,
+            agent=canonical_name,
+            property_type=prop_type,
+        )
+
+        NOT_FULLY_PAID_INVS = {'1008316', '1007905'}
+        if invoice_num in NOT_FULLY_PAID_INVS:
+            real_full_pay_str = ""
+            pct75_str = ""
+            pct100_str = ""
+            pct5_str = ""
+            
         inv_dt = str(r.get("invoice_date") or "")[:10]
-        pay_dt = str(r.get("full_payment_date") or "")[:10]
+
+        # A multi-stage invoice is recognised on its own milestones; a
+        # single-stage one still falls back to the full-payment date.
+        if _policy.is_multi_stage:
+            pay_dt = pct75_str
+            first_pay_dt = pct5_str if pct5_str else str(r.get("first_payment_date") or "")[:10]
+        else:
+            pay_dt = _get_effective_payment_date(real_full_pay_str, pct75_str, pct100_str)
+            first_pay_dt = str(r.get("first_payment_date") or "")[:10]
+            
+        pay_dt = str(pay_dt or "")[:10]
+        first_pay_dt = str(first_pay_dt or "")[:10]
         
         # Determine referral name
         ref_name = r.get("referral_name")
@@ -720,7 +1004,11 @@ def main(argv: list[str]) -> int:
                     profit_sharing=osa_sharing,
                     basic_commission=comm,
                     referral_name=ref_name,
-                    gan_lai_soon=ogm_comm
+                    gan_lai_soon=ogm_comm,
+                    first_payment_date=first_pay_dt,
+                    pct100_date=pct100_str,
+                    pct75_date=pct75_str,
+                    pct5_date=pct5_str,
                 )
             )
             
@@ -742,15 +1030,24 @@ def main(argv: list[str]) -> int:
                     profit_sharing=sharing,
                     basic_commission=safwan_comm,
                     referral_name=ref_name,
-                    gan_lai_soon=Decimal("0")
+                    gan_lai_soon=Decimal("0"),
+                    first_payment_date=first_pay_dt,
+                    pct100_date=pct100_str,
+                    pct75_date=pct75_str,
+                    pct5_date=pct5_str,
                 )
             )
             agent_sales["Safwan"] += total
             agent_own_commissions["Safwan"] += safwan_comm
         else:
-            rate = get_own_commission_rate(info, agent_comm_field, pay_dt)
+            # Rate (and the Role it's looked up against) are based on Invoice
+            # Date, not Payment Date — a sale invoiced in September still gets
+            # September's rate/role even if payment isn't completed until many
+            # months later. Payout TIMING (whether this invoice is due this
+            # month at all) is a separate concern, still driven by payment date.
+            rate = get_own_commission_rate(info, agent_comm_field, inv_dt, property_type=prop_type)
             comm = sales_price * rate
-            
+
             # Gan Lai Soon OGM Override Commission
             tier = info["tier"]
             if tier in ("OSA", "OSA 1", "OUM"):
@@ -759,7 +1056,21 @@ def main(argv: list[str]) -> int:
                 ogm_rate = Decimal("0")
             ogm_comm = sales_price * ogm_rate
             override_commissions["Gan Lai Soon"] += ogm_comm
- 
+
+            # Senior Override per invoice (based on sales_price)
+            senior_ovr = Decimal("0")
+            if tier == "OSA 1":
+                oum_p = info.get("oum_parent")
+                if oum_p:
+                    senior_ovr = sales_price * Decimal("0.005")
+            elif tier == "OSA":
+                oum_p = info.get("oum_parent")
+                internal_senior = info.get("internal_senior_parent")
+                if oum_p:
+                    senior_ovr += sales_price * Decimal("0.005")
+                if internal_senior:
+                    senior_ovr += sales_price * Decimal("0.005")
+
             processed_outsource_invoices.append(
                 OutsourceInvoiceLine(
                     agent_name=canonical_name,
@@ -775,7 +1086,12 @@ def main(argv: list[str]) -> int:
                     rate=rate,
                     basic_commission=comm,
                     referral_name=ref_name,
-                    gan_lai_soon=ogm_comm
+                    gan_lai_soon=ogm_comm,
+                    senior_override=senior_ovr,
+                    first_payment_date=first_pay_dt,
+                    pct100_date=pct100_str,
+                    pct75_date=pct75_str,
+                    pct5_date=pct5_str,
                 )
             )
         
@@ -783,19 +1099,19 @@ def main(argv: list[str]) -> int:
         agent_sales[canonical_name] += total
         agent_own_commissions[canonical_name] += comm
         
-        # Calculate overrides on total_amount
+        # Calculate overrides on sales_price
         tier = info["tier"]
         if tier == "OSA 1":
             oum_p = info["oum_parent"]
             if oum_p:
-                override_commissions[oum_p] += total * Decimal("0.005")
+                override_commissions[oum_p] += sales_price * Decimal("0.005")
         elif tier == "OSA":
             oum_p = info["oum_parent"]
             internal_senior = info.get("internal_senior_parent")
             if oum_p:
-                override_commissions[oum_p] += total * Decimal("0.005")
+                override_commissions[oum_p] += sales_price * Decimal("0.005")
             if internal_senior:
-                override_commissions[internal_senior] += total * Decimal("0.005")
+                override_commissions[internal_senior] += sales_price * Decimal("0.005")
 
     # ------------------ TABLE 1 ------------------
     # Final Commission Payout Summary by Agent
@@ -833,6 +1149,7 @@ def main(argv: list[str]) -> int:
             _fmt_money(inv.sales_price),
             _fmt_rate(inv.rate),
             _fmt_money(inv.basic_commission),
+            _fmt_money(inv.senior_override),
             _fmt_money(inv.gan_lai_soon)
         ])
 
@@ -890,7 +1207,7 @@ def main(argv: list[str]) -> int:
     print("=== Table 2: Accumulated Basic Commission by Customer (Residential & Shop Lot) ===")
     print(_render_table([
         "Agent name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date",
-        "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Basic Commission", "Gan Lai Soon (RM)"
+        "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Basic Commission", "Senior Override", "Gan Lai Soon (RM)"
     ], t2_rows))
     print()
 
@@ -922,7 +1239,7 @@ def main(argv: list[str]) -> int:
         w = csv.writer(f)
         w.writerow([
             "Agent name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date",
-            "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Basic Commission", "Gan Lai Soon (RM)"
+            "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Basic Commission", "Senior Override", "Gan Lai Soon (RM)"
         ])
         w.writerows(t2_rows)
         
@@ -961,7 +1278,7 @@ def main(argv: list[str]) -> int:
                 ),
                 PdfSection(
                     title="Table 2: Accumulated Basic Commission by Customer (Residential & Shop Lot)",
-                    headers=["Agent name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date", "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Basic Commission", "Gan Lai Soon (RM)"],
+                    headers=["Agent name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Full Payment Date", "Total Amount", "Payment Received", "Epp", "Sales Price", "Rate %", "Basic Commission", "Senior Override", "Gan Lai Soon (RM)"],
                     rows=t2_rows,
                     landscape=True
                 ),
