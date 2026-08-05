@@ -54,7 +54,23 @@ try:
 except ImportError:
     pass
 
-PROXY_URL = os.environ.get("PG_PROXY_URL", "https://pg-proxy-production.up.railway.app/api/sql")
+def _normalize_proxy_url(url: str) -> str:
+    """Accept the proxy's origin with or without the /api/sql path.
+
+    The repo carries more than one .env and they do not agree on which form
+    PG_PROXY_URL takes; the commission engines normalize it, so a bare origin
+    works for them and used to 404 only here. That failure is invisible — every
+    dashboard-table read falls back to the stale local SQLite copy and serves
+    rates that were edited weeks ago, with nothing but a warning on stderr.
+    """
+    base = (url or "").strip().rstrip("/")
+    if not base or base.endswith("/api/sql"):
+        return base
+    return f"{base}/api/sql"
+
+
+PROXY_URL = _normalize_proxy_url(
+    os.environ.get("PG_PROXY_URL", "https://pg-proxy-production.up.railway.app/api/sql"))
 PROXY_TOKEN = os.environ.get("PG_MIRROR_TOKEN")
 PROXY_DB = os.environ.get("PG_MIRROR_DB", "NUrul_DB")
 SCHEMA = os.environ.get("PG_MIRROR_SCHEMA", "dashboard")
