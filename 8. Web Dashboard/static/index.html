@@ -147,10 +147,13 @@
                     <label for="searchFilter">Search Agent or Customer</label>
                     <input type="text" id="searchFilter" placeholder="Type agent or customer name...">
                 </div>
-                <div class="rm300-filter-toggle" id="rm300FilterGroup" style="display:none;">
-                    <label for="rm300OnlyFilter">
-                        <input type="checkbox" id="rm300OnlyFilter"> RM300 rows only
-                    </label>
+                <div class="filter-group filter-group-narrow" id="rm300FilterGroup" style="display:none;">
+                    <label for="payoutStageFilter">Payout Stage</label>
+                    <select id="payoutStageFilter">
+                        <option value="all" selected>All Payouts</option>
+                        <option value="advance">Advance RM 300</option>
+                        <option value="balance">Balance Payout</option>
+                    </select>
                 </div>
                 <button id="clearFiltersBtn" class="btn-clear" title="Clear search filter">Clear</button>
             </section>
@@ -257,7 +260,7 @@
                 </div>
 
                 <!-- Type of Special Case Selection -->
-                <div class="form-row" style="margin-top: 10px;">
+                <div class="form-row" id="rowCaseType" style="margin-top: 10px;">
                     <label style="font-weight: 700; color: var(--accent-blue);">Type of Special Case</label>
                     <select id="modalCaseType" style="padding: 10px; border-radius: 6px; border: 1px solid var(--border-color); font-weight: 600;">
                         <option value="adjusted_nfp">Adjusted Net Floor Price</option>
@@ -503,7 +506,7 @@
     </div>
 
 
-    <script src="/static/app.js?v=20260729-nfp-refetch-v1"></script>
+    <script src="/static/app.js?v=20260805-sc-bucket-v1"></script>
     <script src="/static/updater.js?v=20260731-ota-v1"></script>
 </body>
 </html>

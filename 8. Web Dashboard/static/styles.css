@@ -503,29 +503,6 @@ body {
     min-width: 200px;
 }
 
-.rm300-filter-toggle {
-    display: flex;
-    align-items: center;
-    padding-bottom: 10px;
-}
-
-.rm300-filter-toggle label {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--text-muted);
-    cursor: pointer;
-    white-space: nowrap;
-}
-
-.rm300-filter-toggle input[type="checkbox"] {
-    width: 16px;
-    height: 16px;
-    cursor: pointer;
-}
-
 .btn-clear {
     background: none;
     border: none;
@@ -870,9 +847,17 @@ body {
     background-color: rgba(15, 23, 42, 0.6);
     backdrop-filter: blur(4px);
     display: flex;
-    align-items: center;
+    /* flex-start, not center, paired with `margin: auto` on .modal-content
+       below: that still centres the dialog when it fits, but when it does not,
+       a centred flex item overflows equally in both directions and the top —
+       including the close button — is clipped off the screen with no way to
+       scroll back to it. */
+    align-items: flex-start;
     justify-content: center;
     z-index: 100;
+    padding: 16px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     transition: var(--transition);
 }
 
@@ -883,7 +868,27 @@ body {
     border-radius: 12px;
     box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 10px 10px -5px rgb(0 0 0 / 0.04);
     animation: modalSlide 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+    margin: auto;
 }
+
+/* Bound the dialog to the screen and make .modal-body the one flexible track,
+   so the scrollbar lands on the body and the header and footer stay pinned
+   however short the viewport gets.
+   As a plain block a max-height here does nothing useful: the box clips at its
+   limit while the content keeps flowing past it, and .modal-body's overflow-y
+   has no bounded height to scroll inside — which is what pushed Save and
+   Delete off the bottom of small screens and at higher browser zoom.
+   The printable commission slip is excluded: it scrolls as one document and
+   sets its own height. */
+.modal-content:not(.slip-modal-content) {
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100vh - 32px);
+    max-height: calc(100dvh - 32px);
+}
+
+.modal-header,
+.modal-footer { flex: 0 0 auto; }
 
 @keyframes modalSlide {
     from { transform: translateY(20px); opacity: 0; }
@@ -922,6 +927,27 @@ body {
     display: flex;
     flex-direction: column;
     gap: 16px;
+    /* min-height:0 is what actually turns the scrolling on. A flex item will
+       not shrink below its content's size without it, so the body would keep
+       growing and overflow-y would never engage. */
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+/* Short screens — a laptop at higher browser zoom lands here. Tighten the
+   chrome rather than the controls, so less of the dialog is spent on padding
+   and more fields fit before anything needs scrolling. */
+@media (max-height: 780px) {
+    .modal-body { padding: 14px 20px; gap: 11px; }
+    .modal-header { padding: 11px 20px; }
+    .modal-footer { padding: 11px 20px; }
+    .modal { padding: 8px; }
+    .modal-content:not(.slip-modal-content) {
+        max-height: calc(100vh - 16px);
+        max-height: calc(100dvh - 16px);
+    }
 }
 
 .form-group-row {

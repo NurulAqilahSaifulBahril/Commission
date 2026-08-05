@@ -66,7 +66,9 @@ document.addEventListener("DOMContentLoaded", () => {
         rawData: null,
         filters: {
             search: "",
-            rm300Only: false
+            // "all" | "advance" (RM300 tranche payable this month) | "balance"
+            // (75%-milestone balance payable this month). July 2026+ only.
+            payoutStage: "all"
         },
         specialCaseRowRefs: new Set(), // Set of row-array references that were added via modal
         specialCasePairs: [],         // Array of [basicRow, nfpRow] pairs for bulk deletion
@@ -79,7 +81,15 @@ document.addEventListener("DOMContentLoaded", () => {
         customerSearchTimer: null,
         agentSearchTimer: null,
         selectedSpecialCaseAgent: "",
-        selectedSpecialCaseCustomer: ""
+        selectedSpecialCaseCustomer: "",
+        // Set when the modal is opened from the Gan Lai Soon column, so the
+        // preview knows to focus that rate field. Cleared once it has.
+        focusGanOverride: false,
+        // Opened from that column the modal edits one thing: his override rate.
+        // The case-type selector and the inputs it drives are hidden, since
+        // none of them are what the click was about. Lives until the modal
+        // closes, unlike focusGanOverride which is consumed on first use.
+        specialCaseGanMode: false
     };
     // Months the contest workbook has a sheet for; populated by initContestMonths().
     // Starts null so the tab is not hidden before the list arrives.
@@ -91,8 +101,9 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // Canonical agent full-name lookup (nickname -> full name), sourced from
-    // "1. Agent Name List.xlsx" via /api/agent-name-map. Used to display full
-    // agent names in Title Case across every table.
+    // the Agent Roles & Hierarchy page (agent_roles table) via
+    // /api/agent-name-map. Used to display full agent names in Title Case
+    // across every table.
     let agentNameMap = {};
 
     function normalizeAgentKey(name) {
@@ -330,7 +341,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const searchFilter = document.getElementById("searchFilter");
     const clearFiltersBtn = document.getElementById("clearFiltersBtn");
     const rm300FilterGroup = document.getElementById("rm300FilterGroup");
-    const rm300OnlyFilter = document.getElementById("rm300OnlyFilter");
+    const payoutStageFilter = document.getElementById("payoutStageFilter");
     const rateCardsContainer = document.getElementById("rateCardsContainer");
     
     const syncDataBtn = document.getElementById("syncDataBtn");
@@ -478,13 +489,14 @@ document.addEventListener("DOMContentLoaded", () => {
             });
         }
 
-        // RM300-only filter (Basic & Net Floor Price Commission section only —
-        // narrows the table to rows whose Basic Commission (RM300) tranche
-        // actually has a value this month, i.e. skips "-", "pending", and
-        // "invoice before july" rows).
-        if (rm300OnlyFilter) {
-            rm300OnlyFilter.addEventListener("change", (e) => {
-                state.filters.rm300Only = e.target.checked;
+        // Payout Stage filter (Basic & Net Floor Price Commission section,
+        // July 2026+ reporting months only). "Advance RM 300" keeps rows whose
+        // Basic Commission (RM300) tranche has a value this month; "Balance
+        // Payout" keeps Basic Commission rows whose 75%-milestone balance is
+        // payable this month.
+        if (payoutStageFilter) {
+            payoutStageFilter.addEventListener("change", (e) => {
+                state.filters.payoutStage = e.target.value;
                 renderActiveSection();
             });
         }
@@ -493,8 +505,8 @@ document.addEventListener("DOMContentLoaded", () => {
         clearFiltersBtn.addEventListener("click", () => {
             if (searchFilter) searchFilter.value = "";
             state.filters.search = "";
-            if (rm300OnlyFilter) rm300OnlyFilter.checked = false;
-            state.filters.rm300Only = false;
+            if (payoutStageFilter) payoutStageFilter.value = "all";
+            state.filters.payoutStage = "all";
             renderActiveSection();
         });
 
@@ -1201,19 +1213,56 @@ document.addEventListener("DOMContentLoaded", () => {
     // own; blank falls back to the standard 0.75%.
     const DEFAULT_GAN_OVERRIDE_PCT = 0.75;
 
+    // Where the modal's agent actually lives, matching how confirmModalBtn
+    // resolves it at save time. In standard mode it is only ever in the
+    // modalAgentName field: state.selectedSpecialCaseAgent is cleared when the
+    // modal opens and set again only in customer mode or when editing, so
+    // reading state alone left this blank and hid the override field.
+    function currentSpecialCaseAgent() {
+        return state.specialCaseMode === "customer"
+            ? (state.selectedSpecialCaseAgent || (modalAgentName ? modalAgentName.value : ""))
+            : ((modalAgentName ? modalAgentName.value : "") || state.selectedSpecialCaseAgent);
+    }
+
+    // The agent-type bucket a case belongs to. "all" is a view, not a bucket:
+    // the report is rebuilt one agent type at a time (_inject_special_case_rows
+    // is only ever called with "internal" or "outsource"), so anything filed
+    // under "all" is written once and then never read back. Resolve it to the
+    // agent's own type instead. Returns "" when the agent is unknown to the
+    // merged payload, which callers must treat as "cannot file this".
+    function agentTypeBucketFor(agentName) {
+        if (state.activeAgentType !== "all") return state.activeAgentType;
+        const agent = String(agentName || "").trim().toLowerCase();
+        return String(state.rawData?.agentTypeMap?.[agent] || "");
+    }
+
     function ganOverrideApplies(agentName) {
         const agent = String(agentName || "").trim();
         if (!agent) return false;
-        const agentType = state.activeAgentType === "all"
-            ? String(state.rawData?.agentTypeMap?.[agent.toLowerCase()] || "")
-            : state.activeAgentType;
-        return agentType === "outsource" && getOutsourceAgentTier(agent) !== "OGM";
+        return agentTypeBucketFor(agent) === "outsource" && getOutsourceAgentTier(agent) !== "OGM";
     }
 
     function ganOverridePctFor(rawValue) {
         const pct = parseFloat(rawValue);
         // 0 is a deliberate "no override"; only blank/garbage means "use default".
         return isNaN(pct) ? DEFAULT_GAN_OVERRIDE_PCT : pct;
+    }
+
+    // Reduce the modal to the one thing the Gan Lai Soon column is about.
+    //
+    // Runs at the end of updateSpecialCasePreview rather than in
+    // onSpecialCaseTypeChange, because that function decides row visibility
+    // from the selected case type and would put these back on the next
+    // keystroke. Last writer wins, so this has to be last.
+    function applyGanModeVisibility() {
+        const on = !!state.specialCaseGanMode;
+        // Left as-is when off: the type selector drives them normally.
+        if (!on) return;
+        [rowCaseType, rowAdjustedNfp, rowFeeWaiver, rowAdjustedRate,
+         rowProfitSharing, rowAdjustedSalesPrice, rowRevisedSalesPrice,
+         rowWaiverSummary, previewProfitSharingRow].forEach(el => {
+            if (el) el.classList.add("hidden");
+        });
     }
 
     function updateSpecialCasePreview() {
@@ -1264,9 +1313,17 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // Shown for information only: this is Gan Lai Soon's money, so it stays
         // out of the agent's Total Net Commission below.
-        const ganApplies = ganOverrideApplies(state.selectedSpecialCaseAgent);
+        const ganApplies = ganOverrideApplies(currentSpecialCaseAgent());
         if (rowGanOverride) rowGanOverride.classList.toggle("hidden", !ganApplies);
         if (previewGanOverrideRow) previewGanOverrideRow.classList.toggle("hidden", !ganApplies);
+        // Opened by clicking his column: put the caret on the rate that cell
+        // shows, so the field is not just visible but ready to type into. The
+        // flag is consumed once, or every later preview would steal focus.
+        if (ganApplies && state.focusGanOverride && modalGanOverridePct) {
+            state.focusGanOverride = false;
+            modalGanOverridePct.focus();
+            modalGanOverridePct.select();
+        }
         if (ganApplies) {
             const ganPct = ganOverridePctFor(modalGanOverridePct?.value);
             if (previewGanOverrideLabel) {
@@ -1279,6 +1336,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const totalNetComm = basicComm + (nfp === 0 ? 0 : nfpComm);
         if (previewTotalNetComm) previewTotalNetComm.textContent = formatRM(totalNetComm);
+
+        applyGanModeVisibility();
     }
 
     function selectCustomerForSpecialCase(customerName) {
@@ -1320,6 +1379,9 @@ document.addEventListener("DOMContentLoaded", () => {
         state.selectedSpecialCaseAgent = agentName;
         if (modalAgentSearch) modalAgentSearch.value = agentName;
         if (modalAgentName) modalAgentName.value = agentName;
+        // Whether Gan Lai Soon's override applies depends on who the agent is,
+        // so the preview has to re-run when that changes.
+        updateSpecialCasePreview();
         if (agentSearchResults) {
             agentSearchResults.innerHTML = "";
             agentSearchResults.classList.add("hidden");
@@ -1725,6 +1787,47 @@ modalPackageType.value = defaults.pkg || "-";
         return commCalcTooltipEl;
     }
 
+    // Hover breakdown for the Gan Lai Soon column, in the same shape the Basic
+    // and Net Floor Price cells use. When a case has changed his rate, both
+    // lines are shown — the standard one it would have been, and the one the
+    // case applies — so the two figures stacked in the cell are accounted for.
+    function getGanOverrideBreakdown(row, headers, custName) {
+        if (!row || !headers) return null;
+        const salesIdx = headers.findIndex(h => {
+            const n = h.toLowerCase().trim();
+            return n === "sales price" || n === "total amount";
+        });
+        if (salesIdx === -1) return null;
+
+        const parseNum = (str) => {
+            if (!str || str === "-") return 0;
+            const val = parseFloat(String(str).replace(/RM/gi, "").replace(/,/g, "").trim());
+            return isNaN(val) ? 0 : val;
+        };
+        const sales = parseNum(row[salesIdx]);
+        if (!sales) return null;
+
+        const fmt = (v) => `RM ${v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+        const casePct = row.specialCaseData ? row.specialCaseData.ganOverridePct : "";
+        const hasOverride = String(casePct ?? "").trim() !== ""
+            && Number(casePct) !== DEFAULT_GAN_OVERRIDE_PCT;
+        const pct = hasOverride ? Number(casePct) : DEFAULT_GAN_OVERRIDE_PCT;
+
+        const standardLine =
+            `Standard: ${fmt(sales)} × ${DEFAULT_GAN_OVERRIDE_PCT}% = ${fmt(sales * DEFAULT_GAN_OVERRIDE_PCT / 100)}`;
+        const subtext = hasOverride
+            ? `${standardLine}<br><span style="color:#dc2626;font-weight:600">`
+              + `Special case: ${fmt(sales)} × ${pct}% = ${fmt(sales * pct / 100)}</span>`
+              + `<br><br>Click to edit Gan Lai Soon's override rate`
+            : `${standardLine}<br><br>Click to set Gan Lai Soon's override rate`;
+
+        return {
+            title: `Gan Lai Soon Override — ${custName || "Agent"}`,
+            formula: `OGM Override = Sales Price × Override Rate %`,
+            subtext,
+        };
+    }
+
     function showCommCalcTooltip(e, info) {
         const el = getOrCreateCommCalcTooltip();
         if (!el || !info) return;
@@ -1946,6 +2049,15 @@ modalPackageType.value = defaults.pkg || "-";
 
         const userObj = USER_ROLES[state.currentUser];
         const originalRows = agSummarySection.rows;
+        // Payout Stage filter: the summary rolls up the detail table, so when a
+        // stage is selected only agents with at least one detail row in that
+        // stage stay. `visibleAgents` is built from the detail rows AFTER all
+        // filters (including the stage), so membership is exactly that test.
+        const payoutStageOn = state.filters.payoutStage !== "all"
+            && parseInt(state.activeMonth) >= 7;
+        const visibleAgentsLower = payoutStageOn
+            ? new Set([...visibleAgents].map(a => String(a).toLowerCase().trim()))
+            : null;
         const rows = [];
         const fullAgentNames = [];
         let tempCur = "";
@@ -1958,6 +2070,7 @@ modalPackageType.value = defaults.pkg || "-";
             }
             // Filter by search box (agent name match)
             if (!matchesSearch(tempCur, "")) return;
+            if (visibleAgentsLower && !visibleAgentsLower.has(tempCur.toLowerCase().trim())) return;
             rows.push(r);
             fullAgentNames.push(tempCur);
         });
@@ -2162,7 +2275,16 @@ modalPackageType.value = defaults.pkg || "-";
         updateNoteBox();
 
         if (rm300FilterGroup) {
-            rm300FilterGroup.style.display = state.activeSection === "basic_nfp" ? "" : "none";
+            // The advance/balance split only exists from July 2026 (the
+            // multi-stage payout months) — earlier months pay in full at 100%,
+            // so the dropdown would have nothing to distinguish.
+            const showPayoutStage = state.activeSection === "basic_nfp"
+                && parseInt(state.activeMonth) >= 7;
+            rm300FilterGroup.style.display = showPayoutStage ? "" : "none";
+            if (!showPayoutStage && state.filters.payoutStage !== "all") {
+                state.filters.payoutStage = "all";
+                if (payoutStageFilter) payoutStageFilter.value = "all";
+            }
         }
 
         // ANP Commission is internal agents only — lock the Agent Type
@@ -2242,14 +2364,38 @@ modalPackageType.value = defaults.pkg || "-";
         const customerIdx = headers.findIndex(h => h.toLowerCase().trim() === "customer");
         const commissionIdx = headers.findIndex(h => h.toLowerCase().trim() === "commission");
         const commissionPriceIdx = headers.findIndex(h => h.toLowerCase().trim() === "commission price");
+        const ganColIdx = headers.findIndex(h => {
+            const n = h.toLowerCase().trim();
+            return n === "gan lai soon" || n === "gan lai soon (rm)";
+        });
         const overrideColIdx = headers.findIndex(h => h.toLowerCase().includes("override"));
         const totalInvColIdx = getCountColumnIdx(headers);
         const rm300ColIdx = headers.findIndex(h => h.toLowerCase().includes("rm300") || h.toLowerCase().includes("basic commission (rm"));
-        const rm300FilterActive = state.activeSection === "basic_nfp" && state.filters.rm300Only && rm300ColIdx !== -1;
+        const pct75ColIdx = headers.findIndex(h => h.toLowerCase().includes("75%") || h.toLowerCase().includes("75 %"));
+        const payoutStageActive = state.activeSection === "basic_nfp"
+            && state.filters.payoutStage !== "all"
+            && parseInt(state.activeMonth) >= 7
+            && rm300ColIdx !== -1;
         const hasRm300Value = (rawRow) => {
             const v = String(rawRow[rm300ColIdx] || "").trim().toLowerCase();
             return v !== "" && v !== "-" && v !== "pending" && v !== "invoice before july";
         };
+        // A balance payout row: a Basic Commission row of a multi-stage (July+)
+        // invoice whose 75% milestone landed this month with money attached.
+        // Pre-July invoices ("invoice before july") pay in full, not a balance;
+        // "pending" in the RM300 cell means even the advance hasn't triggered.
+        const hasBalanceValue = (rawRow) => {
+            const kind = commissionIdx !== -1 ? String(rawRow[commissionIdx] || "").trim().toLowerCase() : "";
+            if (kind && !kind.includes("basic")) return false;
+            const rm300v = String(rawRow[rm300ColIdx] || "").trim().toLowerCase();
+            if (rm300v === "invoice before july" || rm300v === "pending") return false;
+            const p75 = pct75ColIdx !== -1 ? String(rawRow[pct75ColIdx] || "").trim().toLowerCase() : "";
+            if (!p75 || p75 === "-" || p75 === "pending" || !/\d/.test(p75)) return false;
+            const price = commissionPriceIdx !== -1 ? String(rawRow[commissionPriceIdx] || "").trim().toLowerCase() : "";
+            return price !== "" && price !== "-" && !price.includes("pending");
+        };
+        const passesPayoutStage = (rawRow) =>
+            state.filters.payoutStage === "advance" ? hasRm300Value(rawRow) : hasBalanceValue(rawRow);
 
         let currentAgentName = "", currentCustomerName = "";
         const processedRows = rows.map(row => {
@@ -2281,7 +2427,7 @@ modalPackageType.value = defaults.pkg || "-";
                 return userObj && userObj.filterAgentName === null;
             }
             if (applySearch && !matchesSearch(p.fullAgentName, p.customerName)) return false;
-            if (applySearch && rm300FilterActive && !hasRm300Value(p.rawRow)) return false;
+            if (applySearch && payoutStageActive && !passesPayoutStage(p.rawRow)) return false;
 
             // Single agent filtering
             if (userObj && userObj.filterAgentName !== null) {
@@ -2612,7 +2758,14 @@ modalPackageType.value = defaults.pkg || "-";
                 const rowCommType = commissionIdx !== -1 ? String(row[commissionIdx] || "").trim() : "";
                 const isTotalRow = agentName.toLowerCase().includes("total") || agentName.toLowerCase().includes("grand");
                 const rowClass = getRowClass(agentName, isOutsource);
-                const isSpecialRow = state.specialCaseRowRefs.has(row);
+                // A Gan-only case restates neither commission, so its row is not
+                // dressed as a special case: the red "New Basic Commission"
+                // treatment would claim a change that was never made. It still
+                // counts as a special case for editing, which is what carries the
+                // saved rate back into the modal.
+                const isGanOnlyCase = !!row.specialCaseData
+                    && String(row.specialCaseData.rowKind || "").toLowerCase() === "gan";
+                const isSpecialRow = state.specialCaseRowRefs.has(row) && !isGanOnlyCase;
                 const tr = document.createElement("tr");
                 if (rowClass) tr.className = rowClass;
                 if (isSpecialRow) tr.classList.add("special-case-row");
@@ -2705,6 +2858,51 @@ modalPackageType.value = defaults.pkg || "-";
                             td.style.cursor = "pointer"; td.title = "Click to set Factory profit sharing rate";
                             td.addEventListener("click", () => openFactoryRateModal(row, headers, agentName, custName, "agent"));
                         }
+                    }
+
+                    // Gan Lai Soon's override cell opens the same special case the
+                    // Commission Price cell does, landing on the rate that drives it.
+                    // Only on the Basic row: the paired Net Floor Price row never
+                    // carries the override and always reads "-". Rows where he earns
+                    // nothing (his own invoices, internal agents) show "-" too and are
+                    // left alone rather than offering an edit that changes nothing.
+                    if (state.activeSection === "basic_nfp" && !isTotalRow
+                        && ganColIdx !== -1 && ci === ganColIdx
+                        && String(row[ci] || "").trim() !== "-"
+                        && String(rowCommType).toLowerCase().includes("basic")
+                        && userObj && !userObj.readOnly) {
+                        // Edit whenever a case is already stored against this row,
+                        // including a Gan-only one. isSpecialRow is deliberately
+                        // false for those (they carry no red restatement), so it
+                        // cannot be the test here or the saved rate would come
+                        // back as an empty box.
+                        const hasStoredCase = !!row.specialCaseData;
+                        td.style.cursor = "pointer";
+                        td.classList.add("clickable-special-case");
+
+                        // Same hover breakdown the Basic and NFP cells give. No
+                        // title attribute alongside it: the browser's own tooltip
+                        // would surface on top of this one.
+                        const ganInfo = getGanOverrideBreakdown(row, headers, custName);
+                        if (ganInfo) {
+                            td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, ganInfo));
+                            td.addEventListener("mousemove", (e) => moveCommCalcTooltip(e));
+                            td.addEventListener("mouseleave", hideCommCalcTooltip);
+                        } else {
+                            td.title = hasStoredCase
+                                ? "Click to edit Gan Lai Soon's override rate"
+                                : "Click to set Gan Lai Soon's override rate";
+                        }
+                        td.addEventListener("click", () => {
+                            hideCommCalcTooltip();
+                            state.focusGanOverride = true;
+                            state.specialCaseGanMode = true;
+                            if (hasStoredCase) {
+                                openEditSpecialCaseModal(row);
+                            } else {
+                                openAddSpecialCaseModal(agentName, custName, row);
+                            }
+                        });
                     }
 
                     // Add hover breakdown & click handlers for Basic/NFP commission cells
@@ -3374,6 +3572,11 @@ modalPackageType.value = defaults.pkg || "-";
     function isNumericHeader(header) {
         if (!header) return false;
         const h = header.toLowerCase();
+        // Two money columns are named after a person rather than after what they
+        // hold, so they match none of the words below and sat left-aligned
+        // against every other amount. Matching the name covers the
+        // "Gan Lai Soon (RM)" spelling as well as the bare one.
+        if (h.includes("gan lai soon") || h.includes("safwan")) return true;
         return h.includes("price") || h.includes("fee") || h.includes("commission") || h.includes("amount") || h.includes("sales") || h.includes("points") || h.includes("clawback") || h.includes("total");
     }
 
@@ -3845,6 +4048,7 @@ modalPackageType.value = defaults.pkg || "-";
     const previewNfpComm = document.getElementById("previewNfpComm");
     const previewProfitSharingRow = document.getElementById("previewProfitSharingRow");
     const previewProfitSharingComm = document.getElementById("previewProfitSharingComm");
+    const rowCaseType = document.getElementById("rowCaseType");
     const rowGanOverride = document.getElementById("rowGanOverride");
     const modalGanOverridePct = document.getElementById("modalGanOverridePct");
     const previewGanOverrideRow = document.getElementById("previewGanOverrideRow");
@@ -3944,28 +4148,56 @@ modalPackageType.value = defaults.pkg || "-";
 
         const deleted = pendingSpecialCaseDeletes.slice();
 
+        // One POST per agent-type bucket. The All Agents view holds internal and
+        // outsource rows side by side, so a single save can touch both, and
+        // posting the view's own name ("all") would file them where the report
+        // never looks. Every other view yields exactly one bucket, as before.
+        const buckets = new Map();
+        const unfiled = [];
+        const bucketFor = (item) => {
+            const type = agentTypeBucketFor(item && item.agent);
+            if (type !== "internal" && type !== "outsource") {
+                unfiled.push(item);
+                return null;
+            }
+            if (!buckets.has(type)) buckets.set(type, { special_cases: [], deleted: [] });
+            return buckets.get(type);
+        };
+
+        const filedDeletes = [];
+        specialCases.forEach(c => { const b = bucketFor(c); if (b) b.special_cases.push(c); });
+        deleted.forEach(d => { const b = bucketFor(d); if (b) { b.deleted.push(d); filedDeletes.push(d); } });
+
+        if (unfiled.length) {
+            console.error("Special cases skipped — agent type could not be resolved:",
+                unfiled.map(c => c && c.agent));
+        }
+        if (buckets.size === 0) return;
+
         try {
-            const res = await fetch("/api/special-cases", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    year: state.activeYear,
-                    month: state.activeMonth,
-                    agent_type: state.activeAgentType,
-                    special_cases: specialCases,
-                    deleted: deleted
+            const results = await Promise.all([...buckets.entries()].map(([agentType, payload]) =>
+                fetch("/api/special-cases", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        year: state.activeYear,
+                        month: state.activeMonth,
+                        agent_type: agentType,
+                        special_cases: payload.special_cases,
+                        deleted: payload.deleted
+                    })
                 })
-            });
-            if (!res.ok) {
+            ));
+            if (results.some(res => !res.ok)) {
                 console.error("Failed to save special cases to server");
                 return;
             }
             // Only clear the queue once the server has accepted the removals,
             // so a failed request retries them on the next save.
             pendingSpecialCaseDeletes = pendingSpecialCaseDeletes.filter(
-                d => !deleted.includes(d));
+                d => !filedDeletes.includes(d));
         } catch (err) {
             console.error("Error saving special cases:", err);
         }
@@ -4183,6 +4415,13 @@ modalPackageType.value = defaults.pkg || "-";
 
     function closeModal() {
         state.pendingAddRowRef = null;
+        // Dropped here too, not only when consumed: closing before the field
+        // ever showed would otherwise leave it armed to steal focus from the
+        // next special case opened from somewhere else entirely.
+        state.focusGanOverride = false;
+        // Same reasoning: the next modal opened from a Commission Price cell
+        // must get the full form back, so the cut-down view ends with this one.
+        state.specialCaseGanMode = false;
         specialCaseModal.classList.add("hidden");
     }
 
@@ -4360,16 +4599,32 @@ modalPackageType.value = defaults.pkg || "-";
             // A case raised from the Net Floor Price row must not restate Basic
             // Commission, and vice versa — only the clicked row is replaced.
             // "all" (Add Special Case Customer) still creates both.
-            const rowKind = state.specialCaseMode === "customer"
-                ? "all" : (state.specialCaseRowKind || "all");
+            // Raised from Gan Lai Soon's column: his override is the only thing
+            // being changed, so neither commission is restated. Kept ahead of the
+            // Adjusted Sales Price rule below, which would otherwise drag both
+            // rows back in.
+            const ganOnly = !!state.specialCaseGanMode;
+            // "gan" is only for a case BORN from the Gan column, where there is
+            // nothing else to keep. Gan-editing an existing case must preserve
+            // its stored rowKind: stamping "gan" over a restating case stops the
+            // injector restating it, and a hand-added customer (caseType
+            // "customer") has no organic row to fall back on — the whole
+            // customer would vanish from the report on the next load.
+            const editingStored = state.editingPair
+                ? (state.editingPair.find(r => r && r.specialCaseData) || {}).specialCaseData
+                : null;
+            const rowKind = ganOnly
+                ? (editingStored ? editingStored.rowKind : "gan")
+                : (state.specialCaseMode === "customer"
+                    ? "all" : (state.specialCaseRowKind || "all"));
             // Exception: Adjusted Sales Price changes the figure BOTH
             // commissions are derived from (basic = sales × rate, NFP =
             // (sales − net floor price) × rate), so it always restates both —
             // whichever row it was raised from. Every other type touches only
             // one side of the calculation.
-            const affectsBothCommissions = specialCaseType === "adjusted_sales_price";
-            const wantsBasic = affectsBothCommissions || rowKind === "basic" || rowKind === "all";
-            const wantsNfp = affectsBothCommissions || rowKind === "nfp" || rowKind === "all";
+            const affectsBothCommissions = !ganOnly && specialCaseType === "adjusted_sales_price";
+            const wantsBasic = !ganOnly && (affectsBothCommissions || rowKind === "basic" || rowKind === "all");
+            const wantsNfp = !ganOnly && (affectsBothCommissions || rowKind === "nfp" || rowKind === "all");
 
             // Stored as typed, so a blank stays blank and keeps tracking the
             // standard rate rather than freezing today's 0.75% into the case.
@@ -4382,6 +4637,38 @@ modalPackageType.value = defaults.pkg || "-";
                 caseType: state.specialCaseMode, rowKind,
                 ganOverridePct: ganOverridePctRaw
             };
+
+            // Gan-only: nothing is restated, so the row the user clicked keeps
+            // its own commissions and just gains the revised override, drawn as
+            // the old figure above the new one. Mirrors _annotate_gan_override()
+            // in app.py, which does the same on a fresh page load.
+            if (ganOnly) {
+                const targetRow = state.pendingAddRowRef
+                    || (state.editingPair && state.editingPair[0]);
+                const ganIdx = headers.findIndex(h => {
+                    const n = String(h).toLowerCase().trim();
+                    return n === "gan lai soon" || n === "gan lai soon (rm)";
+                });
+                if (targetRow && ganIdx !== -1) {
+                    const prev = String(targetRow[ganIdx] || "-");
+                    // Keep the first render's original: re-editing must not
+                    // promote a previously revised figure into the "was" slot.
+                    const originalMatch = prev.match(/special-case-primary-value">([^<]*)</);
+                    const original = originalMatch ? originalMatch[1] : prev;
+                    const newVal = ganLaiSoonStr;
+                    targetRow[ganIdx] = (original === newVal || newVal === "-")
+                        ? original
+                        : `<div class="special-case-merge-stack">`
+                          + `<span class="special-case-primary-value">${original}</span>`
+                          + `<span class="special-case-secondary-value">${newVal}</span>`
+                          + `</div>`;
+                    targetRow.specialCaseData = dataObject;
+                }
+                closeModal();
+                saveSpecialCases();
+                renderActiveSection();
+                return;
+            }
 
             if (state.editingPair) {
                 // A pair may hold just one row when the case only replaced one
