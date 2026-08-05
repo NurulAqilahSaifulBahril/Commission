@@ -21,10 +21,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +73,44 @@ def _proxy_sql(*, sql: str, params: list[Any] | None = None) -> dict[str, Any]:
         raise RuntimeError(f"HTTP {e.code} from proxy: {detail}") from e
 
 
+_MILESTONE_FRACS_CACHE: dict[int, tuple[str, str]] = {}
+
+
+def _milestone_fracs(year: int) -> tuple[str, str]:
+    """(advance, balance) SQL fractions for the pct5/pct75 milestone CTEs.
+
+    pct5_date / pct75_date are legacy COLUMN NAMES, fixed by the Supabase
+    `invoices` schema the portal reads; what they mean is "the date the
+    advance payout trigger was reached" / "the date the balance trigger was
+    reached". The percentages behind them come from the dashboard Data page
+    (basic_commission_rates.multi_stage_cutover — 4.99/75 as of July 2026),
+    the same source the commission engines read, so an edit there changes
+    the portal's milestone dates on the next sync instead of silently
+    diverging from the reports. Years with no multi-stage rule — and any run
+    where the dashboard DB is unreachable — keep the historic 5%/75%.
+    """
+    cached = _MILESTONE_FRACS_CACHE.get(year)
+    if cached:
+        return cached
+    adv, bal = "0.05", "0.75"
+    try:
+        rates_dir = str(_REPO_ROOT / "1. Basic Commission" / "3. Python Script")
+        if rates_dir not in sys.path:
+            sys.path.insert(0, rates_dir)
+        import basic_commission_rates as bcr
+        cut = bcr.multi_stage_cutover(year)
+        if cut:
+            pol = cut[1]
+            adv = format((Decimal(pol.advance_trigger) / 100).normalize(), "f")
+            bal = format((Decimal(pol.balance_trigger) / 100).normalize(), "f")
+            print(f"  [thresholds] {year}: advance {pol.advance_trigger}%, "
+                  f"balance {pol.balance_trigger}% (from Data page)")
+    except Exception as e:
+        print(f"  [thresholds] Data page unavailable ({e}); using legacy 5%/75% for {year}")
+    _MILESTONE_FRACS_CACHE[year] = (adv, bal)
+    return adv, bal
+
+
 def _invoices_sql(*, year: int, month: int) -> str:
     # Adapted from full_internal_basic_commission.py's _invoices_sql:
     # same agent-resolution / pct5-75-100 / epp_interest joins (proven
@@ -80,6 +120,10 @@ def _invoices_sql(*, year: int, month: int) -> str:
     # qualifies for a commission run. Adds invoice_bubble_id and
     # agent_bubble_id, which that query computes internally but never
     # returns, and which RLS on the `invoices` table depends on.
+    #
+    # The pct5/pct75 thresholds follow the Data page's payout triggers via
+    # _milestone_fracs(); the CTE names stay pct5/pct75 because the upsert
+    # columns (and the portal's readers) are keyed on those names.
     #
     # Scoped to a single (year, month) rather than a whole year: the full
     # CTE (pct5/75/100 window functions + EPP-interest + referral-matching
@@ -91,6 +135,7 @@ def _invoices_sql(*, year: int, month: int) -> str:
     # version would — an invoice just surfaces in whichever month(s) it has
     # an invoice_date or a payment in, which the upsert on invoice_bubble_id
     # handles fine even if that's more than one month.
+    adv_frac, bal_frac = _milestone_fracs(year)
     return f"""
 WITH target_invoices AS (
   SELECT *
@@ -113,7 +158,7 @@ pct5 AS (
     FROM payment p JOIN target_invoices i ON i.bubble_id = p.linked_invoice
     WHERE p.id NOT IN (101334, 104412, 101333, 104413, 4899)
   ) sub
-  WHERE sub.running_total >= sub.total_amount * 0.05
+  WHERE sub.running_total >= sub.total_amount * {adv_frac}
   GROUP BY sub.linked_invoice
 ),
 pct75 AS (
@@ -125,7 +170,7 @@ pct75 AS (
     FROM payment p JOIN target_invoices i ON i.bubble_id = p.linked_invoice
     WHERE p.id NOT IN (101334, 104412, 101333, 104413, 4899)
   ) sub
-  WHERE sub.running_total >= sub.total_amount * 0.75
+  WHERE sub.running_total >= sub.total_amount * {bal_frac}
   GROUP BY sub.linked_invoice
 ),
 pct100 AS (
