@@ -77,6 +77,14 @@ INCLUDE = [
     # app.py imports build_commission_pack from here.
     "7. Presentation/*.py",
     "tools/*.py",
+    # Static reference data nfp_paths.get_620w_json_path() requires at
+    # runtime -- not live state, so it belongs in the package unlike the rest
+    # of "4. data" (tokens, generated reports), which EXCLUDE below still
+    # keeps out. Named explicitly rather than "*/4. data/*" so a future file
+    # dropped in that folder (a token, an export dump) is never shipped by
+    # accident -- every other "4. data" folder in the repo holds exactly that
+    # kind of file today.
+    "2. NFP Commission/4. data/nfp_620w_schedule.json",
 ]
 
 # Applied after INCLUDE — anything matching is dropped.
