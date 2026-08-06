@@ -7,7 +7,14 @@ echo  Finance Commission Dashboard - environment setup
 echo ============================================================
 echo.
 
-:: ── Locate Python ───────────────────────────────────────────────────────────
+:: An install built since the runtime was bundled ships its own Python under
+:: runtime\, dependencies included. There is nothing to download or build, so
+:: this whole step is a no-op for the user -- which is the point: it used to
+:: mean installing Python by hand, then several minutes of pip behind a console
+:: they were told not to close.
+if exist "runtime\python.exe" goto bundled
+
+:: ---- No bundled runtime (source checkout, or an older install) -------------
 set "PY="
 where py >nul 2>&1 && set "PY=py -3"
 if not defined PY (
@@ -23,7 +30,6 @@ if not defined PY (
     exit /b 1
 )
 
-:: ── Private virtual environment ─────────────────────────────────────────────
 if not exist ".venv\Scripts\python.exe" (
     echo Creating a private Python environment in .venv ...
     %PY% -m venv ".venv"
@@ -42,31 +48,40 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+set "PYEXE=.venv\Scripts\python.exe"
+goto haveenv
 
-:: ── Session secret ──────────────────────────────────────────────────────────
+:bundled
+set "PYEXE=runtime\python.exe"
+echo Using the bundled Python runtime - nothing to install.
+echo.
+
+:haveenv
+:: -- Session secret ---------------------------------------------------------
 :: Flask refuses to start without FLASK_SECRET_KEY. Generate one per install so
 :: sessions from one machine are never valid on another.
 findstr /b /c:"FLASK_SECRET_KEY=" ".env" >nul 2>&1
 if errorlevel 1 (
     echo Generating a session secret ...
-    for /f %%k in ('".venv\Scripts\python.exe" -c "import secrets;print(secrets.token_hex(32))"') do (
+    for /f %%k in ('"%PYEXE%" -c "import secrets;print(secrets.token_hex(32))"') do (
         echo FLASK_SECRET_KEY=%%k>> ".env"
     )
 )
 
-:: ── First admin account ─────────────────────────────────────────────────────
+:: -- First admin account ----------------------------------------------------
 if not exist "8. Web Dashboard\dashboard.db" (
     echo.
     echo No user database yet - create the first administrator account.
-    ".venv\Scripts\python.exe" "8. Web Dashboard\create_admin.py"
+    "%PYEXE%" "8. Web Dashboard\create_admin.py"
 )
 
 echo.
 echo ============================================================
 echo  Setup complete.
 echo.
-echo  One more step: the dashboard needs a PG_PROXY_TOKEN to read
-echo  live data. Add this line to the .env file in this folder:
+echo  One more step: the dashboard needs its access keys to read
+echo  live data. Add the lines your IT admin gave you to the .env
+echo  file in this folder, for example:
 echo.
 echo      PG_PROXY_TOKEN=your-token-here
 echo.

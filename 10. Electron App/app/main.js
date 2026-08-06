@@ -68,8 +68,15 @@ function startFlask(root) {
   const cachePkl = path.join(root, "8. Web Dashboard", "data", "dashboard_cache.pkl");
   try { fs.unlinkSync(cachePkl); } catch {}
 
-  const venvPython = path.join(root, ".venv", "Scripts", "python.exe");
-  const python = fs.existsSync(venvPython) ? venvPython : "python";
+  // The bundled runtime first: an install ships with its own interpreter and
+  // dependencies, so nothing needs to be on the machine. .venv is the fallback
+  // for installs made before the runtime was bundled, and for running from a
+  // source checkout; bare "python" is the last resort.
+  const candidates = [
+    path.join(root, "runtime", "python.exe"),
+    path.join(root, ".venv", "Scripts", "python.exe"),
+  ];
+  const python = candidates.find((p) => fs.existsSync(p)) || "python";
 
   flaskProc = spawn(python, [path.join(root, "8. Web Dashboard", "app.py")], {
     cwd: root,

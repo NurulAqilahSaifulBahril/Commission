@@ -8,7 +8,8 @@
 [![Downloads](https://img.shields.io/github/downloads/NurulAqilahSaifulBahril/Commission/total?style=for-the-badge)](https://github.com/NurulAqilahSaifulBahril/Commission/releases/latest)
 
 On that page, grab **`CommissionDashboard-Setup-<version>.exe`** and run it.
-**Requires Python 3.10+** on the machine ([python.org](https://www.python.org/downloads/windows/) — tick *Add python.exe to PATH*).
+**No prerequisites** — the installer bundles its own Python runtime with the
+dependencies already installed, so nothing needs to be on the machine first.
 
 📖 **[Install & Update guide](USER_GUIDE.md)** — step by step, written for non-technical users.
 📖 **[Using the Portal](docs/using-the-portal.md)** — reading the reports, filters, special cases, the Data page.

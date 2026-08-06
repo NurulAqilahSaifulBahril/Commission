@@ -25,6 +25,9 @@
 # Release build output (recreated by tools/build_package.py)
 /dist/
 
+# Downloaded embeddable-Python zip, cached so repeat builds skip the download
+/.cache/
+
 # Python
 **/.venv/
 **/__pycache__/

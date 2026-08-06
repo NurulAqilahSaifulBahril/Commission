@@ -57,15 +57,17 @@ Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#ShellExe}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-; Builds .venv, installs dependencies, generates FLASK_SECRET_KEY and prompts
-; for the first admin account. Shown in a console window so the user can see
-; pip working and read the PG_PROXY_TOKEN reminder at the end.
-Filename: "{cmd}"; Parameters: "/c """"{app}\Setup Environment.bat"""""; WorkingDir: "{app}"; StatusMsg: "Setting up the Python environment (this can take a few minutes)..."; Flags: waituntilterminated
+; Generates FLASK_SECRET_KEY and prompts for the first admin account. The
+; payload ships its own Python under runtime\, so this no longer builds a .venv
+; or runs pip -- it finishes in seconds. Still a console window, because it
+; prompts for the admin username/password and shows the access-key reminder.
+Filename: "{cmd}"; Parameters: "/c """"{app}\Setup Environment.bat"""""; WorkingDir: "{app}"; StatusMsg: "Finishing setup..."; Flags: waituntilterminated
 Filename: "{app}\{#ShellExe}"; Description: "Start the dashboard now"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent
 
 [UninstallDelete]
 ; Created after install, so Inno does not track them.
 Type: filesandordirs; Name: "{app}\.venv"
+Type: filesandordirs; Name: "{app}\runtime\Lib\site-packages\__pycache__"
 Type: filesandordirs; Name: "{app}\__pycache__"
 Type: filesandordirs; Name: "{app}\8. Web Dashboard\__pycache__"
 Type: files; Name: "{app}\8. Web Dashboard\dashboard.log"
@@ -76,15 +78,23 @@ var
   ResultCode: Integer;
 begin
   Result := True;
-  // Python is a hard requirement — the dashboard runs from source in a venv.
-  if not Exec('cmd.exe', '/c where py >nul 2>&1 || where python >nul 2>&1', '',
-              SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+  // The payload carries its own Python (runtime\), so an interpreter on the
+  // machine is no longer required -- this used to be a hard gate that sent
+  // non-technical staff off to python.org before they could install anything.
+  // The check is kept only as a courtesy for source checkouts, where
+  // "Setup Environment.bat" still has to build a .venv, and it never blocks.
+  if not FileExists(ExpandConstant('{src}\runtime\python.exe')) then
   begin
-    if MsgBox('Python was not found on this computer.' + #13#10#13#10 +
-              'The dashboard needs Python 3.10 or newer. Install it from ' +
-              'python.org (tick "Add python.exe to PATH"), then run this setup again.' + #13#10#13#10 +
-              'Continue anyway?',
-              mbConfirmation, MB_YESNO) = IDNO then
-      Result := False;
+    if not Exec('cmd.exe', '/c where py >nul 2>&1 || where python >nul 2>&1', '',
+                SW_HIDE, ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
+    begin
+      if MsgBox('This installer does not appear to include the bundled Python '
+                + 'runtime, and no Python was found on this computer.' + #13#10#13#10 +
+                'Install Python 3.10 or newer from python.org (tick '
+                + '"Add python.exe to PATH"), or ask IT for a full installer.' + #13#10#13#10 +
+                'Continue anyway?',
+                mbConfirmation, MB_YESNO) = IDNO then
+        Result := False;
+    end;
   end;
 end;

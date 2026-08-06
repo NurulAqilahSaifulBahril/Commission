@@ -5,15 +5,19 @@
 setlocal
 cd /d "%~dp0"
 
-:: First run (or a wiped .venv) - build the environment before starting.
+:: An install ships its own interpreter under runtime\. Only a source checkout
+:: or a pre-bundle install has to build a .venv first.
+if exist "runtime\python.exe" goto haveruntime
 if not exist ".venv\Scripts\python.exe" (
     call "Setup Environment.bat"
     if errorlevel 1 exit /b 1
 )
 
+:haveruntime
 :: python.exe, not pythonw.exe — under pythonw sys.stdout/stderr are None, which
 :: the server's stream wrapper cannot fully paper over. Minimised instead.
-set "PYEXE=%~dp0.venv\Scripts\python.exe"
+set "PYEXE=%~dp0runtime\python.exe"
+if not exist "%PYEXE%" set "PYEXE=%~dp0.venv\Scripts\python.exe"
 if not exist "%PYEXE%" set "PYEXE=python"
 
 :: Free port 5001 so a stale server can never shadow the new build.

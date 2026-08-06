@@ -21,6 +21,9 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -32,6 +35,27 @@ DIST = REPO_ROOT / "dist"
 # and updater.py pins "shell" in PRESERVE_PATHS so they can't touch it either.
 SHELL_BUILD = REPO_ROOT / "10. Electron App" / "app" / "dist" / "win-unpacked"
 
+# ── Bundled Python runtime ───────────────────────────────────────────────────
+# The dashboard runs from source, so the target machine needs an interpreter.
+# It used to need its own: the installer demanded Python 3.10+ on PATH and then
+# spent minutes building a .venv and pip-installing, behind a black console that
+# non-technical staff are told not to close. Shipping python.org's *embeddable*
+# distribution with the dependencies already in it removes both steps.
+#
+# Staged to <root>/runtime/, alongside shell/ and pinned in updater.py's
+# PRESERVE_PATHS for the same reason: it is installer-only payload, never part
+# of a code-only OTA package, so an update can neither ship nor delete it.
+PYTHON_EMBED_VERSION = "3.12.10"
+PYTHON_EMBED_URL = (
+    f"https://www.python.org/ftp/python/{PYTHON_EMBED_VERSION}"
+    f"/python-{PYTHON_EMBED_VERSION}-embed-amd64.zip"
+)
+# Wheels are resolved FOR this version, not for whatever python is running the
+# build — otherwise a 3.13 build host silently stages cp313 binaries into a
+# cp312 runtime and every import of pandas/psycopg2 fails on the user's machine.
+PYTHON_EMBED_TAG = ".".join(PYTHON_EMBED_VERSION.split(".")[:2])
+RUNTIME_CACHE = REPO_ROOT / ".cache" / "python-embed"
+
 # Files/folders copied into the package, as glob patterns relative to the root.
 INCLUDE = [
     "version.json",
@@ -41,7 +65,6 @@ INCLUDE = [
     "Launch Dashboard.bat",
     "Setup Environment.bat",
     "run_*.bat",
-    "agent_name_map.json",
     "8. Web Dashboard/*.py",
     "8. Web Dashboard/*.json",
     "8. Web Dashboard/*.bat",
@@ -135,7 +158,108 @@ def _clean_dist() -> None:
     raise RuntimeError(f"Could not clear {DIST} — close anything using it and retry.")
 
 
-def build(version: str) -> Path:
+def _download_embed_zip() -> Path:
+    """The embeddable Python zip, cached so repeat builds do not re-download."""
+    RUNTIME_CACHE.mkdir(parents=True, exist_ok=True)
+    dest = RUNTIME_CACHE / f"python-{PYTHON_EMBED_VERSION}-embed-amd64.zip"
+    if dest.is_file() and dest.stat().st_size > 0:
+        print(f"runtime: using cached {dest.name}")
+        return dest
+    print(f"runtime: downloading {PYTHON_EMBED_URL}")
+    with urllib.request.urlopen(PYTHON_EMBED_URL, timeout=120) as resp:
+        dest.write_bytes(resp.read())
+    print(f"runtime: cached {dest.name} ({dest.stat().st_size // 1024} KB)")
+    return dest
+
+
+def _configure_pth(runtime: Path) -> None:
+    """Point the embeddable build's `._pth` at everything the app needs.
+
+    Two separate gotchas, both of which produce a runtime that starts and then
+    fails on an import:
+
+    * The shipped `python3xx._pth` comments out `import site`, so anything pip
+      puts in Lib/site-packages is invisible -- `import flask` dies.
+    * The presence of a `._pth` also puts the interpreter in isolated mode,
+      which means the script's own directory is NOT prepended to sys.path the
+      way it normally is. `app.py` lives beside `db.py` and imports it as a
+      plain `import db`, so that dies too.
+
+    The file's entries are relative to the directory holding python.exe, and
+    runtime/ sits at the install root -- so ".." is the install root and
+    "..\\8. Web Dashboard" is where the Flask app and its siblings live.
+    """
+    pth_files = list(runtime.glob("python*._pth"))
+    if not pth_files:
+        raise RuntimeError(f"no python*._pth found in {runtime}")
+    pth = pth_files[0]
+
+    sep = chr(92)  # backslash, spelled out so no escape handling can mangle it
+    wanted = [
+        "Lib" + sep + "site-packages",   # pip --target lands here
+        "..",                            # install root (agent_names, commission_pdf)
+        ".." + sep + "8. Web Dashboard",  # app.py's own package directory
+    ]
+
+    lines = [l.rstrip() for l in pth.read_text(encoding="utf-8").splitlines()]
+    out = []
+    for line in lines:
+        if line.strip() in ("#import site", "# import site"):
+            continue  # re-added at the end, where site.main() should run last
+        out.append(line)
+
+    present = {l.strip().lower().replace("/", sep) for l in out}
+    for entry in wanted:
+        if entry.lower() not in present:
+            out.append(entry)
+    out.append("import site")
+
+    pth.write_text("\n".join(out) + "\n", encoding="utf-8")
+    print(f"runtime: configured {pth.name} -> {', '.join(wanted)} + import site")
+
+
+def stage_runtime(payload: Path) -> bool:
+    """Put a ready-to-run Python, dependencies included, at payload/runtime."""
+    runtime = payload / "runtime"
+    try:
+        zip_path = _download_embed_zip()
+    except Exception as e:
+        print(f"WARNING: could not fetch the embeddable Python ({e}). "
+              f"Installer will fall back to requiring Python on the machine.")
+        return False
+
+    runtime.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(runtime)
+    _configure_pth(runtime)
+
+    site_packages = runtime / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True, exist_ok=True)
+    req = REPO_ROOT / "requirements-dashboard.txt"
+    cmd = [
+        sys.executable, "-m", "pip", "install",
+        "--target", str(site_packages),
+        "--python-version", PYTHON_EMBED_TAG,
+        "--platform", "win_amd64",
+        "--only-binary=:all:",
+        "--no-compile",
+        "--upgrade",
+        "-r", str(req),
+    ]
+    print(f"runtime: installing dependencies for cp{PYTHON_EMBED_TAG.replace('.', '')}...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stdout[-3000:])
+        print(result.stderr[-3000:])
+        raise RuntimeError("dependency install into the bundled runtime failed")
+
+    total = sum(f.stat().st_size for f in runtime.rglob("*") if f.is_file())
+    print(f"payload: Python {PYTHON_EMBED_VERSION} runtime -> {runtime} "
+          f"({total // (1024 * 1024)} MB)")
+    return True
+
+
+def build(version: str, with_runtime: bool = True) -> Path:
     _clean_dist()
     payload = DIST / "payload"
     payload.mkdir(parents=True)
@@ -147,6 +271,9 @@ def build(version: str) -> Path:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
     print(f"payload: {len(files)} files -> {payload}")
+
+    if with_runtime:
+        stage_runtime(payload)
 
     if SHELL_BUILD.is_dir():
         shutil.copytree(SHELL_BUILD, payload / "shell")
@@ -188,6 +315,12 @@ def main() -> int:
         action="store_true",
         help="Re-write SHA256SUMS.txt over the current dist/ contents (used after the installer is built).",
     )
+    parser.add_argument(
+        "--no-runtime",
+        action="store_true",
+        help="Skip bundling the Python runtime. The resulting install then needs "
+             "Python on the machine, as it did before the runtime was bundled.",
+    )
     args = parser.parse_args()
 
     if args.checksums_only:
@@ -200,7 +333,7 @@ def main() -> int:
     else:
         version = json.loads((REPO_ROOT / "version.json").read_text(encoding="utf-8"))["version"]
 
-    build(version)
+    build(version, with_runtime=not args.no_runtime)
     write_checksums()
     return 0
 
