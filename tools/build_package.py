@@ -34,6 +34,8 @@ DIST = REPO_ROOT / "dist"
 # payload as <root>/shell/ but NEVER into the OTA zip — updates stay code-only,
 # and updater.py pins "shell" in PRESERVE_PATHS so they can't touch it either.
 SHELL_BUILD = REPO_ROOT / "10. Electron App" / "app" / "dist" / "win-unpacked"
+SHELL_SRC = REPO_ROOT / "10. Electron App" / "app"
+SHELL_SRC_FILES = ["main.js", "loading.html", "package.json"]
 
 # ── Bundled Python runtime ───────────────────────────────────────────────────
 # The dashboard runs from source, so the target machine needs an interpreter.
@@ -302,6 +304,35 @@ def stage_seed_env(payload: Path, seed_env: Path) -> None:
           "Share it internally only — do NOT publish it. <<<")
 
 
+def check_shell_fresh() -> None:
+    """Refuse to ship an Electron shell older than the sources it was built from.
+
+    The shell is a prebuilt folder this script only copies, so edits to main.js
+    reach users solely via `npm run dist`. Skipping that rebuild once shipped a
+    July shell inside an August installer: the payload had a bundled runtime/
+    the shell predated knowing about, so it looked for a .venv that no longer
+    exists, never started Flask, and blamed the user for a setup step that had
+    been removed. Nothing in the build said a word.
+    """
+    asar = SHELL_BUILD / "resources" / "app.asar"
+    if not asar.exists():
+        raise SystemExit(
+            f"ERROR: {asar} is missing — the shell build is incomplete.\n"
+            "       Run `npm run dist` in \"10. Electron App/app\"."
+        )
+    built = asar.stat().st_mtime
+    stale = [
+        name for name in SHELL_SRC_FILES
+        if (SHELL_SRC / name).exists() and (SHELL_SRC / name).stat().st_mtime > built
+    ]
+    if stale:
+        raise SystemExit(
+            "ERROR: the Electron shell is older than its sources — "
+            f"{', '.join(stale)} changed after the last build.\n"
+            "       Run `npm run dist` in \"10. Electron App/app\", then build again."
+        )
+
+
 def build(version: str, with_runtime: bool = True,
           seed_env: Path | None = None) -> Path:
     _clean_dist()
@@ -323,6 +354,7 @@ def build(version: str, with_runtime: bool = True,
         stage_seed_env(payload, seed_env)
 
     if SHELL_BUILD.is_dir():
+        check_shell_fresh()
         shutil.copytree(SHELL_BUILD, payload / "shell")
         print(f"payload: Electron shell -> {payload / 'shell'}")
     else:
