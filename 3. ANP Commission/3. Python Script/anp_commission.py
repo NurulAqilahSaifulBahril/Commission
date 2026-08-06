@@ -7,13 +7,20 @@ Data source: prod_main via Postgres SQL proxy API.
 Amount per invoice: invoice total_amount (EPP not applied).
 
 Eligibility:
-    - Agent agent_type = 'internal' (see --agent-types)
+    - Agent agent_type = 'internal' only. Outsource agents are not eligible for
+      ANP Commission at all; fetch_agents() returns an empty list for any
+      non-internal --agent-types value.
     - Invoice has 1st payment secured (1st_payment_date IS NOT NULL)
     - Invoice not soft-deleted (is_deleted IS NOT TRUE)
+    - 1st_payment_date must fall in the SAME calendar month as invoice_date
+    - At least RM0.01 has actually been paid on the invoice (SUM of the
+      `payment` table's `amount` column for that invoice, same exclusion list
+      used by Basic/NFP Commission's paid_amount)
 
 Commission timing:
     Payout in month M includes invoices with invoice_date in month M-1
-    (e.g. January invoice -> February commission), once 1st payment is secured.
+    (e.g. January invoice -> February commission), once 1st payment is secured
+    in the same month as the invoice date.
 
 ANP tier (on accumulated total amount per agent within each invoicing month):
     RM 0      : below RM 60,000
@@ -43,6 +50,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 MONEY = Decimal("0.01")
+# Smallest payment that counts as "this invoice has been paid".
+MIN_PAID = Decimal("0.01")
+
+# Bad/duplicate payment rows excluded from any "amount actually paid"
+# calculation — the same exclusion list Basic/NFP Commission use for their
+# paid_amount column.
+EXCLUDED_PAYMENT_IDS_SQL = "(101334, 104412, 101333, 104413, 4899)"
 
 
 @dataclass(frozen=True)
@@ -59,6 +73,95 @@ TIERS: tuple[CommissionTier, ...] = (
     CommissionTier(Decimal("360000"), Decimal("719999.99"), Decimal("1500")),
     CommissionTier(Decimal("720000"), None, Decimal("2000")),
 )
+
+
+# ---------------------------------------------------------------------------
+# Rules entered on the dashboard Data page. Every value falls back to the
+# constant that was hardcoded here before, so a period that has not been set up
+# on the Data page produces exactly the figures it always did.
+# ---------------------------------------------------------------------------
+def _load_anp_rules(effective_from: str | None = None):
+    import os as _os
+    import sys as _sys
+    from datetime import date as _date
+
+    key = effective_from or _date.today().strftime("%Y-%m")
+    dashboard_dir = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))),
+        "8. Web Dashboard",
+    )
+    try:
+        if dashboard_dir not in _sys.path:
+            _sys.path.insert(0, dashboard_dir)
+        import db as _db
+        payload = _db.get_anp_rules(key)
+        if not payload.get("saved"):
+            return None
+    except Exception as exc:
+        print(f"[ANP Rules] Warning: could not read rules from the dashboard DB "
+              f"({type(exc).__name__}: {exc}); using built-in defaults.", file=sys.stderr)
+        return None
+    print(f"[ANP Rules] Loaded {key} from the dashboard Data page.")
+    return payload
+
+
+def _apply_anp_rules(payload) -> None:
+    """Overwrite the module-level tiers and qualifying values from a saved rule
+    set. Anything blank or unparseable keeps the built-in value."""
+    global TIERS, EXCLUDED_PAYMENT_IDS_SQL, MIN_PAID, ANP_SAME_MONTH_EXCEPTIONS
+
+    rules = payload.get("rules") or {}
+
+    # Invoice-month overrides. Blank keeps the built-in list, so an empty field
+    # can never silently drop an approved exception; a non-empty field replaces
+    # it wholesale, which is what editing the list on the Data page means.
+    raw_overrides = str(rules.get("invoice_overrides") or "")
+    parsed = {t.strip().upper() for t in raw_overrides.replace(";", ",").split(",") if t.strip()}
+    if parsed:
+        ANP_SAME_MONTH_EXCEPTIONS = frozenset(parsed)
+
+    raw_min = str(rules.get("min_paid") or "").strip()
+    if raw_min:
+        try:
+            MIN_PAID = Decimal(raw_min)
+        except Exception:
+            pass
+
+    ids = [t.strip() for t in str(rules.get("excluded_payment_ids") or "").split(",") if t.strip().isdigit()]
+    if ids:
+        EXCLUDED_PAYMENT_IDS_SQL = "(" + ", ".join(ids) + ")"
+
+    tiers = []
+    for row in payload.get("tiers") or []:
+        try:
+            lo = Decimal(str(row.get("from_amount") or "0").replace(",", "").strip())
+            hi_raw = str(row.get("to_amount") or "").replace(",", "").strip()
+            hi = Decimal(hi_raw) if hi_raw else None
+            rm = Decimal(str(row.get("commission_rm") or "0").replace(",", "").strip())
+        except Exception:
+            continue
+        tiers.append(CommissionTier(lo, hi, rm))
+    if tiers:
+        TIERS = tuple(sorted(tiers, key=lambda t: t.min_inclusive))
+
+
+# Applied at import: TIERS and EXCLUDED_PAYMENT_IDS_SQL are read inside the
+# query and matching functions, so overriding them here reaches every caller.
+_ANP_RULES = _load_anp_rules()
+if _ANP_RULES:
+    _apply_anp_rules(_ANP_RULES)
+
+# ---------------------------------------------------------------------------
+# Special-case invoice overrides
+# Invoices listed here are included in ANP for their invoice_date month even
+# if their 1st_payment_date falls in a different calendar month.
+# Add new overrides as: "INV-XXXXXXX",  # Agent Name – reason / date approved
+# ---------------------------------------------------------------------------
+ANP_SAME_MONTH_EXCEPTIONS: frozenset[str] = frozenset({
+    "INV-1009932",  # Goh Hock Lye   – May 2026 special case (1st pay in Jun)
+    "INV-1009895",  # Liew Chan Sang  – May 2026 special case (1st pay in Jun)
+    "INV-1010642",  # Chan Jia Wei   – July 2026 special case (1st pay in Jun)
+})
 
 
 def normalize_proxy_token(raw: str) -> str:
@@ -145,6 +248,18 @@ def parse_date(value: Any) -> date | None:
     return None
 
 
+def _same_month(d1: date | None, d2: date | None) -> bool:
+    """Return True if both dates are non-None and share the same year and month."""
+    if d1 is None or d2 is None:
+        return False
+    return d1.year == d2.year and d1.month == d2.month
+
+
+def _is_paid(invoice: dict[str, Any]) -> bool:
+    """True once at least the configured minimum has been paid on the invoice."""
+    return to_decimal(invoice.get("paid_amount")) >= MIN_PAID
+
+
 def anp_commission(accumulated_total_amount: Decimal) -> Decimal:
     for tier in TIERS:
         if accumulated_total_amount < tier.min_inclusive:
@@ -219,21 +334,93 @@ def payout_label_calendar_invoice_month(inv_year: int, inv_month: int) -> str:
     return f"inv-{inv_year:04d}-{inv_month:02d}_pay-{py:04d}-{pm:02d}"
 
 
+def _agent_type_override(agent_name: str):
+    """'internal' / 'outsource' as set on the Agent Roles & Hierarchy page, or
+    None when that page says nothing about this agent."""
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        rates_dir = str(repo_root / "1. Basic Commission" / "3. Python Script")
+        if rates_dir not in sys.path:
+            sys.path.append(rates_dir)
+        from basic_commission_rates import get_agent_type_override as _override
+    except Exception:
+        return None
+    return _override(agent_name)
+
+
+def _agent_display_name(agent_name: str):
+    """Full Name from the Agent Roles & Hierarchy page, falling back to that
+    page's own Agent Name (from eeAdmin) field, or None when that page says
+    nothing about this agent — callers keep the Postgres name in that case."""
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        rates_dir = str(repo_root / "1. Basic Commission" / "3. Python Script")
+        if rates_dir not in sys.path:
+            sys.path.append(rates_dir)
+        from basic_commission_rates import get_agent_display_name as _display
+    except Exception:
+        return None
+    return _display(agent_name)
+
+
 def sql_in_list(values: Iterable[str]) -> str:
     escaped = ", ".join("'" + v.replace("'", "''") + "'" for v in values)
     return escaped
 
 
 def fetch_agents(client: PostgresProxyClient, agent_types: list[str]) -> list[dict[str, Any]]:
-    types_sql = sql_in_list(agent_types)
-    return client.query(
-        f"""
-        SELECT bubble_id, name, agent_type, unique_id, linked_user_login
-        FROM agent
-        WHERE agent_type IN ({types_sql})
-        ORDER BY name
+    # ANP Commission applies to internal agents only — outsource agents are
+    # not eligible, so any non-internal request returns no agents at all
+    # (rather than the outsource roster), which in turn makes every
+    # downstream ANP table/report empty for outsource.
+    if not any(t.lower() in ("internal", "full time") for t in agent_types):
+        return []
+    # Agents live in BOTH the agent table and the user table since the
+    # 2026-07-20 "agent retirement" migration (same bubble_id kept).
+    all_agents = client.query(
+        """
+        SELECT DISTINCT ON (au.bubble_id)
+               au.bubble_id, au.name, au.agent_type, au.unique_id, au.linked_user_login
+        FROM (
+          SELECT u.bubble_id, u.name, u.agent_type, u.unique_id,
+                 NULL::text AS linked_user_login, 1 AS pri
+            FROM "user" u
+           WHERE u.bubble_id IS NOT NULL AND COALESCE(BTRIM(u.agent_type), '') <> ''
+          UNION ALL
+          SELECT ag.bubble_id, ag.name, ag.agent_type, ag.unique_id,
+                 ag.linked_user_login, 2
+            FROM agent ag
+           WHERE ag.bubble_id IS NOT NULL
+          UNION ALL
+          SELECT u2.bubble_id, u2.name, u2.agent_type, u2.unique_id,
+                 NULL::text, 3
+            FROM "user" u2
+           WHERE u2.bubble_id IS NOT NULL
+        ) au
+        ORDER BY au.bubble_id, au.pri
         """
     )
+    all_agents = sorted(all_agents, key=lambda a: str(a.get("name") or ""))
+    filtered = []
+    for a in all_agents:
+        name = str(a.get("name") or "").strip()
+        name_lower = name.lower()
+        row_type = str(a.get("agent_type") or "").strip().lower()
+        if row_type in ("block", "test"):
+            continue
+        # The Agent Roles & Hierarchy page wins over Postgres' agent_type,
+        # which is blank for several internal agents — and blank reads as
+        # outsource, which put them in the wrong report entirely. No invoice
+        # date to date-match against here (this picks the agent list for a
+        # whole-year period), so the agent's latest entry decides.
+        override = _agent_type_override(name)
+        if override:
+            is_internal = override == "internal" and "gan lai soon" not in name_lower
+        else:
+            is_internal = row_type in ("internal", "full time") and "gan lai soon" not in name_lower
+        if is_internal:
+            filtered.append(a)
+    return filtered
 
 
 def fetch_invoices_for_agents(
@@ -264,7 +451,10 @@ def fetch_invoices_for_agents(
           i.package_name_snapshot,
           i.description,
           COALESCE(sr_link.nem_type, sr_back.nem_type) AS seda_nem_type,
-          ref.project_type AS referral_project_type
+          ref.project_type AS referral_project_type,
+          COALESCE((SELECT SUM(p.amount) FROM payment p
+                     WHERE p.linked_invoice = i.bubble_id
+                       AND p.id NOT IN {EXCLUDED_PAYMENT_IDS_SQL}), 0)::numeric AS paid_amount
         FROM invoice i
         LEFT JOIN SEDA_registration sr_link ON sr_link.bubble_id = i.linked_seda_registration
         LEFT JOIN SEDA_registration sr_back ON i.bubble_id = ANY(sr_back.linked_invoice)
@@ -301,6 +491,26 @@ def fetch_payment_planning(
 
 
 def classify_property_type(row: dict[str, Any]) -> str:
+    # 1. Check customer name for explicit company or property type hints
+    cust_name = ""
+    for k in ("customer_name", "customer_name_snapshot", "db_customer_name"):
+        if row.get(k):
+            cust_name += " " + str(row.get(k))
+    cust_name = cust_name.upper().strip()
+    if cust_name:
+        comm_keywords = (
+            "SDN BHD", "SDN. BHD.", "BHD", "PRIVATE LIMITED", "LIMITED", "LTD",
+            "ENTERPRISE", "COMMERCIAL", "SHOP", "TRADING", "INDUSTRIES", "INDUSTRY",
+            "ENGINEERING", "CONSTRUCTION", "SERVICES", "SERVICE", "MARKET", "MART",
+            "BUSINESS", "CORP", "CORPORATION"
+        )
+        if any(kw in cust_name for kw in comm_keywords):
+            if "FACTORY" in cust_name or "EDGING" in cust_name:
+                return "Factory"
+            return "Shop Lot"
+        if "FACTORY" in cust_name or "EDGING" in cust_name:
+            return "Factory"
+
     nem = str(row.get("seda_nem_type") or "").upper().strip()
     if "RAKYAT" in nem: return "Residential"
     if "SHOPLOT" in nem or "SHOP-LOT" in nem or "COMMERCIAL" in nem: return "Shop Lot"
@@ -463,6 +673,17 @@ def build_anp_tables(
         inv_date = parse_date(inv.get("invoice_date"))
         if inv_date is None:
             continue
+        # Require 1st payment date in the same month as invoice date,
+        # unless this invoice is a whitelisted special case.
+        inv_num = str(inv.get("invoice_number") or "").strip()
+        if inv_num not in ANP_SAME_MONTH_EXCEPTIONS:
+            first_pay_date = parse_date(inv.get("1st_payment_date"))
+            if not _same_month(inv_date, first_pay_date):
+                continue
+        # A 1st_payment_date can be set without a real payment behind it
+        # (data entry gap) — require an actual amount paid, however small.
+        if not _is_paid(inv):
+            continue
         agent_id = str(inv.get("linked_agent") or "")
         if agent_id not in agent_by_id:
             continue
@@ -474,7 +695,10 @@ def build_anp_tables(
     ):
         inv_list = buckets[(agent_id, inv_year, inv_month)]
         agent = agent_by_id[agent_id]
-        agent_name = (agent.get("name") or "").strip()
+        # This report's own output (CSV/Excel/console) is self-contained — no
+        # other script joins against these dicts by name — so it's safe to
+        # show the Agent Roles "Full Name" here directly.
+        agent_name = _agent_display_name(agent.get("name")) or (agent.get("name") or "").strip()
 
         sorted_invs = sorted(
             inv_list,
@@ -569,6 +793,17 @@ def build_report_rows(
         inv_date = parse_date(inv.get("invoice_date"))
         if inv_date is None:
             continue
+        # Require 1st payment date in the same month as invoice date,
+        # unless this invoice is a whitelisted special case.
+        inv_num = str(inv.get("invoice_number") or "").strip()
+        if inv_num not in ANP_SAME_MONTH_EXCEPTIONS:
+            first_pay_date = parse_date(inv.get("1st_payment_date"))
+            if not _same_month(inv_date, first_pay_date):
+                continue
+        # A 1st_payment_date can be set without a real payment behind it
+        # (data entry gap) — require an actual amount paid, however small.
+        if not _is_paid(inv):
+            continue
         agent_id = str(inv.get("linked_agent") or "")
         if agent_id not in agent_by_id:
             continue
@@ -579,6 +814,11 @@ def build_report_rows(
         buckets.items(), key=lambda k: (k[0][0], k[0][1], k[0][2])
     ):
         agent = agent_by_id[agent_id]
+        # Kept as the raw Postgres/eeAdmin name here (not the Agent Roles
+        # "Full Name" override) — this is the key build_commission_pack.py's
+        # PDF pack uses to join ANP rows back to the matching Basic Commission
+        # agent name. The Full Name display swap happens downstream, on the
+        # already-joined output only (build_anp_tables() / dashboard rows).
         agent_name = (agent.get("name") or "").strip()
 
         sorted_invs = sorted(
@@ -1052,6 +1292,14 @@ def main() -> int:
     agent_types = [t.strip() for t in args.agent_types.split(",") if t.strip()]
     if not agent_types:
         print("At least one --agent-types value is required.", file=sys.stderr)
+        return 1
+    if not any(t.lower() in ("internal", "full time") for t in agent_types):
+        print(
+            "ANP Commission is internal agents only — outsource agents are not "
+            "eligible. Omit --agent-types (or set it to internal/FULL TIME) to "
+            "generate a report; there is nothing to generate for other agent types.",
+            file=sys.stderr,
+        )
         return 1
 
     client = PostgresProxyClient(base_url, token, db_name)

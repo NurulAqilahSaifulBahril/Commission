@@ -30,6 +30,44 @@ except Exception:
     FONT_ITALIC = "Helvetica-Oblique"
 
 
+# Shared agent full-name resolver (nickname -> canonical full name, Title Case),
+# sourced from the dashboard's Agent Roles & Hierarchy page (agent_roles table).
+# Applied to Agent columns at render time so upstream tier/hierarchy logic
+# (keyed on nicknames) is unaffected.
+import os as _os
+import sys as _sys
+_REPO_ROOT = _os.path.dirname(_os.path.abspath(__file__))
+if _REPO_ROOT not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT)
+try:
+    import agent_names as _agent_names
+except Exception:
+    _agent_names = None
+
+
+def _is_agent_header(header: Any) -> bool:
+    return isinstance(header, str) and "agent" in header.lower()
+
+
+def _resolve_agent_cells(headers: Sequence[Any], rows: list[list[Any]]) -> list[list[Any]]:
+    """Return a copy of rows with Agent columns replaced by canonical full names."""
+    if not _agent_names or not headers:
+        return rows
+    agent_cols = [i for i, h in enumerate(headers) if _is_agent_header(h)]
+    if not agent_cols:
+        return rows
+    new_rows = []
+    for row in rows:
+        row = list(row)
+        for i in agent_cols:
+            if i < len(row):
+                val = row[i]
+                if isinstance(val, str) and val.strip() and val.strip() != "-":
+                    row[i] = _agent_names.resolve(val.strip())
+        new_rows.append(row)
+    return new_rows
+
+
 @dataclass(frozen=True)
 class PdfSection:
     title: str
@@ -424,8 +462,11 @@ def build_stacked_table(month_title: str, headers: list[str], rows: list[list[st
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 
+    # Agent columns -> canonical full names (Title Case) before layout/merging.
+    rows = _resolve_agent_cells(headers, rows)
+
     styles = getSampleStyleSheet()
-    
+
     cell_style_left = ParagraphStyle("CellLeft", parent=styles["Normal"], fontSize=7.5, leading=8.5, alignment=TA_LEFT, fontName=FONT_REGULAR)
     cell_style_center = ParagraphStyle("CellCenter", parent=styles["Normal"], fontSize=7.5, leading=8.5, alignment=TA_CENTER, fontName=FONT_REGULAR)
     cell_style_right = ParagraphStyle("CellRight", parent=styles["Normal"], fontSize=7.5, leading=8.5, alignment=TA_RIGHT, fontName=FONT_REGULAR)
@@ -659,6 +700,7 @@ def build_matrix_table(
     comm_type: str,  # "Basic Commission" or "NFP Commission" or "ANP Commission"
     rows: list[list[str]],
     page_width: float,
+    is_h2: bool = False,
 ) -> Table:
     from reportlab.platypus import Table, TableStyle, Paragraph
     from reportlab.lib import colors
@@ -683,6 +725,12 @@ def build_matrix_table(
     sub_header_style_nfp = ParagraphStyle("StackedSubHeaderMatrixNfp", parent=styles["Normal"], fontSize=5.8, leading=6.8, fontName=FONT_BOLD, textColor=colors.white, alignment=TA_CENTER)
 
     rows = [list(r) for r in rows]
+    # Agent column (col 0) -> canonical full name for display. Done before the
+    # span logic below so identical agents still merge correctly.
+    if _agent_names:
+        for _r in rows:
+            if _r and isinstance(_r[0], str) and _r[0].strip() and _r[0].strip() not in ("-", "Total"):
+                _r[0] = _agent_names.resolve(_r[0].strip())
     has_customer = False
     if rows:
         if len(rows[0]) == 15 or len(rows[0]) == 28:
@@ -714,17 +762,18 @@ def build_matrix_table(
             total_ratio = sum(col_ratios)
             col_widths = [page_width * r / total_ratio for r in col_ratios]
             
+            months_names = ["Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] if is_h2 else ["Jan", "Feb", "Mac", "Apr", "May", "Jun"]
             row1 = [
                 Paragraph("Agent", header_style_nfp),
                 Paragraph("Customer", header_style_nfp),
                 Paragraph("Invoice Date", header_style_nfp),
                 Paragraph("Commission Rate", header_style_nfp),
-                Paragraph("Jan", header_style_nfp), "", "", "",
-                Paragraph("Feb", header_style_nfp), "", "", "",
-                Paragraph("Mac", header_style_nfp), "", "", "",
-                Paragraph("Apr", header_style_nfp), "", "", "",
-                Paragraph("May", header_style_nfp), "", "", "",
-                Paragraph("Jun", header_style_nfp), "", "", ""
+                Paragraph(months_names[0], header_style_nfp), "", "", "",
+                Paragraph(months_names[1], header_style_nfp), "", "", "",
+                Paragraph(months_names[2], header_style_nfp), "", "", "",
+                Paragraph(months_names[3], header_style_nfp), "", "", "",
+                Paragraph(months_names[4], header_style_nfp), "", "", "",
+                Paragraph(months_names[5], header_style_nfp), "", "", ""
             ]
             row2 = [
                 "", "", "", "",
@@ -753,15 +802,16 @@ def build_matrix_table(
             total_ratio = sum(col_ratios)
             col_widths = [page_width * r / total_ratio for r in col_ratios]
             
+            months_names = ["Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] if is_h2 else ["Jan", "Feb", "Mac", "Apr", "May", "Jun"]
             row1 = [
                 Paragraph("Agent Name", header_style_nfp),
                 Paragraph("Commission Rate", header_style_nfp),
-                Paragraph("Jan", header_style_nfp), "", "", "",
-                Paragraph("Feb", header_style_nfp), "", "", "",
-                Paragraph("Mac", header_style_nfp), "", "", "",
-                Paragraph("Apr", header_style_nfp), "", "", "",
-                Paragraph("May", header_style_nfp), "", "", "",
-                Paragraph("Jun", header_style_nfp), "", "", ""
+                Paragraph(months_names[0], header_style_nfp), "", "", "",
+                Paragraph(months_names[1], header_style_nfp), "", "", "",
+                Paragraph(months_names[2], header_style_nfp), "", "", "",
+                Paragraph(months_names[3], header_style_nfp), "", "", "",
+                Paragraph(months_names[4], header_style_nfp), "", "", "",
+                Paragraph(months_names[5], header_style_nfp), "", "", ""
             ]
             row2 = [
                 "", "",
@@ -789,15 +839,16 @@ def build_matrix_table(
             total_ratio = sum(col_ratios)
             col_widths = [page_width * r / total_ratio for r in col_ratios]
             
+            months_names = ["Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] if is_h2 else ["Jan", "Feb", "Mac", "Apr", "May", "Jun"]
             row1 = [
                 Paragraph("Agent", header_style),
                 Paragraph("Customer", header_style),
-                Paragraph("Jan", header_style), "",
-                Paragraph("Feb", header_style), "",
-                Paragraph("Mac", header_style), "",
-                Paragraph("Apr", header_style), "",
-                Paragraph("May", header_style), "",
-                Paragraph("Jun", header_style), ""
+                Paragraph(months_names[0], header_style), "",
+                Paragraph(months_names[1], header_style), "",
+                Paragraph(months_names[2], header_style), "",
+                Paragraph(months_names[3], header_style), "",
+                Paragraph(months_names[4], header_style), "",
+                Paragraph(months_names[5], header_style), ""
             ]
             row2 = [
                 "", "",
@@ -824,16 +875,17 @@ def build_matrix_table(
             total_ratio = sum(col_ratios)
             col_widths = [page_width * r / total_ratio for r in col_ratios]
             
+            months_names = ["Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] if is_h2 else ["Jan", "Feb", "Mac", "Apr", "May", "Jun"]
             row1 = [
                 Paragraph("Agent", header_style),
                 Paragraph("Customer", header_style),
                 Paragraph("Commission Rate", header_style),
-                Paragraph("Jan", header_style), "",
-                Paragraph("Feb", header_style), "",
-                Paragraph("Mac", header_style), "",
-                Paragraph("Apr", header_style), "",
-                Paragraph("May", header_style), "",
-                Paragraph("Jun", header_style), ""
+                Paragraph(months_names[0], header_style), "",
+                Paragraph(months_names[1], header_style), "",
+                Paragraph(months_names[2], header_style), "",
+                Paragraph(months_names[3], header_style), "",
+                Paragraph(months_names[4], header_style), "",
+                Paragraph(months_names[5], header_style), ""
             ]
             row2 = [
                 "", "", "",
@@ -861,14 +913,15 @@ def build_matrix_table(
         total_ratio = sum(col_ratios)
         col_widths = [page_width * r / total_ratio for r in col_ratios]
         
+        months_names = ["Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] if is_h2 else ["Jan", "Feb", "Mac", "Apr", "May", "Jun"]
         row1 = [
             Paragraph("Agent Name", header_style),
-            Paragraph("Jan", header_style), "",
-            Paragraph("Feb", header_style), "",
-            Paragraph("Mac", header_style), "",
-            Paragraph("Apr", header_style), "",
-            Paragraph("May", header_style), "",
-            Paragraph("Jun", header_style), ""
+            Paragraph(months_names[0], header_style), "",
+            Paragraph(months_names[1], header_style), "",
+            Paragraph(months_names[2], header_style), "",
+            Paragraph(months_names[3], header_style), "",
+            Paragraph(months_names[4], header_style), "",
+            Paragraph(months_names[5], header_style), ""
         ]
         row2 = [
             "",
@@ -894,15 +947,16 @@ def build_matrix_table(
         total_ratio = sum(col_ratios)
         col_widths = [page_width * r / total_ratio for r in col_ratios]
         
+        months_names = ["Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] if is_h2 else ["Jan", "Feb", "Mac", "Apr", "May", "Jun"]
         row1 = [
             Paragraph("Agent Name", header_style),
             Paragraph("Commission Rate", header_style),
-            Paragraph("Jan", header_style), "",
-            Paragraph("Feb", header_style), "",
-            Paragraph("Mac", header_style), "",
-            Paragraph("Apr", header_style), "",
-            Paragraph("May", header_style), "",
-            Paragraph("Jun", header_style), ""
+            Paragraph(months_names[0], header_style), "",
+            Paragraph(months_names[1], header_style), "",
+            Paragraph(months_names[2], header_style), "",
+            Paragraph(months_names[3], header_style), "",
+            Paragraph(months_names[4], header_style), "",
+            Paragraph(months_names[5], header_style), ""
         ]
         row2 = [
             "", "",
@@ -1018,14 +1072,21 @@ def build_matrix_table(
     return table
 
 
-def build_nfp_matrix_tables(rows: list[list[str]], page_width: float) -> tuple[Table, Table, Table]:
+def build_nfp_matrix_tables(rows: list[list[str]], page_width: float) -> list[Table]:
     from reportlab.platypus import Table, TableStyle, Paragraph
     from reportlab.lib import colors
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 
+    # Agent column (col 0) -> canonical full name for display.
+    rows = [list(r) for r in rows]
+    if _agent_names:
+        for _r in rows:
+            if _r and isinstance(_r[0], str) and _r[0].strip() and _r[0].strip() not in ("-", "Total"):
+                _r[0] = _agent_names.resolve(_r[0].strip())
+
     styles = getSampleStyleSheet()
-    
+
     cell_style_left = ParagraphStyle("NfpLeft", parent=styles["Normal"], fontSize=6.5, leading=7.5, alignment=TA_LEFT, fontName=FONT_REGULAR)
     cell_style_center = ParagraphStyle("NfpCenter", parent=styles["Normal"], fontSize=6.5, leading=7.5, alignment=TA_CENTER, fontName=FONT_REGULAR)
     cell_style_right = ParagraphStyle("NfpRight", parent=styles["Normal"], fontSize=6.5, leading=7.5, alignment=TA_RIGHT, fontName=FONT_REGULAR)
@@ -1104,13 +1165,27 @@ def build_nfp_matrix_tables(rows: list[list[str]], page_width: float) -> tuple[T
         t.setStyle(TableStyle(t_styles))
         return t
 
-    t1 = make_table("Jan", "Feb", 2, 10)
-    t2 = make_table("Mac", "Apr", 10, 18)
-    t3 = make_table("May", "Jun", 18, 26)
-    return t1, t2, t3
+    cols_count = len(rows[0]) if rows else 0
+    is_full_year = (cols_count > 30)
+    if is_full_year:
+        slices = [
+            ("Jan", "Feb", 2, 10),
+            ("Mac", "Apr", 10, 18),
+            ("May", "Jun", 18, 26),
+            ("Jul", "Aug", 26, 34),
+            ("Sep", "Oct", 34, 42),
+            ("Nov", "Dec", 42, 50)
+        ]
+    else:
+        slices = [
+            ("Jan", "Feb", 2, 10),
+            ("Mac", "Apr", 10, 18),
+            ("May", "Jun", 18, 26)
+        ]
+    return [make_table(m1, m2, s_start, s_end) for m1, m2, s_start, s_end in slices]
 
 
-def build_nfp_customer_matrix_tables(rows: list[list[str]], page_width: float) -> tuple[Table, Table, Table]:
+def build_nfp_customer_matrix_tables(rows: list[list[str]], page_width: float) -> list[Table]:
     from reportlab.platypus import Table, TableStyle, Paragraph
     from reportlab.lib import colors
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -1130,6 +1205,11 @@ def build_nfp_customer_matrix_tables(rows: list[list[str]], page_width: float) -
     col_widths = [page_width * r / total_ratio for r in col_ratios]
 
     rows = [list(r) for r in rows]
+    # Agent column (col 0) -> canonical full name for display.
+    if _agent_names:
+        for _r in rows:
+            if _r and isinstance(_r[0], str) and _r[0].strip() and _r[0].strip() not in ("-", "Total"):
+                _r[0] = _agent_names.resolve(_r[0].strip())
     if rows:
         current_agent = ""
         span_count = 0
@@ -1239,10 +1319,24 @@ def build_nfp_customer_matrix_tables(rows: list[list[str]], page_width: float) -
         t.setStyle(TableStyle(t_styles))
         return t
 
-    t1 = make_table("Jan", "Feb", 4, 12)
-    t2 = make_table("Mac", "Apr", 12, 20)
-    t3 = make_table("May", "Jun", 20, 28)
-    return t1, t2, t3
+    cols_count = len(rows[0]) if rows else 0
+    is_full_year = (cols_count > 30)
+    if is_full_year:
+        slices = [
+            ("Jan", "Feb", 4, 12),
+            ("Mac", "Apr", 12, 20),
+            ("May", "Jun", 20, 28),
+            ("Jul", "Aug", 28, 36),
+            ("Sep", "Oct", 36, 44),
+            ("Nov", "Dec", 44, 52)
+        ]
+    else:
+        slices = [
+            ("Jan", "Feb", 4, 12),
+            ("Mac", "Apr", 12, 20),
+            ("May", "Jun", 20, 28)
+        ]
+    return [make_table(m1, m2, s_start, s_end) for m1, m2, s_start, s_end in slices]
 
 
 
@@ -1391,82 +1485,86 @@ def build_trend_summary_table(charts: FinanceChartData, page_width: float) -> Ta
     return t
 
 def load_internal_hierarchy() -> list[dict[str, Any]]:
-    import openpyxl
-    from datetime import datetime, date
-    repo_root = Path(__file__).resolve().parent
-    excel_path = repo_root / "1. Basic Commission" / "1. Excel" / "1. Agent Details.xlsx"
-    
-    # Fallback to hardcoded list if the Excel file is not found
+    """Senior -> executives groups from the dashboard's Agent Roles & Hierarchy
+    page (agent_roles: Internal rows with Reports To filled). Falls back to a
+    hardcoded snapshot when the table is unreachable or has no groups."""
     fallback = [
         {"senior": "Teng Kah Kent", "start_date": "01 Jul 2025", "executives": ["Louis Ng", "Anisah Najwa", "Najwa"]},
         {"senior": "Sunny Tan", "start_date": "01 Jul 2025", "executives": ["Jia Keat", "Zulkarnain", "Denise", "Jia Xuan"]},
         {"senior": "Zhe Hang", "start_date": "01 May 2025", "executives": ["Joshua Yap Jia Hao"]},
         {"senior": "Martin Hing", "start_date": "01 Feb 2026", "executives": ["Js"]}
     ]
-    
-    if not excel_path.is_file():
-        return fallback
-        
-    try:
-        import shutil
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-        try:
-            shutil.copy2(excel_path, tmp_path)
-            wb = openpyxl.load_workbook(tmp_path, data_only=True)
-        finally:
-            try:
-                tmp_path.unlink()
-            except Exception:
-                pass
-        if "Internal" not in wb.sheetnames:
-            return fallback
-            
-        ws = wb["Internal"]
-        groups = []
-        current_group = None
-        
-        for r in range(2, ws.max_row + 1):
-            start_date = ws.cell(row=r, column=2).value
-            senior = ws.cell(row=r, column=3).value
-            executive = ws.cell(row=r, column=4).value
-            
-            if not executive and not senior and not start_date:
-                continue
-                
-            if senior:
-                senior = str(senior).strip()
-            if executive:
-                executive = str(executive).strip()
-                
-            if start_date:
-                if isinstance(start_date, (datetime, date)):
-                    start_date_str = start_date.strftime("%d %b %Y")
-                else:
-                    start_date_str = str(start_date).strip()
-            else:
-                start_date_str = None
-                
-            if senior or start_date_str:
-                current_group = {
-                    "senior": senior or "Unknown Senior",
-                    "start_date": start_date_str,
-                    "executives": []
-                }
-                groups.append(current_group)
-                
-            if executive and current_group is not None:
-                current_group["executives"].append(executive)
-                
-        # If no groups were parsed, return fallback
-        if not groups:
-            return fallback
-        return groups
 
+    try:
+        import sys as _sys
+        rates_dir = str(Path(__file__).resolve().parent / "1. Basic Commission" / "3. Python Script")
+        if rates_dir not in _sys.path:
+            _sys.path.insert(0, rates_dir)
+        from basic_commission_rates import _load_db_table, effective_start
+        rows = _load_db_table("agent_roles")
     except Exception as e:
-        print(f"Error loading internal hierarchy from Excel: {e}")
+        print(f"Error loading internal hierarchy from agent_roles: {e}")
         return fallback
+
+    def _fmt_month(eff: str) -> str | None:
+        # A range ("2026-01 to 2026-08") prints as the month it started, which
+        # is what "start_date" on the chart means.
+        eff = effective_start(eff)
+        try:
+            from datetime import datetime as _dt
+            return _dt.strptime(eff, "%Y-%m").strftime("01 %b %Y")
+        except ValueError:
+            return eff or None
+
+    # Per agent: the latest non-hidden Internal row overall (for start dates),
+    # and the latest one whose Reports To is filled (for grouping). Re-seeded
+    # rows often arrive with a blank Reports To, so requiring the very latest
+    # row to carry it would silently drop agents from the chart.
+    latest: dict[str, dict] = {}
+    latest_with_rt: dict[str, dict] = {}
+    for r in rows:
+        if r.get("hidden"):
+            continue
+        if str(r.get("agent_type") or "").strip().lower() != "internal":
+            continue
+        agent = str(r.get("agent") or "").strip()
+        if not agent:
+            continue
+        key = agent.lower()
+        # An effective month may be a closed range ("2026-01 to 2026-08"), so
+        # rank on the start month — the raw cell sorts a range above the plain
+        # month it starts in, on string length alone.
+        eff = effective_start(r.get("effective_from"))
+        prev = latest.get(key)
+        if prev is None or eff > effective_start(prev.get("effective_from")):
+            latest[key] = r
+        if str(r.get("reports_to") or "").strip():
+            prev = latest_with_rt.get(key)
+            if prev is None or eff > effective_start(prev.get("effective_from")):
+                latest_with_rt[key] = r
+
+    display = (_agent_names.resolve if _agent_names else (lambda n: n))
+    groups: dict[str, dict[str, Any]] = {}
+    for r in latest_with_rt.values():
+        senior = str(r.get("reports_to") or "").strip()
+        if not senior:
+            continue
+        skey = senior.lower()
+        if skey not in groups:
+            senior_row = latest.get(skey)
+            groups[skey] = {
+                "senior": display(senior),
+                "start_date": _fmt_month(senior_row.get("effective_from")) if senior_row else None,
+                "executives": [],
+            }
+        groups[skey]["executives"].append(display(str(r.get("agent") or "").strip()))
+
+    if not groups:
+        return fallback
+    out = sorted(groups.values(), key=lambda g: str(g["senior"]).lower())
+    for g in out:
+        g["executives"].sort(key=str.lower)
+    return out
 def load_outsource_hierarchy() -> list[dict]:
     """Returns outsource org groups for rendering. Each group has role, name, and executives."""
     return [
@@ -1819,7 +1917,7 @@ def write_finance_presentation_pdf(
         col_width = page_width / max(ncols, 1)
         col_widths = [col_width] * ncols
         table_data: list[list] = [[cell_para(h, header=True) for h in sect.headers]]
-        for row in sect.rows:
+        for row in _resolve_agent_cells(sect.headers, sect.rows):
             padded = list(row) + [""] * (ncols - len(row))
             table_data.append([cell_para(c) for c in padded[:ncols]])
         table = Table(table_data, colWidths=col_widths, repeatRows=1)
@@ -2325,6 +2423,33 @@ def write_finance_presentation_pdf(
         analysis_txt2 = _generate_agent_customer_analysis(charts, analysis_intro_style, analysis_bullet_style)
         story.extend(analysis_txt2)
         story.append(PageBreak())
+        
+        # Grid 2: Jul - Dec (only if we have more than 6 months of data)
+        if len(charts.monthly_agent_customers) > 6:
+            story.append(Paragraph("Commission Analysis", main_title_style))
+            story.append(Paragraph("Agent Customer Count (Jul - Dec)", analysis_subtitle_style))
+            story.append(Spacer(1, 0.05 * inch))
+            drawings2 = []
+            for m in range(7, 13):
+                m_data = charts.monthly_agent_customers[m-1] if m-1 < len(charts.monthly_agent_customers) else {}
+                chart = _draw_monthly_agent_customer_chart(m_data, charts.agent_names, months_full[m-1], width=250, height=145)
+                drawings2.append(ChartFlowable(chart, 250, 145))
+                
+            grid_table2 = Table([
+                [drawings2[0], drawings2[1], drawings2[2]],
+                [drawings2[3], drawings2[4], drawings2[5]]
+            ], colWidths=[doc.width/3, doc.width/3, doc.width/3], rowHeights=[150, 150])
+            grid_table2.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]))
+            story.append(grid_table2)
+            story.append(Spacer(1, 0.1 * inch))
+            story.append(PageBreak())
 
     # --- Page 6: Commission Composition Split (Grids) ---
     if charts.monthly_agent_commission_split and charts.agent_names:
@@ -2358,6 +2483,34 @@ def write_finance_presentation_pdf(
         story.append(Spacer(1, 0.08 * inch))
         analysis_txt3 = _generate_commission_split_analysis(charts, analysis_intro_style, analysis_bullet_style)
         story.extend(analysis_txt3)
+        
+        # Grid 2: Jul - Dec (only if we have more than 6 months of data)
+        if len(charts.monthly_agent_customers) > 6:
+            story.append(PageBreak())
+            story.append(Paragraph("Commission Analysis", main_title_style))
+            story.append(Paragraph("Agent Commission Split (Jul - Dec)", analysis_subtitle_style))
+            story.append(Spacer(1, 0.05 * inch))
+            drawings4 = []
+            for m in range(7, 13):
+                m_data = charts.monthly_agent_commission_split.get(m, {})
+                chart = _draw_monthly_commission_split_chart(m_data, charts.agent_names, months_full[m-1], width=250, height=145)
+                drawings4.append(ChartFlowable(chart, 250, 145))
+                
+            grid_table4 = Table([
+                [drawings4[0], drawings4[1], drawings4[2]],
+                [drawings4[3], drawings4[4], drawings4[5]]
+            ], colWidths=[doc.width/3, doc.width/3, doc.width/3], rowHeights=[150, 150])
+            grid_table4.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]))
+            story.append(grid_table4)
+            story.append(Spacer(1, 0.05 * inch))
+            story.append(_create_split_legend(doc.width))
 
     # --- Pages 7+: Details Tables ---
     page_w = lw - 2 * margin
@@ -2438,19 +2591,51 @@ def write_finance_presentation_pdf(
                     comm_type = section.title.split("Details")[0].strip()
                     if comm_type == "NFP Commission":
                         has_customer = False
-                        if section.rows and len(section.rows[0]) == 28:
+                        # 28 columns for H1, 52 columns for Full Year
+                        if section.rows and len(section.rows[0]) in (28, 52):
                             has_customer = True
                         if has_customer:
-                            t1, t2, t3 = build_nfp_customer_matrix_tables(section.rows, page_w)
+                            tables = build_nfp_customer_matrix_tables(section.rows, page_w)
                         else:
-                            t1, t2, t3 = build_nfp_matrix_tables(section.rows, page_w)
-                        story.append(t1)
-                        story.append(Spacer(1, 0.08 * inch))
-                        story.append(t2)
-                        story.append(PageBreak())
-                        story.append(t3)
+                            tables = build_nfp_matrix_tables(section.rows, page_w)
+                        for idx, t in enumerate(tables):
+                            story.append(t)
+                            if idx < len(tables) - 1:
+                                if idx % 2 == 1:
+                                    story.append(PageBreak())
+                                else:
+                                    story.append(Spacer(1, 0.08 * inch))
                     else:
-                        story.append(build_matrix_table(section.title, comm_type, section.rows, page_w))
+                        cols_count = len(section.rows[0]) if section.rows else 0
+                        is_full_year = (cols_count > 20)
+                        if is_full_year:
+                            if comm_type == "ANP Commission" and "Customer" in section.title:
+                                prefix_cols = 2
+                                h1_cols = prefix_cols + 12
+                            elif "Customer" in section.title:
+                                prefix_cols = 3
+                                h1_cols = prefix_cols + 12
+                            elif comm_type == "ANP Commission":
+                                prefix_cols = 1
+                                h1_cols = prefix_cols + 12
+                            else:
+                                prefix_cols = 2
+                                h1_cols = prefix_cols + 12
+                            
+                            h1_rows = []
+                            h2_rows = []
+                            for row in section.rows:
+                                h1_rows.append(row[:h1_cols])
+                                h2_rows.append(list(row[:prefix_cols]) + row[h1_cols:])
+                            
+                            t1 = build_matrix_table(section.title + " (Jan - Jun)", comm_type, h1_rows, page_w, is_h2=False)
+                            t2 = build_matrix_table(section.title + " (Jul - Dec)", comm_type, h2_rows, page_w, is_h2=True)
+                            
+                            story.append(t1)
+                            story.append(PageBreak())
+                            story.append(t2)
+                        else:
+                            story.append(build_matrix_table(section.title, comm_type, section.rows, page_w))
                     
                     # Add descriptive notes below the tables
                     if comm_type == "NFP Commission":
@@ -2776,7 +2961,7 @@ def write_commission_pdf(
         col_widths = [col_width] * ncols
 
         table_data: list[list] = [[cell_para(h, header=True) for h in section.headers]]
-        for row in section.rows:
+        for row in _resolve_agent_cells(section.headers, section.rows):
             padded = list(row) + [""] * (ncols - len(row))
             table_data.append([cell_para(c) for c in padded[:ncols]])
 

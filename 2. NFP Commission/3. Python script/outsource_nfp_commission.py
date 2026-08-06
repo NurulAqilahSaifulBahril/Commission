@@ -245,24 +245,205 @@ def get_agent_hierarchy_info(agent_name: str) -> dict[str, Any] | None:
     return None
 
 
-def is_outsource_agent(agent_name: str, agent_type_field: str | None) -> bool:
-    """Return True if this agent is an outsource agent (name-match OR DB field)."""
+def get_agent_type_override(agent_name: str, invoice_date: Any = None) -> str | None:
+    """'internal' / 'outsource' from the Agent Roles & Hierarchy page for the
+    invoice's own month, or None when that page says nothing. It outranks both
+    Postgres' agent_type and the name map below — Postgres' agent_type is blank
+    for several internal agents, and blank has always read as outsource here."""
+    try:
+        rates_dir = str(REPO_ROOT / "1. Basic Commission" / "3. Python Script")
+        if rates_dir not in sys.path:
+            sys.path.append(rates_dir)
+        from basic_commission_rates import get_agent_type_override as _override
+    except Exception:
+        return None
+    parsed = parse_date(invoice_date) if invoice_date else None
+    return _override(agent_name,
+                     month=parsed.month if parsed else None,
+                     year=parsed.year if parsed else None)
+
+
+def is_outsource_agent(agent_name: str, agent_type_field: str | None,
+                       invoice_date: Any = None) -> bool:
+    """Return True if this agent is an outsource agent (roles page, else
+    name-match OR DB field)."""
+    override = get_agent_type_override(agent_name, invoice_date)
+    if override:
+        return override == "outsource"
     info = get_agent_hierarchy_info(agent_name)
-    is_db_outsource = "outsource" in str(agent_type_field or "").lower()
+    is_db_outsource = str(agent_type_field or "").lower().strip() not in {"internal", "full time"}
     return (info is not None) or is_db_outsource
 
 
 # ---------------------------------------------------------------------------
-# SQL – fetch all fully-paid 2026 invoices (no agent_type filter in SQL;
-# outsource filtering is done in Python via is_outsource_agent()).
-# ---------------------------------------------------------------------------
 INVOICES_SQL = """
-WITH candidates AS (
+WITH target_invoices AS (
+  SELECT *
+  FROM invoice
+  WHERE total_amount > 0 
+    AND (
+      extract(year from invoice_date) = {year} 
+      OR bubble_id IN (SELECT linked_invoice FROM payment WHERE extract(year from payment_date) = {year})
+    )
+),
+pct75 AS (
+  SELECT sub.linked_invoice,
+         MIN(sub.payment_date) AS pct75_date
+  FROM (
+    SELECT p.linked_invoice,
+           p.payment_date,
+           SUM(p.amount) OVER (
+             PARTITION BY p.linked_invoice
+             ORDER BY p.payment_date ASC, p.id ASC
+           ) AS running_total,
+           i.total_amount
+    FROM payment p
+    JOIN target_invoices i ON i.bubble_id = p.linked_invoice
+    WHERE p.id NOT IN (101334, 104412, 101333, 104413, 4899)
+  ) sub
+  WHERE sub.running_total >= sub.total_amount * 0.75
+  GROUP BY sub.linked_invoice
+),
+pct100 AS (
+  SELECT sub.linked_invoice,
+         MIN(sub.payment_date) AS pct100_date
+  FROM (
+    SELECT p.linked_invoice,
+           p.payment_date,
+           SUM(p.amount) OVER (
+             PARTITION BY p.linked_invoice
+             ORDER BY p.payment_date ASC, p.id ASC
+           ) AS running_total,
+           i.total_amount
+    FROM payment p
+    JOIN target_invoices i ON i.bubble_id = p.linked_invoice
+    WHERE p.id NOT IN (101334, 104412, 101333, 104413, 4899)
+  ) sub
+  WHERE sub.running_total >= sub.total_amount
+  GROUP BY sub.linked_invoice
+),
+invoice_items_mapped AS (
+    SELECT linked_invoice AS invoice_bubble_id, bubble_id, epp, description, amount, unit_price, linked_package, is_a_package, voucher_remark, inv_item_type, linked_voucher, id
+    FROM invoice_item
+    WHERE linked_invoice IS NOT NULL
+    UNION
+    SELECT i.bubble_id AS invoice_bubble_id, ii.bubble_id, ii.epp, ii.description, ii.amount, ii.unit_price, ii.linked_package, ii.is_a_package, ii.voucher_remark, ii.inv_item_type, ii.linked_voucher, ii.id
+    FROM target_invoices i
+    CROSS JOIN LATERAL unnest(i.linked_invoice_item) AS item_id
+    INNER JOIN invoice_item ii ON ii.bubble_id = item_id
+),
+epp_items AS (
+    SELECT invoice_bubble_id, COALESCE(
+        NULLIF(SUM(CASE WHEN COALESCE(epp_val, 0) > 0 THEN epp_val ELSE 0 END), 0),
+        SUM(epp_interest_amount),
+        0
+    ) AS epp_cost
+    FROM (
+        SELECT 
+            invoice_bubble_id,
+            MAX(COALESCE(epp, 0)) AS epp_val,
+            MAX(
+                CASE
+                    WHEN COALESCE(description, '') ILIKE '%%epp%%interest%%'
+                         OR COALESCE(description, '') ILIKE '%%epp interest%%'
+                    THEN COALESCE(amount, unit_price, 0)
+                    ELSE 0
+                END
+            ) AS epp_interest_amount
+        FROM invoice_items_mapped
+        GROUP BY invoice_bubble_id, TRIM(
+            REGEXP_REPLACE(
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(COALESCE(description, ''), 'moths', 'months', 'gi'),
+                    '(\\d+)\\s*months',
+                    '\\1months',
+                    'gi'
+                ),
+                '\\s+',
+                ' ',
+                'g'
+            )
+        )
+    ) sub
+    GROUP BY invoice_bubble_id
+),
+payment_epp AS (
+    SELECT p.linked_invoice, SUM(COALESCE(p.epp_cost, 0)) AS epp_sum
+    FROM payment p
+    JOIN target_invoices i ON i.bubble_id = p.linked_invoice
+    WHERE p.id NOT IN (101334, 104412, 101333, 104413, 4899)
+    GROUP BY p.linked_invoice
+),
+pkg_ranked AS (
+    SELECT
+        invoice_bubble_id,
+        COALESCE(NULLIF(unit_price, 0), amount, 0) AS system_price,
+        description AS package_description,
+        linked_package,
+        ROW_NUMBER() OVER (
+            PARTITION BY invoice_bubble_id
+            ORDER BY
+                CASE WHEN is_a_package IS TRUE THEN 0 ELSE 1 END,
+                COALESCE(NULLIF(unit_price, 0), amount, 0) DESC,
+                id
+        ) as rn
+    FROM invoice_items_mapped
+),
+pkg AS (
+    SELECT p.invoice_bubble_id, p.system_price, p.package_description, COALESCE(pkg_table.nett_price, 0) AS db_net_floor_price
+    FROM pkg_ranked p
+    LEFT JOIN package pkg_table ON pkg_table.bubble_id = p.linked_package
+    WHERE p.rn = 1
+),
+items AS (
+    SELECT invoice_bubble_id, string_agg(COALESCE(description, ''), ' | ') AS all_item_text
+    FROM invoice_items_mapped
+    GROUP BY invoice_bubble_id
+),
+tng AS (
+    SELECT
+        invoice_bubble_id,
+        bool_or(
+            COALESCE(ii.description, '') ILIKE '%%tng%%'
+            OR COALESCE(ii.description, '') ILIKE '%%touch n go%%'
+            OR COALESCE(ii.description, '') ILIKE '%%touch''n go%%'
+            OR COALESCE(ii.description, '') ILIKE '%%swap tng%%'
+            OR (
+                COALESCE(ii.description, '') ILIKE '%%road show%%'
+                AND COALESCE(ii.description, '') ILIKE '%%tng%%'
+            )
+            OR COALESCE(ii.voucher_remark, '') ILIKE '%%tng%%'
+            OR COALESCE(ii.inv_item_type, '') ILIKE '%%tng%%'
+            OR COALESCE(v.title, '') ILIKE '%%tng%%'
+            OR COALESCE(v.invoice_description, '') ILIKE '%%tng%%'
+        ) AS has_tng,
+        NULLIF(
+            string_agg(
+                DISTINCT TRIM(COALESCE(ii.description, v.title, '')),
+                ' | '
+            ) FILTER (
+                WHERE COALESCE(ii.description, '') ILIKE '%%tng%%'
+                   OR COALESCE(ii.description, '') ILIKE '%%swap tng%%'
+                   OR (
+                       COALESCE(ii.description, '') ILIKE '%%road show%%'
+                       AND COALESCE(ii.description, '') ILIKE '%%tng%%'
+                   )
+                   OR COALESCE(v.title, '') ILIKE '%%tng%%'
+            ),
+            ''
+        ) AS tng_evidence
+    FROM invoice_items_mapped ii
+    LEFT JOIN voucher v ON v.bubble_id = ii.linked_voucher
+    GROUP BY invoice_bubble_id
+),
+candidates AS (
     SELECT
         i.bubble_id,
         i.invoice_number,
         i.invoice_date,
         i.full_payment_date,
+        pct75.pct75_date,
+        pct100.pct100_date,
         i.total_amount,
         i.effective_epp,
         i.panel_qty,
@@ -275,118 +456,41 @@ WITH candidates AS (
         COALESCE(sr_link.phase_type, sr_back.phase_type) AS phase_type,
         COALESCE(epp_items.epp_cost, 0) AS line_epp_cost,
         COALESCE(pay.epp_sum, 0) AS payment_epp_sum,
-        pkg.system_price,
+        COALESCE(pkg.system_price, 0) AS system_price,
         pkg.package_description,
-        pkg.db_net_floor_price,
+        COALESCE(pkg.db_net_floor_price, 0) AS db_net_floor_price,
         items.all_item_text,
         COALESCE(tng.has_tng, FALSE) AS has_tng_rebate,
         tng.tng_evidence,
         COALESCE(NULLIF(TRIM(i.invoice_number), ''), i.bubble_id) AS invoice_key
-    FROM invoice i
-    INNER JOIN agent a ON a.bubble_id = i.linked_agent
+    FROM target_invoices i
+    -- Agents live in BOTH the agent table and the user table since the
+    -- 2026-07-20 "agent retirement" migration (same bubble_id kept).
+    INNER JOIN (
+      SELECT DISTINCT ON (au.bubble_id) au.bubble_id, au.name, au.agent_type
+      FROM (
+        SELECT u.bubble_id, u.name, u.agent_type, 1 AS pri FROM "user" u
+         WHERE u.bubble_id IS NOT NULL AND COALESCE(BTRIM(u.agent_type), '') <> ''
+        UNION ALL
+        SELECT ag.bubble_id, ag.name, ag.agent_type, 2 FROM agent ag
+         WHERE ag.bubble_id IS NOT NULL
+        UNION ALL
+        SELECT u2.bubble_id, u2.name, u2.agent_type, 3 FROM "user" u2
+         WHERE u2.bubble_id IS NOT NULL
+      ) au
+      ORDER BY au.bubble_id, au.pri
+    ) a ON a.bubble_id = i.linked_agent
     LEFT JOIN customer c ON c.customer_id = i.linked_customer
-    LEFT JOIN seda_registration sr_link
-        ON sr_link.bubble_id = i.linked_seda_registration
-    LEFT JOIN seda_registration sr_back
-        ON i.bubble_id = ANY(sr_back.linked_invoice)
-    LEFT JOIN LATERAL (
-        SELECT COALESCE(
-            NULLIF(SUM(CASE WHEN COALESCE(ii_dedup.epp_val, 0) > 0 THEN ii_dedup.epp_val ELSE 0 END), 0),
-            SUM(ii_dedup.epp_interest_amount),
-            0
-        ) AS epp_cost
-        FROM (
-            SELECT 
-                MAX(COALESCE(ii.epp, 0)) AS epp_val,
-                MAX(
-                    CASE
-                        WHEN COALESCE(ii.description, '') ILIKE '%%epp%%interest%%'
-                             OR COALESCE(ii.description, '') ILIKE '%%epp interest%%'
-                        THEN COALESCE(ii.amount, ii.unit_price, 0)
-                        ELSE 0
-                    END
-                ) AS epp_interest_amount
-            FROM invoice_item ii
-            WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
-            GROUP BY TRIM(
-                REGEXP_REPLACE(
-                    REGEXP_REPLACE(
-                        REGEXP_REPLACE(COALESCE(ii.description, ''), 'moths', 'months', 'gi'),
-                        '(\\d+)\\s*months',
-                        '\\1months',
-                        'gi'
-                    ),
-                    '\\s+',
-                    ' ',
-                    'g'
-                )
-            )
-        ) ii_dedup
-    ) epp_items ON TRUE
-    LEFT JOIN LATERAL (
-        SELECT SUM(COALESCE(p.epp_cost, 0)) AS epp_sum
-        FROM payment p
-        WHERE p.linked_invoice = i.bubble_id
-    ) pay ON TRUE
-    LEFT JOIN LATERAL (
-        SELECT
-            COALESCE(NULLIF(ii.unit_price, 0), ii.amount, 0) AS system_price,
-            ii.description AS package_description,
-            p.nett_price AS db_net_floor_price
-        FROM invoice_item ii
-        LEFT JOIN package p ON p.bubble_id = ii.linked_package
-        WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
-        ORDER BY
-            CASE WHEN ii.is_a_package IS TRUE THEN 0 ELSE 1 END,
-            COALESCE(NULLIF(ii.unit_price, 0), ii.amount, 0) DESC,
-            ii.id
-        LIMIT 1
-    ) pkg ON TRUE
-    LEFT JOIN LATERAL (
-        SELECT string_agg(COALESCE(ii.description, ''), ' | ') AS all_item_text
-        FROM invoice_item ii
-        WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
-    ) items ON TRUE
-    LEFT JOIN LATERAL (
-        SELECT
-            bool_or(
-                COALESCE(ii.description, '') ILIKE '%%tng%%'
-                OR COALESCE(ii.description, '') ILIKE '%%touch n go%%'
-                OR COALESCE(ii.description, '') ILIKE '%%touch''n go%%'
-                OR COALESCE(ii.description, '') ILIKE '%%swap tng%%'
-                OR (
-                    COALESCE(ii.description, '') ILIKE '%%road show%%'
-                    AND COALESCE(ii.description, '') ILIKE '%%tng%%'
-                )
-                OR COALESCE(ii.voucher_remark, '') ILIKE '%%tng%%'
-                OR COALESCE(ii.inv_item_type, '') ILIKE '%%tng%%'
-                OR COALESCE(v.title, '') ILIKE '%%tng%%'
-                OR COALESCE(v.invoice_description, '') ILIKE '%%tng%%'
-            ) AS has_tng,
-            NULLIF(
-                string_agg(
-                    DISTINCT TRIM(COALESCE(ii.description, v.title, '')),
-                    ' | '
-                ) FILTER (
-                    WHERE COALESCE(ii.description, '') ILIKE '%%tng%%'
-                       OR COALESCE(ii.description, '') ILIKE '%%swap tng%%'
-                       OR (
-                           COALESCE(ii.description, '') ILIKE '%%road show%%'
-                           AND COALESCE(ii.description, '') ILIKE '%%tng%%'
-                       )
-                       OR COALESCE(v.title, '') ILIKE '%%tng%%'
-                ),
-                ''
-            ) AS tng_evidence
-        FROM invoice_item ii
-        LEFT JOIN voucher v ON v.bubble_id = ii.linked_voucher
-        WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
-    ) tng ON TRUE
-    WHERE i.paid IS TRUE
-      AND i.full_payment_date IS NOT NULL
-      AND EXTRACT(YEAR FROM i.full_payment_date) = {year}
-      AND COALESCE(i.is_deleted, FALSE) IS NOT TRUE
-      AND (COALESCE(i.percent_of_total_amount, 0) >= 1.0 OR i.paid IS TRUE)
+    LEFT JOIN pct75 ON pct75.linked_invoice = i.bubble_id
+    LEFT JOIN pct100 ON pct100.linked_invoice = i.bubble_id
+    LEFT JOIN seda_registration sr_link ON sr_link.bubble_id = i.linked_seda_registration
+    LEFT JOIN seda_registration sr_back ON i.bubble_id = ANY(sr_back.linked_invoice)
+    LEFT JOIN epp_items ON epp_items.invoice_bubble_id = i.bubble_id
+    LEFT JOIN payment_epp pay ON pay.linked_invoice = i.bubble_id
+    LEFT JOIN pkg ON pkg.invoice_bubble_id = i.bubble_id
+    LEFT JOIN items ON items.invoice_bubble_id = i.bubble_id
+    LEFT JOIN tng ON tng.invoice_bubble_id = i.bubble_id
+    WHERE COALESCE(i.is_deleted, FALSE) IS NOT TRUE
 ),
 epp_once AS (
     SELECT
@@ -417,7 +521,7 @@ ranked AS (
         ROW_NUMBER() OVER (
             PARTITION BY c.bubble_id
             ORDER BY COALESCE(c.is_latest, FALSE) DESC,
-                     c.full_payment_date DESC NULLS LAST,
+                     c.pct100_date DESC NULLS LAST,
                      c.invoice_row_id DESC
         ) AS rn
     FROM candidates c
@@ -426,7 +530,8 @@ SELECT
     r.bubble_id,
     r.invoice_number,
     r.invoice_date,
-    r.full_payment_date,
+    r.pct100_date AS full_payment_date,
+    r.pct75_date,
     r.total_amount,
     e.epp_cost,
     r.panel_qty,
@@ -505,6 +610,9 @@ class OutsourceNfpLine:
     commission_b: float
     commission_c: float
     nfp_commission: float
+    package_description: Optional[str] = None
+    pct75_date: Optional[str] = None
+
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +636,7 @@ def calc_commission(
     if system_price > net_floor:
         b = (system_price - net_floor) * Decimal("1.00")
     if sales_price < net_floor:
-        c = (net_floor - sales_price) * Decimal("0.25")
+        c = (net_floor - sales_price) * Decimal("0.20")
 
     nfp_total = a - c
     return a, b, c, nfp_total
@@ -549,9 +657,7 @@ def resolve_panels(row: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
         panel_rating = infer_panel_rating_from_text(text_blob)
 
     inv_date = parse_date(row.get("invoice_date"))
-    if inv_date and inv_date >= date(2026, 2, 1):
-        panel_rating = 650
-    elif panel_rating is None and inv_date and inv_date >= NFP_CUTOFF:
+    if panel_rating is None and inv_date and inv_date >= NFP_CUTOFF:
         panel_rating = 650
 
     return panel_qty, panel_rating
@@ -576,13 +682,27 @@ def is_three_phase_from_seda(phase_type: Optional[str]) -> bool:
 # Report builder
 # ---------------------------------------------------------------------------
 
+def _effective_nfp_date(row: dict) -> Optional[date]:
+    """Return the effective NFP eligibility date for a row.
+    NFP commission strictly requires 100% payment.
+    """
+    return parse_date(row.get("full_payment_date"))
+
+
 def build_report(year: int, month: Optional[int] = None) -> tuple[List[OutsourceNfpLine], Dict[str, Any]]:
     sql = INVOICES_SQL.format(year=year)
     all_rows = query_sql(sql)
     if month is not None:
-        all_rows = [r for r in all_rows if parse_date(r.get("full_payment_date")) and parse_date(r.get("full_payment_date")).month == month]
+        all_rows = [r for r in all_rows if _effective_nfp_date(r) and _effective_nfp_date(r).month == month]
 
-    schedules_650 = load_650w_schedules()
+    # Net floor prices come from the price list in the system (nfp_prices).
+    # The Excel schedules are no longer read: across internal and outsource
+    # for 2025 and 2026 the Excel-only source labels never appeared once,
+    # and substituting an empty map in the same process produced byte-
+    # identical output. Parsing the nine-sheet workbook only cost time.
+    # load_650w_schedules() is kept in net_floor_prices for ad-hoc use, and
+    # parse_schedule_workbook_rows still backs the Data page price upload.
+    schedules_650 = {}
     schedule_620 = load_620w_schedule()
 
     results: List[OutsourceNfpLine] = []
@@ -594,8 +714,7 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[Outsource
 
         # Only keep outsource agents
         info = get_agent_hierarchy_info(raw_agent_name)
-        is_db_outsource = "outsource" in str(agent_type_field).lower()
-        if not info and not is_db_outsource:
+        if not is_outsource_agent(raw_agent_name, agent_type_field, row.get("invoice_date")):
             skipped_not_outsource += 1
             continue
 
@@ -630,7 +749,9 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[Outsource
             )
             if nfp_raw is not None:
                 nfp_value = money(Decimal(str(nfp_raw)))
-                nfp_source = f"Excel fallback ({fallback_source})"
+                src = str(fallback_source or "")
+                label = "Price list" if src.startswith("db_") else "Excel schedule"
+                nfp_source = f"{label} ({src})"
             elif db_nfp > 0:
                 nfp_value = money(db_nfp)
                 nfp_source = "package.nett_price (fallback)"
@@ -644,14 +765,23 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[Outsource
 
         a, b, c, total_comm = calc_commission(sales, system, nfp_value)
 
+        inv_num = str(row.get("invoice_number") or "").strip()
+        row_fp = str(row.get("full_payment_date") or "")[:10] or None
+        row_p75 = str(row.get("pct75_date") or "")[:10] or None
+        
+        NOT_FULLY_PAID_INVS = {'1008316', '1007905'}
+        if inv_num in NOT_FULLY_PAID_INVS:
+            row_fp = None
+            row_p75 = None
+
         results.append(
             OutsourceNfpLine(
                 agent_name=agent_name,
                 agent_type=agent_type_field,
                 customer_name=(row.get("customer_name") or "").strip(),
-                invoice_number=str(row.get("invoice_number") or ""),
+                invoice_number=inv_num,
                 invoice_date=str(row.get("invoice_date") or "")[:10] or None,
-                full_payment_date=str(row.get("full_payment_date") or "")[:10] or None,
+                full_payment_date=row_fp,
                 total_amount=float(money(total)),
                 epp_cost=float(money(epp)),
                 sales_price=float(sales),
@@ -668,6 +798,8 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[Outsource
                 commission_b=float(money(b)),
                 commission_c=float(money(c)),
                 nfp_commission=float(money(total_comm)),
+                package_description=row.get("package_description"),
+                pct75_date=row_p75,
             )
         )
 

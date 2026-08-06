@@ -310,6 +310,8 @@ def _get_mock_data_for_fetching(year: int, h1_only: bool = False) -> dict[str, A
 
 
 def _load_module(name: str, path: Path):
+    if name in sys.modules:
+        return sys.modules[name]
     script_dir = str(path.resolve().parent)
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
@@ -460,11 +462,39 @@ def _style_sheet(ws, headers: list[str], *, money_cols: set[int] | None = None) 
         ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{ws.max_row}"
 
 
+# Shared agent full-name resolver, sourced from the dashboard's Agent Roles &
+# Hierarchy page (agent_roles table). Applied to Agent columns at sheet-write
+# time only, so joins keyed on raw eeAdmin names upstream are unaffected.
+try:
+    import agent_names as _agent_names
+except Exception:
+    _agent_names = None
+
+
+def _resolve_agent_columns(headers: list[str], rows: list[list[Any]]) -> list[list[Any]]:
+    if not _agent_names:
+        return rows
+    cols = [i for i, h in enumerate(headers)
+            if isinstance(h, str) and "agent" in h.lower()]
+    if not cols:
+        return rows
+    out = []
+    for row in rows:
+        row = list(row)
+        for i in cols:
+            if i < len(row):
+                v = row[i]
+                if isinstance(v, str) and v.strip() and v.strip() not in ("-", "Total"):
+                    row[i] = _agent_names.resolve(v.strip())
+        out.append(row)
+    return out
+
+
 def _append_sheet(wb, title: str, headers: list[str], rows: list[list[Any]], money_cols: set[int]) -> None:
     safe_title = title[:31]
     ws = wb.create_sheet(safe_title)
     ws.append(headers)
-    for row in rows:
+    for row in _resolve_agent_columns(headers, rows):
         out: list[Any] = []
         for i, cell in enumerate(row):
             if (i + 1) in money_cols:
@@ -501,6 +531,83 @@ def _parse_month(date_val: Any) -> int | None:
     if m2:
         return int(m2.group(2))
     return None
+
+
+def _effective_nfp_date(r: Any) -> str | None:
+    pct75 = getattr(r, "pct75_date", None)
+    if not pct75 and isinstance(r, dict):
+        pct75 = r.get("pct75_date")
+    
+    full_pay = getattr(r, "full_payment_date", None)
+    if not full_pay and isinstance(r, dict):
+        full_pay = r.get("full_payment_date")
+        
+    pct75_str = str(pct75)[:10] if pct75 else None
+    full_pay_str = str(full_pay)[:10] if full_pay else None
+    
+    if pct75_str:
+        parts = pct75_str.split("-")
+        if len(parts) >= 2:
+            try:
+                y = int(parts[0])
+                m = int(parts[1])
+                if y > 2026 or (y == 2026 and m >= 7):
+                    return pct75_str
+                
+                # Transition check:
+                if y < 2026 or (y == 2026 and m < 7):
+                    if not full_pay_str:
+                        return "2026-07-01"
+                    fp_parts = full_pay_str.split("-")
+                    if len(fp_parts) >= 2:
+                        fpy = int(fp_parts[0])
+                        fpm = int(fp_parts[1])
+                        if fpy > 2026 or (fpy == 2026 and fpm >= 7):
+                            return "2026-07-01"
+            except ValueError:
+                pass
+                
+    return full_pay_str
+
+
+def _basic_commission_payout_for_month(ln: Any, m: int) -> float:
+    # m is 1..12 representing the month we are querying payout for.
+    comm_val = 0.0
+    basic_comm_attr = getattr(ln, "basic_commission", None)
+    if basic_comm_attr is None and isinstance(ln, dict):
+        basic_comm_attr = ln.get("basic_commission")
+    if basic_comm_attr is not None:
+        try:
+            comm_val = float(basic_comm_attr)
+        except (ValueError, TypeError):
+            pass
+
+    first_pay = getattr(ln, "first_payment_date", None)
+    if not first_pay and isinstance(ln, dict):
+        first_pay = ln.get("first_payment_date")
+    
+    full_pay = getattr(ln, "full_payment_date", None)
+    if not full_pay and isinstance(ln, dict):
+        full_pay = ln.get("full_payment_date")
+
+    first_pay_month = _parse_month(first_pay)
+    full_pay_month = _parse_month(full_pay)
+    
+    if m < 7:
+        if full_pay_month == m:
+            return comm_val
+        return 0.0
+    
+    payout_m = 0.0
+    if first_pay_month == m:
+        payout_m += 300.0
+    if full_pay_month == m:
+        if first_pay_month and first_pay_month >= 7:
+            payout_m += (comm_val - 300.0)
+        else:
+            payout_m += comm_val
+            
+    return payout_m
 
 
 def compute_table_spans(rows: list[list[Any]], start_row: int = 2) -> tuple[list[list[Any]], list[tuple[str, tuple[int, int], tuple[int, int]]]]:
@@ -542,7 +649,21 @@ def compute_table_spans(rows: list[list[Any]], start_row: int = 2) -> tuple[list
     return cleaned_rows, span_commands
 
 
-def get_reporting_senior(agent_name: str) -> str | None:
+def _role_table_senior(agent_name: str, month: int | None = None):
+    """(listed, reports_to) from the dashboard role table; the hardcoded map
+    below is the fallback only for agents not yet entered there. Listed with a
+    blank Reports To means "nobody"."""
+    try:
+        import basic_commission_rates as _bcr
+        return _bcr.get_reporting_senior_from_table(agent_name, month or 7)
+    except Exception:
+        return False, None
+
+
+def get_reporting_senior(agent_name: str, month: int | None = None) -> str | None:
+    listed, senior = _role_table_senior(agent_name, month)
+    if listed:
+        return senior
     n = agent_name.lower().strip()
     seniors = ["sunny", "martin", "kent", "zhe hang"]
     if any(s in n for s in seniors):
@@ -566,30 +687,52 @@ def get_override_rate(agent_name: str) -> float:
 def get_basic_monthly_tables(lines: list[Any]) -> dict[int, list[list[str]]]:
     monthly_groups = {}
     for m in range(1, 13):
-        m_lines = [ln for ln in lines if _parse_month(ln.invoice_date) == m]
+        m_lines = []
+        for ln in lines:
+            payout = _basic_commission_payout_for_month(ln, m)
+            if payout > 0:
+                m_lines.append((ln, payout))
+                
         if not m_lines:
             continue
             
-        m_lines.sort(key=lambda x: (x.agent_name.strip().lower(), x.customer_name.strip().lower(), str(x.invoice_date)))
+        m_lines.sort(key=lambda x: (x[0].agent_name.strip().lower(), x[0].customer_name.strip().lower()))
         
         cust_counts = defaultdict(int)
-        for ln in m_lines:
+        for ln, payout in m_lines:
             key = (ln.agent_name.strip().lower(), ln.customer_name.strip().lower())
             cust_counts[key] += 1
             
         rows = []
-        for ln in m_lines:
+        for ln, payout in m_lines:
             key = (ln.agent_name.strip().lower(), ln.customer_name.strip().lower())
             count = cust_counts[key]
             override_val = get_override_rate(ln.agent_name)
+            
+            first_pay_m = _parse_month(getattr(ln, "first_payment_date", ""))
+            full_pay_m = _parse_month(getattr(ln, "full_payment_date", ""))
+            
+            rate_val = float(ln.commission_rate) * 100
+            if m >= 7:
+                if first_pay_m == m and full_pay_m == m:
+                    rate_str = f"{rate_val:.2f}%"
+                elif first_pay_m == m:
+                    rate_str = "1st Pay (RM300)"
+                elif full_pay_m == m:
+                    rate_str = f"{rate_val:.2f}% Bal"
+                else:
+                    rate_str = f"{rate_val:.2f}%"
+            else:
+                rate_str = f"{rate_val:.2f}%"
+                
             rows.append([
                 ln.agent_name,
                 ln.customer_name,
                 str(count),
                 f"{ln.net_base:,.2f}",
-                f"{ln.commission_rate * 100:.2f}%",
+                rate_str,
                 f"{override_val * 100:.2f}%" if override_val > 0 else "-",
-                f"{ln.basic_commission:,.2f}"
+                f"{payout:,.2f}"
             ])
         monthly_groups[m] = rows
     return monthly_groups
@@ -598,11 +741,11 @@ def get_basic_monthly_tables(lines: list[Any]) -> dict[int, list[list[str]]]:
 def get_nfp_monthly_tables(nfp_rows: list[Any]) -> dict[int, list[list[str]]]:
     monthly_groups = {}
     for m in range(1, 13):
-        m_rows = [r for r in nfp_rows if _parse_month(r.full_payment_date) == m]
+        m_rows = [r for r in nfp_rows if _parse_month(_effective_nfp_date(r)) == m]
         if not m_rows:
             continue
             
-        m_rows.sort(key=lambda x: (x.agent_name.strip().lower(), x.customer_name.strip().lower(), str(x.full_payment_date)))
+        m_rows.sort(key=lambda x: (x.agent_name.strip().lower(), x.customer_name.strip().lower(), str(_effective_nfp_date(x))))
         
         cust_counts = defaultdict(int)
         for r in m_rows:
@@ -779,7 +922,7 @@ def fetch_basic(year: int, h1_only: bool = False) -> tuple[list[list[str]], list
         params=[],
     )
     raw_rows = list(payload.get("rows") or [])
-    factory_rates = basic.get_factory_rates(raw_rows)
+    factory_rates = basic.get_factory_rates(raw_rows, default_profit_sharing=(Decimal("0"), Decimal("0")))
     lines = basic._process_invoices(raw_rows, factory_rates)
     if h1_only:
         lines = [ln for ln in lines if _parse_month(ln.full_payment_date) in (1, 2, 3, 4, 5, 6)]
@@ -862,12 +1005,12 @@ def fetch_nfp(year: int, h1_only: bool = False) -> tuple[list[list[str]], list[l
         raise RuntimeError(nfp_paths.proxy_token_help())
     rows, summary = nfp.build_report(year)
     
-    # Filter NFP rows for cases with full payment only
-    rows = [r for r in rows if r.full_payment_date]
+    # Filter NFP rows for cases with full payment date or pct75 date (for July 2026+)
+    rows = [r for r in rows if r.full_payment_date or getattr(r, "pct75_date", None)]
     
     # Filter by month if h1_only
     if h1_only:
-        rows = [r for r in rows if _parse_month(r.full_payment_date) in (1, 2, 3, 4, 5, 6)]
+        rows = [r for r in rows if _parse_month(_effective_nfp_date(r)) in (1, 2, 3, 4, 5, 6)]
         
     agents_filtered = {r.agent_name for r in rows if r.agent_name}
     accumulated_filtered = {}
@@ -905,7 +1048,7 @@ def fetch_nfp(year: int, h1_only: bool = False) -> tuple[list[list[str]], list[l
         "agents": summary.get("total_qualifying_agents", 0),
         "invoices": summary.get("total_invoices", 0),
         "total_commission": Decimal(str(summary.get("total_nfp_commission", 0))),
-        "filter": "payment 100% (full_payment_date IS NOT NULL); invoice_date year; internal/full time" + (" (H1)" if h1_only else ""),
+        "filter": "payment 100% or 75% paid (Jul 2026+); invoice_date year; internal/full time" + (" (H1)" if h1_only else ""),
     }
     return agent_rows, detail_rows, meta, rows
 
@@ -951,26 +1094,31 @@ def aggregate_monthly_metrics(basic_lines: list[Any], anp_detail: list[dict[str,
     
     # Process Basic
     for line in basic_lines:
-        m = _parse_month(line.invoice_date)
-        if m:
-            agent = line.agent_name.strip()
-            cust = line.customer_name.strip()
-            comm = float(line.basic_commission)
-            sales = float(line.net_base)
+        agent = line.agent_name.strip()
+        cust = line.customer_name.strip()
+        sales = float(line.net_base)
+        
+        all_agents.add(agent)
+        all_customers.add(cust)
+        
+        # Sales are recognized in the full payment date month
+        full_pay_m = _parse_month(line.full_payment_date)
+        if full_pay_m:
+            monthly_customers_union[full_pay_m].add(cust)
+            monthly_agent_cust[full_pay_m][agent].add(cust)
+            monthly_data[full_pay_m]["total_sales"] += sales
+            monthly_agent_sales_map[full_pay_m][agent] += sales
             
-            all_agents.add(agent)
-            all_customers.add(cust)
-            monthly_customers_union[m].add(cust)
-            monthly_agent_cust[m][agent].add(cust)
-            monthly_data[m]["total_commission"] += comm
-            monthly_data[m]["total_sales"] += sales
-            monthly_split[m]["Basic"] += comm
-            monthly_agent_sales_map[m][agent] += sales
-            
-            if agent not in monthly_data[m]["agent_commissions"]:
-                monthly_data[m]["agent_commissions"][agent] = 0.0
-            monthly_data[m]["agent_commissions"][agent] += comm
-            monthly_agent_split[m][agent]["Basic"] += comm
+        # Commission is split
+        for m in range(1, 13):
+            comm = _basic_commission_payout_for_month(line, m)
+            if comm > 0:
+                monthly_data[m]["total_commission"] += comm
+                monthly_split[m]["Basic"] += comm
+                if agent not in monthly_data[m]["agent_commissions"]:
+                    monthly_data[m]["agent_commissions"][agent] = 0.0
+                monthly_data[m]["agent_commissions"][agent] += comm
+                monthly_agent_split[m][agent]["Basic"] += comm
             
     # Process ANP
     # To avoid double-counting the monthly tier commission for each agent,
@@ -1006,7 +1154,7 @@ def aggregate_monthly_metrics(basic_lines: list[Any], anp_detail: list[dict[str,
             
     # Process NFP
     for r in nfp_rows:
-        m = _parse_month(r.full_payment_date)
+        m = _parse_month(_effective_nfp_date(r))
         if m:
             agent = r.agent_name.strip()
             cust = r.customer_name.strip()
@@ -1027,24 +1175,24 @@ def aggregate_monthly_metrics(basic_lines: list[Any], anp_detail: list[dict[str,
             monthly_data[m]["agent_commissions"][agent] += comm
             monthly_agent_split[m][agent]["NFP"] += comm
 
-    for m in range(1, 7):
+    for m in range(1, 13):
         monthly_data[m]["customer_count"] = len(monthly_customers_union[m])
         
     monthly_agent_counts = []
     monthly_agent_sales_list = []
-    for m in range(1, 7):
+    for m in range(1, 13):
         counts = {}
         for agent, cust_set in monthly_agent_cust[m].items():
             counts[agent] = len(cust_set)
         monthly_agent_counts.append(counts)
         monthly_agent_sales_list.append(dict(monthly_agent_sales_map[m]))
         
-    monthly_data_list = [monthly_data[m] for m in range(1, 7)]
-    monthly_split_list = [monthly_split[m] for m in range(1, 7)]
+    monthly_data_list = [monthly_data[m] for m in range(1, 13)]
+    monthly_split_list = [monthly_split[m] for m in range(1, 13)]
     
     # Convert monthly_agent_split defaultdicts to standard dicts
     monthly_agent_split_dicts = {}
-    for m in range(1, 7):
+    for m in range(1, 13):
         monthly_agent_split_dicts[m] = {agent: dict(splits) for agent, splits in monthly_agent_split[m].items()}
         
     return {
@@ -1354,13 +1502,13 @@ def build_pdf(year: int, output_path: Path) -> Path:
     from commission_pdf import FinanceChartData, PdfSection, write_finance_presentation_pdf
 
     print(f"Building finance PDF for {year}...")
-    basic_t1, basic_t2, basic_t3, basic_t4, basic_meta, basic_lines = fetch_basic(year, h1_only=True)
+    basic_t1, basic_t2, basic_t3, basic_t4, basic_meta, basic_lines = fetch_basic(year, h1_only=False)
     print(f"  Basic: {basic_meta['agents']} agents, {basic_meta['invoices']} invoices")
 
-    anp_summary, anp_detail, anp_meta = fetch_anp(year, h1_only=True)
+    anp_summary, anp_detail, anp_meta = fetch_anp(year, h1_only=False)
     print(f"  ANP: {anp_meta['agents']} agents, {anp_meta['invoices']} invoices")
 
-    nfp_agent, nfp_detail, nfp_meta, nfp_rows = fetch_nfp(year, h1_only=True)
+    nfp_agent, nfp_detail, nfp_meta, nfp_rows = fetch_nfp(year, h1_only=False)
     print(f"  NFP: {nfp_meta['agents']} agents, {nfp_meta['invoices']} invoices")
 
     ega_t1, ega_t2, ega_t3, ega_h1, ega_h2, ega_h3 = fetch_ega_esa(year)
@@ -1411,18 +1559,21 @@ def build_pdf(year: int, output_path: Path) -> Path:
         agent_rates[agent] = "<br/>".join(sorted_rates)
 
     # Build Basic Commission Matrix Rows
-    basic_matrix = defaultdict(lambda: {m: {"sales": 0.0, "comm": 0.0} for m in range(1, 7)})
+    basic_matrix = defaultdict(lambda: {m: {"sales": 0.0, "comm": 0.0} for m in range(1, 13)})
     for ln in basic_lines:
-        m = _parse_month(ln.full_payment_date)
-        if m and 1 <= m <= 6:
-            agent = ln.agent_name.strip()
-            basic_matrix[agent][m]["sales"] += float(ln.net_base)
-            basic_matrix[agent][m]["comm"] += float(ln.basic_commission)
+        agent = ln.agent_name.strip()
+        full_pay_m = _parse_month(ln.full_payment_date)
+        if full_pay_m and 1 <= full_pay_m <= 12:
+            basic_matrix[agent][full_pay_m]["sales"] += float(ln.net_base)
+        for m in range(1, 13):
+            payout = _basic_commission_payout_for_month(ln, m)
+            if payout > 0:
+                basic_matrix[agent][m]["comm"] += payout
 
     # Apply override commission to seniors
     for ln in basic_lines:
         m = _parse_month(ln.full_payment_date)
-        if m and 1 <= m <= 6:
+        if m and 1 <= m <= 12:
             senior = get_reporting_senior(ln.agent_name)
             if senior:
                 basic_matrix[senior][m]["comm"] += float(ln.net_base) * 0.0025
@@ -1431,7 +1582,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
     for agent in sorted(basic_matrix.keys()):
         rate = agent_rates.get(agent, "-")
         row = [agent, rate]
-        for m in range(1, 7):
+        for m in range(1, 13):
             sales = basic_matrix[agent][m]["sales"]
             comm = basic_matrix[agent][m]["comm"]
             row.append(f"{sales:,.2f}" if sales > 0 else "-")
@@ -1439,7 +1590,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         basic_matrix_rows.append(row)
 
     basic_total_row = ["Total", ""]
-    for m in range(1, 7):
+    for m in range(1, 13):
         m_sales = sum(basic_matrix[a][m]["sales"] for a in basic_matrix)
         m_comm = sum(basic_matrix[a][m]["comm"] for a in basic_matrix)
         basic_total_row.append(f"{m_sales:,.2f}" if m_sales > 0 else "-")
@@ -1447,10 +1598,10 @@ def build_pdf(year: int, output_path: Path) -> Path:
     basic_matrix_rows.append(basic_total_row)
 
     # Build ANP Commission Matrix Rows
-    anp_matrix = defaultdict(lambda: {m: {"sales": 0.0, "comm": 0.0} for m in range(1, 7)})
+    anp_matrix = defaultdict(lambda: {m: {"sales": 0.0, "comm": 0.0} for m in range(1, 13)})
     for r in anp_detail:
         m = _parse_month(r.get("invoice_date"))
-        if m and 1 <= m <= 6:
+        if m and 1 <= m <= 12:
             agent = r.get("agent_name", "").strip()
             anp_matrix[agent][m]["sales"] += float(r.get("invoice_total_amount", 0.0))
             anp_matrix[agent][m]["comm"] += float(r.get("anp_commission_accumulated_tier", 0.0))
@@ -1458,7 +1609,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
     anp_matrix_rows = []
     for agent in sorted(anp_matrix.keys()):
         row = [agent, "-"]
-        for m in range(1, 7):
+        for m in range(1, 13):
             sales = anp_matrix[agent][m]["sales"]
             comm = anp_matrix[agent][m]["comm"]
             row.append(f"{sales:,.2f}" if sales > 0 else "-")
@@ -1466,18 +1617,17 @@ def build_pdf(year: int, output_path: Path) -> Path:
         anp_matrix_rows.append(row)
 
     anp_total_row = ["Total", ""]
-    for m in range(1, 7):
+    for m in range(1, 13):
         m_sales = sum(anp_matrix[a][m]["sales"] for a in anp_matrix)
         m_comm = sum(anp_matrix[a][m]["comm"] for a in anp_matrix)
         anp_total_row.append(f"{m_sales:,.2f}" if m_sales > 0 else "-")
         anp_total_row.append(f"{m_comm:,.2f}" if m_comm > 0 else "-")
     anp_matrix_rows.append(anp_total_row)
 
-    # Build NFP Commission Matrix Rows
-    nfp_matrix = defaultdict(lambda: {m: {"sales": 0.0, "system": 0.0, "nfp": 0.0, "comm": 0.0} for m in range(1, 7)})
+    nfp_matrix = defaultdict(lambda: {m: {"sales": 0.0, "system": 0.0, "nfp": 0.0, "comm": 0.0} for m in range(1, 13)})
     for r in nfp_rows:
-        m = _parse_month(r.full_payment_date)
-        if m and 1 <= m <= 6:
+        m = _parse_month(_effective_nfp_date(r))
+        if m and 1 <= m <= 12:
             agent = r.agent_name.strip()
             nfp_matrix[agent][m]["sales"] += float(r.sales_price)
             nfp_matrix[agent][m]["system"] += float(r.system_price)
@@ -1489,7 +1639,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         agent_rows = [r for r in nfp_rows if r.agent_name.strip().lower() == agent.strip().lower()]
         rate_str = determine_nfp_rate(agent_rows)
         row = [agent, rate_str]
-        for m in range(1, 7):
+        for m in range(1, 13):
             sales = nfp_matrix[agent][m]["sales"]
             system = nfp_matrix[agent][m]["system"]
             nfp_val = nfp_matrix[agent][m]["nfp"]
@@ -1501,7 +1651,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         nfp_matrix_rows.append(row)
 
     nfp_total_row = ["Total", ""]
-    for m in range(1, 7):
+    for m in range(1, 13):
         m_sales = sum(nfp_matrix[a][m]["sales"] for a in nfp_matrix)
         m_system = sum(nfp_matrix[a][m]["system"] for a in nfp_matrix)
         m_nfp = sum(nfp_matrix[a][m]["nfp"] for a in nfp_matrix)
@@ -1515,14 +1665,14 @@ def build_pdf(year: int, output_path: Path) -> Path:
     # Calculate full payment and pending payment counts from report-relevant invoices
     if MOCK_MODE:
         mock_raw = get_mock_data(year)
-        unfiltered_h1_rows = [r for r in mock_raw["nfp_rows"] if _parse_month(r.invoice_date) in (1, 2, 3, 4, 5, 6)]
+        unfiltered_h1_rows = [r for r in mock_raw["nfp_rows"] if _parse_month(r.invoice_date) in range(1, 13)]
     else:
         nfp_dir = REPO_ROOT / "2. NFP Commission" / "3. Python script"
         nfp_mod = _load_module("nfp_commission", nfp_dir / "nfp_commission.py")
         unfiltered_rows, _ = nfp_mod.build_report(year)
-        unfiltered_h1_rows = [r for r in unfiltered_rows if _parse_month(r.invoice_date) in (1, 2, 3, 4, 5, 6)]
+        unfiltered_h1_rows = [r for r in unfiltered_rows if _parse_month(r.invoice_date) in range(1, 13)]
 
-    payment_map = {r.invoice_number.strip(): r.full_payment_date for r in unfiltered_h1_rows if r.invoice_number}
+    payment_map = {r.invoice_number.strip(): _effective_nfp_date(r) for r in unfiltered_h1_rows if r.invoice_number}
 
     basic_keys = {ln.invoice_number.strip() for ln in basic_lines if getattr(ln, "invoice_number", None)}
     nfp_keys = {r.invoice_number.strip() for r in nfp_rows}
@@ -1581,28 +1731,33 @@ def build_pdf(year: int, output_path: Path) -> Path:
     pending_agents_count = len(agents_with_pending)
 
     # ----------------- Group and Aggregate Table 2 and Table 3 Matrix Rows -----------------
-    basic_t2_matrix = defaultdict(lambda: {"rates": set(), "monthly": {m: {"sales": 0.0, "comm": 0.0} for m in range(1, 7)}})
-    basic_t3_matrix = defaultdict(lambda: {"rates": set(), "monthly": {m: {"sales": 0.0, "comm": 0.0} for m in range(1, 7)}})
+    basic_t2_matrix = defaultdict(lambda: {"rates": set(), "monthly": {m: {"sales": 0.0, "comm": 0.0} for m in range(1, 13)}})
+    basic_t3_matrix = defaultdict(lambda: {"rates": set(), "monthly": {m: {"sales": 0.0, "comm": 0.0} for m in range(1, 13)}})
 
     for ln in basic_lines:
-        m = _parse_month(ln.full_payment_date)
-        if m and 1 <= m <= 6:
-            agent = ln.agent_name.strip()
-            customer = ln.customer_name.strip()
-            rate_val = float(ln.commission_rate) * 100
-            rate_str = f"{rate_val:g}%"
+        agent = ln.agent_name.strip()
+        customer = ln.customer_name.strip()
+        rate_val = float(ln.commission_rate) * 100
+        rate_str = f"{rate_val:g}%"
+        
+        if ln.package == "Factory":
+            if float(ln.profit_sharing) > 0:
+                ps_val = float(ln.profit_sharing) * 100
+                rate_str += f" + {ps_val:g}%"
+            target_matrix = basic_t3_matrix
+        else:
+            target_matrix = basic_t2_matrix
+
+        target_matrix[(agent, customer)]["rates"].add(rate_str)
+        
+        full_pay_m = _parse_month(ln.full_payment_date)
+        if full_pay_m and 1 <= full_pay_m <= 12:
+            target_matrix[(agent, customer)]["monthly"][full_pay_m]["sales"] += float(ln.net_base)
             
-            if ln.package == "Factory":
-                if float(ln.profit_sharing) > 0:
-                    ps_val = float(ln.profit_sharing) * 100
-                    rate_str += f" + {ps_val:g}%"
-                basic_t3_matrix[(agent, customer)]["rates"].add(rate_str)
-                basic_t3_matrix[(agent, customer)]["monthly"][m]["sales"] += float(ln.net_base)
-                basic_t3_matrix[(agent, customer)]["monthly"][m]["comm"] += float(ln.basic_commission)
-            else:
-                basic_t2_matrix[(agent, customer)]["rates"].add(rate_str)
-                basic_t2_matrix[(agent, customer)]["monthly"][m]["sales"] += float(ln.net_base)
-                basic_t2_matrix[(agent, customer)]["monthly"][m]["comm"] += float(ln.basic_commission)
+        for m in range(1, 13):
+            payout = _basic_commission_payout_for_month(ln, m)
+            if payout > 0:
+                target_matrix[(agent, customer)]["monthly"][m]["comm"] += payout
 
     # Convert to sorted list of rows with duplicate agent blanking for vertical spanning
     basic_t2_matrix_rows = []
@@ -1615,7 +1770,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         last_agent = agent
         
         row = [row_agent, customer, rate_str]
-        for m in range(1, 7):
+        for m in range(1, 13):
             sales = basic_t2_matrix[(agent, customer)]["monthly"][m]["sales"]
             comm = basic_t2_matrix[(agent, customer)]["monthly"][m]["comm"]
             row.append(f"{sales:,.2f}" if sales > 0 else "-")
@@ -1624,14 +1779,14 @@ def build_pdf(year: int, output_path: Path) -> Path:
 
     if basic_t2_matrix_rows:
         basic_t2_total_row = ["Total", "", ""]
-        for m in range(1, 7):
+        for m in range(1, 13):
             m_sales = sum(basic_t2_matrix[k]["monthly"][m]["sales"] for k in basic_t2_matrix)
             m_comm = sum(basic_t2_matrix[k]["monthly"][m]["comm"] for k in basic_t2_matrix)
             basic_t2_total_row.append(f"{m_sales:,.2f}" if m_sales > 0 else "-")
             basic_t2_total_row.append(f"{m_comm:,.2f}" if m_comm > 0 else "-")
         basic_t2_matrix_rows.append(basic_t2_total_row)
     else:
-        basic_t2_matrix_rows = [["No residential/shop lot/commercial cases"] + ["-"] * 14]
+        basic_t2_matrix_rows = [["No residential/shop lot/commercial cases"] + ["-"] * 26]
 
     basic_t3_matrix_rows = []
     last_agent = None
@@ -1643,7 +1798,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         last_agent = agent
         
         row = [row_agent, customer, rate_str]
-        for m in range(1, 7):
+        for m in range(1, 13):
             sales = basic_t3_matrix[(agent, customer)]["monthly"][m]["sales"]
             comm = basic_t3_matrix[(agent, customer)]["monthly"][m]["comm"]
             row.append(f"{sales:,.2f}" if sales > 0 else "-")
@@ -1652,24 +1807,24 @@ def build_pdf(year: int, output_path: Path) -> Path:
 
     if basic_t3_matrix_rows:
         basic_t3_total_row = ["Total", "", ""]
-        for m in range(1, 7):
+        for m in range(1, 13):
             m_sales = sum(basic_t3_matrix[k]["monthly"][m]["sales"] for k in basic_t3_matrix)
             m_comm = sum(basic_t3_matrix[k]["monthly"][m]["comm"] for k in basic_t3_matrix)
             basic_t3_total_row.append(f"{m_sales:,.2f}" if m_sales > 0 else "-")
             basic_t3_total_row.append(f"{m_comm:,.2f}" if m_comm > 0 else "-")
         basic_t3_matrix_rows.append(basic_t3_total_row)
     else:
-        basic_t3_matrix_rows = [["No factory cases"] + ["-"] * 14]
+        basic_t3_matrix_rows = [["No factory cases"] + ["-"] * 26]
 
     # ----------------- Group and Aggregate NFP Table 2 and Table 3 Matrix Rows -----------------
-    nfp_t2_matrix = defaultdict(lambda: {m: {"sales": 0.0, "system": 0.0, "nfp": 0.0, "comm": 0.0} for m in range(1, 7)})
-    nfp_t3_matrix = defaultdict(lambda: {m: {"sales": 0.0, "system": 0.0, "nfp": 0.0, "comm": 0.0} for m in range(1, 7)})
+    nfp_t2_matrix = defaultdict(lambda: {m: {"sales": 0.0, "system": 0.0, "nfp": 0.0, "comm": 0.0} for m in range(1, 13)})
+    nfp_t3_matrix = defaultdict(lambda: {m: {"sales": 0.0, "system": 0.0, "nfp": 0.0, "comm": 0.0} for m in range(1, 13)})
     nfp_t2_dates = defaultdict(set)
     nfp_t3_dates = defaultdict(set)
 
     for r in nfp_rows:
-        m = _parse_month(r.full_payment_date)
-        if m and 1 <= m <= 6:
+        m = _parse_month(_effective_nfp_date(r))
+        if m and 1 <= m <= 12:
             agent = r.agent_name.strip()
             customer = r.customer_name.strip()
             is_factory = "factory" in str(r.package_description).lower()
@@ -1707,7 +1862,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         ]
         rate_str = determine_nfp_rate(customer_rows)
         row = [row_agent, customer, date_str, rate_str]
-        for m in range(1, 7):
+        for m in range(1, 13):
             sales = nfp_t2_matrix[(agent, customer)][m]["sales"]
             system = nfp_t2_matrix[(agent, customer)][m]["system"]
             nfp_val = nfp_t2_matrix[(agent, customer)][m]["nfp"]
@@ -1720,7 +1875,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
 
     if nfp_t2_matrix_rows:
         nfp_t2_total_row = ["Total", "", "", ""]
-        for m in range(1, 7):
+        for m in range(1, 13):
             m_sales = sum(nfp_t2_matrix[k][m]["sales"] for k in nfp_t2_matrix)
             m_system = sum(nfp_t2_matrix[k][m]["system"] for k in nfp_t2_matrix)
             m_nfp = sum(nfp_t2_matrix[k][m]["nfp"] for k in nfp_t2_matrix)
@@ -1731,7 +1886,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
             nfp_t2_total_row.append(f"{m_comm:,.0f}" if m_comm > 0 else "-")
         nfp_t2_matrix_rows.append(nfp_t2_total_row)
     else:
-        nfp_t2_matrix_rows = [["No residential/shop lot/commercial NFP cases"] + ["-"] * 27]
+        nfp_t2_matrix_rows = [["No residential/shop lot/commercial NFP cases"] + ["-"] * 51]
 
     nfp_t3_matrix_rows = []
     last_agent = None
@@ -1749,7 +1904,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         ]
         rate_str = determine_nfp_rate(customer_rows)
         row = [row_agent, customer, date_str, rate_str]
-        for m in range(1, 7):
+        for m in range(1, 13):
             sales = nfp_t3_matrix[(agent, customer)][m]["sales"]
             system = nfp_t3_matrix[(agent, customer)][m]["system"]
             nfp_val = nfp_t3_matrix[(agent, customer)][m]["nfp"]
@@ -1762,7 +1917,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
 
     if nfp_t3_matrix_rows:
         nfp_t3_total_row = ["Total", "", "", ""]
-        for m in range(1, 7):
+        for m in range(1, 13):
             m_sales = sum(nfp_t3_matrix[k][m]["sales"] for k in nfp_t3_matrix)
             m_system = sum(nfp_t3_matrix[k][m]["system"] for k in nfp_t3_matrix)
             m_nfp = sum(nfp_t3_matrix[k][m]["nfp"] for k in nfp_t3_matrix)
@@ -1773,15 +1928,15 @@ def build_pdf(year: int, output_path: Path) -> Path:
             nfp_t3_total_row.append(f"{m_comm:,.0f}" if m_comm > 0 else "-")
         nfp_t3_matrix_rows.append(nfp_t3_total_row)
     else:
-        nfp_t3_matrix_rows = [["No factory NFP cases"] + ["-"] * 27]
+        nfp_t3_matrix_rows = [["No factory NFP cases"] + ["-"] * 51]
 
     # ----------------- Group and Aggregate ANP Table 2 and Table 3 Matrix Rows -----------------
-    anp_t2_matrix = defaultdict(lambda: {m: {"sales": 0.0, "comm": 0.0} for m in range(1, 7)})
-    anp_t3_matrix = defaultdict(lambda: {m: {"sales": 0.0, "comm": 0.0} for m in range(1, 7)})
+    anp_t2_matrix = defaultdict(lambda: {m: {"sales": 0.0, "comm": 0.0} for m in range(1, 13)})
+    anp_t3_matrix = defaultdict(lambda: {m: {"sales": 0.0, "comm": 0.0} for m in range(1, 13)})
 
     for r in anp_detail:
         m = _parse_month(r.get("invoice_date"))
-        if m and 1 <= m <= 6:
+        if m and 1 <= m <= 12:
             agent = r.get("agent_name", "").strip()
             customer = r.get("customer_name", "").strip()
             prop_type = str(r.get("prop_type") or "").lower().strip()
@@ -1799,7 +1954,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         last_agent = agent
         
         row = [row_agent, customer]
-        for m in range(1, 7):
+        for m in range(1, 13):
             sales = anp_t2_matrix[(agent, customer)][m]["sales"]
             comm = anp_t2_matrix[(agent, customer)][m]["comm"]
             row.append(f"{sales:,.2f}" if sales > 0 else "-")
@@ -1808,14 +1963,14 @@ def build_pdf(year: int, output_path: Path) -> Path:
 
     if anp_t2_matrix_rows:
         anp_t2_total_row = ["Total", ""]
-        for m in range(1, 7):
+        for m in range(1, 13):
             m_sales = sum(anp_t2_matrix[k][m]["sales"] for k in anp_t2_matrix)
             m_comm = sum(anp_t2_matrix[k][m]["comm"] for k in anp_t2_matrix)
             anp_t2_total_row.append(f"{m_sales:,.2f}" if m_sales > 0 else "-")
             anp_t2_total_row.append(f"{m_comm:,.2f}" if m_comm > 0 else "-")
         anp_t2_matrix_rows.append(anp_t2_total_row)
     else:
-        anp_t2_matrix_rows = [["No residential/shop lot/commercial ANP cases"] + ["-"] * 13]
+        anp_t2_matrix_rows = [["No residential/shop lot/commercial ANP cases"] + ["-"] * 25]
 
     anp_t3_matrix_rows = []
     last_agent = None
@@ -1824,7 +1979,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         last_agent = agent
         
         row = [row_agent, customer]
-        for m in range(1, 7):
+        for m in range(1, 13):
             sales = anp_t3_matrix[(agent, customer)][m]["sales"]
             comm = anp_t3_matrix[(agent, customer)][m]["comm"]
             row.append(f"{sales:,.2f}" if sales > 0 else "-")
@@ -1833,14 +1988,14 @@ def build_pdf(year: int, output_path: Path) -> Path:
 
     if anp_t3_matrix_rows:
         anp_t3_total_row = ["Total", ""]
-        for m in range(1, 7):
+        for m in range(1, 13):
             m_sales = sum(anp_t3_matrix[k][m]["sales"] for k in anp_t3_matrix)
             m_comm = sum(anp_t3_matrix[k][m]["comm"] for k in anp_t3_matrix)
             anp_t3_total_row.append(f"{m_sales:,.2f}" if m_sales > 0 else "-")
             anp_t3_total_row.append(f"{m_comm:,.2f}" if m_comm > 0 else "-")
         anp_t3_matrix_rows.append(anp_t3_total_row)
     else:
-        anp_t3_matrix_rows = [["No factory ANP cases"] + ["-"] * 13]
+        anp_t3_matrix_rows = [["No factory ANP cases"] + ["-"] * 25]
 
     sections = [
         PdfSection(
@@ -2009,7 +2164,7 @@ def build_pdf(year: int, output_path: Path) -> Path:
         title=f"Commission Report {year}",
         year=year,
         generated_at=run_at,
-        period_subtitle="for first half year",
+        period_subtitle="for full year",
         logo_path=str(REPO_ROOT / "assets" / "eternalgy_logo.png"),
         meta_lines=meta_lines,
         sections=sections,

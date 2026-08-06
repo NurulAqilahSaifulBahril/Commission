@@ -3,7 +3,20 @@
 Production Bonus Report -- Outsource Agents (2026).
 
 Rules:
-  Sales Price = total_amount - EPP interest
+  Scope: any invoice with at least one payment dated January 1 of the report
+    year through today — invoice_date itself is not a filter, so an invoice
+    issued earlier still counts once a payment lands in the window. Not
+    just invoices that have reached 100% paid.
+  Sales Price = payments received in that window for the invoice, minus its
+    total EPP interest. EPP interest is read, per invoice, in priority order:
+    1) the invoice's own "EPP Interest (RM... x N%) ... Months" line item(s)
+       (the real-world source of truth — usually one such line per EPP
+       instalment payment); 2) payment.epp_cost summed across its payments
+       (rarely populated in practice); 3) calculated from the invoice's
+       effective_epp rate applied to the amount actually paid. A
+       partially-paid invoice contributes only what has actually come in,
+       and its figure grows as further payments land — there is no "wait
+       until fully paid" gate.
   Production Bonus = Team-based
   - OUM Bonus: 0.5% of Team Total Sales (if Team Total >= 2M AND Personal Sales >= 300K)
   - OGM Bonus: 0.75% of OSA Sales + 0.25% of OUM Sales (if Team Total >= 8M)
@@ -22,16 +35,12 @@ import argparse
 import csv
 import os
 import re
-import shutil
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
-
-import pandas as pd
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -46,8 +55,6 @@ else:
 
 _OUTPUT_DIR = _REPO_ROOT / "5. Production Bonus" / "2. Output"
 _NFP_SCRIPT = _REPO_ROOT / "2. NFP Commission" / "3. Python script"
-
-AGENT_DETAILS_PATH = _REPO_ROOT / "1. Basic Commission" / "1. Excel" / "1. Agent Details.xlsx"
 
 # Reuse api_client from NFP Commission folder
 if str(_NFP_SCRIPT) not in sys.path:
@@ -70,6 +77,79 @@ OGM_TEAM_THRESHOLD     = Decimal("8000000")
 OGM_OSA_BONUS_RATE     = Decimal("0.0075")
 OGM_OUM_BONUS_RATE     = Decimal("0.0025")
 
+
+# ---------------------------------------------------------------------------
+# Rates and thresholds entered on the dashboard Data page. Each falls back to
+# the constant above, so a period not set up there produces the same figures it
+# always did.
+#
+# NOTE: agent ROLES and TEAM MEMBERSHIP are deliberately still read from the
+# hierarchy below. agent_roles carries the roles but has `reports_to` filled in
+# for only one outsource agent, and this bonus is team-based — switching before
+# that column is populated would empty every team and zero every bonus.
+# ---------------------------------------------------------------------------
+def _load_production_bonus_rules(effective_from: str | None = None):
+    import os as _os
+    import sys as _sys
+    from datetime import date as _date
+
+    key = effective_from or _date.today().strftime("%Y-%m")
+    dashboard_dir = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))),
+        "8. Web Dashboard",
+    )
+    try:
+        if dashboard_dir not in _sys.path:
+            _sys.path.insert(0, dashboard_dir)
+        import db as _db
+        payload = _db.get_production_bonus_rules(key)
+        if not payload.get("saved"):
+            return None
+    except Exception as exc:
+        print(f"  Note: could not read production bonus rules from the dashboard DB "
+              f"({type(exc).__name__}: {exc}); using built-in defaults.", file=sys.stderr)
+        return None
+    print(f"  Production bonus rules loaded for {key} from the dashboard Data page.")
+    return payload
+
+
+def _apply_production_bonus_rules(payload) -> None:
+    global OUM_TEAM_THRESHOLD, OUM_PERSONAL_THRESHOLD, OUM_BONUS_RATE
+    global OGM_TEAM_THRESHOLD, OGM_OSA_BONUS_RATE, OGM_OUM_BONUS_RATE
+
+    rules = payload.get("rules") or {}
+
+    def _amount(key, current):
+        raw = str(rules.get(key) or "").replace(",", "").strip()
+        if not raw:
+            return current
+        try:
+            return Decimal(raw)
+        except Exception:
+            return current
+
+    def _rate(key, current):
+        """Stored as a percentage on the page; used as a fraction here."""
+        raw = str(rules.get(key) or "").replace(",", "").strip()
+        if not raw:
+            return current
+        try:
+            return Decimal(raw) / Decimal("100")
+        except Exception:
+            return current
+
+    OUM_TEAM_THRESHOLD = _amount("oum_team_target", OUM_TEAM_THRESHOLD)
+    OUM_PERSONAL_THRESHOLD = _amount("oum_personal_target", OUM_PERSONAL_THRESHOLD)
+    OUM_BONUS_RATE = _rate("oum_rate_pct", OUM_BONUS_RATE)
+    OGM_TEAM_THRESHOLD = _amount("ogm_team_target", OGM_TEAM_THRESHOLD)
+    OGM_OSA_BONUS_RATE = _rate("ogm_osa_rate_pct", OGM_OSA_BONUS_RATE)
+    OGM_OUM_BONUS_RATE = _rate("ogm_oum_rate_pct", OGM_OUM_BONUS_RATE)
+
+
+_PB_RULES = _load_production_bonus_rules()
+if _PB_RULES:
+    _apply_production_bonus_rules(_PB_RULES)
+
 # ---------------------------------------------------------------------------
 # Hierarchy Parsing
 # ---------------------------------------------------------------------------
@@ -77,45 +157,11 @@ def _norm_name(name: str) -> str:
     return re.sub(r"\s+", " ", str(name).strip()).lower()
 
 
-def _try_read_excel(path: Path) -> pd.DataFrame | None:
-    """Try to read Excel file, copying to temp to avoid lock issues."""
-    if not path.is_file():
-        return None
-
-    def get_outsource_sheet(xl_file: pd.ExcelFile) -> pd.DataFrame | None:
-        for sheet in xl_file.sheet_names:
-            if str(sheet).lower().startswith("outsource"):
-                return xl_file.parse(sheet)
-        return None
-
-    # Try direct read first
-    try:
-        xl = pd.ExcelFile(path)
-        df = get_outsource_sheet(xl)
-        if df is not None:
-            return df
-    except Exception:
-        pass
-    # Try via temp copy (handles open-file locks)
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-        try:
-            shutil.copy2(path, tmp_path)
-            xl = pd.ExcelFile(tmp_path)
-            return get_outsource_sheet(xl)
-        finally:
-            try:
-                tmp_path.unlink()
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"Warning: Failed to read Agent Details.xlsx: {e}", file=sys.stderr)
-        return None
-
-
 # ---------------------------------------------------------------------------
-# Fallback hierarchy when Excel is locked or unavailable.
+# Hardcoded outsource hierarchy. The Agent Roles & Hierarchy page carries the
+# roles, but its `reports_to` column is not yet populated for outsource agents
+# and this bonus is team-based — switching before that column is filled in
+# would empty every team and zero every bonus.
 # ---------------------------------------------------------------------------
 _FALLBACK_HIERARCHY: dict[str, str] = {
     # OUM
@@ -183,133 +229,52 @@ def _build_hierarchy() -> tuple[dict[str, str], dict[str, list[str]], dict[str, 
     global _HIERARCHY, _TEAM_MAP, _OGM_TEAM_MAP
     if _HIERARCHY:
         return _HIERARCHY, _TEAM_MAP, _OGM_TEAM_MAP
+    _HIERARCHY = dict(_FALLBACK_HIERARCHY)
+    _TEAM_MAP = dict(_FALLBACK_TEAM_MAP)
+    _OGM_TEAM_MAP = {}
+    return _HIERARCHY, _TEAM_MAP, _OGM_TEAM_MAP
 
-    result: dict[str, str] = {}
-    team_map: dict[str, list[str]] = {}
-    ogm_team_map: dict[str, list[str]] = {}
 
-    df = _try_read_excel(AGENT_DETAILS_PATH)
-    if df is None:
-        print("  Note: Agent Details.xlsx unavailable; using built-in hierarchy fallback.",
-              file=sys.stderr)
-        _HIERARCHY = dict(_FALLBACK_HIERARCHY)
-        _TEAM_MAP = dict(_FALLBACK_TEAM_MAP)
-        _OGM_TEAM_MAP = {}
-        return _HIERARCHY, _TEAM_MAP, _OGM_TEAM_MAP
+def _agent_type_override(agent_name: str, invoice_date: Any = None):
+    """'internal' / 'outsource' from the Agent Roles & Hierarchy page for the
+    invoice's own month, or None when that page says nothing about this
+    agent."""
+    try:
+        rates_dir = str(_REPO_ROOT / "1. Basic Commission" / "3. Python Script")
+        if rates_dir not in sys.path:
+            sys.path.append(rates_dir)
+        from basic_commission_rates import get_agent_type_override as _override
+    except Exception:
+        return None
+    raw = str(invoice_date or "")[:7]
+    month = year = None
+    if len(raw) == 7 and raw[4] == "-":
+        try:
+            year, month = int(raw[:4]), int(raw[5:])
+        except ValueError:
+            month = year = None
+    return _override(agent_name, month=month, year=year)
 
-    has_ogm = "OGM" in df.columns
-    current_ogms: list[str] = []
-    current_ogm_team: str | None = None
-    current_oums: list[str] = []
-    current_oum_team: str | None = None
 
-    for _, row in df.iterrows():
-        # Parse names in current row
-        row_ogms = []
-        if has_ogm:
-            val = str(row.get("OGM", "nan")).strip()
-            if val.lower() not in ("nan", ""):
-                current_ogm_team = val
-                if current_ogm_team not in ogm_team_map:
-                    ogm_team_map[current_ogm_team] = []
-                for n in val.split("/"):
-                    n = _norm_name(n)
-                    if n:
-                        result.setdefault(n, "OGM")
-                        row_ogms.append(n)
-
-        row_oums = []
-        val = str(row.get("OUM", "nan")).strip()
-        if val.lower() not in ("nan", ""):
-            current_oum_team = val
-            if current_oum_team not in team_map:
-                team_map[current_oum_team] = []
-            for n in val.split("/"):
-                n = _norm_name(n)
-                if n:
-                    result.setdefault(n, "OUM")
-                    row_oums.append(n)
-
-        row_osas = []
-        val = str(row.get("OSA", "nan")).strip()
-        if val.lower() not in ("nan", ""):
-            for n in val.split("/"):
-                n = _norm_name(n)
-                if n:
-                    result.setdefault(n, "OSA")
-                    row_osas.append(n)
-
-        val = str(row.get("OSA 1", "nan")).strip()
-        if val.lower() not in ("nan", ""):
-            for n in val.split("/"):
-                n = _norm_name(n)
-                if n:
-                    result.setdefault(n, "OSA 1")
-                    row_osas.append(n)
-
-        # Hierarchy tracking logic
-        if row_ogms:
-            current_ogms = row_ogms
-            current_oums = []
-            current_oum_team = None
-        if row_oums:
-            current_oums = row_oums
-
-        # Add members to current OUMs
-        if current_oum_team:
-            # OUMs belong to their own team
-            for n in current_oums:
-                if n not in team_map[current_oum_team]:
-                    team_map[current_oum_team].append(n)
-            # OSAs belong to the OUM's team
-            for n in row_osas:
-                if n not in team_map[current_oum_team]:
-                    team_map[current_oum_team].append(n)
-
-        # Add members to current OGMs
-        if current_ogm_team:
-            for n in current_ogms:
-                if n not in ogm_team_map[current_ogm_team]:
-                    ogm_team_map[current_ogm_team].append(n)
-            for n in row_oums + row_osas:
-                if n not in ogm_team_map[current_ogm_team]:
-                    ogm_team_map[current_ogm_team].append(n)
-
-    if not result:
-        result = dict(_FALLBACK_HIERARCHY)
-        team_map = dict(_FALLBACK_TEAM_MAP)
-        ogm_team_map = {}
-
-    # Explicit mapping for database names that combine parts of split Excel names
-    db_mapping = [
-        ("deanwaileongyee", "Dean Wai/ Wai Leong Yee", "OUM"),
-        ("philmoowuikead", "Phil Moo/ Moo Wui Kead", "OUM"),
-        ("wilsontanweisheng", "Wilson Tan/ Tan Wei Sheng", "OUM"),
-        ("olivierkohconglee", "Oliver Koh/ Koh Chong Lee", "OUM"),
-    ]
-    for db_norm, team_key, tier in db_mapping:
-        result[db_norm] = tier
-        # Add to OUM team map
-        if team_key in team_map:
-            if db_norm not in team_map[team_key]:
-                team_map[team_key].append(db_norm)
-        # Also check lowercase key (as in fallback map)
-        lower_key = team_key.lower().strip()
-        if lower_key in team_map:
-            if db_norm not in team_map[lower_key]:
-                team_map[lower_key].append(db_norm)
-
-        # Add to OGM team map
-        first_member = _norm_name(team_key.split("/")[0])
-        for ogm_key, ogm_members in ogm_team_map.items():
-            if first_member in ogm_members:
-                if db_norm not in ogm_members:
-                    ogm_members.append(db_norm)
-
-    _HIERARCHY = result
-    _TEAM_MAP = team_map
-    _OGM_TEAM_MAP = ogm_team_map
-    return result, team_map, ogm_team_map
+def _agent_display_name(agent_name: str, invoice_date: Any = None):
+    """Full Name from the Agent Roles & Hierarchy page for the invoice's own
+    month, falling back to that page's own Agent Name (from eeAdmin) field,
+    or None when that page says nothing about this agent."""
+    try:
+        rates_dir = str(_REPO_ROOT / "1. Basic Commission" / "3. Python Script")
+        if rates_dir not in sys.path:
+            sys.path.append(rates_dir)
+        from basic_commission_rates import get_agent_display_name as _display
+    except Exception:
+        return None
+    raw = str(invoice_date or "")[:7]
+    month = year = None
+    if len(raw) == 7 and raw[4] == "-":
+        try:
+            year, month = int(raw[:4]), int(raw[5:])
+        except ValueError:
+            month = year = None
+    return _display(agent_name, month=month, year=year)
 
 
 def get_agent_tier(agent_name: str, is_db_outsource: bool) -> str:
@@ -318,7 +283,7 @@ def get_agent_tier(agent_name: str, is_db_outsource: bool) -> str:
     norm = _norm_name(agent_name)
     if norm in hier:
         return hier[norm]
-    # Not in Excel — fall back based on DB flag (Outsource = OSA)
+    # Not in the hierarchy map — fall back based on DB flag (Outsource = OSA)
     return "OSA" if is_db_outsource else "Unknown"
 
 
@@ -349,8 +314,18 @@ def _get_token() -> str | None:
     return os.environ.get("PG_PROXY_TOKEN") or os.environ.get("POSTGRES_PROXY_TOKEN")
 
 
-def _invoices_sql(year: int, upto_month: int | None = None) -> str:
-    month_filter = f"AND EXTRACT(MONTH FROM i.invoice_date)::int <= {upto_month}" if upto_month else ""
+# Bad/duplicate payment rows excluded from any "amount actually paid"
+# calculation — the same exclusion list Basic/NFP/ANP Commission use.
+_EXCLUDED_PAYMENT_IDS_SQL = "(101334, 104412, 101333, 104413, 4899)"
+
+
+def _invoices_sql(year: int) -> str:
+    """Any invoice, regardless of its own invoice_date, that has received at
+    least one real payment dated Jan 1 of `year` through today — an old
+    invoice with a fresh payment still counts. Sales Price is built from only
+    those in-window payments (not the invoice's full total_amount), so an
+    invoice appears — and its figure grows — as soon as, and as much as,
+    money actually comes in, rather than only once it reaches 100% paid."""
     return f"""
 WITH candidates AS (
   SELECT
@@ -360,18 +335,19 @@ WITH candidates AS (
     i.invoice_number,
     i.invoice_date,
     COALESCE(i.total_amount, 0)::numeric              AS total_amount,
+    pay.paid_amount,
     COALESCE(
       NULLIF(epp_items.epp_interest, 0),
-      NULLIF(pay.epp_sum, 0),
+      NULLIF(pay.paid_epp_cost_sum, 0),
       NULLIF(
         CASE
           WHEN i.effective_epp > 1.0 AND i.effective_epp < 2.0
-            THEN (i.total_amount * (i.effective_epp - 1.0) / i.effective_epp)::numeric
+            THEN (pay.paid_amount * (i.effective_epp - 1.0) / i.effective_epp)::numeric
           WHEN i.effective_epp >= 2.0 AND i.effective_epp <= 100.0
-            THEN (i.total_amount * (i.effective_epp / 100.0) / (1.0 + i.effective_epp / 100.0))::numeric
+            THEN (pay.paid_amount * (i.effective_epp / 100.0) / (1.0 + i.effective_epp / 100.0))::numeric
           ELSE 0
         END, 0), 0
-    )::numeric AS epp_interest,
+    )::numeric AS paid_epp_total,
     COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name, '(unknown)') AS customer_name,
     COALESCE(NULLIF(TRIM(a.name), ''), '(unknown)')   AS agent_name,
     a.agent_type,
@@ -385,12 +361,47 @@ WITH candidates AS (
       ORDER BY COALESCE(i.is_latest, FALSE) DESC, i.invoice_date DESC NULLS LAST, i.id DESC
     ) AS rn
   FROM invoice i
-  INNER JOIN agent a ON a.bubble_id = i.linked_agent
+  -- Agents live in BOTH the agent table and the user table since the
+  -- 2026-07-20 "agent retirement" migration (same bubble_id kept).
+  INNER JOIN (
+    SELECT DISTINCT ON (au.bubble_id) au.bubble_id, au.name, au.agent_type
+    FROM (
+      SELECT u.bubble_id, u.name, u.agent_type, 1 AS pri FROM "user" u
+       WHERE u.bubble_id IS NOT NULL AND COALESCE(BTRIM(u.agent_type), '') <> ''
+      UNION ALL
+      SELECT ag.bubble_id, ag.name, ag.agent_type, 2 FROM agent ag
+       WHERE ag.bubble_id IS NOT NULL
+      UNION ALL
+      SELECT u2.bubble_id, u2.name, u2.agent_type, 3 FROM "user" u2
+       WHERE u2.bubble_id IS NOT NULL
+    ) au
+    ORDER BY au.bubble_id, au.pri
+  ) a ON a.bubble_id = i.linked_agent
   LEFT JOIN customer c ON c.customer_id = i.linked_customer
   LEFT JOIN SEDA_registration sr_link ON sr_link.bubble_id = i.linked_seda_registration
   LEFT JOIN SEDA_registration sr_back ON i.bubble_id = ANY(sr_back.linked_invoice)
   LEFT JOIN referral ref ON ref.bubble_id = i.linked_referral
   LEFT JOIN LATERAL (
+    -- Total amount actually paid IN THE WINDOW (payment_date, not invoice
+    -- date — an old invoice with a fresh payment still counts), and the sum
+    -- of payment.epp_cost across those payments (rarely populated in
+    -- practice — see epp_items below, the real-world source of truth).
+    SELECT
+      COALESCE(SUM(p.amount), 0)::numeric AS paid_amount,
+      COALESCE(SUM(COALESCE(p.epp_cost, 0)), 0)::numeric AS paid_epp_cost_sum
+    FROM payment p
+    WHERE p.linked_invoice = i.bubble_id
+      AND p.id NOT IN {_EXCLUDED_PAYMENT_IDS_SQL}
+      AND p.payment_date >= '{int(year)}-01-01'
+      AND p.payment_date <= NOW()
+  ) pay ON TRUE
+  LEFT JOIN LATERAL (
+    -- EPP interest booked as its own invoice line item (e.g. "EPP Interest
+    -- (RM15,179.32 x 6%) 36 Months PBB") — one such line typically appears
+    -- per EPP instalment payment, created around the same time as that
+    -- payment, so this sums to the EPP interest for the payments actually
+    -- counted above (bounded by the same window via the item's created_at,
+    -- the closest available proxy since line items have no payment_date).
     SELECT COALESCE(SUM(ii_dedup.epp_interest_amount), 0) AS epp_interest
     FROM (
       SELECT MAX(
@@ -399,6 +410,8 @@ WITH candidates AS (
       ) AS epp_interest_amount
       FROM invoice_item ii
       WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
+        AND ii.created_at >= '{int(year)}-01-01'
+        AND ii.created_at <= NOW()
       GROUP BY TRIM(
         REGEXP_REPLACE(
           REGEXP_REPLACE(
@@ -414,16 +427,8 @@ WITH candidates AS (
       )
     ) ii_dedup
   ) epp_items ON TRUE
-  LEFT JOIN LATERAL (
-    SELECT SUM(COALESCE(p.epp_cost, 0)) AS epp_sum
-    FROM payment p
-    WHERE p.linked_invoice = i.bubble_id
-  ) pay ON TRUE
-  WHERE i.invoice_date IS NOT NULL
-    AND EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
-    {month_filter}
-    AND COALESCE(i.is_deleted, FALSE) IS NOT TRUE
-    AND COALESCE(i.percent_of_total_amount, 0) >= 100.0
+  WHERE COALESCE(i.is_deleted, FALSE) IS NOT TRUE
+    AND pay.paid_amount > 0
 )
 SELECT * FROM candidates WHERE rn = 1
 ORDER BY agent_name ASC, invoice_date ASC NULLS LAST, invoice_number ASC NULLS LAST
@@ -486,10 +491,7 @@ def _render_table(headers: list[str], rows: list[list[str]]) -> str:
 # ---------------------------------------------------------------------------
 # Main Logic
 # ---------------------------------------------------------------------------
-def build_report(year: int, upto_month: int | None = None, may_only: bool = False) -> dict | None:
-    # Support legacy may_only flag: treat it as upto_month=5
-    if may_only and upto_month is None:
-        upto_month = 5
+def build_report(year: int) -> dict | None:
     _load_dotenv()
 
     token = _get_token()
@@ -508,9 +510,8 @@ def build_report(year: int, upto_month: int | None = None, may_only: bool = Fals
     print("Parsing Agent Hierarchy...")
     hier, team_map, ogm_team_map = _build_hierarchy()
 
-    label = f"Jan–{['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][upto_month]}" if upto_month else "full year"
-    print(f"Fetching 100% paid invoices for year {year} ({label})...")
-    rows = query_sql(_invoices_sql(year, upto_month=upto_month))
+    print(f"Fetching invoices with real payments received, {year}-01-01 through today...")
+    rows = query_sql(_invoices_sql(year))
     print(f"  {len(rows)} invoice rows fetched.\n")
 
     # Accumulate agent sales across ALL packages
@@ -521,10 +522,19 @@ def build_report(year: int, upto_month: int | None = None, may_only: bool = Fals
 
     for r in rows:
         agent_type_raw = str(r.get("agent_type") or "").lower()
-        is_db_outsource = "outsource" in agent_type_raw
+        is_db_outsource = agent_type_raw.strip() not in {"internal", "full time"}
 
         raw_name = str(r.get("agent_name") or "(unknown)").strip()
         norm = _norm_name(raw_name)
+
+        # The Agent Roles & Hierarchy page wins over Postgres' agent_type (and
+        # over the hardcoded hierarchy below): agent_type is blank for several
+        # internal agents, and blank reads as outsource everywhere.
+        override = _agent_type_override(raw_name, r.get("invoice_date"))
+        if override == "internal":
+            continue
+        if override == "outsource":
+            is_db_outsource = True
 
         # Determine tier from hierarchy
         tier = get_agent_tier(raw_name, is_db_outsource)
@@ -534,9 +544,9 @@ def build_report(year: int, upto_month: int | None = None, may_only: bool = Fals
             continue
 
         prop_type = classify_property_type(r)
-        total = Decimal(str(r.get("total_amount") or 0))
-        epp   = Decimal(str(r.get("epp_interest") or 0))
-        sales_price = total - epp
+        paid_amount = Decimal(str(r.get("paid_amount") or 0))
+        paid_epp    = Decimal(str(r.get("paid_epp_total") or 0))
+        sales_price = paid_amount - paid_epp
 
         customer_name  = str(r.get("customer_name") or "(unknown)").strip()
         invoice_number = str(r.get("invoice_number") or "").strip()
@@ -597,8 +607,9 @@ def build_report(year: int, upto_month: int | None = None, may_only: bool = Fals
                 if _norm_name(raw_name) == member_norm:
                     for d in details:
                         row_bonus = (d["sales_price"] * OUM_BONUS_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if qualified == "Yes" else Decimal(0)
+                        display_name = _agent_display_name(raw_name, d["invoice_date"]) or raw_name
                         t2_rows.append([
-                            raw_name,
+                            display_name,
                             d["customer_name"],
                             d["invoice_number"],
                             d["prop_type"],
@@ -660,13 +671,9 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Production Bonus report for Outsource agents.")
     parser.add_argument("--year", type=int, default=2026, help="Invoice date year (default: 2026)")
     parser.add_argument("--no-csv", action="store_true", help="Skip CSV output")
-    parser.add_argument("--May", "--may", action="store_true", dest="May", help="Limit report to January through May")
-    parser.add_argument("--upto-month", type=int, default=None, choices=range(1, 13),
-                        help="Limit report to January through this month (1-12). Overrides --May.")
     args = parser.parse_args(argv)
 
-    upto_month = args.upto_month if args.upto_month else (5 if args.May else None)
-    report_data = build_report(args.year, upto_month=upto_month)
+    report_data = build_report(args.year)
     if report_data is None:
         return 2
         

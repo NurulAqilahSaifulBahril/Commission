@@ -86,6 +86,46 @@ from api_client import query_sql  # noqa: E402  (after sys.path setup)
 # ---------------------------------------------------------------------------
 AGENT_TYPES_SQL = "'internal', 'full time'"
 
+
+def _rates_module():
+    """basic_commission_rates, or None. Routing must never be the thing that
+    breaks a report, so callers fall back to the Postgres-only behaviour."""
+    try:
+        rates_dir = str(_REPO_ROOT / "1. Basic Commission" / "3. Python Script")
+        if rates_dir not in sys.path:
+            sys.path.append(rates_dir)
+        import basic_commission_rates as _bcr
+        return _bcr
+    except Exception:
+        return None
+
+
+def _agent_type_override_sql() -> str:
+    """Names the Agent Roles & Hierarchy page routes explicitly, as a SQL list.
+    Postgres' agent_type is blank for several internal agents, so filtering on
+    it alone hands them to the outsource report. The widened filter lets
+    _is_internal_row() decide per invoice, where the invoice date is known."""
+    bcr = _rates_module()
+    names = bcr.agent_type_override_names() if bcr else []
+    if not names:
+        return "''"
+    return ", ".join("'" + n.replace("'", "''") + "'" for n in names)
+
+
+def _is_internal_row(row: dict) -> bool:
+    """Whether this invoice belongs to the internal report — Agent Roles &
+    Hierarchy page first, then Postgres' agent_type."""
+    pg = str(row.get("agent_type") or "").strip().lower()
+    bcr = _rates_module()
+    if bcr is None:
+        return pg in ("internal", "full time")
+    parsed = _parse_invoice_date(row.get("invoice_date"))
+    return bcr.resolve_agent_type(
+        row.get("agent_name"), pg,
+        month=parsed.month if parsed else None,
+        year=parsed.year if parsed else None,
+    ) == "internal"
+
 # Standard thresholds (cumulative EP, any time in the year)
 EGA_THRESHOLD = Decimal("600000")    # EP Points > 600,000  -> EGA
 ESA_THRESHOLD = Decimal("1300000")   # EP Points > 1,300,000 -> ESA
@@ -109,6 +149,77 @@ FACTORY_CUTOFF_DATE  = datetime(2026, 5, 1)   # "After May 2026" starts here
 FACTORY_FIRST_BLOCK  = Decimal("40000")        # first RM40,000 at 100%
 FACTORY_BALANCE_RATE = Decimal("0.4")          # balance above RM40,000 at 40%
 FACTORY_MIN_PANELS   = 36                       # < 36 pcs -> follows Residential
+
+
+# ---------------------------------------------------------------------------
+# Rules entered on the dashboard Data page (Internal). Every value falls back to
+# the constant hardcoded above, so a year not set up there produces exactly the
+# figures it always did.
+#
+# NOTE: the Outsource script carries DIFFERENT thresholds (720,000 / 1,560,000),
+# so it is deliberately NOT wired to this table until the table gains an
+# agent-type dimension.
+# ---------------------------------------------------------------------------
+def _load_ega_rules(year):
+    import os as _os
+    import sys as _sys
+    dashboard_dir = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))),
+        "8. Web Dashboard",
+    )
+    try:
+        if dashboard_dir not in _sys.path:
+            _sys.path.insert(0, dashboard_dir)
+        import db as _db
+        payload = _db.get_ega_rules(str(year))
+        if not payload.get("saved"):
+            return None
+    except Exception as exc:
+        print(f"[EGA Rules] Warning: could not read rules from the dashboard DB "
+              f"({type(exc).__name__}: {exc}); using built-in defaults.", file=sys.stderr)
+        return None
+    print(f"[EGA Rules] Loaded {year} from the dashboard Data page.")
+    return payload
+
+
+def _apply_ega_rules(payload) -> None:
+    global EGA_THRESHOLD, ESA_THRESHOLD, FACTORY_CUTOFF_DATE
+    global FACTORY_FIRST_BLOCK, FACTORY_BALANCE_RATE, FACTORY_MIN_PANELS
+
+    rules = payload.get("rules") or {}
+
+    def _dec(key, current):
+        raw = str(rules.get(key) or "").replace(",", "").strip()
+        if not raw:
+            return current
+        try:
+            return Decimal(raw)
+        except Exception:
+            return current
+
+    EGA_THRESHOLD = _dec("ega_threshold", EGA_THRESHOLD)
+    ESA_THRESHOLD = _dec("esa_threshold", ESA_THRESHOLD)
+    FACTORY_FIRST_BLOCK = _dec("factory_first_block", FACTORY_FIRST_BLOCK)
+
+    rate = str(rules.get("factory_balance_rate") or "").strip()
+    if rate:
+        try:
+            FACTORY_BALANCE_RATE = Decimal(rate) / Decimal("100")
+        except Exception:
+            pass
+
+    panels = str(rules.get("factory_min_panels") or "").strip()
+    if panels.isdigit():
+        FACTORY_MIN_PANELS = int(panels)
+
+    cutoff = str(rules.get("factory_from") or "").strip()
+    if cutoff:
+        try:
+            y, m = cutoff.split("-")
+            FACTORY_CUTOFF_DATE = datetime(int(y), int(m), 1)
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # .env loader
@@ -150,8 +261,18 @@ def _get_token() -> str | None:
 # SQL
 # ---------------------------------------------------------------------------
 
-def _invoices_sql(year: int, may_only: bool = False) -> str:
-    month_filter = "AND EXTRACT(MONTH FROM i.invoice_date)::int <= 5" if may_only else ""
+def _invoices_sql(year: int, may_only: bool = False, upto_month: int | None = None) -> str:
+    # Both the CLI and the commission pack call this first, so it is the one
+    # place the year is known before any figure is computed.
+    _payload = _load_ega_rules(year)
+    if _payload:
+        _apply_ega_rules(_payload)
+    if upto_month is None and may_only:
+        upto_month = 5
+    if upto_month is not None:
+        month_filter = f"AND EXTRACT(MONTH FROM i.invoice_date)::int <= {int(upto_month)}"
+    else:
+        month_filter = ""
     return f"""
 WITH candidates AS (
   SELECT
@@ -193,7 +314,22 @@ WITH candidates AS (
                i.id DESC
     ) AS rn
   FROM invoice i
-  INNER JOIN agent a ON a.bubble_id = i.linked_agent
+  -- Agents live in BOTH the agent table and the user table since the
+  -- 2026-07-20 "agent retirement" migration (same bubble_id kept).
+  INNER JOIN (
+    SELECT DISTINCT ON (au.bubble_id) au.bubble_id, au.name, au.agent_type
+    FROM (
+      SELECT u.bubble_id, u.name, u.agent_type, 1 AS pri FROM "user" u
+       WHERE u.bubble_id IS NOT NULL AND COALESCE(BTRIM(u.agent_type), '') <> ''
+      UNION ALL
+      SELECT ag.bubble_id, ag.name, ag.agent_type, 2 FROM agent ag
+       WHERE ag.bubble_id IS NOT NULL
+      UNION ALL
+      SELECT u2.bubble_id, u2.name, u2.agent_type, 3 FROM "user" u2
+       WHERE u2.bubble_id IS NOT NULL
+    ) au
+    ORDER BY au.bubble_id, au.pri
+  ) a ON a.bubble_id = i.linked_agent
   LEFT JOIN customer c ON c.customer_id = i.linked_customer
   LEFT JOIN SEDA_registration sr_link ON sr_link.bubble_id = i.linked_seda_registration
   LEFT JOIN SEDA_registration sr_back ON i.bubble_id = ANY(sr_back.linked_invoice)
@@ -234,7 +370,10 @@ WITH candidates AS (
   WHERE i.invoice_date IS NOT NULL
     AND EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
     {month_filter}
-    AND LOWER(TRIM(COALESCE(a.agent_type, ''))) IN ({AGENT_TYPES_SQL})
+    AND (
+      LOWER(TRIM(COALESCE(a.agent_type, ''))) IN ({AGENT_TYPES_SQL})
+      OR LOWER(TRIM(COALESCE(a.name, ''))) IN ({_agent_type_override_sql()})
+    )
     AND COALESCE(i.is_deleted, FALSE) IS NOT TRUE
     AND i."1st_payment_date" IS NOT NULL
 )
@@ -507,6 +646,11 @@ def build_report(rows: list[dict[str, Any]]) -> tuple[
     agent_invoice_ep: dict[str, list[tuple[str, Decimal]]]  = defaultdict(list)
 
     for row in rows:
+        # The SQL filter is deliberately wide (it cannot date-match the roles
+        # page), so drop anything that resolves to the outsource report here.
+        if not _is_internal_row(row):
+            continue
+
         agent_name    = str(row.get("agent_name") or "(unknown)").strip()
         customer_name = str(row.get("customer_name") or "(unknown)").strip()
         invoice_num   = str(row.get("invoice_number") or "").strip()
@@ -658,6 +802,8 @@ def main(argv: list[str]) -> int:
                         help="Skip CSV output")
     parser.add_argument("--May", "--may", action="store_true", dest="May",
                         help="Limit report to January through May")
+    parser.add_argument("--month", type=int, default=None,
+                        help="Limit report to January through this month")
     args = parser.parse_args(argv)
 
     token = _get_token()
@@ -678,8 +824,11 @@ def main(argv: list[str]) -> int:
     if not os.environ.get("POSTGRES_PROXY_TOKEN"):
         os.environ["POSTGRES_PROXY_TOKEN"] = token
 
-    print(f"Fetching invoices for year {args.year} (May only: {args.May})...")
-    rows = query_sql(_invoices_sql(args.year, may_only=args.May))
+    upto_month = args.month
+    if upto_month is None and args.May:
+        upto_month = 5
+    print(f"Fetching invoices for year {args.year} (up to month: {upto_month if upto_month else 'all'})...")
+    rows = query_sql(_invoices_sql(args.year, upto_month=upto_month))
     print(f"  {len(rows)} invoice rows fetched.\n")
 
     lines, agent_ep, agent_sales, agent_eligibility = build_report(rows)

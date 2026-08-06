@@ -485,16 +485,29 @@
                     </div>
                     <div class="section-hint">
                         Who holds which role and who they report to — this drives the override
-                        attribution. Agent Name, Agent Type, Branch and (when a person's active
-                        tags resolve to exactly one role) Role can be pulled from Postgres;
-                        <strong>Reports To is never in Postgres</strong> and must always be entered
-                        here. A "⚠ needs split" Role means Postgres has conflicting old- and
-                        new-system tags at once (e.g. both "Sales Senior" and "Sales Development
-                        Manager") — add two rows by hand with the right effective months instead of
-                        guessing which applied when. Effective-dated like the rates: a promotion or
-                        a branch move is a new row, so recalculating an old month uses the hierarchy
-                        as it stood then. Until an agent is listed here the calculation falls back
+                        attribution. Agent Name, Agent Type, Branch and Role are pulled live from
+                        eeAdmin every time this page loads; <strong>Reports To is never in
+                        eeAdmin</strong> and must always be entered here.
+                        <strong>One row per role.</strong> An agent who carries several role tags
+                        at once — a promotion usually adds the new tag without removing the old
+                        one, and a transfer can leave an Internal and an Outsource tag side by
+                        side — gets a separate row for each, so all of them can be kept with the
+                        period each actually applied to.
+                        <strong>eeAdmin tags carry no dates</strong>, so every pulled role arrives
+                        marked "⚠ Set effective date". Until you enter that month the row is not
+                        saved and no commission calculation uses it. Once dated it behaves like the
+                        rates: recalculating an old month uses the hierarchy as it stood then.
+                        An undated row disappears by itself if its tag is removed in eeAdmin; a row
+                        you have dated is kept and marked "no longer tagged in eeAdmin" instead,
+                        because earlier months were priced with it — delete it here if it was
+                        entered in error. Until an agent is listed here the calculation falls back
                         to the old hardcoded name matching.
+                    </div>
+
+                    <!-- Needs-review summary: only shown when something is flagged -->
+                    <div id="rolesReviewBanner" style="display:none; margin:0 24px 0; padding:8px 14px; border-radius:8px; background:#fffbeb; border:1px solid #fde68a; color:#92400e; font-size:13px; font-weight:600; align-items:center; gap:8px;">
+                        <span id="rolesReviewBannerText"></span>
+                        <a href="#" id="rolesReviewBannerLink" style="color:#92400e; text-decoration:underline; font-weight:600;">show them</a>
                     </div>
 
                     <!-- Agent Type Filter + Search + Refresh -->
@@ -512,13 +525,18 @@
                                 <option value="Sales">Sales</option>
                             </select>
                         </div>
+                        <label style="display:flex; align-items:center; gap:6px; font-weight:600; font-size:13px; cursor:pointer;" title="Show only rows flagged with a drift/removed/expired/mismatch warning below the Role badge.">
+                            <input type="checkbox" id="rolesNeedsReviewFilter"> Needs review only
+                        </label>
                         <button class="btn btn-secondary" id="refreshPgAgentsBtn" style="font-size:12.5px; padding:6px 14px;">🔄 Refresh from Postgres</button>
+                        <span id="rolesSyncedAt" style="font-size:11.5px; color:var(--text-muted);" title="This page re-pulls from eeAdmin when you come back to the tab and every 5 minutes while it is open. It never refreshes while the edit window is open."></span>
                         <span class="save-status" id="pgAgentsStatus"></span>
                     </div>
 
                     <div class="table-footer-actions" style="padding-bottom:0;">
                         <button class="btn btn-secondary" id="seedRolesBtn" style="display:none;">⬇ Pull agents from Postgres</button>
                         <button class="btn btn-secondary" id="addRoleBtn" style="display:none;">+ Add agent</button>
+                        <button class="btn btn-secondary" id="showExcludedRolesBtn" style="display:none; font-size:12.5px;">🗑 Excluded agents</button>
                         <button class="btn btn-primary" id="saveRolesBtn" style="display:none;">Save</button>
                         <span class="save-status" id="rolesStatus"></span>
                     </div>
@@ -531,6 +549,29 @@
                         </table>
                     </div>
                     <div id="rolesPagination" style="display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:8px 0;"></div>
+
+                    <!-- Excluded agents: rows deleted via the grid, kept as tombstones so
+                         Postgres / Seed never bring them back on their own. Hidden by
+                         default — toggled by the "Excluded agents" button above. -->
+                    <div id="excludedRolesPanel" style="display:none; margin:0 24px 16px; border-top:1px solid var(--border-color); padding-top:12px;">
+                        <div style="font-weight:600; font-size:13px; margin-bottom:6px;">
+                            Excluded agents <span id="excludedRolesCount" style="font-weight:400; color:var(--text-muted);"></span>
+                        </div>
+                        <div class="section-hint" style="margin-bottom:8px;">
+                            Deleted through this grid. They stay off the table above and are never
+                            re-added by Seed or a Postgres refresh, even if eeAdmin still tags them.
+                            Restore puts an agent back exactly as if they had never been deleted —
+                            they reappear next load using whatever eeAdmin currently tags them.
+                        </div>
+                        <div class="table-container">
+                            <table class="dashboard-table" style="table-layout:auto;">
+                                <thead>
+                                    <tr><th>Agent</th><th>Reason</th><th></th></tr>
+                                </thead>
+                                <tbody id="excludedRolesBody"></tbody>
+                            </table>
+                        </div>
+                    </div>
                 </section>
 
                 <!-- ── MONTHLY CONTEST ─────────────────────────────────────── -->
@@ -1001,16 +1042,36 @@
                 <div class="form-row">
                     <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Agent Type</label>
                     <select id="roleModalAgentType" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;">
+                        <option value="">(needs review)</option>
                         <option value="Internal">Internal</option>
                         <option value="Outsource">Outsource</option>
-                        <option value="Sales">Sales</option>
+                        <!-- Kept only so rows already saved as "Sales" show their
+                             real stored value instead of a fabricated one. It names
+                             no rate table, so it is not a valid choice going forward. -->
+                        <option value="Sales">Sales (needs review - no rate table)</option>
                     </select>
                 </div>
 
-                <!-- Effective Month -->
+                <!-- Effective Month — single (open-ended) or a closed range,
+                     the same two shapes the Basic Commission Data page uses. -->
                 <div class="form-row">
                     <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Effective Month</label>
-                    <input type="month" id="roleModalMonth" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;">
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                        <span style="font-size:12px; color:var(--text-muted); font-weight:600;">From</span>
+                        <input type="month" id="roleModalMonthFrom" style="padding:8px 12px; font-size:13.5px; width:150px; border:1px solid var(--border-color); border-radius:6px;">
+                        <span style="font-size:12px; color:var(--text-muted); font-weight:600;">To</span>
+                        <input type="month" id="roleModalMonthTo" style="padding:8px 12px; font-size:13.5px; width:150px; border:1px solid var(--border-color); border-radius:6px;">
+                        <label for="roleModalMonthPresent" style="display:flex; align-items:center; gap:6px; font-size:12.5px; font-weight:600; cursor:pointer; white-space:nowrap;">
+                            <input type="checkbox" id="roleModalMonthPresent" checked style="cursor:pointer;">
+                            Present
+                        </label>
+                    </div>
+                    <div style="font-size:11px; color:var(--text-muted); margin-top:6px; line-height:1.45;">
+                        <strong>To Present</strong> means the role still applies and keeps applying to every
+                        later month. Set an end month only when the role actually stopped — after it, this
+                        row no longer governs the agent, and if no later row covers them the calculation
+                        falls back to the old hardcoded name matching.
+                    </div>
                 </div>
 
                 <!-- Role -->
@@ -1030,10 +1091,13 @@
                 <!-- Branch -->
                 <div class="form-row">
                     <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Branch</label>
-                    <input type="text" id="roleModalBranch" list="branchList" placeholder="—" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;">
+                    <!-- A picker, not free text: typing was how "Sales Dept",
+                         "Engineering Dept" and other departments got in here. -->
+                    <select id="roleModalBranch" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;"></select>
                 </div>
             </div>
             <div class="modal-footer">
+                <div id="roleModalNote" style="display:none; flex-basis:100%; font-size:11.5px; color:#b45309; line-height:1.45; margin-bottom:8px;"></div>
                 <button id="roleModalDeleteBtn" class="btn btn-danger">Delete Agent</button>
                 <div class="modal-footer-actions">
                     <button id="roleModalCancelBtn" class="btn btn-secondary">Cancel</button>
@@ -1043,6 +1107,6 @@
         </div>
     </div>
 
-    <script src="/static/data.js?v=20260729_nfp_loading_v1"></script>
+    <script src="/static/data.js?v=20260805_role_tombstone_v1"></script>
 </body>
 </html>
