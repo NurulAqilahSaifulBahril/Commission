@@ -259,7 +259,43 @@ def stage_runtime(payload: Path) -> bool:
     return True
 
 
-def build(version: str, with_runtime: bool = True) -> Path:
+def stage_seed_env(payload: Path, seed_env: Path) -> None:
+    """Pre-fill the install's .env so the user never pastes access keys.
+
+    INSTALLER-ONLY, like shell/ and runtime/: this lands in dist/payload for
+    Inno to pick up and is never part of the OTA zip (which is built from the
+    code file list, where *.env is excluded). An installer produced with this
+    carries live credentials — distribute it over internal channels only,
+    NEVER as an asset on the public GitHub Releases page. The CI release
+    workflow does not pass --seed-env, so public builds stay key-free.
+
+    Only the PG_* proxy lines are taken from the seed file. FLASK_SECRET_KEY
+    must stay per-install (the server generates one on first boot), and
+    anything else in a working .env (e.g. a retired DATABASE_URL) has no
+    business being copied onto six machines.
+    """
+    allowed = ("PG_PROXY_URL", "PG_PROXY_TOKEN", "PG_PROXY_DB",
+               "PG_MIRROR_TOKEN", "PG_MIRROR_DB", "PG_MIRROR_SCHEMA")
+    lines = []
+    for raw in seed_env.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if "=" not in line or line.startswith("#"):
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in allowed:
+            lines.append(line)
+    if not any(l.startswith("PG_MIRROR_TOKEN=") for l in lines):
+        raise RuntimeError(f"{seed_env} has no PG_MIRROR_TOKEN line — "
+                           f"a seeded install would still show the setup page.")
+    (payload / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"payload: seeded .env with {len(lines)} key line(s) "
+          f"({', '.join(l.split('=')[0] for l in lines)})")
+    print("         >>> This installer will contain live credentials. "
+          "Share it internally only — do NOT publish it. <<<")
+
+
+def build(version: str, with_runtime: bool = True,
+          seed_env: Path | None = None) -> Path:
     _clean_dist()
     payload = DIST / "payload"
     payload.mkdir(parents=True)
@@ -274,6 +310,9 @@ def build(version: str, with_runtime: bool = True) -> Path:
 
     if with_runtime:
         stage_runtime(payload)
+
+    if seed_env is not None:
+        stage_seed_env(payload, seed_env)
 
     if SHELL_BUILD.is_dir():
         shutil.copytree(SHELL_BUILD, payload / "shell")
@@ -321,6 +360,14 @@ def main() -> int:
         help="Skip bundling the Python runtime. The resulting install then needs "
              "Python on the machine, as it did before the runtime was bundled.",
     )
+    parser.add_argument(
+        "--seed-env",
+        metavar="ENV_FILE",
+        help="Pre-fill the install's .env with the PG_* access keys from this "
+             "file, so the user never pastes them. The resulting INSTALLER "
+             "contains live credentials: distribute internally only, never on "
+             "the public Releases page. The OTA update zip is unaffected.",
+    )
     args = parser.parse_args()
 
     if args.checksums_only:
@@ -333,7 +380,10 @@ def main() -> int:
     else:
         version = json.loads((REPO_ROOT / "version.json").read_text(encoding="utf-8"))["version"]
 
-    build(version, with_runtime=not args.no_runtime)
+    seed = Path(args.seed_env).resolve() if args.seed_env else None
+    if seed is not None and not seed.is_file():
+        parser.error(f"--seed-env file not found: {seed}")
+    build(version, with_runtime=not args.no_runtime, seed_env=seed)
     write_checksums()
     return 0
 
