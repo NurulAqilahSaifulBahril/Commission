@@ -78,12 +78,31 @@ function startFlask(root) {
   ];
   const python = candidates.find((p) => fs.existsSync(p)) || "python";
 
+  // The server's own words, kept. With stdio "ignore" a crash-on-boot (missing
+  // access keys, a broken .env) left nothing behind, so the timeout dialog
+  // could only guess at the cause — and guessed wrong once the runtime was
+  // bundled and "Python is missing" stopped being the likely explanation.
+  let out = "ignore";
+  try {
+    out = fs.openSync(path.join(root, "8. Web Dashboard", "shell-startup.log"), "w");
+  } catch {}
   flaskProc = spawn(python, [path.join(root, "8. Web Dashboard", "app.py")], {
     cwd: root,
-    stdio: "ignore",
+    stdio: ["ignore", out, out],
     windowsHide: true,
   });
   flaskProc.on("error", () => { flaskProc = null; });
+}
+
+function startupLogTail(root, maxLines = 12) {
+  try {
+    const raw = fs.readFileSync(
+      path.join(root, "8. Web Dashboard", "shell-startup.log"), "utf8");
+    const lines = raw.trim().split(/\r?\n/);
+    return lines.slice(-maxLines).join("\n");
+  } catch {
+    return "";
+  }
 }
 
 function stopFlask() {
@@ -153,10 +172,31 @@ async function launch() {
     }
   }
   if (!loaded) {
+    // Say what actually happened, not a guess. The old text blamed a missing
+    // Python environment, which stopped being the plausible cause the moment
+    // the installer started bundling one — while the real first-run failure
+    // (no access keys in .env) crashed the server silently and got
+    // misdiagnosed. The server's own last words are in shell-startup.log.
+    const tail = startupLogTail(root);
+    const hasInterpreter =
+      fs.existsSync(path.join(root, "runtime", "python.exe")) ||
+      fs.existsSync(path.join(root, ".venv", "Scripts", "python.exe"));
+    let hint;
+    if (tail.includes("PG_MIRROR_TOKEN") || tail.includes("PG_PROXY_TOKEN")) {
+      hint = "The access keys are missing or wrong. Ask IT for your keys and " +
+        "add them to the .env file in the install folder, then open this app again.";
+    } else if (!hasInterpreter) {
+      hint = "No Python environment was found — run \"Setup Environment.bat\" " +
+        "in the install folder, then open this app again.";
+    } else {
+      hint = "Check \"8. Web Dashboard\\shell-startup.log\" and " +
+        "\"8. Web Dashboard\\dashboard.log\" in the install folder, or send " +
+        "them to IT.";
+    }
     dialog.showErrorBox(
       "Commission Portal",
-      "The dashboard server did not start within 60 seconds.\n\n" +
-        "If this is the first run, the Python environment may still be missing — run \"Setup Environment.bat\" in the install folder, then open this app again."
+      "The dashboard server did not start.\n\n" + hint +
+        (tail ? "\n\nServer output:\n" + tail : "")
     );
     app.quit();
   }

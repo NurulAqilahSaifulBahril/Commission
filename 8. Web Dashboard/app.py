@@ -821,18 +821,88 @@ build_commission_pack._load_env_files()
 
 app.secret_key = os.environ.get("FLASK_SECRET_KEY")
 if not app.secret_key:
-    raise RuntimeError(
-        "FLASK_SECRET_KEY not set. Add it to Commission/.env "
-        "(generate one with: python -c \"import secrets; print(secrets.token_hex(32))\")"
-    )
+    # Generate one rather than refusing to boot. Historically Setup
+    # Environment.bat wrote this, so a fresh machine where that step failed
+    # (or was skipped) produced a server that died before it could explain
+    # itself. Persisted to .env so sessions survive restarts; only kept
+    # in-memory if .env cannot be written.
+    import secrets as _secrets
+    app.secret_key = _secrets.token_hex(32)
+    try:
+        env_path = REPO_ROOT / ".env"
+        with open(env_path, "a", encoding="utf-8") as fh:
+            fh.write(f"\nFLASK_SECRET_KEY={app.secret_key}\n")
+        _log(f"Generated FLASK_SECRET_KEY and saved it to {env_path}")
+    except Exception:
+        _log("Generated a session-only FLASK_SECRET_KEY (.env not writable); "
+             "logins will not survive a restart until one is saved to .env.")
 
-db.init_db()
-db.migrate_from_json()
+# A fresh install has no access keys yet, and every dashboard table lives
+# behind them. Dying here (as this used to, via an unguarded init_db()) kills
+# the server before it can say anything, so the Electron shell times out and
+# blames a missing Python environment — wrongly, since v1.2.0 bundles one.
+# Boot anyway and remember why we couldn't reach the database; a gate below
+# serves a setup page that says exactly what to add and where.
+SETUP_ERROR: str | None = None
+try:
+    db.init_db()
+    db.migrate_from_json()
+except Exception as _setup_exc:
+    SETUP_ERROR = str(_setup_exc)
+    _log("[SETUP] Database unreachable at startup - serving the setup page.\n"
+         + traceback.format_exc())
+
+
+_SETUP_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Commission Portal — Setup needed</title>
+<style>
+ body {{ font-family: 'Segoe UI', Arial, sans-serif; background:#F5F7FA; color:#22303C;
+        display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; }}
+ .card {{ background:#fff; border:1px solid #DCE1E6; border-radius:10px; max-width:640px;
+         padding:36px 42px; box-shadow:0 8px 28px rgba(11,31,46,.08); }}
+ h1 {{ font-size:22px; margin:0 0 6px; color:#0B1F2E; }}
+ p  {{ line-height:1.55; }}
+ code {{ background:#F3F4F6; padding:2px 6px; border-radius:4px; font-size:13px; }}
+ .path {{ background:#F3F4F6; padding:8px 12px; border-radius:6px; font-family:Consolas,monospace;
+         font-size:12.5px; word-break:break-all; }}
+ ol {{ line-height:1.7; }}
+ .muted {{ color:#7A8794; font-size:13px; }}
+</style></head><body><div class="card">
+<h1>Almost there — the Portal needs its access keys</h1>
+<p>The app itself installed fine. It just cannot reach the company database yet,
+because the access keys are not in place on this computer.</p>
+<ol>
+  <li><b>Ask IT for your access keys</b> — a few lines that look like
+      <code>PG_PROXY_TOKEN=…</code> and <code>PG_MIRROR_TOKEN=…</code></li>
+  <li>Open this file in Notepad (create it if it does not exist):
+      <div class="path">{env_path}</div></li>
+  <li>Paste the lines in, each on its own line, and save.</li>
+  <li><b>Close the Portal window and open it again.</b></li>
+</ol>
+<p class="muted">Details for IT: {error}</p>
+</div></body></html>"""
+
+
+@app.before_request
+def _setup_gate():
+    """While the database is unreachable, every page is the setup page.
+
+    Nothing else can work — there are no users to log in, no rates to read —
+    so showing the normal login form would just move the dead end one screen
+    later and hide the actual problem."""
+    if SETUP_ERROR is None:
+        return None
+    from markupsafe import escape
+    return _SETUP_PAGE.format(env_path=escape(str(REPO_ROOT / ".env")),
+                              error=escape(SETUP_ERROR)), 503
 
 # Load disk cache and start pre-fetch if empty or missing main data keys
 load_disk_cache()
 with _disk_cache_lock:
     has_main_keys = (2026, 'internal') in _data_cache and (2026, 'outsource') in _data_cache
+if SETUP_ERROR is not None:
+    # No keys, no data: every fetch would fail the same way init_db just did.
+    has_main_keys = True
 FAST_START = False  # Disabled to ensure full pre-fetch when cache is incomplete
 if not has_main_keys and not FAST_START:
     _log("Cache is missing internal or outsource data on startup. Triggering background pre-fetch...")

@@ -69,11 +69,24 @@ if errorlevel 1 (
 )
 
 :: -- First admin account ----------------------------------------------------
+:: Needs the access keys: accounts live in the shared database, and without
+:: PG_MIRROR_TOKEN create_admin.py can only die in a traceback. Skip with
+:: instructions instead - the Portal itself now shows a setup page explaining
+:: the same thing, and this file can simply be run again once keys are in.
+findstr /b /c:"PG_MIRROR_TOKEN=" ".env" >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo NOTE: no access keys in .env yet, so the first admin account cannot
+    echo be created now. Add the keys IT gave you to the .env file in this
+    echo folder, then run this file again to create the account.
+    goto keysmissing
+)
 if not exist "8. Web Dashboard\dashboard.db" (
     echo.
     echo No user database yet - create the first administrator account.
     "%PYEXE%" "8. Web Dashboard\create_admin.py"
 )
+:keysmissing
 
 echo.
 echo ============================================================
