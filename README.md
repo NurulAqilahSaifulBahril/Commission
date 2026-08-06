@@ -8,26 +8,16 @@
 [![Downloads](https://img.shields.io/github/downloads/NurulAqilahSaifulBahril/Commission/total?style=for-the-badge)](https://github.com/NurulAqilahSaifulBahril/Commission/releases/latest)
 
 On that page, grab **`CommissionDashboard-Setup-<version>.exe`** and run it.
+**Requires Python 3.10+** on the machine ([python.org](https://www.python.org/downloads/windows/) — tick *Add python.exe to PATH*).
 
-| Step | What happens |
-|------|--------------|
-| 1. Run the installer | Installs to `%LOCALAPPDATA%\Programs\Eternalgy\Commission Dashboard` — no admin rights needed |
-| 2. Setup window opens | Creates a private Python environment, installs dependencies, generates a session secret, asks you to create the first admin account |
-| 3. Add your token | Put `PG_PROXY_TOKEN=<your token>` in the `.env` file inside the install folder |
-| 4. Launch | Start Menu → **Finance Commission Dashboard**. It opens <http://127.0.0.1:5001> |
+📖 **[Install & Update guide](USER_GUIDE.md)** — step by step, written for non-technical users.
+📖 **[Using the Portal](docs/using-the-portal.md)** — reading the reports, filters, special cases, the Data page.
 
-**Requires Python 3.10+** on the machine ([python.org](https://www.python.org/downloads/windows/) — tick *Add python.exe to PATH*). The installer checks for it and tells you if it is missing.
-
-### Updating
-
-You only ever run the installer once. After that the dashboard updates itself:
-
-- It checks GitHub for a newer release on startup and hourly after that.
-- When one exists, a **Software Update** panel appears in the sidebar showing the new version number and a link to the release notes.
-- An admin clicks **Install Update** — the app downloads the package, verifies its SHA-256 checksum, swaps the files in, restarts, and the browser tab reloads on its own.
-- Your database, `.env`, Excel workbooks, generated reports and admin-edited rule settings are never touched by an update.
-
-If an update fails part-way, the previous version is restored automatically and the reason is written to `8. Web Dashboard\dashboard.log`.
+You only ever run the installer once; after that the dashboard updates itself from
+GitHub Releases and an admin installs the update from the sidebar. Nothing of yours
+is touched by an update — database, `.env`, workbooks, reports and edited rules all
+survive. A failed update rolls back automatically and logs the reason to
+`8. Web Dashboard\dashboard.log`.
 
 ### Cutting a release (maintainers)
 
