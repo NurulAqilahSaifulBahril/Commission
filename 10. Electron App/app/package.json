@@ -8,7 +8,7 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --dir"
+    "dist": "electron-builder"
   },
   "devDependencies": {
     "electron": "^37.0.0",
