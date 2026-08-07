@@ -122,12 +122,12 @@ jobs:
       - name: Organize artifacts
         run: |
           mkdir -p dist
-          # Update package
-          find artifacts/update-package -name "*.zip" -exec mv {} dist/ \;
+          # Update package (keep original name)
+          cp artifacts/update-package/*.zip dist/
           # Windows app
-          find artifacts/windows-app -name "*.exe" -exec mv {} dist/ \;
-          # macOS app
-          find artifacts/macos-app -name "*.zip" -exec mv {} dist/CommissionDashboard-${{ needs.build-update-package.outputs.version }}-macos.zip \;
+          cp artifacts/windows-app/*.exe dist/CommissionDashboard-Setup-${{ needs.build-update-package.outputs.version }}.exe
+          # macOS app (rename from CommissionDashboard-*.zip to follow naming convention)
+          cp artifacts/macos-app/*.zip dist/CommissionDashboard-Setup-${{ needs.build-update-package.outputs.version }}-macos.zip
           ls -lh dist/
 
       - name: Generate checksums

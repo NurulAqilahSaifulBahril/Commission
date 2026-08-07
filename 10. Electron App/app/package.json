@@ -16,7 +16,7 @@
   },
   "build": {
     "appId": "me.eternalgy.commission.portal",
-    "productName": "Commission Portal",
+    "productName": "CommissionDashboard",
     "files": [
       "main.js",
       "loading.html",
