@@ -574,6 +574,27 @@ body {
     overflow-wrap: anywhere;
 }
 
+/* Every table on the report page -- Basic & NFP, ANP, Production Bonus,
+   EGA/ESA and Monthly Contest all render as `.dashboard-table`. Scoped to the
+   page rather than the class because the Data page (data.html) uses the same
+   class and keeps the filled header. Anchoring on the body class means a table
+   added later inherits this automatically. The white cell borders go
+   transparent with it: they only read as separators against the grey fill, and
+   left white they would punch gaps through the rule below. */
+.report-page .dashboard-table th {
+    background-color: transparent;
+    text-transform: uppercase;
+    border: 1px solid transparent;
+    border-bottom: 2px solid #000000;
+}
+
+/* "Other Commission" grouping row on the Basic & NFP detail table: the merged
+   cell spans OVERRIDE / Safwan / Gan Lai Soon, so it reads best centered
+   rather than left-aligned like every single-column header. */
+.dashboard-table th.group-header {
+    text-align: center;
+}
+
 .dashboard-table td {
     padding: 7px 8px;
     border: 1px solid #ffffff;
@@ -1301,11 +1322,14 @@ body {
 }
 
 .agent-summary-inline-table th {
-    background-color: #e5e7eb;
+    /* Matches .dashboard-table th: no fill, the rule below does the separating. */
+    background-color: transparent;
     color: #111111;
     font-weight: 700;
     padding: 6px 8px;
-    border: 1px solid #ffffff;
+    text-transform: uppercase;
+    border: 1px solid transparent;
+    border-bottom: 2px solid #000000;
     /* Headers and body both wrap so text stays inside the cell */
     white-space: normal;
     overflow-wrap: anywhere;
@@ -1818,6 +1842,21 @@ body {
     font-size: 13px;
     font-weight: 700;
     color: #0f172a;
+    text-align: right;
+}
+
+.slip-paid-stamp {
+    color: #dc2626;
+    font-size: 18px;
+    font-weight: 800;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+    /* The slip is printed and saved as PDF, and browsers drop background and
+       text colour by default when printing -- without this the stamp comes out
+       black and reads as ordinary text. */
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
 }
 
 .slip-table-wrapper {

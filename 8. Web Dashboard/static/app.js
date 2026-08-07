@@ -350,6 +350,14 @@ document.addEventListener("DOMContentLoaded", () => {
     
     const dataTable = document.getElementById("dataTable");
     const tableHeaders = document.getElementById("tableHeaders");
+    // Grouping row for the Basic & NFP detail table only ("Other Commission"
+    // spanning OVERRIDE / Safwan / Gan Lai Soon). Created once and inserted
+    // ahead of #tableHeaders so every other report table -- which never
+    // populates it -- renders exactly as before with a single header row.
+    const tableGroupHeaders = document.createElement("tr");
+    tableGroupHeaders.id = "tableGroupHeaders";
+    tableGroupHeaders.style.display = "none";
+    tableHeaders.parentElement.insertBefore(tableGroupHeaders, tableHeaders);
     const tableBody = document.getElementById("tableBody");
     const loader = document.getElementById("loader");
     const noDataView = document.getElementById("noDataView");
@@ -584,7 +592,10 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function getCommissionCacheKey() {
-        return `commission_api_cache_v2:${state.activeYear}:${state.activeMonth}:${state.activeAgentType}`;
+        // v3: v2 payloads predate the basic_nfp "system_details" map, and the
+        // client cache lives for 6 hours -- without the bump a returning
+        // browser keeps rendering a payload with no panel/phase data.
+        return `commission_api_cache_v3:${state.activeYear}:${state.activeMonth}:${state.activeAgentType}`;
     }
 
     function loadCachedCommissionPayload() {
@@ -626,8 +637,11 @@ document.addEventListener("DOMContentLoaded", () => {
             if (!bootId) return;
             const storedBootId = localStorage.getItem("dashboard_server_boot_id");
             if (storedBootId !== bootId) {
+                // Version-agnostic on purpose: pinning the prefix to one cache
+                // version silently stops the eviction the day the version is
+                // bumped, and leaves the superseded entries behind forever.
                 Object.keys(localStorage)
-                    .filter(k => k.startsWith("commission_api_cache_v2:"))
+                    .filter(k => k.startsWith("commission_api_cache_"))
                     .forEach(k => localStorage.removeItem(k));
                 localStorage.setItem("dashboard_server_boot_id", bootId);
             }
@@ -872,8 +886,34 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // Combines an Internal and an Outsource commission payload into one
     // payload for the "All Agents" view.
+    // Customer -> invoice system details, combined across both agent types.
+    // Each side is keyed by lowercased customer name; an invoice present in
+    // both payloads is kept once so a customer never lists it twice.
+    function mergeSystemDetails(a, b) {
+        const merged = {};
+        [a, b].forEach(map => {
+            Object.keys(map || {}).forEach(key => {
+                const list = merged[key] || (merged[key] = []);
+                (map[key] || []).forEach(entry => {
+                    const dup = entry && entry.invoice
+                        && list.some(e => e.invoice === entry.invoice);
+                    if (!dup) list.push(entry);
+                });
+            });
+        });
+        return merged;
+    }
+
     function mergeCommissionPayloads(internalData, outsourceData) {
         const basicNfp = unionMergeSections(internalData?.sections?.basic_nfp, outsourceData?.sections?.basic_nfp);
+        // unionMergeSections rebuilds the section as bare {headers, rows}, so
+        // anything else it carried is lost unless re-attached. Without this the
+        // Customer hover has no data under "All Agents", and the Balance Payout
+        // filter silently falls back to the column that holds the 100% date.
+        basicNfp.system_details = mergeSystemDetails(
+            internalData?.sections?.basic_nfp?.system_details,
+            outsourceData?.sections?.basic_nfp?.system_details
+        );
         const agentSummaryMerged = unionMergeSections(internalData?.sections?.agent_summary, outsourceData?.sections?.agent_summary, agentSummaryHeaderAlias);
         const referralFeeByAgent = computeReferralFeeByAgent(basicNfp);
         return {
@@ -1587,6 +1627,216 @@ modalPackageType.value = defaults.pkg || "-";
         return commType.includes("basic") || commType.includes("net floor") || commType.includes("netfloor");
     }
 
+    // Payout Stage classification, shared by the detail table and the total
+    // cards so the two can never disagree about which rows are in a stage.
+    function payoutStageIndexes(headers) {
+        return {
+            rm300: headers.findIndex(h => h.toLowerCase().includes("rm300") || h.toLowerCase().includes("basic commission (rm")),
+            pct75: headers.findIndex(h => h.toLowerCase().includes("75%") || h.toLowerCase().includes("75 %")),
+            comm: headers.findIndex(h => {
+                const n = String(h).toLowerCase().trim();
+                return n === "commission" || n === "commission type";
+            }),
+            price: headers.findIndex(h => h.toLowerCase().trim() === "commission price"),
+            customer: headers.findIndex(h => h.toLowerCase().trim() === "customer")
+        };
+    }
+
+    // The real 75% milestone for a customer's invoice. The "75% Payment Date"
+    // column cannot supply it: that column is filled from the invoice's
+    // full_payment_date (the 100% date), so an invoice that reached 75% but not
+    // 100% reads "pending" there and would drop out of the balance run
+    // entirely. Served by app.py's system_details, matched on customer name.
+    function realPct75Date(customerName) {
+        const details = state.rawData?.sections?.basic_nfp?.system_details;
+        const key = String(customerName || "").trim().toLowerCase();
+        if (!details || !key) return "";
+        const entries = details[key];
+        return entries && entries.length ? String(entries[0].pct75_date || "") : "";
+    }
+
+    // The 75% milestone must land in the month being reported. An invoice that
+    // reached 5% this month but whose balance is due in a later month is still
+    // only paying its advance today, so it is not a balance payout yet.
+    function milestoneLandsInActiveMonth(dateText) {
+        const m = /^(\d{4})-(\d{2})-\d{2}$/.exec(String(dateText || "").trim());
+        if (!m) return false;
+        return parseInt(m[1], 10) === parseInt(state.activeYear, 10)
+            && parseInt(m[2], 10) === parseInt(state.activeMonth, 10);
+    }
+
+    function rowPassesPayoutStage(rawRow, idx, stage) {
+        if (idx.rm300 === -1) return true;
+        const rm300v = String(rawRow[idx.rm300] || "").trim().toLowerCase();
+        if (stage === "advance") {
+            // Pre-July invoices predate the two-stage policy and never receive
+            // an advance -- they pay in full at their milestone instead.
+            return rm300v !== "" && rm300v !== "-" && rm300v !== "pending" && rm300v !== "invoice before july";
+        }
+        // Both commission kinds settle at the 75% milestone, so both belong in
+        // the balance run: Basic pays whatever the advance did not cover, and
+        // NFP (never advanced at all) pays in full -- possibly as a deduction.
+        const kind = idx.comm !== -1 ? String(rawRow[idx.comm] || "").trim().toLowerCase() : "";
+        const isCommissionRow = !kind || kind.includes("basic")
+            || kind.includes("net floor") || kind.includes("netfloor");
+        if (!isCommissionRow) return false;
+        // "pending" means the 5% milestone has not triggered, so nothing is
+        // payable yet. Pre-July invoices DO belong here: they never received an
+        // advance, so their full commission is settled at the 75% milestone.
+        if (rm300v === "pending") return false;
+        if (idx.pct75 === -1) return false;
+        // A Basic Commission row of a July 2026+ invoice settles at 75%, so it
+        // is tested against the real milestone rather than the column (which
+        // holds the 100% date and would hide an invoice sitting between the
+        // two). Everything else is correctly served by the column: a pre-July
+        // invoice settles at 100%, and so does NFP, which is never advanced.
+        let milestoneDate = rawRow[idx.pct75];
+        if (kind.includes("basic") && rm300v !== "invoice before july") {
+            const real = idx.customer === -1 ? "" : realPct75Date(rawRow[idx.customer]);
+            if (real) milestoneDate = real;
+        }
+        if (!milestoneLandsInActiveMonth(milestoneDate)) return false;
+        const price = idx.price !== -1 ? String(rawRow[idx.price] || "").trim().toLowerCase() : "";
+        return price !== "" && price !== "-" && !price.includes("pending");
+    }
+
+    // Under "Advance RM 300" a Basic Commission row owes only its advance, not
+    // the invoice's full commission -- the two differ when an invoice clears
+    // both milestones in one month. The numeric twin of advanceOnlyPrice (which
+    // works on cell text so the table keeps the payload's formatting).
+    function advanceCappedValue(rawRow, idx, fullValue) {
+        if (idx.comm !== -1 && !String(rawRow[idx.comm] || "").toLowerCase().includes("basic")) return fullValue;
+        const advance = idx.rm300 === -1 ? 0 : parseMoneyValue(rawRow[idx.rm300]);
+        if (!advance || !fullValue || advance >= fullValue) return fullValue;
+        return advance;
+    }
+
+    // The mirror of advanceCappedValue: what the balance run still owes once the
+    // advance is taken off. It only bites when an invoice clears BOTH milestones
+    // in the same month -- that is the only case where the row carries a live
+    // RM300 cell and also qualifies for the balance, and paying the full
+    // commission there would hand over the RM 300 advance a second time. When
+    // the advance went out in an earlier month the cell reads "-", and a
+    // pre-July invoice reads "invoice before july"; both parse to 0, leaving
+    // the full amount alone.
+    function balanceRemainderValue(rawRow, idx, fullValue) {
+        if (idx.comm !== -1 && !String(rawRow[idx.comm] || "").toLowerCase().includes("basic")) return fullValue;
+        const advance = idx.rm300 === -1 ? 0 : parseMoneyValue(rawRow[idx.rm300]);
+        if (!advance || !fullValue || advance >= fullValue) return fullValue;
+        return fullValue - advance;
+    }
+
+    // A special case appends "New ..." rows next to the invoice's originals, so
+    // summing a column blind counts that invoice at both the old rate and the
+    // new one. Returns a predicate spotting the originals that were superseded.
+    function makeIsReplacedPredicate(processed, commIdx) {
+        const supersededKeys = new Set();
+        (processed || []).forEach(p => {
+            if (p.isSpecialCase && !p.isTotalRow) {
+                supersededKeys.add(`${String(p.fullAgentName).toLowerCase()}||${String(p.customerName).toLowerCase()}`);
+            }
+        });
+        if (supersededKeys.size === 0) return () => false;
+        return (p) => supersededKeys.has(`${String(p.fullAgentName).toLowerCase()}||${String(p.customerName).toLowerCase()}`)
+            && isSupersededOriginalRow(p, commIdx);
+    }
+
+    // Override money always sits on the DOWNLINE agent's detail row while
+    // belonging to their upline, and the detail table spells the recipient two
+    // different ways. This one is the cell text: "RM 85.00 (Sunny Tan)" is
+    // Sunny Tan's, which the rollup states as "RM 85.00 override from
+    // Zulkarnain" on Sunny Tan's own row. Credits each amount to the agent
+    // named in trailing parentheses, falling back to the row's agent.
+    function creditOtherCommissionCell(cellText, rowAgentKey, credit) {
+        const text = String(cellText || "").trim();
+        if (!text || text === "-") return;
+        text.split(/<br\s*\/?>/i).forEach(part => {
+            const amount = parseMoneyValue(part);
+            if (!amount) return;
+            const named = /\(([^()]+)\)\s*$/.exec(part.trim());
+            credit(named ? named[1].trim().toLowerCase() : rowAgentKey, amount);
+        });
+    }
+
+    // The other spelling: an OGM's override is a whole column named after them
+    // ("Gan Lai Soon") on every other agent's row, and the money is the OGM's
+    // own Other Commission -- again how the rollup already reports it. Matching
+    // against agents that actually have a summary row keeps a name deliberately
+    // kept out of these reports (Safwan) from being resurrected by its column.
+    function overrideColumnsByAgent(headers) {
+        const summaryAgents = new Set();
+        ((state.rawData?.sections?.agent_summary?.rows) || []).forEach(r => {
+            const v = String((r || [])[0] || "").trim().toLowerCase();
+            if (v) summaryAgents.add(v);
+        });
+        const found = [];
+        (headers || []).forEach((h, i) => {
+            const name = String(h || "").toLowerCase().replace(/\(\s*rm\s*\)/g, "").trim();
+            if (name && summaryAgents.has(name)) found.push({ idx: i, agent: name });
+        });
+        return found;
+    }
+
+    // Per-agent figures for the detail rows a filter left visible. The Summary
+    // Agent Commission rollup is a whole-month figure built server side, so
+    // under the search box or a Payout Stage it has to be recomputed from the
+    // surviving rows or it contradicts the table beneath it. Keyed by
+    // lowercased agent name.
+    function buildFilteredAgentStats(visibleProcessed, creditProcessed, headers) {
+        const idx = payoutStageIndexes(headers);
+        const otherIdx = headers.findIndex(h => h.toLowerCase().trim() === "override");
+        const overrideCols = overrideColumnsByAgent(headers);
+        const isReplaced = makeIsReplacedPredicate(visibleProcessed, idx.comm);
+        const stats = new Map();
+        const entryFor = (key) => {
+            if (!stats.has(key)) {
+                stats.set(key, { commission: 0, basic: 0, nfp: 0, other: 0, customers: new Set(), ownRows: 0 });
+            }
+            return stats.get(key);
+        };
+
+        // Commission and customers come from what the filters left on screen.
+        (visibleProcessed || []).forEach(p => {
+            if (p.isTotalRow) return;
+            const entry = entryFor(String(p.fullAgentName).toLowerCase().trim());
+            entry.ownRows++;
+
+            // Counted per distinct customer, not per row: an invoice carries a
+            // Basic and an NFP row, and both stages can surface both.
+            const cust = String(p.customerName || "").trim();
+            const custLower = cust.toLowerCase();
+            if (cust && cust !== "-" && !custLower.includes("total") && !custLower.includes("summary")) {
+                entry.customers.add(custLower);
+            }
+
+            if (isReplaced(p) || idx.price === -1) return;
+            let val = parseMoneyValue(p.rawRow[idx.price]);
+            if (state.filters.payoutStage === "advance") val = advanceCappedValue(p.rawRow, idx, val);
+            else if (state.filters.payoutStage === "balance") val = balanceRemainderValue(p.rawRow, idx, val);
+            entry.commission += val;
+            // Split the same way the hover breakdown reports it.
+            const kind = idx.comm === -1 ? "" : String(p.rawRow[idx.comm] || "").toLowerCase();
+            if (kind.includes("basic")) entry.basic += val;
+            else if (kind.includes("net floor") || kind.includes("netfloor")) entry.nfp += val;
+        });
+
+        // Override credits are read from a wider set of rows -- the recipient is
+        // normally not the agent whose row carries the money, so the search must
+        // not hide it -- and both spellings credit the RECIPIENT, never the row.
+        (creditProcessed || []).forEach(p => {
+            if (p.isTotalRow) return;
+            const credit = (agentKey, amount) => { entryFor(agentKey).other += amount; };
+            if (otherIdx !== -1) {
+                creditOtherCommissionCell(p.rawRow[otherIdx], String(p.fullAgentName).toLowerCase().trim(), credit);
+            }
+            overrideCols.forEach(col => {
+                const amount = parseMoneyValue(p.rawRow[col.idx]);
+                if (amount) credit(col.agent, amount);
+            });
+        });
+        return stats;
+    }
+
     // The three commission totals are a whole-month figure, not a property of
     // whichever table is on screen, so every section shows the same cards. They
     // are rebuilt from the basic_nfp payload rather than the active section's
@@ -1621,7 +1871,7 @@ modalPackageType.value = defaults.pkg || "-";
         renderBasicNfpTotalCards(built.processed, built.headers);
     }
 
-    function renderBasicNfpTotalCards(processed, headers) {
+    function renderBasicNfpTotalCards(processed, headers, agentStats, agentsInView) {
         if (!rateCardsContainer) return;
         rateCardsContainer.innerHTML = "";
         rateCardsContainer.classList.remove("hidden");
@@ -1629,26 +1879,39 @@ modalPackageType.value = defaults.pkg || "-";
         let totalCommission = 0, totalOtherCommission = 0, totalReferralFee = 0;
 
         const commPriceIdx = headers.findIndex(h => h.toLowerCase().trim() === "commission price");
-        const otherCommIdx = headers.findIndex(h => h.toLowerCase().trim() === "other commission");
+        const otherCommIdx = headers.findIndex(h => h.toLowerCase().trim() === "override");
         const referralFeeIdx = headers.findIndex(h => h.toLowerCase().trim() === "referral fee");
         const commIdx = headers.findIndex(h => {
             const n = String(h).toLowerCase().trim();
             return n === "commission" || n === "commission type";
         });
+        const stageIdx = payoutStageIndexes(headers);
+        const rm300ColIdx = stageIdx.rm300;
 
-        // agent||customer of every invoice a special case has replaced.
-        const supersededKeys = new Set();
-        (processed || []).forEach(p => {
-            if (p.isSpecialCase && !p.isTotalRow) {
-                supersededKeys.add(`${String(p.fullAgentName).toLowerCase()}||${String(p.customerName).toLowerCase()}`);
-            }
-        });
+        const isReplaced = makeIsReplacedPredicate(processed, commIdx);
 
-        const isReplaced = (p) => supersededKeys.size > 0
-            && supersededKeys.has(`${String(p.fullAgentName).toLowerCase()}||${String(p.customerName).toLowerCase()}`)
-            && isSupersededOriginalRow(p, commIdx);
+        // On the Basic & NFP tab, the search box and Payout Stage filter should
+        // narrow these cards to match the detail table below them (so picking
+        // "Advance RM 300" shows the advance total, not the whole month's). Every
+        // other tab keeps showing the whole month's figure, same as before.
+        const payoutStageOn = state.activeSection === "basic_nfp"
+            && state.filters.payoutStage !== "all"
+            && parseInt(state.activeMonth) >= 7
+            && rm300ColIdx !== -1;
+        const searchOn = state.activeSection === "basic_nfp" && !!state.filters.search;
+        const filtersActive = payoutStageOn || searchOn;
 
-        if (state.activeAgentType === "all") {
+        const passesPayoutStage = (rawRow) =>
+            rowPassesPayoutStage(rawRow, stageIdx, state.filters.payoutStage);
+
+        const isVisible = (p) => {
+            if (!filtersActive) return true;
+            if (searchOn && !matchesSearch(p.fullAgentName, p.customerName)) return false;
+            if (payoutStageOn && !passesPayoutStage(p.rawRow)) return false;
+            return true;
+        };
+
+        if (state.activeAgentType === "all" && !filtersActive) {
             // "All" sources the cards from the Summary Agent Commission rollup
             // (agent_summary) rather than the raw basic_nfp detail rows. That
             // rollup is built server-side from the ORIGINAL invoices, so it is
@@ -1665,13 +1928,33 @@ modalPackageType.value = defaults.pkg || "-";
                 else if (isReplaced(p)) totalCommission -= parseMoneyValue(p.rawRow[commPriceIdx]);
             });
         } else {
+            // With a filter active (or a single agent type), the rollup above
+            // can't be sliced by row, so sum the visible detail rows directly.
             (processed || []).forEach(p => {
                 if (p.isTotalRow) return;
                 if (isReplaced(p)) return;
-                if (commPriceIdx !== -1) totalCommission += parseMoneyValue(p.rawRow[commPriceIdx]);
-                if (otherCommIdx !== -1) totalOtherCommission += parseMoneyValue(p.rawRow[otherCommIdx]);
+                if (!isVisible(p)) return;
+                if (commPriceIdx !== -1) {
+                    let val = parseMoneyValue(p.rawRow[commPriceIdx]);
+                    if (payoutStageOn && state.filters.payoutStage === "advance") val = advanceCappedValue(p.rawRow, stageIdx, val);
+                    else if (payoutStageOn && state.filters.payoutStage === "balance") val = balanceRemainderValue(p.rawRow, stageIdx, val);
+                    totalCommission += val;
+                }
+                if (otherCommIdx !== -1 && !agentStats) totalOtherCommission += parseMoneyValue(p.rawRow[otherCommIdx]);
                 if (referralFeeIdx !== -1) totalReferralFee += parseMoneyValue(p.rawRow[referralFeeIdx]);
             });
+
+            // Other Commission follows the RECIPIENT, not the row it sits on:
+            // the RM 85.00 written on Zulkarnain's row is Sunny Tan's money, so
+            // filtering to Zulkarnain owes RM 0 and filtering to Sunny Tan owes
+            // RM 85.00. Summing the visible rows' cells would report the exact
+            // opposite, so the per-agent credits are used instead.
+            if (agentStats) {
+                totalOtherCommission = 0;
+                agentStats.forEach((s, name) => {
+                    if (!agentsInView || agentsInView.has(name)) totalOtherCommission += s.other;
+                });
+            }
         }
 
         function makeTotalCard(label, value) {
@@ -1833,8 +2116,12 @@ modalPackageType.value = defaults.pkg || "-";
         if (!el || !info) return;
         const safeTitle = escapeHtml(info.title);
         const safeFormula = escapeHtml(info.formula);
+        // `preformula` is raw HTML placed above the formula line -- the payment
+        // milestone dates sit there so they read before the calculation they
+        // gate, rather than being buried under it.
         el.innerHTML = `
             <div class="tooltip-header">${safeTitle}</div>
+            ${info.preformula ? `<div class="tooltip-subtext">${info.preformula}</div>` : ""}
             <div class="tooltip-formula">${safeFormula}</div>
             ${info.subtext ? `<div class="tooltip-subtext">${info.subtext}</div>` : ""}
         `;
@@ -1856,6 +2143,99 @@ modalPackageType.value = defaults.pkg || "-";
     function hideCommCalcTooltip() {
         const el = getOrCreateCommCalcTooltip();
         if (el) el.classList.remove("visible");
+    }
+
+    // Hover breakdown for a Commission Price cell the filters have restated.
+    // Same shape as the unfiltered one in getCommissionCalcBreakdown (Basic +
+    // Net Floor Price, then the total) -- only the figures differ, because the
+    // rollup's whole-month numbers would contradict the restated cell.
+    function getStageCommissionBreakdown(agentName, stats) {
+        if (!stats || stats.ownRows === 0) return null;
+        return {
+            title: `Commission Price Breakdown — ${agentName || "Agent"}`,
+            formula: `Total Commission Price = Basic Commission + Net Floor Price Commission`,
+            subtext: `
+                <div style="display:flex; justify-content:space-between; gap:20px; margin-bottom:4px;">
+                    <span>Basic Commission:</span> <strong>${formatRM(stats.basic)}</strong>
+                </div>
+                <div style="display:flex; justify-content:space-between; gap:20px; margin-bottom:6px;">
+                    <span>Net Floor Price Commission:</span> <strong>${formatRM(stats.nfp)}</strong>
+                </div>
+                <div style="display:flex; justify-content:space-between; gap:20px; padding-top:6px; border-top:1px solid rgba(255,255,255,0.2); font-weight:700; color:#4ade80;">
+                    <span>Total Commission Price:</span> <span>${formatRM(stats.commission)}</span>
+                </div>
+            `
+        };
+    }
+
+    // Customer-column hover on the Basic & NFP table: the panels and the supply
+    // phase for that customer's invoice(s), served by app.py's system_details.
+    // A customer with more than one invoice gets a line each rather than a
+    // merged figure, since the panel counts belong to separate systems.
+    function getCustomerSystemTooltip(customerName) {
+        const map = state.rawData?.sections?.basic_nfp?.system_details;
+        const name = String(customerName || "").trim();
+        if (!map || !name) return null;
+        const entries = map[name.toLowerCase()];
+        if (!entries || !entries.length) return null;
+        const lines = entries.map(e => {
+            const panel = e.panel_qty && e.panel_rating
+                ? `${e.panel_qty}X ${e.panel_rating}W${e.brand ? ` ${e.brand}` : ""}`
+                : "-";
+            return `<div style="display:flex; justify-content:space-between; gap:20px; margin-bottom:4px;">
+                    <span>${escapeHtml(panel)}</span> <strong>${escapeHtml(e.phase || "-")}</strong>
+                </div>`;
+        }).join("");
+        return {
+            title: `System Details — ${name}`,
+            formula: entries.length > 1 ? `${entries.length} invoices` : "Panels · Phase",
+            subtext: lines
+        };
+    }
+
+    // Payment milestones for a Basic Commission row, rendered above the formula.
+    //
+    // The advance triggers on the 1st Payment Date. The balance triggers at 75%
+    // for invoices under the multi-stage policy (July 2026+); a pre-July invoice
+    // was never advanced at all and settles in full at 100% instead, so it gets
+    // the single 100% line.
+    //
+    // The 75% date is read from system_details, NOT from the row: the column
+    // headed "75% Payment Date" is filled from the invoice's full_payment_date,
+    // so an invoice that reached 75% but not 100% shows "pending" there. That
+    // same column IS the right source for the pre-July 100% line.
+    function getBasicMilestoneLines(row, headers, custName) {
+        const findIdx = (pred) => headers.findIndex(h => pred(String(h).toLowerCase().trim()));
+        const firstPayIdx = findIdx(n => n === "1st payment date");
+        const rm300Idx = findIdx(n => n.includes("rm300") || n.includes("basic commission (rm"));
+        const payDateIdx = findIdx(n => n === "75% payment date" || n === "full payment date");
+        if (firstPayIdx === -1 && payDateIdx === -1) return "";
+
+        const cell = (i) => (i === -1 ? "" : String(row[i] || "").trim());
+        const isPreJuly = cell(rm300Idx).toLowerCase() === "invoice before july";
+
+        let payoutDate;
+        if (isPreJuly) {
+            payoutDate = cell(payDateIdx);
+        } else {
+            const details = state.rawData?.sections?.basic_nfp?.system_details;
+            const entries = details ? details[String(custName || "").toLowerCase().trim()] : null;
+            payoutDate = entries && entries.length ? entries[0].pct75_date : "";
+        }
+
+        const shown = (v) => {
+            const s = String(v || "").trim();
+            return !s || s === "-" ? "pending" : s;
+        };
+        const line = (label, value) => `
+            <div style="display:flex; justify-content:space-between; gap:20px; margin-bottom:4px;">
+                <span>${label}:</span> <strong>${escapeHtml(shown(value))}</strong>
+            </div>`;
+
+        const out = [];
+        if (!isPreJuly) out.push(line("Advance RM 300 (1st Payment)", cell(firstPayIdx)));
+        out.push(line(isPreJuly ? "Payout (100% Payment)" : "Balance Payout (75% Payment)", payoutDate));
+        return out.join("");
     }
 
     function getCommissionCalcBreakdown(row, headers, agentName, custName, ri, rowsList) {
@@ -1959,9 +2339,11 @@ modalPackageType.value = defaults.pkg || "-";
 
         // 1. Basic Commission
         if (commTypeLower.includes("basic commission")) {
+            const milestones = getBasicMilestoneLines(row, headers, custName);
             if (row.specialCaseData) {
                 return {
                     title: `Basic Commission — ${custName || "Special Case"}`,
+                    preformula: milestones,
                     formula: `Sales Price = Total Amount - EPP Effective`,
                     subtext: `Basic Commission = Sales Price × Rate % = ${fmtNum(sales)} × Rate = ${commValStr}` + clickTip
                 };
@@ -1970,12 +2352,14 @@ modalPackageType.value = defaults.pkg || "-";
                 const ratePct = ((commPrice / sales) * 100).toFixed(2);
                 return {
                     title: `Basic Commission — ${custName}`,
+                    preformula: milestones,
                     formula: `Sales Price = Total Amount - EPP Effective`,
                     subtext: `Basic Commission = Sales Price × Rate % = ${fmtNum(sales)} × ${ratePct}% = ${commValStr}` + clickTip
                 };
             }
             return {
                 title: `Basic Commission — ${custName}`,
+                preformula: milestones,
                 formula: `Sales Price = Total Amount - EPP Effective`,
                 subtext: `Basic Commission = Sales Price × Rate % = ${commValStr || "Standard Rate"}` + clickTip
             };
@@ -2040,23 +2424,40 @@ modalPackageType.value = defaults.pkg || "-";
     // ------------------------------------------------------------------
     // Agent Summary Inline Renderer
     // ------------------------------------------------------------------
-    function renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents) {
+    function renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents, filteredAgentStats, agentRemarks) {
         const headers = agSummarySection.headers;
         const agentColIdx = headers.findIndex(h => h.toLowerCase().trim() === "agent");
         const totalInvColIdx = getCountColumnIdx(headers);
         const overrideColIdx = headers.findIndex(h => h.toLowerCase().includes("override"));
         const referralFeeColIdx = headers.findIndex(h => h.toLowerCase().trim() === "referral fee");
+        // Dropped from this table only -- the columns stay in the payload (and
+        // in the detail table below), they are just not rendered here. Skipping
+        // them at render time keeps every index-based merge/rowspan pass below
+        // working against the payload's own column positions.
+        const HIDDEN_SUMMARY_HEADERS = ["package type", "system price", "net floor price"];
+        const hiddenSummaryCols = new Set(
+            headers.reduce((acc, h, i) => {
+                if (HIDDEN_SUMMARY_HEADERS.includes(String(h).toLowerCase().trim())) acc.push(i);
+                return acc;
+            }, [])
+        );
 
         const userObj = USER_ROLES[state.currentUser];
         const originalRows = agSummarySection.rows;
-        // Payout Stage filter: the summary rolls up the detail table, so when a
-        // stage is selected only agents with at least one detail row in that
-        // stage stay. `visibleAgents` is built from the detail rows AFTER all
-        // filters (including the stage), so membership is exactly that test.
-        const payoutStageOn = state.filters.payoutStage !== "all"
-            && parseInt(state.activeMonth) >= 7;
-        const visibleAgentsLower = payoutStageOn
-            ? new Set([...visibleAgents].map(a => String(a).toLowerCase().trim()))
+        // The summary rolls up the detail table, so whenever a filter narrows
+        // those rows only agents that still have one stay. `visibleAgents` is
+        // built from the detail rows AFTER every filter, so membership is
+        // exactly that test -- and unlike an agent-name match it keeps the
+        // right agent when the search term is a CUSTOMER name. An OGM earns
+        // only via the override column and owns no detail rows at all, so the
+        // stats map (which credits them) is what keeps their row alive.
+        const visibleAgentsLower = filteredAgentStats
+            ? new Set([
+                ...[...visibleAgents].map(a => String(a).toLowerCase().trim()),
+                ...[...filteredAgentStats.entries()]
+                    .filter(([name, s]) => s.ownRows === 0 && s.other !== 0 && matchesSearch(name, ""))
+                    .map(([name]) => name)
+            ])
             : null;
         const rows = [];
         const fullAgentNames = [];
@@ -2068,9 +2469,13 @@ modalPackageType.value = defaults.pkg || "-";
             if (userObj && userObj.filterAgentName !== null) {
                 if (tempCur.toLowerCase().trim() !== userObj.filterAgentName.toLowerCase().trim()) return;
             }
-            // Filter by search box (agent name match)
-            if (!matchesSearch(tempCur, "")) return;
-            if (visibleAgentsLower && !visibleAgentsLower.has(tempCur.toLowerCase().trim())) return;
+            if (visibleAgentsLower) {
+                if (!visibleAgentsLower.has(tempCur.toLowerCase().trim())) return;
+            } else if (!matchesSearch(tempCur, "")) {
+                // Callers without per-agent stats (other sections) keep the
+                // original agent-name-only search behaviour.
+                return;
+            }
             rows.push(r);
             fullAgentNames.push(tempCur);
         });
@@ -2093,13 +2498,17 @@ modalPackageType.value = defaults.pkg || "-";
         const thead = document.createElement("thead");
         const trHead = document.createElement("tr");
         const tableHeaders = [...headers, "Action"];
-        headers.forEach(h => {
+        headers.forEach((h, ci) => {
+            if (hiddenSummaryCols.has(ci)) return;
             const th = document.createElement("th");
             th.textContent = h;
             if (isNumericHeader(h)) th.classList.add("numeric");
             else if (isDateHeader(h)) th.classList.add("date");
             trHead.appendChild(th);
         });
+        const thRemark = document.createElement("th");
+        thRemark.textContent = "Remark";
+        trHead.appendChild(thRemark);
         const thAction = document.createElement("th");
         thAction.textContent = "Action";
         thAction.style.textAlign = "center";
@@ -2147,12 +2556,39 @@ modalPackageType.value = defaults.pkg || "-";
                 fi = fj;
             }
         }
+        // While a filter is narrowing the detail rows, the rollup's whole-month
+        // Commission Price, Count of Customer and Other Commission are replaced
+        // by the figures for what survived -- before the merge pass runs, so
+        // rowspans and the hover breakdown both read the value on screen. The
+        // restated Other Commission is a bare total: the rollup's per-source
+        // wording ("override from Ng Zhan Yi") describes the whole month and
+        // would no longer match the amount beside it.
+        const commPriceColIdx = headers.findIndex(h => h.toLowerCase().trim() === "commission price");
+        const otherCommColIdx = headers.findIndex(h => h.toLowerCase().trim() === "other commission");
         const cellGrid = [];
         for (let ri = 0; ri < N; ri++) {
-            cellGrid.push(rows[ri].map(val => ({
-                value: val === null || val === undefined || String(val).trim() === "" ? "-" : String(val),
-                rowspan: 1, visible: true
-            })));
+            const agentStats = filteredAgentStats
+                ? filteredAgentStats.get(String(fullAgentNames[ri]).toLowerCase().trim())
+                : null;
+            cellGrid.push(rows[ri].map((val, ci) => {
+                if (agentStats && ci === commPriceColIdx) {
+                    // An override-only agent (an OGM) has no invoices of their
+                    // own; the rollup writes "-" rather than RM 0.00 there.
+                    const commission = agentStats.ownRows === 0 ? "-" : formatRM(agentStats.commission);
+                    return { value: commission, rowspan: 1, visible: true };
+                }
+                if (agentStats && ci === totalInvColIdx) {
+                    return { value: String(agentStats.customers.size), rowspan: 1, visible: true };
+                }
+                if (agentStats && ci === otherCommColIdx) {
+                    const other = agentStats.other === 0 ? "-" : formatRM(agentStats.other);
+                    return { value: other, rowspan: 1, visible: true };
+                }
+                return {
+                    value: val === null || val === undefined || String(val).trim() === "" ? "-" : String(val),
+                    rowspan: 1, visible: true
+                };
+            }));
         }
         const _pkgCol = headers.findIndex(h => h.toLowerCase().includes("package"));
         const colsToMerge = [];
@@ -2200,6 +2636,7 @@ modalPackageType.value = defaults.pkg || "-";
             if (rc) tr.className = rc;
             for (let ci = 0; ci < headers.length; ci++) {
                 const cellVal = row[ci];
+                if (hiddenSummaryCols.has(ci)) continue;
                 if (ci === agentColIdx && !agentVisible[ri]) continue;
                 if (ci === totalInvColIdx && !totalInvVisible[ri]) continue;
                 if (ci === referralFeeColIdx && !referralFeeVisible[ri]) continue;
@@ -2216,8 +2653,17 @@ modalPackageType.value = defaults.pkg || "-";
                 else if (isDateHeader(colHeader)) td.classList.add("date");
                 if (ci === overrideColIdx && cellGrid[ri][ci].value !== "-") { td.style.fontWeight = "600"; td.style.color = "#1d4ed8"; }
 
+                // A restated cell itemises the rows it was summed from; an
+                // untouched one keeps the stock whole-month breakdown. Using
+                // the rollup's explanation on a restated figure would describe
+                // a number that is not the one on screen.
                 if (colHeader.toLowerCase().trim() === "commission price") {
-                    const calcInfo = getCommissionCalcBreakdown(row, headers, fullAgentNames[ri], "", ri, rows);
+                    const rowStats = filteredAgentStats
+                        ? filteredAgentStats.get(String(fullAgentNames[ri]).toLowerCase().trim())
+                        : null;
+                    const calcInfo = filteredAgentStats
+                        ? getStageCommissionBreakdown(fullAgentNames[ri], rowStats)
+                        : getCommissionCalcBreakdown(row, headers, fullAgentNames[ri], "", ri, rows);
                     if (calcInfo) {
                         td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, calcInfo));
                         td.addEventListener("mousemove", (e) => moveCommCalcTooltip(e));
@@ -2226,6 +2672,20 @@ modalPackageType.value = defaults.pkg || "-";
                 }
 
                 tr.appendChild(td);
+            }
+
+            // Remark: the distinct Remarks this agent's detail rows carry, so
+            // it narrows with the same filters as the rest of the table. Merged
+            // per agent block like the Agent cell, since it is an agent-level
+            // roll-up rather than a per-row value.
+            if (agentVisible[ri]) {
+                const tdRemark = document.createElement("td");
+                if (agentSpans[ri] > 1) tdRemark.rowSpan = agentSpans[ri];
+                const remarks = agentRemarks
+                    ? agentRemarks.get(String(fullAgentNames[ri]).toLowerCase().trim())
+                    : null;
+                tdRemark.textContent = remarks && remarks.size ? [...remarks].join("; ") : "-";
+                tr.appendChild(tdRemark);
             }
 
             // Action column cell for Monthly Commission Slip
@@ -2273,6 +2733,7 @@ modalPackageType.value = defaults.pkg || "-";
         updateHeaders();
         renderLegend();
         updateNoteBox();
+
 
         if (rm300FilterGroup) {
             // The advance/balance split only exists from July 2026 (the
@@ -2348,6 +2809,7 @@ modalPackageType.value = defaults.pkg || "-";
 
         if (!sectionData || !sectionData.headers || !sectionData.rows || sectionData.rows.length === 0) {
             tableHeaders.innerHTML = ""; tableBody.innerHTML = "";
+            tableGroupHeaders.innerHTML = ""; tableGroupHeaders.style.display = "none";
             noDataView.classList.remove("hidden");
             rowCount.textContent = "0 rows"; totalAgents.textContent = "0"; totalCustomers.textContent = "0";
             renderSectionTotalCards();
@@ -2358,6 +2820,20 @@ modalPackageType.value = defaults.pkg || "-";
         if (state.activeSection === "basic_nfp" && state.specialCaseRowRefs.size === 0) {
             headers = headers.filter(h => h !== "Remarks");
         }
+
+        // Hidden from the Basic & NFP table, but deliberately NOT dropped from
+        // `headers`: the Payout Stage filter reads the RM300 and 75% columns to
+        // decide which rows a stage pays, the Basic Commission hover reads the
+        // 1st Payment Date, and every merge/rowspan pass below is index-based.
+        // Removing them from the array would shift all of that; skipping them
+        // when the cells are emitted changes only what is drawn.
+        const HIDDEN_DETAIL_HEADERS = ["1st payment date", "basic commission (rm300)", "75% payment date"];
+        const hiddenDetailCols = new Set(
+            state.activeSection !== "basic_nfp" ? [] : headers.reduce((acc, h, i) => {
+                if (HIDDEN_DETAIL_HEADERS.includes(String(h).toLowerCase().trim())) acc.push(i);
+                return acc;
+            }, [])
+        );
         const rows = sectionData.rows;
         const isOutsource = state.activeAgentType === "outsource";
         const agentIdx = headers.findIndex(h => h.toLowerCase().trim() === "agent");
@@ -2370,32 +2846,32 @@ modalPackageType.value = defaults.pkg || "-";
         });
         const overrideColIdx = headers.findIndex(h => h.toLowerCase().includes("override"));
         const totalInvColIdx = getCountColumnIdx(headers);
-        const rm300ColIdx = headers.findIndex(h => h.toLowerCase().includes("rm300") || h.toLowerCase().includes("basic commission (rm"));
-        const pct75ColIdx = headers.findIndex(h => h.toLowerCase().includes("75%") || h.toLowerCase().includes("75 %"));
+        const stageIdx = payoutStageIndexes(headers);
+        const rm300ColIdx = stageIdx.rm300;
         const payoutStageActive = state.activeSection === "basic_nfp"
             && state.filters.payoutStage !== "all"
             && parseInt(state.activeMonth) >= 7
             && rm300ColIdx !== -1;
-        const hasRm300Value = (rawRow) => {
-            const v = String(rawRow[rm300ColIdx] || "").trim().toLowerCase();
-            return v !== "" && v !== "-" && v !== "pending" && v !== "invoice before july";
-        };
-        // A balance payout row: a Basic Commission row of a multi-stage (July+)
-        // invoice whose 75% milestone landed this month with money attached.
-        // Pre-July invoices ("invoice before july") pay in full, not a balance;
-        // "pending" in the RM300 cell means even the advance hasn't triggered.
-        const hasBalanceValue = (rawRow) => {
-            const kind = commissionIdx !== -1 ? String(rawRow[commissionIdx] || "").trim().toLowerCase() : "";
-            if (kind && !kind.includes("basic")) return false;
-            const rm300v = String(rawRow[rm300ColIdx] || "").trim().toLowerCase();
-            if (rm300v === "invoice before july" || rm300v === "pending") return false;
-            const p75 = pct75ColIdx !== -1 ? String(rawRow[pct75ColIdx] || "").trim().toLowerCase() : "";
-            if (!p75 || p75 === "-" || p75 === "pending" || !/\d/.test(p75)) return false;
-            const price = commissionPriceIdx !== -1 ? String(rawRow[commissionPriceIdx] || "").trim().toLowerCase() : "";
-            return price !== "" && price !== "-" && !price.includes("pending");
-        };
         const passesPayoutStage = (rawRow) =>
-            state.filters.payoutStage === "advance" ? hasRm300Value(rawRow) : hasBalanceValue(rawRow);
+            rowPassesPayoutStage(rawRow, stageIdx, state.filters.payoutStage);
+
+        // Under "Advance RM 300" the table is the advance payout run, so a Basic
+        // Commission row states the advance payable rather than the invoice's
+        // full commission. The two only differ when an invoice clears both the
+        // 5% and the 75% milestone inside the same month: the full figure is
+        // what the month owes, but it is not what the advance run pays. The
+        // amount is read off the row's own RM300 cell instead of recomputed --
+        // that cell already carries the Data page's advance, which is not always
+        // RM 300 (a commission smaller than the advance is capped to itself).
+        const advanceOnlyPrice = (rawRow, fullPriceText) => {
+            if (commissionIdx !== -1
+                && !String(rawRow[commissionIdx] || "").toLowerCase().includes("basic")) return fullPriceText;
+            const advanceText = String(rawRow[rm300ColIdx] || "").trim();
+            const advance = parseMoneyValue(advanceText);
+            const fullPrice = parseMoneyValue(fullPriceText);
+            if (!advance || !fullPrice || advance >= fullPrice) return fullPriceText;
+            return advanceText;
+        };
 
         let currentAgentName = "", currentCustomerName = "";
         const processedRows = rows.map(row => {
@@ -2447,6 +2923,48 @@ modalPackageType.value = defaults.pkg || "-";
         const visibleAgents = new Set(filteredProcessed.filter(p => !p.isTotalRow && p.fullAgentName).map(p => p.fullAgentName));
         totalAgents.textContent = visibleAgents.size;
 
+        // While a Payout Stage or the search box is narrowing the detail rows,
+        // the summary's Commission Price and Count of Customer are restated
+        // from what survived; unfiltered, the server rollup stands as-is.
+        const summaryFiltersActive = state.activeSection === "basic_nfp"
+            && (payoutStageActive || !!state.filters.search);
+        // Override money is credited to its RECIPIENT, who is normally not the
+        // agent whose row carries it -- searching "Sunny" must still find the
+        // RM 85.00 sitting on Zulkarnain's row. So credits are collected from
+        // the stage-filtered rows BEFORE the search narrows them, then shown
+        // only for the agents actually in view.
+        const stageOnlyProcessed = processedRows.filter(p =>
+            passesFilters(p, false) && (!payoutStageActive || passesPayoutStage(p.rawRow)));
+        const filteredAgentStats = summaryFiltersActive
+            ? buildFilteredAgentStats(filteredProcessed, stageOnlyProcessed, headers)
+            : null;
+        // An agent is in view if they still have detail rows, or if they earn
+        // an override and their own name matches the search (an OGM owns no
+        // detail rows at all, so only the credit keeps their row alive).
+        // Per-agent Remark roll-up for the summary table. Read off the payload's
+        // own headers rather than the local copy, which drops "Remarks" when no
+        // special case is present -- the row arrays keep the column either way.
+        const agentRemarks = new Map();
+        const payloadHeaders = state.rawData?.sections?.basic_nfp?.headers || headers;
+        const remarksIdx = payloadHeaders.findIndex(h => String(h).toLowerCase().trim() === "remarks");
+        if (remarksIdx !== -1) {
+            filteredProcessed.forEach(p => {
+                if (p.isTotalRow) return;
+                const text = String(p.rawRow[remarksIdx] || "").trim();
+                if (!text || text === "-") return;
+                const key = String(p.fullAgentName).toLowerCase().trim();
+                if (!agentRemarks.has(key)) agentRemarks.set(key, new Set());
+                agentRemarks.get(key).add(text);
+            });
+        }
+
+        const agentsInView = new Set([...visibleAgents].map(a => String(a).toLowerCase().trim()));
+        if (filteredAgentStats) {
+            filteredAgentStats.forEach((s, name) => {
+                if (s.ownRows === 0 && s.other !== 0 && matchesSearch(name, "")) agentsInView.add(name);
+            });
+        }
+
         const visibleCustomers = new Set();
         if (customerIdx !== -1) {
             filteredProcessed.forEach(p => {
@@ -2461,19 +2979,72 @@ modalPackageType.value = defaults.pkg || "-";
 
         if (state.activeSection === "basic_nfp") {
             // Unsearched on purpose — see passesFilters above.
-            renderBasicNfpTotalCards(unsearchedProcessed, headers);
+            renderBasicNfpTotalCards(unsearchedProcessed, headers, filteredAgentStats, agentsInView);
         } else {
             renderSectionTotalCards();
         }
 
         tableHeaders.innerHTML = "";
-        headers.forEach(h => {
-            const th = document.createElement("th");
-            th.textContent = h;
-            if (isNumericHeader(h)) th.classList.add("numeric");
-            else if (isDateHeader(h)) th.classList.add("date");
-            tableHeaders.appendChild(th);
-        });
+        tableGroupHeaders.innerHTML = "";
+
+        // "Other Commission" groups OVERRIDE / Safwan / Gan Lai Soon under one
+        // merged header, Basic & NFP detail table only. They are adjacent by
+        // construction (see basic_nfp_headers in app.py), including after a
+        // no-factory-deal month pops Safwan out from between them, so a single
+        // left-to-right scan always finds the whole run, whatever survives.
+        const OTHER_COMMISSION_GROUP_HEADERS = new Set(["override", "safwan (rm)", "gan lai soon"]);
+        const isOtherCommissionHeader = (h) => OTHER_COMMISSION_GROUP_HEADERS.has(String(h).toLowerCase().trim());
+        const useGroupedHeader = state.activeSection === "basic_nfp"
+            && headers.some((h, ci) => !hiddenDetailCols.has(ci) && isOtherCommissionHeader(h));
+
+        if (useGroupedHeader) {
+            tableGroupHeaders.style.display = "";
+            let ci = 0;
+            while (ci < headers.length) {
+                if (hiddenDetailCols.has(ci)) { ci++; continue; }
+                const h = headers[ci];
+                if (isOtherCommissionHeader(h)) {
+                    const runCols = [];
+                    while (ci < headers.length) {
+                        if (hiddenDetailCols.has(ci)) { ci++; continue; }
+                        if (!isOtherCommissionHeader(headers[ci])) break;
+                        runCols.push(ci);
+                        ci++;
+                    }
+                    const groupTh = document.createElement("th");
+                    groupTh.textContent = "Other Commission";
+                    groupTh.colSpan = runCols.length;
+                    groupTh.classList.add("group-header");
+                    tableGroupHeaders.appendChild(groupTh);
+                    runCols.forEach(rc => {
+                        const subH = headers[rc];
+                        const th = document.createElement("th");
+                        th.textContent = subH;
+                        if (isNumericHeader(subH)) th.classList.add("numeric");
+                        else if (isDateHeader(subH)) th.classList.add("date");
+                        tableHeaders.appendChild(th);
+                    });
+                } else {
+                    const th = document.createElement("th");
+                    th.textContent = h;
+                    th.rowSpan = 2;
+                    if (isNumericHeader(h)) th.classList.add("numeric");
+                    else if (isDateHeader(h)) th.classList.add("date");
+                    tableGroupHeaders.appendChild(th);
+                    ci++;
+                }
+            }
+        } else {
+            tableGroupHeaders.style.display = "none";
+            headers.forEach((h, ci) => {
+                if (hiddenDetailCols.has(ci)) return;
+                const th = document.createElement("th");
+                th.textContent = h;
+                if (isNumericHeader(h)) th.classList.add("numeric");
+                else if (isDateHeader(h)) th.classList.add("date");
+                tableHeaders.appendChild(th);
+            });
+        }
         tableBody.innerHTML = "";
         noDataView.classList.add("hidden");
 
@@ -2494,6 +3065,9 @@ modalPackageType.value = defaults.pkg || "-";
                 const addCustBtn = document.createElement("button");
                 addCustBtn.className = "btn btn-primary btn-sm-inline";
                 addCustBtn.innerHTML = '<span class="icon">➕</span> Add Special Case Customer';
+                // "Adds" already implies the customer is missing from the table,
+                // so the reason they are missing is the only thing worth saying.
+                addCustBtn.title = "Adds a customer below the payout threshold — creates both commission rows.";
                 addCustBtn.addEventListener("click", openAddCustomerSpecialCaseModal);
                 actionsGroup.appendChild(addCustBtn);
             }
@@ -2506,9 +3080,9 @@ modalPackageType.value = defaults.pkg || "-";
                 tableContainer.insertBefore(actionsTarget, dataTable);
                 actionsTarget.appendChild(actionsGroup);
 
-                if (hasAgentSummary) renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents);
+                if (hasAgentSummary) renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents, filteredAgentStats, agentRemarks);
             } else {
-                if (hasAgentSummary) renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents);
+                if (hasAgentSummary) renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents, filteredAgentStats, agentRemarks);
 
                 const legendCard = document.getElementById("legendCard");
                 const legendVisible = legendCard && !legendCard.classList.contains("hidden");
@@ -2775,12 +3349,23 @@ modalPackageType.value = defaults.pkg || "-";
 
                 for (let ci = 0; ci < headers.length; ci++) {
                     const cellVal = row[ci];
+                    if (hiddenDetailCols.has(ci)) continue;
                     if (ci === agentIdx && !agentVisible[ri]) continue;
                     if (ci === totalInvColIdx && !totalInvVisible[ri]) continue;
                     if (colsToMerge.includes(ci) && !cellGrid[ri][ci].visible) continue;
                     if (isGroupFollower && specialCaseMergeCols.includes(ci)) continue;
                     const td = document.createElement("td");
-                    const displayVal = cellGrid[ri][ci] ? cellGrid[ri][ci].value : (cellVal === null || cellVal === undefined ? "-" : String(cellVal));
+                    let displayVal = cellGrid[ri][ci] ? cellGrid[ri][ci].value : (cellVal === null || cellVal === undefined ? "-" : String(cellVal));
+                    if (payoutStageActive && state.filters.payoutStage === "advance" && ci === commissionPriceIdx) {
+                        displayVal = advanceOnlyPrice(row, displayVal);
+                    } else if (payoutStageActive && state.filters.payoutStage === "balance" && ci === commissionPriceIdx) {
+                        // Same reasoning as advanceOnlyPrice, from the other end:
+                        // when an invoice clears both milestones in one month the
+                        // balance run owes the commission LESS the advance it
+                        // already paid, not the whole figure.
+                        const remainder = balanceRemainderValue(row, stageIdx, parseMoneyValue(displayVal));
+                        if (remainder !== parseMoneyValue(displayVal)) displayVal = formatRM(remainder);
+                    }
                     td.innerHTML = displayVal;
                     if (ci === agentIdx && displayVal !== "-") td.textContent = resolveAgentName(displayVal);
                     if (ci === agentIdx && agentSpans[ri] > 1) td.rowSpan = agentSpans[ri];
@@ -2791,6 +3376,15 @@ modalPackageType.value = defaults.pkg || "-";
                     if (isNumericHeader(colHeader)) td.classList.add("numeric");
                     else if (isDateHeader(colHeader)) td.classList.add("date");
                     if (ci === overrideColIdx && displayVal !== "-") { td.style.fontWeight = "600"; td.style.color = "#1d4ed8"; }
+
+                    if (ci === customerIdx && !isTotalRow) {
+                        const sysInfo = getCustomerSystemTooltip(custName);
+                        if (sysInfo) {
+                            td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, sysInfo));
+                            td.addEventListener("mousemove", (e) => moveCommCalcTooltip(e));
+                            td.addEventListener("mouseleave", hideCommCalcTooltip);
+                        }
+                    }
 
                     if (isGroupAnchor && ci === nfpIdx) {
                         const secondaryValue = specialCaseGroupNfpByAnchor.get(ri);
@@ -3602,7 +4196,21 @@ modalPackageType.value = defaults.pkg || "-";
 
     function parseMoneyValue(val) {
         if (!val || val === "-") return 0;
-        return parseFloat(String(val).replace(/[^0-9.-]/g, "")) || 0;
+        const text = String(val).trim();
+        // A real amount leads with its figure ("RM 300.00", "-RM 361.62",
+        // "RM 49.50 (Teng Kah Kent)"). Text sentinels like "invoice before
+        // Oct 25" lead with words, and their digits are not money -- stripping
+        // non-numerics blind would read that one as RM 25.
+        if (!/^-?\s*(rm)?\s*-?\s*[\d.]/i.test(text)) return 0;
+        // One cell can carry several amounts -- an agent's Other Commission
+        // lists an override per downline agent, joined by <br/>. The cell's
+        // value is their sum; parsing only the leading figure dropped the rest.
+        // Restricted to RM-prefixed amounts so digits inside a name are ignored.
+        const amounts = text.match(/-?\s*rm\s*-?\s*[\d,]+(?:\.\d+)?/gi);
+        if (amounts && amounts.length > 1) {
+            return amounts.reduce((sum, a) => sum + (parseFloat(a.replace(/[^0-9.-]/g, "")) || 0), 0);
+        }
+        return parseFloat(text.replace(/[^0-9.-]/g, "")) || 0;
     }
 
     function formatRM(value) {
@@ -5095,7 +5703,7 @@ modalPackageType.value = defaults.pkg || "-";
         const refPersonIdx = headers.findIndex(h => h.toLowerCase().includes("referral person") || h.toLowerCase().includes("referral name"));
         const refRateIdx = headers.findIndex(h => h.toLowerCase().includes("referral rate"));
         const refFeeIdx = headers.findIndex(h => h.toLowerCase().includes("referral fee"));
-        const otherCommIdx = headers.findIndex(h => h.toLowerCase().includes("other comm") || h.toLowerCase().includes("other commission"));
+        const otherCommIdx = headers.findIndex(h => h.toLowerCase().includes("other comm") || h.toLowerCase().trim() === "override");
 
         const parseVal = (v) => {
             if (!v || v === "-") return 0;
@@ -5118,6 +5726,36 @@ modalPackageType.value = defaults.pkg || "-";
             }
         });
 
+        // Other Commission belongs to the agent NAMED in the cell -- the
+        // "RM 85.00 (Sunny Tan)" sitting on Zulkarnain's row is Sunny Tan's
+        // money -- and an OGM's override is a whole column named after them.
+        // Same rule the Data page and the summary tables apply, so a slip can
+        // never credit the agent whose row merely carries the amount. Scans
+        // every row, not just this agent's: the override that belongs to them
+        // is by definition written on somebody else's invoice.
+        const slipOverrideCols = overrideColumnsByAgent(headers);
+        const otherCommCredits = [];
+        if (otherCommIdx !== -1 || slipOverrideCols.length) {
+            let rowAgent = "";
+            section.rows.forEach(r => {
+                const a = agentIdx !== -1 && r[agentIdx] ? String(r[agentIdx]).trim() : "";
+                if (a && !a.toLowerCase().includes("total") && !a.toLowerCase().includes("summary")) rowAgent = a;
+                const cust = custIdx !== -1 && r[custIdx] ? String(r[custIdx]).trim() : "";
+                const custLower = cust.toLowerCase();
+                if (!cust || custLower.includes("total") || custLower.includes("summary")) return;
+                const credit = (who, amount) => {
+                    if (cleanAgent(who) === targetClean) {
+                        otherCommCredits.push({ customer: cust, fromAgent: rowAgent, amount });
+                    }
+                };
+                if (otherCommIdx !== -1) creditOtherCommissionCell(r[otherCommIdx], rowAgent, credit);
+                slipOverrideCols.forEach(col => {
+                    const amount = parseMoneyValue(r[col.idx]);
+                    if (amount) credit(col.agent, amount);
+                });
+            });
+        }
+
         let itemNo = 1;
         let totalCommSum = 0;
         const notesList = [];
@@ -5133,7 +5771,10 @@ modalPackageType.value = defaults.pkg || "-";
             customerGroups.get(cust).push(r);
         });
 
-        if (customerGroups.size === 0) {
+        // An OGM sells nothing themselves -- their whole income is the override
+        // column on other agents' invoices -- so "no customers" is only really
+        // an empty slip when there are no credits to them either.
+        if (customerGroups.size === 0 && otherCommCredits.length === 0) {
             tableBody.innerHTML = `<tr><td colspan="10" style="text-align:center; padding:20px; color:#64748b; font-style:italic;">No customer transactions found for ${escapeHtml(resolvedName)} in ${getMonthName(state.activeMonth)} ${state.activeYear}.</td></tr>`;
             document.getElementById("slipTotalComm").textContent = "RM 0.00";
             document.getElementById("slipAmountPayable").textContent = "RM 0.00";
@@ -5160,7 +5801,11 @@ modalPackageType.value = defaults.pkg || "-";
             const refPerson = refPersonIdx !== -1 && basicRow[refPersonIdx] ? String(basicRow[refPersonIdx]).trim() : "-";
             const refRate = refRateIdx !== -1 ? parseVal(basicRow[refRateIdx]) : 0;
             const refFee = refFeeIdx !== -1 ? parseVal(basicRow[refFeeIdx]) : 0;
-            const otherCommVal = otherCommIdx !== -1 ? parseVal(basicRow[otherCommIdx]) : 0;
+            // Only what this customer's invoice credits to THIS agent. An
+            // amount on their row naming someone else is that person's.
+            const otherCommVal = otherCommCredits
+                .filter(c => c.customer === customerName && cleanAgent(c.fromAgent) === targetClean)
+                .reduce((sum, c) => sum + c.amount, 0);
 
             totalCommSum += basicCommVal + otherCommVal;
 
@@ -5204,6 +5849,30 @@ modalPackageType.value = defaults.pkg || "-";
                 tableBody.appendChild(tr2);
             }
 
+            itemNo++;
+        });
+
+        // Overrides earned on OTHER agents' invoices. Those customers are not
+        // this agent's, so they get their own line items rather than being
+        // folded into a customer group that does not belong to them -- and
+        // without these the money would simply vanish from every slip.
+        const externalCredits = otherCommCredits.filter(c => cleanAgent(c.fromAgent) !== targetClean);
+        externalCredits.forEach(c => {
+            totalCommSum += c.amount;
+            const tr = document.createElement("tr");
+            tr.innerHTML = `
+                <td style="text-align: center;">${itemNo}</td>
+                <td><b>${escapeHtml(c.customer)}</b><br/><span style="color:#475569; font-style:italic; font-size:11px;">Override from ${escapeHtml(resolveAgentName(c.fromAgent))}</span></td>
+                <td class="numeric">-</td>
+                <td class="numeric">-</td>
+                <td style="text-align: center;">-</td>
+                <td class="numeric">-</td>
+                <td style="text-align: center;">-</td>
+                <td style="text-align: center;">-</td>
+                <td class="numeric">-</td>
+                <td class="numeric" style="font-weight: 700;">${formatRM(c.amount)}</td>
+            `;
+            tableBody.appendChild(tr);
             itemNo++;
         });
 

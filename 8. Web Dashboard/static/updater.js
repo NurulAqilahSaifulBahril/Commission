@@ -77,10 +77,8 @@
 
         show("available");
         headline.textContent = "Version " + info.latest_version + " is available";
-        sub.textContent = isAdmin
-            ? "You are on v" + info.current_version + "."
-            : "You are on v" + info.current_version + ". Ask an admin to install it.";
-        installBtn.style.display = isAdmin ? "" : "none";
+        sub.textContent = "You are on v" + info.current_version + ".";
+        installBtn.style.display = "";
         installBtn.disabled = false;
         progress.style.display = "none";
 
@@ -96,10 +94,12 @@
     installBtn.addEventListener("click", async () => {
         if (!latest) return;
         const ok = window.confirm(
-            "Install version " + latest.latest_version + "?\n\n" +
-            "The dashboard will download the update, restart itself, and this " +
-            "page will reload automatically. Your data, database and Excel files " +
-            "are not touched."
+            "⚠️  Install version " + latest.latest_version + "?\n\n" +
+            "The dashboard will:\n" +
+            "  • Restart immediately (any unsaved work will be lost)\n" +
+            "  • Download and apply the update\n" +
+            "  • Reload this page automatically\n\n" +
+            "Your database and Excel files are NOT affected."
         );
         if (!ok) return;
 

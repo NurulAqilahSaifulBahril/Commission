@@ -10,7 +10,7 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/styles.css">
 </head>
-<body>
+<body class="report-page">
     <div class="app-container">
         <!-- Sidebar Navigation -->
         <aside class="sidebar">
@@ -108,7 +108,7 @@
                         <span class="icon">🔄</span> Sync Data
                     </button>
                     <button id="downloadPdfBtn" class="btn btn-secondary">
-                        <span class="icon">📄</span> Download PDF
+                        <span class="icon">📄</span> Download Report
                     </button>
                     <button id="downloadExcelBtn" class="btn btn-primary">
                         <span class="icon">📊</span> Download Excel
@@ -459,6 +459,7 @@
                         <div><b>Month:</b> <span id="slipMonthLabel">-</span></div>
                     </div>
                     <div class="slip-date-display">
+                        <div class="slip-paid-stamp">PAID</div>
                         DATE: <span id="slipCurrentDate">-</span>
                     </div>
                 </div>
@@ -506,7 +507,7 @@
     </div>
 
 
-    <script src="/static/app.js?v=20260805-sc-bucket-v1"></script>
+    <script src="/static/app.js?v=20260807-system-details-v1"></script>
     <script src="/static/updater.js?v=20260731-ota-v1"></script>
 </body>
 </html>

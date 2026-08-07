@@ -267,13 +267,13 @@ def _empty_commission_payload(agent_type: str) -> dict:
         headers = [
             "Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date",
             "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission",
-            "Commission Price", "Other Commission", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"
+            "Commission Price", "OVERRIDE", "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee"
         ]
     else:
         headers = [
             "Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date",
             "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission",
-            "Commission Price", "Other Commission", "Referral Name", "Referral Fee", "Safwan (RM)"
+            "Commission Price", "OVERRIDE", "Safwan (RM)", "Referral Name", "Referral Fee"
         ]
 
     return {
@@ -1288,7 +1288,7 @@ def _commission_agent_name_pool(year: int, month: int, agent_type: str) -> list[
             int_ega_t1, int_ega_t2, int_ega_t3, int_ega_h1, int_ega_h2, int_ega_h3 = build_commission_pack.fetch_internal_ega_esa(year, may_only=False)
 
         int_anp_detail_filtered = [r for r in int_anp_detail if build_commission_pack._parse_month(r.get("invoice_date")) == month]
-        int_agent_summary, int_customer_summary, int_agent_anp, int_customer_anp = build_commission_pack.build_internal_summary_tables(
+        int_agent_summary, int_customer_summary, int_agent_anp, int_customer_anp, _int_agent_totals = build_commission_pack.build_internal_summary_tables(
             basic_t1=int_basic_t1,
             basic_lines=int_basic_lines,
             basic_t4=int_basic_t4,
@@ -1324,7 +1324,7 @@ def _commission_agent_name_pool(year: int, month: int, agent_type: str) -> list[
             out_ega_t1, out_ega_t2, out_ega_t3, out_ega_h1, out_ega_h2, out_ega_h3 = build_commission_pack.fetch_outsource_ega_esa(year, may_only=False)
 
         out_anp_detail_filtered = [r for r in out_anp_detail if build_commission_pack._parse_month(r.get("invoice_date")) == month]
-        out_agent_summary, out_customer_summary, out_customer_anp_summary = build_commission_pack.build_outsource_summary_tables(
+        out_agent_summary, out_customer_summary, out_customer_anp_summary, _out_agent_totals = build_commission_pack.build_outsource_summary_tables(
             basic_t1=out_basic_t1,
             basic_lines=out_basic_lines,
             basic_meta=out_basic_meta,
@@ -1364,6 +1364,77 @@ def is_internal_contest_agent(name):
         if int_agent.lower().strip() == clean_name:
             return True
     return False
+
+
+_PANEL_BRAND_RE = re.compile(r"jinko\s*solar|jinkosolar|jinko", re.IGNORECASE)
+
+
+def _panel_brand(package_description: str) -> str:
+    """Brand for the panel line, normalised.
+
+    The source spells it "Jinko", "JinkoSolar" and "JINKO" across invoices, so
+    every variant is reported as one name. Invoices whose package text names no
+    brand return "" and are shown as a bare quantity/rating.
+    """
+    first_line = str(package_description or "").split("\n")[0]
+    return "JinkoSolar" if _PANEL_BRAND_RE.search(first_line) else ""
+
+
+def _phase_label(phase_type) -> str:
+    """"1P (Single Phase)" / "3P (Three Phase)", or "" when SEDA has no record.
+
+    Deliberately NOT defaulting a blank to single phase. The NFP engine treats
+    missing as not-three-phase for its own arithmetic, but printing "1P" for an
+    invoice with no registration on file would state a fact we do not have.
+    """
+    text = str(phase_type or "").strip().lower()
+    if not text:
+        return ""
+    if "three" in text or text in ("3", "3 phase") or text.startswith("3"):
+        return "3P (Three Phase)"
+    if "single" in text or text in ("1", "1 phase") or text.startswith("1"):
+        return "1P (Single Phase)"
+    return ""
+
+
+def _build_system_details(nfp_by_inv_all: dict) -> dict:
+    """customer name (lowercased) -> list of system detail dicts, one per invoice.
+
+    Powers the Customer-column hover on the Basic & NFP table. Keyed off
+    ``nfp_by_inv_all`` rather than the NFP commission report: the report only
+    covers fully-paid invoices (~55% of the table), while this map carries every
+    invoice and matches 100% of the rows on screen.
+    """
+    details: dict = {}
+    for inv in (nfp_by_inv_all or {}).values():
+        customer = str(getattr(inv, "customer_name", "") or "").strip()
+        if not customer:
+            continue
+        qty = getattr(inv, "panel_qty", None)
+        rating = getattr(inv, "panel_rating", None)
+        entry = {
+            "invoice": str(getattr(inv, "invoice_number", "") or ""),
+            "invoice_date": str(getattr(inv, "invoice_date", "") or ""),
+            "panel_qty": int(qty) if qty is not None else None,
+            "panel_rating": int(rating) if rating is not None else None,
+            "brand": _panel_brand(getattr(inv, "package_description", "")),
+            "phase": _phase_label(getattr(inv, "phase_type", None)),
+            # The 75% milestone is NOT on the table row: the column headed
+            # "75% Payment Date" is filled from the invoice's full_payment_date
+            # (the 100% date), so a post-July invoice that reached 75% but not
+            # 100% reads "pending" there. Carried here so the Basic Commission
+            # hover can name the date each tranche actually became payable.
+            "pct75_date": str(getattr(inv, "pct75_date", "") or ""),
+            "full_payment_date": str(getattr(inv, "full_payment_date", "") or ""),
+        }
+        if (entry["panel_qty"] is None and entry["panel_rating"] is None
+                and not entry["phase"] and not entry["pct75_date"]
+                and not entry["full_payment_date"]):
+            continue
+        details.setdefault(customer.lower(), []).append(entry)
+    for rows in details.values():
+        rows.sort(key=lambda e: e.get("invoice_date") or "")
+    return details
 
 
 @app.route("/api/commission")
@@ -1443,7 +1514,7 @@ def get_commission():
             int_anp_detail_filtered = [r for r in int_anp_detail if build_commission_pack._parse_month(r.get("invoice_date")) == month]
 
             # Run build internal summary tables to get customer layout rows
-            int_agent_summary, int_customer_summary, int_agent_anp, int_customer_anp = build_commission_pack.build_internal_summary_tables(
+            int_agent_summary, int_customer_summary, int_agent_anp, int_customer_anp, _int_agent_totals = build_commission_pack.build_internal_summary_tables(
                 basic_t1=int_basic_t1,
                 basic_lines=int_basic_lines,
                 basic_t4=int_basic_t4,
@@ -1459,9 +1530,9 @@ def get_commission():
 
             # Determine headers and pop Safwan column if no factory deal exists
             if month >= 7:
-                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Other Commission", "Referral Name", "Referral Fee", "Safwan (RM)"]
+                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Referral Name", "Referral Fee"]
             else:
-                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Other Commission", "Referral Name", "Referral Fee", "Safwan (RM)"]
+                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Referral Name", "Referral Fee"]
 
             # Extract ANP rows before column removal
             anp_rows = _apply_anp_agent_display_names(int_customer_anp.get(month, []))
@@ -1580,7 +1651,12 @@ def get_commission():
                 if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
 
             sections = {
-                "basic_nfp": {"headers": basic_nfp_headers, "rows": basic_nfp_rows},
+                "basic_nfp": {
+                    "headers": basic_nfp_headers,
+                    "rows": basic_nfp_rows,
+                    # Customer-column hover: panel and phase per invoice.
+                    "system_details": _build_system_details(int_nfp_by_inv_all),
+                },
                 "agent_summary": {"headers": agent_summary_headers, "rows": agent_summary_rows},
                 "anp": {"headers": anp_headers, "rows": anp_rows},
                 "ega_esa": {
@@ -1646,7 +1722,7 @@ def get_commission():
                 })
 
             out_anp_detail_filtered = [r for r in out_anp_detail if build_commission_pack._parse_month(r.get("invoice_date")) == month]
-            out_agent_summary, out_customer_summary, out_customer_anp_summary = build_commission_pack.build_outsource_summary_tables(
+            out_agent_summary, out_customer_summary, out_customer_anp_summary, _out_agent_totals = build_commission_pack.build_outsource_summary_tables(
                 basic_t1=out_basic_t1,
                 basic_lines=out_basic_lines,
                 basic_meta=out_basic_meta,
@@ -1661,9 +1737,9 @@ def get_commission():
             )
 
             if month >= 7:
-                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Other Commission", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
+                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee"]
             else:
-                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Other Commission", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
+                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee"]
 
             out_anp_rows = _apply_anp_agent_display_names(build_anp_customer_rows_custom(
                 anp_summary=out_anp_summary,
@@ -1808,7 +1884,12 @@ def get_commission():
                     if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
 
             sections = {
-                "basic_nfp": {"headers": basic_nfp_headers, "rows": basic_nfp_rows},
+                "basic_nfp": {
+                    "headers": basic_nfp_headers,
+                    "rows": basic_nfp_rows,
+                    # Customer-column hover: panel and phase per invoice.
+                    "system_details": _build_system_details(out_nfp_by_inv_all),
+                },
                 "agent_summary": {"headers": agent_summary_headers, "rows": agent_summary_rows},
                 "anp": {"headers": anp_headers, "rows": out_anp_rows},
                 "ega_esa": {

@@ -756,6 +756,100 @@ def get_anp_tier_label(comm_amount: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Unified (Internal + Outsource combined) report-overview helpers
+#
+# These feed the Executive Summary, Top Performers & Concentration, and Total
+# Commission Payout by Type pages -- all "all agents together" views. They
+# only ever combine numbers the per-type builders above already computed
+# (agent_totals_by_month), so they can't drift from the detailed ledgers.
+# ---------------------------------------------------------------------------
+
+def _max_anp_by_agent_for_month(anp_detail_full: list, m: int) -> dict[str, float]:
+    """Outsource has no per-agent monthly ANP total anywhere upstream --
+    anp_commission_accumulated_tier is a running tier value repeated across
+    an agent's invoices, so (mirroring how the internal side handles it) the
+    agent's figure for the month is the MAX seen that month, not a sum."""
+    agent_max: dict[str, float] = {}
+    for r in anp_detail_full:
+        if _parse_month(r.get("invoice_date")) != m:
+            continue
+        agent = to_title_case(str(r.get("agent_name", "")).strip())
+        if not agent:
+            continue
+        comm = float(r.get("anp_commission_accumulated_tier", 0.0) or 0.0)
+        if comm > agent_max.get(agent, 0.0):
+            agent_max[agent] = comm
+    return agent_max
+
+
+def _unified_agent_totals(int_totals: dict, out_totals: dict, out_anp_by_agent: dict) -> list[dict]:
+    """Merge Internal + Outsource per-agent Basic+NFP+ANP totals for one
+    month into a single list, tagged by type, ranked by total commission
+    descending -- the "all agents together" ranking used by Top Performers."""
+    merged: list[dict] = []
+    for agent, t in (int_totals or {}).items():
+        total = t["basic"] + t["nfp"] + t["anp"]
+        if total <= 0 and t["invoices"] == 0:
+            continue
+        merged.append({
+            "agent": agent, "type": "Internal",
+            "basic": t["basic"], "nfp": t["nfp"], "anp": t["anp"],
+            "sales": t["sales"], "invoices": t["invoices"], "total": total,
+        })
+    for agent, t in (out_totals or {}).items():
+        anp = out_anp_by_agent.get(agent, 0.0)
+        total = t["basic"] + t["nfp"] + anp
+        if total <= 0 and t["invoices"] == 0:
+            continue
+        merged.append({
+            "agent": agent, "type": "Outsource",
+            "basic": t["basic"], "nfp": t["nfp"], "anp": anp,
+            "sales": t["sales"], "invoices": t["invoices"], "total": total,
+        })
+    merged.sort(key=lambda r: r["total"], reverse=True)
+    return merged
+
+
+def _report_overview_totals(unified: list[dict]) -> dict:
+    """Grand totals across every agent, plus the Effective Commission Rate
+    (total commission paid / total sales value) -- see the methodology note
+    rendered alongside it on the Executive Summary page."""
+    grand_total = sum(r["total"] for r in unified)
+    grand_sales = sum(r["sales"] for r in unified)
+    return {
+        "basic": sum(r["basic"] for r in unified),
+        "nfp": sum(r["nfp"] for r in unified),
+        "anp": sum(r["anp"] for r in unified),
+        "total": grand_total,
+        "sales": grand_sales,
+        "effective_rate": (grand_total / grand_sales * 100.0) if grand_sales else 0.0,
+        "agents": len(unified),
+        "invoices": sum(r["invoices"] for r in unified),
+    }
+
+
+def _rank_changes(current: list[dict], previous: list[dict]) -> dict[str, str]:
+    """agent -> 'up:N' / 'down:N' / 'flat' / 'new', vs. the previous month's
+    rank in the same unified (Internal+Outsource) leaderboard."""
+    prev_rank = {r["agent"]: i + 1 for i, r in enumerate(previous)}
+    changes: dict[str, str] = {}
+    for i, r in enumerate(current):
+        agent = r["agent"]
+        rank_now = i + 1
+        if agent not in prev_rank:
+            changes[agent] = "new"
+            continue
+        delta = prev_rank[agent] - rank_now
+        if delta > 0:
+            changes[agent] = f"up:{delta}"
+        elif delta < 0:
+            changes[agent] = f"down:{-delta}"
+        else:
+            changes[agent] = "flat"
+    return changes
+
+
+# ---------------------------------------------------------------------------
 # Data fetchers (reusing logic from existing builder scripts)
 # ---------------------------------------------------------------------------
 
@@ -1642,13 +1736,14 @@ def build_internal_summary_tables(
     year: int,
     invoice_dates_map: dict,
     month: int | None = None,
-    nfp_by_inv_all: dict | None = None) -> tuple[dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]]]:
+    nfp_by_inv_all: dict | None = None) -> tuple[dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, dict[str, dict]]]:
     """
     Returns:
       agent_summary_by_month - dict of month -> rows for "Summary Internal Agent Commission"
       customer_summary_by_month - dict of month -> rows for "Summary Internal Agent Commission by Customer"
       agent_anp_by_month - dict of month -> rows for agent ANP Commission
       customer_anp_by_month - dict of month -> rows for agent ANP Commission by Customer
+      agent_totals_by_month - dict of month -> {agent: {"basic","nfp","anp","sales","invoices"}}
     """
     nfp_by_inv_all = nfp_by_inv_all or {}
     basic_path = REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "full_internal_basic_commission.py"
@@ -1672,6 +1767,13 @@ def build_internal_summary_tables(
     customer_summary_by_month = {}
     agent_anp_by_month = {}
     customer_anp_by_month = {}
+    # Per-agent Basic+NFP+ANP totals, one entry per agent per month -- feeds
+    # the unified (Internal+Outsource combined) Executive Summary, Top
+    # Performers ranking and Effective Commission Rate on the report overview
+    # pages. Captured straight from the same per-agent numbers this loop
+    # already computes for the detailed ledger, so it can never drift from
+    # what the ledger itself shows.
+    agent_totals_by_month = {}
     nfp_by_inv = {r.invoice_number.strip(): r for r in nfp_rows if r.invoice_number}
 
     for m in range(1, 13):
@@ -1806,6 +1908,11 @@ def build_internal_summary_tables(
 
             basic_sales = sum(float(ln.sales_price) for ln in month_basic_lines if ln.agent_name.strip() == agent)
             nfp_sales = sum(float(r.sales_price) for r in month_nfp_rows if r.agent_name.strip() == agent)
+
+            agent_totals_by_month.setdefault(m, {})[agent] = {
+                "basic": basic_total, "nfp": nfp_comm, "anp": anp_comm,
+                "sales": basic_sales + nfp_sales, "invoices": total_invoices_count,
+            }
 
             basic_system = sum(float(nfp_by_inv[ln.invoice_number.strip()].system_price) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
             basic_nfp = sum(float(nfp_by_inv[ln.invoice_number.strip()].net_floor_price or 0.0) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
@@ -2030,8 +2137,8 @@ def build_internal_summary_tables(
                         ensure_rm_prefix(f"{basic_info['sales']:,.2f}" if basic_info['sales'] != 0 else "-"),
                         "Basic Commission", ensure_rm_prefix(basic_comm_val),
                         row_other_commission,
-                        to_title_case(row_referral_label), ensure_rm_prefix(f"{cust_referral_rm:,.2f}" if cust_referral_rm != 0 else "-"),
-                        ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-")
+                        ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"),
+                        to_title_case(row_referral_label), ensure_rm_prefix(f"{cust_referral_rm:,.2f}" if cust_referral_rm != 0 else "-")
                     ])
                     customer_rows.append(basic_row)
                     show_agent = ""
@@ -2110,7 +2217,7 @@ def build_internal_summary_tables(
         if customer_anp_rows:
             customer_anp_by_month[m] = customer_anp_rows
 
-    return agent_summary_by_month, customer_summary_by_month, agent_anp_by_month, customer_anp_by_month
+    return agent_summary_by_month, customer_summary_by_month, agent_anp_by_month, customer_anp_by_month, agent_totals_by_month
 
 
 # ---------------------------------------------------------------------------
@@ -2129,12 +2236,13 @@ def build_outsource_summary_tables(
     invoice_dates_map: dict,
     month: int | None = None,
     nfp_by_inv_all: dict | None = None,
-) -> tuple[dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]]]:
+) -> tuple[dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, dict[str, dict]]]:
     """
     Returns:
       agent_summary_by_month - dict of month -> rows for "Summary Outsource Agent Commission"
       customer_summary_by_month - dict of month -> rows for "Summary Outsource Agent Commission by Customer"
       customer_anp_by_month - dict of month -> rows for "ANP Commission by Customer" (outsource)
+      agent_totals_by_month - dict of month -> {agent: {"basic","nfp","anp","sales","invoices"}} (anp always 0 here -- outsource ANP is aggregated separately from anp_detail)
     """
     nfp_by_inv_all = nfp_by_inv_all or {}
     out_path = REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "outsource_basic_commission.py"
@@ -2151,6 +2259,7 @@ def build_outsource_summary_tables(
     agent_summary_by_month = {}
     customer_summary_by_month = {}
     customer_anp_by_month = {}
+    agent_totals_by_month = {}
     nfp_by_inv = {r.invoice_number.strip(): r for r in nfp_rows if r.invoice_number}
 
     for m in range(1, 13):
@@ -2257,6 +2366,11 @@ def build_outsource_summary_tables(
             basic_invs = [ln.invoice_number for ln in month_basic_lines if ln.agent_name.strip() == agent]
             nfp_invs = [r.invoice_number for r in month_nfp_rows if r.agent_name.strip() == agent]
             total_invoices_count = len(set(basic_invs + nfp_invs))
+
+            agent_totals_by_month.setdefault(m, {})[agent] = {
+                "basic": basic_total, "nfp": nfp_comm, "anp": 0.0,
+                "sales": basic_sales + nfp_sales, "invoices": total_invoices_count,
+            }
 
             basic_dates = get_dates_for_invoices(basic_invs, invoice_dates_map)
             nfp_dates = get_dates_for_invoices(nfp_invs, invoice_dates_map)
@@ -2475,7 +2589,7 @@ def build_outsource_summary_tables(
                         ensure_rm_prefix(f"{basic_display_sales:,.2f}" if basic_display_sales != 0 else "-"),
                         "Basic Commission", ensure_rm_prefix(basic_comm_val),
                         row_other_commission,
-                        "-", "-", ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"), ensure_rm_prefix(f"{row_gan_lai_soon:,.2f}" if row_gan_lai_soon != 0 else "-")
+                        ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"), ensure_rm_prefix(f"{row_gan_lai_soon:,.2f}" if row_gan_lai_soon != 0 else "-"), "-", "-"
                     ])
                     customer_rows.append(basic_row)
                     show_agent = ""
@@ -2564,7 +2678,7 @@ def build_outsource_summary_tables(
         if customer_anp_rows:
             customer_anp_by_month[m] = customer_anp_rows
 
-    return agent_summary_by_month, customer_summary_by_month, customer_anp_by_month
+    return agent_summary_by_month, customer_summary_by_month, customer_anp_by_month, agent_totals_by_month
 
 # ---------------------------------------------------------------------------
 
@@ -2785,6 +2899,10 @@ def _build_summary_table_rl(title: str, headers: list[str], rows: list[list[str]
             pass
 
     # Horizontal/Vertical span for System Price and Net Floor Price columns
+    # (lower_hdrs is normally set by the agent-span finalizers above, but
+    # those never run when every agent has exactly one row -- e.g. a month
+    # with just a single qualifying agent -- so it's re-derived here too.)
+    lower_hdrs = [h.lower().strip() for h in headers]
     try:
         sys_idx = lower_hdrs.index("system price")
         try:
@@ -2836,7 +2954,52 @@ def _build_summary_table_rl(title: str, headers: list[str], rows: list[list[str]
     return t
 
 
-def _build_customer_summary_table_rl(title: str, headers: list[str], rows: list[list[str]], page_width: float, is_outsource: bool = False):
+def _build_customer_summary_table_rl(title: str, headers: list[str], rows: list[list[str]], page_width: float, is_outsource: bool = False) -> list:
+    """Chunks the customer rows into several page-sized Tables (returned as a
+    list of flowables) instead of one giant Table.
+
+    A single Table only splits across pages where no vertical SPAN crosses the
+    split row. An agent with enough customers produces an agent-name SPAN
+    taller than a whole page, leaving ReportLab no legal split point at all --
+    doc.build() then dies with "Flowable too large on page ...". Chunking at
+    span-safe boundaries (whole Basic/NFP row-pairs, agent name re-stamped on
+    each continuation chunk) keeps every table under a page tall so the
+    question never arises.
+    """
+    MAX_ROWS_PER_TABLE = 14  # conservative: fits an empty landscape-A4 frame even with multi-line cells
+    lower_hdrs = [h.lower().strip() for h in headers]
+    # Basic/NFP tables pair every 2 rows (SPANs stitch each pair); ANP tables don't.
+    step = 2 if ("customer" in lower_hdrs and "package type" in lower_hdrs and "commission" in lower_hdrs) else 1
+
+    chunks: list[list[list[str]]] = []
+    current: list[list[str]] = []
+    current_agent = ""
+    i = 0
+    while i < len(rows):
+        unit = rows[i:i + step]
+        first_agent = str(unit[0][0]).strip() if unit and unit[0] else ""
+        if first_agent:
+            current_agent = first_agent
+        if current and len(current) + len(unit) > MAX_ROWS_PER_TABLE:
+            chunks.append(current)
+            current = []
+            if not first_agent and current_agent:
+                # Continuation chunk starts mid-agent: re-stamp the agent name
+                # on a COPY (pass 1 and pass 2 render from the same row lists).
+                unit = [list(unit[0])] + list(unit[1:])
+                unit[0][0] = current_agent
+        current.extend(unit)
+        i += step
+    if current:
+        chunks.append(current)
+
+    return [
+        _build_customer_summary_table_chunk(title, headers, chunk, page_width, is_outsource)
+        for chunk in chunks
+    ]
+
+
+def _build_customer_summary_table_chunk(title: str, headers: list[str], rows: list[list[str]], page_width: float, is_outsource: bool = False):
     """Builds a ReportLab Table for the stacked customer summary commission table."""
     from reportlab.platypus import Table, TableStyle, Paragraph
     from reportlab.lib import colors
@@ -3221,6 +3384,7 @@ def build_commission_pdf(
     contest_t1_headers=None, contest_t1_rows=None,
     contest_t2_headers=None, contest_t2_rows=None,
     contest_t3_headers=None, contest_t3_rows=None,
+    report_overview: dict | None = None,
     page_nums_dict: dict[str, int] = None,
     page_registry: dict[str, int] = None,
     month: int | None = None,
@@ -3387,6 +3551,240 @@ def build_commission_pdf(
                                  leading=11, fontName=FONT_REGULAR,
                                  textColor=_rl_color("#4A5568"), spaceBefore=2, spaceAfter=6)
 
+    # Report-overview styles (Executive Summary / Top Performers / Payout by Type)
+    overview_eyebrow_style = ParagraphStyle("OverviewEyebrow", parent=styles["Normal"],
+                                             fontSize=9, leading=11, fontName=FONT_BOLD,
+                                             textColor=_rl_color("#0E7C66"), spaceAfter=2)
+    ov_kpi_label_style = ParagraphStyle("OvKpiLabel", parent=styles["Normal"], fontSize=8.5,
+                                         leading=10, fontName=FONT_BOLD,
+                                         textColor=_rl_color("#576270"))
+    ov_kpi_value_style = ParagraphStyle("OvKpiValue", parent=styles["Normal"], fontSize=24,
+                                         leading=28, fontName=FONT_BOLD,
+                                         textColor=_rl_color("#141A1F"))
+    ov_kpi_sub_style = ParagraphStyle("OvKpiSub", parent=styles["Normal"], fontSize=8,
+                                       leading=10, fontName=FONT_REGULAR,
+                                       textColor=_rl_color("#8B95A3"))
+    ov_tile_value_style = ParagraphStyle("OvTileValue", parent=styles["Normal"], fontSize=17,
+                                          leading=20, fontName=FONT_BOLD,
+                                          textColor=_rl_color("#141A1F"))
+    ov_delta_style = ParagraphStyle("OvDelta", parent=styles["Normal"], fontSize=8.5,
+                                     leading=11, fontName=FONT_BOLD)
+    ov_row_style = ParagraphStyle("OvRow", parent=styles["Normal"], fontSize=9,
+                                   leading=12, fontName=FONT_REGULAR,
+                                   textColor=_rl_color("#141A1F"))
+    ov_amt_style = ParagraphStyle("OvAmt", parent=styles["Normal"], fontSize=9,
+                                   leading=12, fontName=FONT_REGULAR,
+                                   textColor=_rl_color("#141A1F"), alignment=TA_RIGHT)
+    ov_hdr_style = ParagraphStyle("OvHdr", parent=styles["Normal"], fontSize=7.5,
+                                   leading=9, fontName=FONT_BOLD,
+                                   textColor=_rl_color("#8B95A3"))
+    ov_hdr_right_style = ParagraphStyle("OvHdrRight", parent=styles["Normal"], fontSize=7.5,
+                                         leading=9, fontName=FONT_BOLD,
+                                         textColor=_rl_color("#8B95A3"), alignment=TA_RIGHT)
+
+    # ---- Style revision: full-bleed band header + gauge/podium/ledger ----
+    BAND_BG = "#0B211C"       # near-black emerald -- the band every interior page opens with
+    BAND_INK = "#EAF3EF"
+    BAND_MUTED = "#8FB3A8"
+    ACCENT = "#FF7A45"        # coral, spent on exactly one number per page
+
+    band_eyebrow_style = ParagraphStyle("BandEyebrow", parent=styles["Normal"], fontSize=9,
+                                         leading=11, fontName=FONT_BOLD,
+                                         textColor=_rl_color(BAND_MUTED), spaceAfter=3)
+    band_title_style = ParagraphStyle("BandTitle", parent=styles["Normal"], fontSize=19,
+                                       leading=22, fontName=FONT_BOLD,
+                                       textColor=_rl_color(BAND_INK))
+    band_sub_style = ParagraphStyle("BandSub", parent=styles["Normal"], fontSize=10,
+                                     leading=13, fontName=FONT_REGULAR,
+                                     textColor=_rl_color(BAND_MUTED), spaceBefore=4)
+
+    cover_title_style = ParagraphStyle("CoverTitle2", parent=styles["Normal"], fontSize=40,
+                                        leading=44, fontName=FONT_BOLD,
+                                        textColor=_rl_color(BAND_INK))
+    cover_sub_style = ParagraphStyle("CoverSub2", parent=styles["Normal"], fontSize=13,
+                                      leading=17, fontName=FONT_REGULAR,
+                                      textColor=_rl_color(BAND_MUTED))
+    cover_meta_style2 = ParagraphStyle("CoverMeta2", parent=styles["Normal"], fontSize=10,
+                                        leading=15, fontName=FONT_REGULAR,
+                                        textColor=_rl_color(BAND_MUTED))
+    cover_meta_b_style = ParagraphStyle("CoverMetaB2", parent=styles["Normal"], fontSize=10,
+                                         leading=15, fontName=FONT_BOLD,
+                                         textColor=_rl_color(BAND_INK))
+
+    hero_num_style = ParagraphStyle("HeroNum", parent=styles["Normal"], fontSize=46,
+                                     leading=48, fontName=FONT_BOLD,
+                                     textColor=_rl_color("#141A1F"))
+    hero_label_style = ParagraphStyle("HeroLabel", parent=styles["Normal"], fontSize=9.5,
+                                       leading=11, fontName=FONT_BOLD,
+                                       textColor=_rl_color("#576270"))
+    hero_sub_style = ParagraphStyle("HeroSub", parent=styles["Normal"], fontSize=8.5,
+                                     leading=11, fontName=FONT_REGULAR,
+                                     textColor=_rl_color("#8B95A3"))
+    rail_label_style = ParagraphStyle("RailLabel", parent=styles["Normal"], fontSize=9,
+                                       leading=11, fontName=FONT_BOLD,
+                                       textColor=_rl_color("#576270"))
+    rail_value_style = ParagraphStyle("RailValue", parent=styles["Normal"], fontSize=14,
+                                       leading=17, fontName=FONT_BOLD,
+                                       textColor=_rl_color("#141A1F"), alignment=TA_RIGHT)
+    gauge_title_style = ParagraphStyle("GaugeTitle", parent=styles["Normal"], fontSize=9,
+                                        leading=11, fontName=FONT_BOLD, alignment=TA_CENTER,
+                                        textColor=_rl_color("#576270"))
+    gauge_value_style = ParagraphStyle("GaugeValue", parent=styles["Normal"], fontSize=24,
+                                        leading=27, fontName=FONT_BOLD, alignment=TA_CENTER,
+                                        textColor=_rl_color("#141A1F"))
+    gauge_caption_style = ParagraphStyle("GaugeCaption", parent=styles["Normal"], fontSize=7.8,
+                                          leading=10, fontName=FONT_REGULAR, alignment=TA_CENTER,
+                                          textColor=_rl_color("#576270"))
+
+    podium_rank_style = ParagraphStyle("PodiumRank", parent=styles["Normal"], fontSize=8.5,
+                                        leading=10, fontName=FONT_BOLD,
+                                        textColor=_rl_color(BAND_MUTED))
+    podium_rank_style_light = ParagraphStyle("PodiumRankL", parent=styles["Normal"], fontSize=8.5,
+                                              leading=10, fontName=FONT_BOLD,
+                                              textColor=_rl_color("#8B95A3"))
+    podium_name_style = ParagraphStyle("PodiumName", parent=styles["Normal"], fontSize=12,
+                                        leading=15, fontName=FONT_BOLD,
+                                        textColor=_rl_color(BAND_INK))
+    podium_name_style_light = ParagraphStyle("PodiumNameL", parent=styles["Normal"], fontSize=12,
+                                              leading=15, fontName=FONT_BOLD,
+                                              textColor=_rl_color("#141A1F"))
+    podium_amt_style = ParagraphStyle("PodiumAmt", parent=styles["Normal"], fontSize=16,
+                                       leading=19, fontName=FONT_BOLD,
+                                       textColor=_rl_color(ACCENT))
+    podium_amt_style_light = ParagraphStyle("PodiumAmtL", parent=styles["Normal"], fontSize=16,
+                                             leading=19, fontName=FONT_BOLD,
+                                             textColor=_rl_color("#141A1F"))
+    rest_name_style = ParagraphStyle("RestName", parent=styles["Normal"], fontSize=10,
+                                      leading=13, fontName=FONT_REGULAR,
+                                      textColor=_rl_color("#141A1F"))
+    rest_amt_style = ParagraphStyle("RestAmt", parent=styles["Normal"], fontSize=9.5,
+                                     leading=12, fontName=FONT_REGULAR, alignment=TA_RIGHT,
+                                     textColor=_rl_color("#576270"))
+
+    type_item_name_style = ParagraphStyle("TypeItemName", parent=styles["Normal"], fontSize=9.5,
+                                           leading=12, fontName=FONT_BOLD,
+                                           textColor=_rl_color("#141A1F"))
+    type_item_amt_style = ParagraphStyle("TypeItemAmt", parent=styles["Normal"], fontSize=14,
+                                          leading=17, fontName=FONT_BOLD,
+                                          textColor=_rl_color("#141A1F"))
+    type_item_pct_style = ParagraphStyle("TypeItemPct", parent=styles["Normal"], fontSize=8.5,
+                                          leading=10, fontName=FONT_REGULAR,
+                                          textColor=_rl_color("#8B95A3"))
+    grand_label_style = ParagraphStyle("GrandLabel", parent=styles["Normal"], fontSize=10,
+                                        leading=13, fontName=FONT_BOLD,
+                                        textColor=_rl_color("#576270"))
+    grand_value_style = ParagraphStyle("GrandValue", parent=styles["Normal"], fontSize=22,
+                                        leading=25, fontName=FONT_BOLD, alignment=TA_RIGHT,
+                                        textColor=_rl_color("#141A1F"))
+
+    ledger_hdr_style = ParagraphStyle("LedgerHdr", parent=styles["Normal"], fontSize=7.8,
+                                       leading=9, fontName=FONT_BOLD,
+                                       textColor=_rl_color("#8B95A3"))
+    ledger_hdr_right_style = ParagraphStyle("LedgerHdrRight", parent=styles["Normal"], fontSize=7.8,
+                                             leading=9, fontName=FONT_BOLD, alignment=TA_RIGHT,
+                                             textColor=_rl_color("#8B95A3"))
+    ledger_row_style = ParagraphStyle("LedgerRow", parent=styles["Normal"], fontSize=9.5,
+                                       leading=12, fontName=FONT_REGULAR,
+                                       textColor=_rl_color("#141A1F"))
+    ledger_num_style = ParagraphStyle("LedgerNum", parent=styles["Normal"], fontSize=9,
+                                       leading=12, fontName=FONT_REGULAR, alignment=TA_RIGHT,
+                                       textColor=_rl_color("#576270"))
+    ledger_tot_style = ParagraphStyle("LedgerTot", parent=styles["Normal"], fontSize=9.5,
+                                       leading=12, fontName=FONT_BOLD, alignment=TA_RIGHT,
+                                       textColor=_rl_color("#141A1F"))
+    ledger_grand_style = ParagraphStyle("LedgerGrand", parent=styles["Normal"], fontSize=10.5,
+                                         leading=13, fontName=FONT_BOLD, alignment=TA_RIGHT,
+                                         textColor=_rl_color("#141A1F"))
+    ledger_grand_label_style = ParagraphStyle("LedgerGrandLabel", parent=styles["Normal"], fontSize=10.5,
+                                               leading=13, fontName=FONT_BOLD,
+                                               textColor=_rl_color("#141A1F"))
+    toc_num_style = ParagraphStyle("TocNum", parent=styles["Normal"], fontSize=9,
+                                    leading=11, fontName=FONT_REGULAR,
+                                    textColor=_rl_color("#8B95A3"))
+    toc_grp2_style = ParagraphStyle("TocGrp2", parent=styles["Normal"], fontSize=9.5,
+                                     leading=12, fontName=FONT_BOLD,
+                                     textColor=_rl_color("#095A4A"), spaceBefore=10, spaceAfter=4)
+    toc_title2_style = ParagraphStyle("TocTitle2", parent=styles["Normal"], fontSize=11,
+                                       leading=14, fontName=FONT_BOLD,
+                                       textColor=_rl_color("#141A1F"))
+    toc_pg2_style = ParagraphStyle("TocPg2", parent=styles["Normal"], fontSize=10,
+                                    leading=13, fontName=FONT_REGULAR, alignment=TA_RIGHT,
+                                    textColor=_rl_color("#576270"))
+    toc_about_style = ParagraphStyle("TocAbout2", parent=styles["Normal"], fontSize=9.5,
+                                      leading=15, fontName=FONT_REGULAR,
+                                      textColor=_rl_color("#576270"))
+
+    def _band_header(eyebrow: str, title: str, subtitle: str = "") -> "Table":
+        """Full-width dark band that opens every interior page -- replaces
+        the old plain-white-page-with-colored-eyebrow-text look."""
+        cell = [Paragraph(eyebrow.upper(), band_eyebrow_style), Paragraph(title, band_title_style)]
+        if subtitle:
+            cell.append(Paragraph(subtitle, band_sub_style))
+        t = Table([[cell]], colWidths=[CONTENT_W])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), _rl_color(BAND_BG)),
+            ("LEFTPADDING", (0, 0), (-1, -1), 18), ("RIGHTPADDING", (0, 0), (-1, -1), 18),
+            ("TOPPADDING", (0, 0), (-1, -1), 13), ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        return t
+
+    def _gauge_drawing(pct: float, max_pct: float = 6.0, size: float = 150):
+        """Semicircle gauge (Effective Commission Rate is a rate against a
+        range, not a headcount, so it gets a dial instead of a flat tile).
+
+        Built on the same Pie class as the donut, not hand-rolled annular
+        Wedges: a Wedge with radius1 set self-intersects into a bowtie for
+        any sweep wider than a few degrees (confirmed empirically), while
+        Pie's own annular ("donut") mode handles wide sweeps correctly. The
+        gauge look comes from a third data slice covering the entire bottom
+        half in the page's own background color, so it's invisible.
+        """
+        from reportlab.graphics.shapes import Drawing
+        from reportlab.graphics.charts.piecharts import Pie
+        frac = max(0.0, min(1.0, pct / max_pct)) if max_pct else 0.0
+        fill_deg = frac * 180.0
+        # Full square Drawing, bottom half painted to match the page (not
+        # clipped) -- a Drawing flowable doesn't reliably clip its children
+        # to a smaller declared height, so asking for only the top half's
+        # worth of space risks the bottom half bleeding into what follows.
+        d = Drawing(size, size)
+        pie = Pie()
+        pie.x, pie.y = 0, 0
+        pie.width = pie.height = size
+        pie.data = [max(fill_deg, 0.001), max(180 - fill_deg, 0.001), 180]
+        pie.labels = None
+        pie.startAngle = 180
+        pie.direction = "clockwise"
+        pie.innerRadiusFraction = 0.62
+        pie.slices.strokeColor = None
+        pie.slices[0].fillColor = _rl_color("#0E7C66")
+        pie.slices[1].fillColor = _rl_color("#E7EBEF")
+        pie.slices[2].fillColor = _rl_color("#FFFFFF")
+        d.add(pie)
+        return d
+
+    def _proportion_bar(segments: list[tuple[str, float, str]], width: float, height: float = 32):
+        """Single stacked bar -- the Payout by Type page's replacement for a
+        thin donut ring, reads left-to-right and scales past 3-4 categories
+        far better than a pie ever does."""
+        total = sum(v for _, v, _ in segments) or 1.0
+        cols, colors_list = [], []
+        for _, val, color_hex in segments:
+            w = max(1, int(round(width * (val / total)))) if val > 0 else 0
+            if w > 0:
+                cols.append(w)
+                colors_list.append(color_hex)
+        if not cols:
+            cols, colors_list = [int(width)], ["#E7EBEF"]
+        t = Table([["" for _ in cols]], colWidths=cols, rowHeights=[height])
+        styles_list = [("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                       ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]
+        for i, c in enumerate(colors_list):
+            styles_list.append(("BACKGROUND", (i, 0), (i, 0), _rl_color(c)))
+        t.setStyle(TableStyle(styles_list))
+        return t
+
     # Current page number tracking
     page_counter = [0]
 
@@ -3402,9 +3800,14 @@ def build_commission_pdf(
     def on_page(canvas, doc):
         page_counter[0] = doc.page
         canvas.saveState()
+        # Cover page (1) is full-bleed dark -- painted before the frame's
+        # flowables land on top of it, per BaseDocTemplate.handle_pageBegin.
+        if doc.page == 1:
+            canvas.setFillColor(_rl_color("#0B211C"))
+            canvas.rect(0, 0, PAGE_W, PAGE_H, fill=1, stroke=0)
         # Footer
         canvas.setFont(FONT_REGULAR, 9)
-        canvas.setFillColor(_rl_color("#4A5568"))
+        canvas.setFillColor(_rl_color("#8FB3A8") if doc.page == 1 else _rl_color("#4A5568"))
         canvas.drawRightString(PAGE_W - MARGIN, 0.35 * inch, str(doc.page))
         # Logo on cover (page 1)
         if doc.page == 1 and logo_reader is not None:
@@ -3488,6 +3891,91 @@ def build_commission_pdf(
         ]))
         story.append(note_table)
 
+    def _mini_bar(frac: float, width: float, height: float = 8,
+                   color_hex: str = "#0E7C66", bg_hex: str = "#EDF2F7"):
+        """A horizontal bar built from a 1-row Table -- ReportLab has no
+        native bar-chart flowable, but a two-cell table with proportional
+        colWidths renders identically."""
+        frac = max(0.0, min(1.0, frac))
+        filled = max(2, int(round(width * frac)))
+        empty = max(0, int(width) - filled)
+        if empty <= 0:
+            t = Table([[""]], colWidths=[width], rowHeights=[height])
+            t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), _rl_color(color_hex))]))
+            return t
+        t = Table([["", ""]], colWidths=[filled, empty], rowHeights=[height])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (0, 0), _rl_color(color_hex)),
+            ("BACKGROUND", (1, 0), (1, 0), _rl_color(bg_hex)),
+            ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        return t
+
+    def _donut_drawing(segments: list[tuple[str, float, str]], size: float = 150,
+                        hole_frac: float = 0.55, center_label: str = ""):
+        """segments: list of (label, value, hex color). Pie with
+        innerRadiusFraction -- hand-built annular Wedges glitch on sweeps
+        past ~180 degrees, the charts module's donut mode doesn't."""
+        from reportlab.graphics.shapes import Drawing, String
+        from reportlab.graphics.charts.piecharts import Pie
+        d = Drawing(size, size)
+        pie = Pie()
+        pie.x = pie.y = 4
+        pie.width = pie.height = size - 8
+        pie.data = [max(v, 0.0) for _, v, _ in segments] or [1.0]
+        pie.labels = None
+        pie.startAngle = 90
+        pie.direction = "clockwise"
+        pie.innerRadiusFraction = hole_frac
+        pie.slices.strokeColor = _rl_color("#FFFFFF")
+        pie.slices.strokeWidth = 1
+        for i, (_, _, color_hex) in enumerate(segments):
+            pie.slices[i].fillColor = _rl_color(color_hex)
+        d.add(pie)
+        if center_label:
+            d.add(String(size / 2.0, size / 2.0 - 4, center_label,
+                         fontName=FONT_BOLD, fontSize=10, fillColor=_rl_color("#141A1F"),
+                         textAnchor="middle"))
+        return d
+
+    def _swatch(color_hex: str, size: float = 10):
+        t = Table([[""]], colWidths=[size], rowHeights=[size])
+        t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), _rl_color(color_hex))]))
+        return t
+
+    def _delta_text(curr: float, prev: float | None, mode: str = "pct") -> tuple[str, str]:
+        """Month-over-month delta as (display text, color). mode is "pct"
+        (percentage change), "points" (percentage-POINT change, e.g. a rate),
+        or "count" (raw difference, e.g. agent headcount)."""
+        if prev is None:
+            return ("No prior month on file", "#8B95A3")
+        diff = curr - prev
+        if mode == "points":
+            label = f"{abs(diff):.2f} pts"
+        elif mode == "count":
+            label = f"{abs(diff):,.0f}"
+        else:
+            pct = (diff / prev * 100.0) if prev else 0.0
+            label = f"{abs(pct):.1f}%"
+        # ASCII +/- only: the registered Verdana TTF has no glyphs for the
+        # &#9650;/&#9660; triangles, which render as empty boxes.
+        if diff > 1e-9:
+            return (f"+{label} vs last month", "#1F8A4C")
+        if diff < -1e-9:
+            return (f"-{label} vs last month", "#C6432E")
+        return ("No change vs last month", "#8B95A3")
+
+    def _rank_badge_text(code: str) -> tuple[str, str]:
+        if code == "new":
+            return ("NEW", "#B5651D")
+        if code == "flat":
+            return ("&mdash;", "#8B95A3")
+        if code.startswith("up:"):
+            return (f"+{code.split(':', 1)[1]}", "#1F8A4C")
+        if code.startswith("down:"):
+            return (f"-{code.split(':', 1)[1]}", "#C6432E")
+        return ("-", "#8B95A3")
 
     def _highlight_block(label: str, grand: float,
                           basic: float, nfp: float, anp: float,
@@ -3570,26 +4058,37 @@ def build_commission_pdf(
     }
     sub_title_text = f"{MONTH_NAMES[month]} {year}" if month is not None else "H1 — January to June"
     contest_title = f"{MONTH_NAMES[month]} Monthly Contest" if month is not None else "Monthly Contest"
-    story.append(Spacer(1, int(1.2 * inch)))
-    story.append(Paragraph(f"Commission Report {year}", title_style))
-    story.append(Paragraph("Internal &amp; Outsource Agent Commission Summary", sub_title_style))
-    story.append(Paragraph(sub_title_text, sub_title_style))
-    story.append(Spacer(1, int(0.3 * inch)))
-    story.append(Paragraph("<b>Prepared for:</b> Eternalgy HR and Finance Department", cover_meta_style))
-    story.append(Paragraph("<b>Prepared by:</b> Nurul Aqilah", cover_meta_style))
-    story.append(Paragraph("<b>Generated on:</b> 23 June 2026", cover_meta_style))
+    story.append(Spacer(1, int(0.9 * inch)))
+    story.append(Paragraph("Commission<br/>Report", cover_title_style))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("All Agents &mdash; Internal &amp; Outsource, Combined", cover_sub_style))
+    period_pill = Table([[Paragraph(sub_title_text.upper(), ParagraphStyle(
+        "PeriodPill", parent=styles["Normal"], fontSize=10.5, leading=13, fontName=FONT_BOLD,
+        textColor=_rl_color("#1A0F08")))]], colWidths=[None])
+    period_pill.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), _rl_color("#FF7A45")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12), ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+        ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(Spacer(1, 10))
+    story.append(period_pill)
+    story.append(Spacer(1, int(0.45 * inch)))
+    story.append(Paragraph('<font color="#EAF3EF"><b>Prepared for</b></font> &nbsp;Eternalgy HR and Finance Department', cover_meta_style2))
+    story.append(Paragraph('<font color="#EAF3EF"><b>Prepared by</b></font> &nbsp;Nurul Aqilah', cover_meta_style2))
+    story.append(Paragraph(f'<font color="#EAF3EF"><b>Generated on</b></font> &nbsp;{_fmt_cover_date(run_at)}', cover_meta_style2))
     story.append(PageBreak())
 
     # ----------------------------------------------------------------
     # Table of Contents  (design: commission_pdf.py Page 2)
     # ----------------------------------------------------------------
-    story.append(Paragraph("Table of Contents &amp; Overview", section_title_style))
-    story.append(Spacer(1, int(0.1 * inch)))
+    story.append(_band_header("Contents", "Table of Contents"))
+    _spacer(10)
     story.append(Paragraph(
         "<b>About this document.</b> This document is the consolidated Commission Report for the "
-        f"{year} calendar year. It combines Internal and Outsource agent commission records "
-        "(Basic, NFP, ANP) together with EGA/ESA Awards and Production Bonus into a "
-        "unified, audit-ready presentation to support reconciliation and payment processing.",
+        f"{year} calendar year. It covers every agent &mdash; Internal and Outsource alike &mdash; "
+        "in one Overview (Executive Summary, Top Performers and Total Payout by Type), "
+        "followed by the per-agent commission summary. Invoice-level detail lives in the "
+        "Excel export from the dashboard.",
         body_style,
     ))
     story.append(Spacer(1, int(0.15 * inch)))
@@ -3597,768 +4096,353 @@ def build_commission_pdf(
     if page_nums_dict is None:
         page_nums_dict = {}
 
-    page_int_anp = page_nums_dict.get("int_anp", 3)
-    page_int_cust = page_nums_dict.get("int_cust", 4)
-    page_int_ega = page_nums_dict.get("int_ega", 5)
-    page_int_agent = page_nums_dict.get("int_agent", 6)
-    page_out_cust = page_nums_dict.get("out_cust", 7)
-    page_out_ega = page_nums_dict.get("out_ega", 8)
-    page_out_agent = page_nums_dict.get("out_agent", 9)
-    page_out_prod = page_nums_dict.get("out_prod", 10)
-    page_out_anp = page_nums_dict.get("out_anp", 11)
-    page_contest = page_nums_dict.get("contest", 12)
+    page_exec_summary = page_nums_dict.get("exec_summary", 3)
+    page_top_performers = page_nums_dict.get("top_performers", 4)
+    page_payout_type = page_nums_dict.get("payout_type", 5)
+    page_agent_summary = page_nums_dict.get("agent_summary", 6)
 
-    toc_data = [
-        [Paragraph("Internal", toc_left_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph("&bull;&nbsp;&nbsp;<b>Basic commission and Net Floor Price Commission</b>", toc_sub_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Commission", toc_sub_style),
-         Paragraph(f"Page {page_int_agent}", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Commission by Customer", toc_sub_style),
-         Paragraph(f"Page {page_int_cust}", toc_right_style)],
-        [Paragraph("&bull;&nbsp;&nbsp;<b>ANP Commission</b>", toc_sub_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;ANP Commission by Customer", toc_sub_style),
-         Paragraph(f"Page {page_int_anp}", toc_right_style)],
-        [Paragraph("&bull;&nbsp;&nbsp;<b>EGA/ESA Awards</b>", toc_sub_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Award", toc_sub_style),
-         Paragraph(f"Page {page_int_ega}", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Award by Customer", toc_sub_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph("Outsource", toc_left_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph("&bull;&nbsp;&nbsp;<b>Basic commission and Net Floor Price Commission</b>", toc_sub_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Commission", toc_sub_style),
-         Paragraph(f"Page {page_out_agent}", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Commission by Customer", toc_sub_style),
-         Paragraph(f"Page {page_out_cust}", toc_right_style)],
-        [Paragraph("&bull;&nbsp;&nbsp;<b>ANP Commission</b>", toc_sub_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;ANP Commission by Customer", toc_sub_style),
-         Paragraph(f"Page {page_out_anp}", toc_right_style)],
-        [Paragraph("&bull;&nbsp;&nbsp;<b>EGA/ESA Awards</b>", toc_sub_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Award", toc_sub_style),
-         Paragraph(f"Page {page_out_ega}", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Summary Agent Award by Customer", toc_sub_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph("&bull;&nbsp;&nbsp;<b>Production Bonus</b>", toc_sub_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Production Bonus Summary", toc_sub_style),
-         Paragraph(f"Page {page_out_prod}", toc_right_style)],
-        [Paragraph("&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;&nbsp;Production Bonus Summary by customer", toc_sub_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph(contest_title, toc_left_style),
-         Paragraph(f"Page {page_contest}", toc_right_style)],
-        [Paragraph("&bull;&nbsp;&nbsp;<b>Team Championship and Team Achievement Bonus</b>", toc_sub_style),
-         Paragraph("", toc_right_style)],
-        [Paragraph("&bull;&nbsp;&nbsp;<b>Summary of Cases and Awards by Agent</b>", toc_sub_style),
-         Paragraph("", toc_right_style)],
-    ]
-    toc_table = Table(toc_data, colWidths=[CONTENT_W - int(1.2 * inch), int(1.2 * inch)])
-    toc_table.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
-        ("TOPPADDING", (0, 0), (-1, -1), 2.5),
-        ("LINEBELOW", (0, 0), (-1, -1), 0.5, _rl_color("#E2E8F0")),
-    ]))
-    story.append(toc_table)
+    def _toc_group(label):
+        story.append(Paragraph(label.upper(), toc_grp2_style))
+
+    def _toc_row(idx, title, page):
+        row = Table([[Paragraph(f"{idx:02d}", toc_num_style),
+                      Paragraph(title, toc_title2_style),
+                      Paragraph(f"Pg {page}", toc_pg2_style)]],
+                    colWidths=[26, CONTENT_W - 26 - 60, 60])
+        row.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, _rl_color("#E7EBEF")),
+        ]))
+        return row
+
+    _toc_group("Overview")
+    story.append(_toc_row(1, "Executive Summary", page_exec_summary))
+    story.append(_toc_row(2, "Top Performers &amp; Concentration", page_top_performers))
+    story.append(_toc_row(3, "Total Commission Payout by Type", page_payout_type))
+    _toc_group("Commission Detail")
+    story.append(_toc_row(4, "Summary Agent Commission &mdash; All Agents", page_agent_summary))
     story.append(PageBreak())
 
     # ----------------------------------------------------------------
-    # i. Summary Internal Agent Commission (Basic + NFP) — comes FIRST
+    # Overview: Executive Summary / Top Performers & Concentration /
+    # Total Commission Payout by Type -- all agents combined.
     # ----------------------------------------------------------------
-    int_agent_headers = ["Agent", "Total Invoice", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override"]
-    MONTH_NAMES = {
-        1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
-        7: "July", 8: "August", 9: "September", 10: "October", 11: "November", 12: "December"
-    }
-    group_label_style = ParagraphStyle("GroupLabel", parent=styles["Normal"],
-                                        fontSize=12, leading=15, fontName=FONT_BOLD,
-                                        textColor=_rl_color("#1A365D"), spaceBefore=8, spaceAfter=4)
+    if report_overview is not None:
+        ov = report_overview["overview_current"]
+        ov_prev = report_overview["overview_prev"]
+        period_label = report_overview.get("period_label", "")
+        prev_label = report_overview.get("prev_period_label")
 
-    has_int_agent_data = False
-    for m in range(1, 13):
-        if month is not None and m != month:
-            continue
-        month_name = MONTH_NAMES[m]
-        rows = int_agent_summary_rows.get(m, [])
-        if rows:
-            if not has_int_agent_data:
-                story.append(PageTracker("int_agent", page_registry))
-            has_int_agent_data = True
-            story.append(Paragraph("Internal", group_label_style))
-            story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
-            _spacer(4)
-            story.append(Paragraph("Summary Agent Commission", sub_section_style))
-            _spacer(6)
-            story.append(Paragraph(f"<b>{month_name} 2026</b>", ParagraphStyle("MonthHdr", parent=styles["Normal"], fontSize=9.5, fontName=FONT_BOLD, textColor=_rl_color("#1A365D"), spaceBefore=6, spaceAfter=4)))
+        # --- Executive Summary ---
+        story.append(PageTracker("exec_summary", page_registry))
+        scope_txt = f"All Agents &middot; {period_label}"
+        scope_txt += (f" &middot; compared against {prev_label}" if prev_label
+                      else " &middot; no prior month on file for comparison")
+        story.append(_band_header("Overview", "Executive Summary", scope_txt))
+        _spacer(14)
 
-            # Metadata block
-            month_basic_lines = _expand_basic_lines_for_month(int_basic_lines, m)
-            month_nfp_rows = [r for r in int_nfp_rows if _parse_month(r.full_payment_date) == m]
-            agents = set(ln.agent_name.strip() for ln in month_basic_lines) | set(r.agent_name.strip() for r in month_nfp_rows)
-            customers = set(ln.customer_name.strip() for ln in month_basic_lines) | set(r.customer_name.strip() for r in month_nfp_rows)
-            story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(customers)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#C3DAF2\" size=\"11\">&bull;</font> Senior &nbsp;&nbsp; <font color=\"#E9F2FA\" size=\"11\">&bull;</font> Executive", meta_style))
-            _spacer(4)
+        total_delta_txt, total_delta_color = _delta_text(ov["total"], ov_prev["total"] if ov_prev else None)
+        eff_txt, eff_color = _delta_text(ov["effective_rate"], ov_prev["effective_rate"] if ov_prev else None, mode="points")
+        ag_txt, ag_color = _delta_text(ov["agents"], ov_prev["agents"] if ov_prev else None, mode="count")
+        inv_txt, inv_color = _delta_text(ov["invoices"], ov_prev["invoices"] if ov_prev else None, mode="count")
 
-            trimmed_rows = rows
-            t = _build_summary_table_rl(
-                f"Summary Agent Commission — {month_name}",
-                int_agent_headers,
-                trimmed_rows,
-                CONTENT_W
-            )
-            story.append(t)
-            story.append(PageBreak())
-    if not has_int_agent_data:
-        story.append(PageTracker("int_agent", page_registry))
-        story.append(Paragraph("Internal", group_label_style))
-        story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
-        _spacer(4)
-        story.append(Paragraph("Summary Agent Commission", sub_section_style))
-        _spacer(6)
-        story.append(Paragraph("No internal commission data available.", body_style))
-        story.append(PageBreak())
+        # Left: one oversized number carries the page instead of a row of
+        # equal-weight tiles, plus a thin rail for the two headcount stats.
+        left_col = [
+            Paragraph("TOTAL COMMISSION PAID", hero_label_style),
+            Spacer(1, 2),
+            Paragraph(f"RM {ov['total']:,.0f}", hero_num_style),
+            Spacer(1, 6),
+            Paragraph("Basic + NFP + ANP &middot; bonuses are added on the Payout by Type page", hero_sub_style),
+            Paragraph(total_delta_txt, ParagraphStyle("DeltaHero2", parent=styles["Normal"], fontSize=12.5,
+                                                       fontName=FONT_BOLD, spaceBefore=8,
+                                                       textColor=_rl_color(total_delta_color))),
+        ]
+        rail = Table(
+            [[Paragraph("ACTIVE AGENTS", rail_label_style), Paragraph(str(ov["agents"]), rail_value_style),
+              Paragraph(ag_txt, ParagraphStyle("RailD1", parent=ov_delta_style, alignment=TA_RIGHT, textColor=_rl_color(ag_color)))],
+             [Paragraph("TOTAL INVOICES", rail_label_style), Paragraph(str(ov["invoices"]), rail_value_style),
+              Paragraph(inv_txt, ParagraphStyle("RailD2", parent=ov_delta_style, alignment=TA_RIGHT, textColor=_rl_color(inv_color)))]],
+            colWidths=[None, 70, 140],
+        )
+        rail.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.75, _rl_color("#E7EBEF")),
+            ("LINEABOVE", (0, 0), (-1, 0), 0.75, _rl_color("#E7EBEF")),
+            ("TOPPADDING", (0, 0), (-1, -1), 9), ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        left_col.append(Spacer(1, 16))
+        left_col.append(rail)
 
-    # ----------------------------------------------------------------
-    # ii. Summary Internal Agent Commission by Customer (Basic + NFP)
-    # ----------------------------------------------------------------
-    int_cust_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price",
-                         "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)"]
-    # July 2026 onwards the builder emits an extra "Basic Commission (RM300)"
-    # column and replaces "Full Payment Date" with "75% Payment Date".
-    int_cust_headers_july = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price",
-                              "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)"]
-
-    has_int_cust_data = False
-    for m in range(1, 13):
-        if month is not None and m != month:
-            continue
-        month_name = MONTH_NAMES[m]
-        rows = int_customer_summary_rows.get(m, [])
-        if rows:
-            if not has_int_cust_data:
-                story.append(PageTracker("int_cust", page_registry))
-            has_int_cust_data = True
-            story.append(Paragraph("Internal", group_label_style))
-            story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
-            _spacer(4)
-            story.append(Paragraph("Summary Agent Commission by Customer", sub_section_style))
-            _spacer(6)
-            story.append(Paragraph(f"<b>{month_name} 2026</b>", ParagraphStyle("MonthHdr", parent=styles["Normal"], fontSize=9.5, fontName=FONT_BOLD, textColor=_rl_color("#1A365D"), spaceBefore=6, spaceAfter=4)))
-
-            # Metadata block — count from the actual table rows to match agent summary page
-            agents = set()
-            customers = set()
-            for r in rows:
-                if len(r) > 0 and r[0]: agents.add(str(r[0]).strip())
-                if len(r) > 1 and r[1]: customers.add(str(r[1]).strip())
-            story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(customers)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#C3DAF2\" size=\"11\">&bull;</font> Senior &nbsp;&nbsp; <font color=\"#E9F2FA\" size=\"11\">&bull;</font> Executive", meta_style))
-            _spacer(4)
-
-            # Check if Safwan column should be kept or removed
-            local_headers = list(int_cust_headers_july if m >= 7 else int_cust_headers)
-            _pkg_idx = 6 if m >= 7 else 5
-            local_rows = [list(r) for r in rows]
-            has_factory = any("factory" in str(r[_pkg_idx]).lower() for r in local_rows if len(r) > _pkg_idx)
-            if not has_factory:
-                lower_hdrs = [h.lower().strip() for h in local_headers]
-                if "safwan (rm)" in lower_hdrs:
-                    safwan_idx = lower_hdrs.index("safwan (rm)")
-                    local_headers.pop(safwan_idx)
-                    for r in local_rows:
-                        if len(r) > safwan_idx:
-                            r.pop(safwan_idx)
-
-            t = _build_customer_summary_table_rl(
-                f"Summary Internal Agent Commission by Customer — {month_name}",
-                local_headers,
-                local_rows,
-                CONTENT_W
-            )
-            story.append(t)
-            # Resolve rates dynamically for month m
-            try:
-                import basic_commission_rates
-                m_exec_val = basic_commission_rates.get_basic_rate("Internal", "executive", m)
-                m_senior_val = basic_commission_rates.get_basic_rate("Internal", "senior", m)
-                m_exec_str = f"{m_exec_val * 100:.2f}%".replace(".00", "")
-                m_senior_str = f"{m_senior_val * 100:.2f}%".replace(".00", "")
-            except Exception:
-                m_exec_str = "4%" if m >= 6 else "3%"
-                m_senior_str = "4.25%" if m >= 6 else "3.25%"
-
-            m_notes = ["<b>Basic Commission:</b>"]
-            if m <= 5:
-                m_notes.extend([
-                    "&bull;&nbsp;&nbsp;Basic Commission is for every Full Payment",
-                    "&bull;&nbsp;&nbsp;Total Amount - EPP Price (if applicable) = Sales Price",
-                    f"&bull;&nbsp;&nbsp;Sales Price x Rate % = Basic Commission (Executive - {m_exec_str}, Senior - {m_senior_str}, Senior Override - 0.25%)",
-                    "&bull;&nbsp;&nbsp;Basic Commission payout condition: given out to Agent once Payment = 100%"
-                ])
-            else:
-                m_notes.extend([
-                    "&bull;&nbsp;&nbsp;Total Amount - EPP Price (if applicable) = Sales Price",
-                    f"&bull;&nbsp;&nbsp;Sales Price x Rate % = Basic Commission (Executive - {m_exec_str}, Senior - {m_senior_str}, Senior Override - 0.25%)",
-                    "&bull;&nbsp;&nbsp;Basic Commission payout condition: i. Payment = 5% then Agent get RM300, ii. Payment = 75% then Agent get Balance Basic Commission"
-                ])
-
-            m_notes.extend([
-                "<b>Referral Fee:</b>",
-                "&bull;&nbsp;&nbsp;All Residential and non-residential: 1% (Before Mar 2026), 2% (From Mar 2026), Additional 0.5% (Mar Specials 2026)",
-                "&bull;&nbsp;&nbsp;Referral fee eligibility excludes spouses",
-                "<b>NFP Commission:</b>",
-                "&bull;&nbsp;&nbsp;NFP Commission distributions are contingent upon the receipt of 100% full payment.",
-                "&bull;&nbsp;&nbsp;Three types of Net Floor Price Commission:",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales above Net Floor Price:</b> Sales Price > Net Floor Price. Formula: (Sales Price - Net Floor Price) x 25% = NFP Commission",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales above System Price:</b> System Price > Net Floor Price. Formula: (System Price - Net Floor Price) x 100% = NFP Commission",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales below Net Floor price:</b> Sales Price < Net Floor Price. Formula: (Sales Price - Net Floor Price) x Bears 20% = NFP Commission",
-                "&bull;&nbsp;&nbsp;Effective October 1, 2025, NFP computations are applicable exclusively to invoices issued on or after this date. Invoices predating this period are structurally excluded from NFP allocations."
-            ])
-            _add_note_paragraphs(m_notes)
-            story.append(PageBreak())
-    if not has_int_cust_data:
-        story.append(PageTracker("int_cust", page_registry))
-        story.append(Paragraph("Internal", group_label_style))
-        story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
-        _spacer(4)
-        story.append(Paragraph("Summary Agent Commission by Customer", sub_section_style))
-        _spacer(6)
-        story.append(Paragraph("No internal customer commission data available.", body_style))
-        story.append(PageBreak())
-
-    # ----------------------------------------------------------------
-    # iii. ANP Commission (Internal) by Customer — comes AFTER Basic/NFP
-    # ----------------------------------------------------------------
-    has_int_anp_data = False
-    for m in range(1, 13):
-        if month is not None and m != month:
-            continue
-        month_name = MONTH_NAMES[m]
-        anp_cust_rows = int_customer_anp_rows.get(m, []) if int_customer_anp_rows else []
-        if anp_cust_rows:
-            if not has_int_anp_data:
-                story.append(PageTracker("int_anp", page_registry))
-            has_int_anp_data = True
-            story.append(Paragraph("Internal", group_label_style))
-            story.append(Paragraph("ANP Commission", section_title_style))
-            _spacer(6)
-            story.append(Paragraph("ANP Commission by Customer", sub_section_style))
-            _spacer(6)
-            story.append(Paragraph(f"<b>{month_name} 2026</b>", ParagraphStyle("MonthHdr", parent=styles["Normal"], fontSize=9.5, fontName=FONT_BOLD, textColor=_rl_color("#1A365D"), spaceBefore=6, spaceAfter=4)))
-
-            month_anp_detail = [r for r in int_anp_detail if _parse_month(r.get("invoice_date")) == m]
-            agents = set(r.get("agent_name", "").strip() for r in month_anp_detail if r.get("agent_name"))
-            customers = set((r.get("customer_name") or "").strip() for r in month_anp_detail if r.get("customer_name"))
-            story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(customers)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#C3DAF2\" size=\"11\">&bull;</font> Senior &nbsp;&nbsp; <font color=\"#E9F2FA\" size=\"11\">&bull;</font> Executive", meta_style))
-            _spacer(4)
-
-            int_anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Commission Price", "Clawback"]
-            t_anp = _build_customer_summary_table_rl(
-                f"ANP Commission by Customer — {month_name}",
-                int_anp_headers,
-                anp_cust_rows,
-                CONTENT_W
-            )
-            story.append(t_anp)
-            _add_note_paragraphs([
-                "&bull;&nbsp;&nbsp;Internal agents only",
-                "&bull;&nbsp;&nbsp;Requires at least RM0.01 paid",
-                "&bull;&nbsp;&nbsp;ANP Commission will be rewarded the next month of case issuance",
-                "&bull;&nbsp;&nbsp;EP Point Recognition Structure:",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- <b>Residence &amp; Shop Lot:</b> 100% recognition rate",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- <b>Factory:</b> Prior to May 2026: 100% recognition. Effective May 2026 onwards: 100% recognition for the first RM 40,000, 40% recognition for the balance amount (unless factory has less than 36pcs, in which case it follows Residence rate).",
-                "&bull;&nbsp;&nbsp;Commission Tiers based on Accumulated Total Sales:",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- RM 0 - 59k qualifies for RM 0",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- RM 60k - 179k qualifies for RM 500",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- RM 180k - 359k qualifies for RM 1000",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Above RM 360k qualifies for RM 1500",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Above RM 720k qualifies for RM 2000",
-                "<i>Reconciliation Note: Invoice 1005425 was issued in 2025 but fully paid in 2026. Consequently, it is excluded from H1 2026 ANP Commission Details (reconciling the section total to 138 invoices).</i>"
-            ])
-            story.append(PageBreak())
-    if not has_int_anp_data:
-        story.append(PageTracker("int_anp", page_registry))
-
-    # ----------------------------------------------------------------
-    # iv. EGA/ESA Awards (Internal) — Summary by Agent, then YTD by Customer on next page
-    # ----------------------------------------------------------------
-    story.append(PageTracker("int_ega", page_registry))
-
-    _ega_notes = [
-        "&bull;&nbsp;&nbsp;<b>EGA Targets (Standard):</b> EP Points > 600,000. <b>Early Bird EGA:</b> Feb &ge; 350,000 | Mar &ge; 400,000 | Apr &ge; 450,000 | May &ge; 500,000",
-        "&bull;&nbsp;&nbsp;<b>ESA Targets (Standard):</b> EP Points > 1,300,000. <b>Early Bird ESA:</b> Oct &ge; 1,000,000 | Nov &ge; 1,200,000",
-        "&bull;&nbsp;&nbsp;EP Point Recognition Structure:",
-        "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Requires a minimum 5% payment",
-        "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Residential / Shop Lot / Commercial: 100% recognition rate",
-        "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Factory / Corporate Projects (Prior to May 2026): 100% recognition rate (unless factory has less than 36pcs, in which case it follows Residence rate)",
-        "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Factory / Corporate Projects (Effective May 2026 onwards): 100% recognition for the initial RM 40,000; 40% recognition for subsequent amounts (unless factory has less than 36pcs, in which case it follows Residence rate)"
-    ]
-
-    if int_ega_t1 and int_ega_h1:
-        story.append(Paragraph("Internal", group_label_style))
-        story.append(Paragraph("EGA / ESA Awards", section_title_style))
-        _spacer(6)
-        story.append(Paragraph("Summary Agent Award", sub_section_style))
-        _spacer(4)
-        agents = set(r[0] for r in int_ega_t1 if r[0])
-        story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#C3DAF2\" size=\"11\">&bull;</font> Senior &nbsp;&nbsp; <font color=\"#E9F2FA\" size=\"11\">&bull;</font> Executive", meta_style))
-        _spacer(4)
-        t = _build_ega_table_rl(int_ega_h1, int_ega_t1, CONTENT_W)
-        story.append(t)
-        story.append(PageBreak())
-    else:
-        story.append(Paragraph("Internal", group_label_style))
-        story.append(Paragraph("EGA / ESA Awards", section_title_style))
-        _spacer(6)
-        story.append(Paragraph("No EGA/ESA award data available for internal agents.", body_style))
-        story.append(PageBreak())
-
-    # EGA/ESA Awards (YTD) by Customer — all invoice types, separate page
-    _int_ega_all = (int_ega_t2 or []) + (int_ega_t3 or [])
-    if _int_ega_all:
-        _int_ega_ytd_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package", "Sales Price", "Accumulated EP", "Eligibility"]
-        _int_ega_ytd_rows = []
-        for _er in sorted(_int_ega_all, key=lambda x: (str(x[0]).lower() if x else "", str(x[4]) if len(x) > 4 else "")):
-            if len(_er) >= 8:
-                inv_key = str(_er[2]).strip()
-                dates = invoice_dates_map.get(inv_key) if invoice_dates_map else None
-                inv_date = dates[0] if dates else str(_er[4]).strip()
-                first_pay_dt = dates[1] if dates else ""
-                _int_ega_ytd_rows.append([
-                    to_title_case(str(_er[0]).strip()),  # agent
-                    to_title_case(str(_er[1]).strip()),  # customer
-                    inv_date,                             # invoice_date
-                    first_pay_dt,                         # 1st payment date
-                    str(_er[3]).strip(),                  # package
-                    str(_er[5]).strip(),                  # sales_price
-                    str(_er[6]).strip(),                  # accum_ep
-                    str(_er[7]).strip(),                  # eligibility
-                ])
-        if _int_ega_ytd_rows:
-            story.append(Paragraph("Internal", group_label_style))
-            story.append(Paragraph("EGA / ESA Awards", section_title_style))
-            _spacer(6)
-            story.append(Paragraph("Summary Agent Award by Customer", sub_section_style))
-            _spacer(4)
-            _ytd_agents = set(r[0] for r in _int_ega_ytd_rows)
-            _ytd_customers = set(r[1] for r in _int_ega_ytd_rows)
-            story.append(Paragraph(f"<b>Total Agents:</b> {len(_ytd_agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(_ytd_customers)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#C3DAF2\" size=\"11\">&bull;</font> Senior &nbsp;&nbsp; <font color=\"#E9F2FA\" size=\"11\">&bull;</font> Executive", meta_style))
-            _spacer(4)
-            t_ytd = _build_ega_table_rl(_int_ega_ytd_headers, _int_ega_ytd_rows, CONTENT_W)
-            story.append(t_ytd)
-            _add_note_paragraphs(_ega_notes)
-            story.append(PageBreak())
-
-    # ----------------------------------------------------------------
-    # iii. Summary Outsource Agent Commission
-    # ----------------------------------------------------------------
-    out_agent_headers = ["Agent", "Total Invoice", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OUM Override"]
-    _out_agent_keep = [0, 1, 2, 3, 4, 5, 6, 7, 8]  # column indices to keep
-
-    has_out_agent_data = False
-    for m in range(1, 13):
-        if month is not None and m != month:
-            continue
-        month_name = MONTH_NAMES[m]
-        rows = out_agent_summary_rows.get(m, [])
-        if rows:
-            if not has_out_agent_data:
-                story.append(PageTracker("out_agent", page_registry))
-            has_out_agent_data = True
-            story.append(Paragraph("Outsource", group_label_style))
-            story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
-            _spacer(4)
-            story.append(Paragraph("Summary Agent Commission", sub_section_style))
-            _spacer(6)
-            story.append(Paragraph(f"<b>{month_name} 2026</b>", ParagraphStyle("MonthHdr", parent=styles["Normal"], fontSize=9.5, fontName=FONT_BOLD, textColor=_rl_color("#1A365D"), spaceBefore=6, spaceAfter=4)))
-
-            month_basic_lines = _expand_basic_lines_for_month(out_basic_lines, m)
-            month_nfp_rows = [r for r in out_nfp_rows if _parse_month(r.full_payment_date) == m]
-            agents = set(ln.agent_name.strip() for ln in month_basic_lines) | set(r.agent_name.strip() for r in month_nfp_rows)
-            customers = set(ln.customer_name.strip() for ln in month_basic_lines) | set(r.customer_name.strip() for r in month_nfp_rows)
-            story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(customers)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#CBD5E0\" size=\"11\">&bull;</font> OGM &nbsp;&nbsp; <font color=\"#E2E8F0\" size=\"11\">&bull;</font> OUM &nbsp;&nbsp; <font color=\"#F7FAFC\" size=\"11\">&bull;</font> OSA", meta_style))
-            _spacer(4)
-
-            # BCG-style note if no OGM agent is present
-            has_ogm = any(get_outsource_agent_tier(agent) == "OGM" for agent in agents)
-            if not has_ogm:
-                story.append(Paragraph("<i><b>Performance Note:</b> There are no active OGM agents recorded for this commission cycle.</i>", ParagraphStyle("OgmNotice2", parent=meta_style, fontName=FONT_REGULAR, fontSize=8.5, leading=11, textColor=_rl_color("#4A5568"))))
-                _spacer(4)
-
-            trimmed_rows = rows
-            t = _build_summary_table_rl(
-                f"Summary Agent Commission — {month_name}",
-                out_agent_headers,
-                trimmed_rows,
-                CONTENT_W,
-                is_outsource=True
-            )
-            story.append(t)
-            story.append(PageBreak())
-    if not has_out_agent_data:
-        story.append(PageTracker("out_agent", page_registry))
-        story.append(Paragraph("Outsource", group_label_style))
-        story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
-        _spacer(4)
-        story.append(Paragraph("Summary Agent Commission", sub_section_style))
-        _spacer(6)
-        story.append(Paragraph("No outsource commission data available.", body_style))
-        story.append(PageBreak())
-
-    # ----------------------------------------------------------------
-    # i. Summary Outsource Agent Commission by Customer
-    # ----------------------------------------------------------------
-    out_cust_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price",
-                         "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
-    # July 2026 onwards: extra "Basic Commission (RM300)" column, and
-    # "75% Payment Date" instead of "Full Payment Date" (see internal section).
-    out_cust_headers_july = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price",
-                              "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
-
-    has_out_cust_data = False
-    for m in range(1, 13):
-        if month is not None and m != month:
-            continue
-        month_name = MONTH_NAMES[m]
-        rows = out_customer_summary_rows.get(m, [])
-        if rows:
-            if not has_out_cust_data:
-                story.append(PageTracker("out_cust", page_registry))
-            has_out_cust_data = True
-            story.append(Paragraph("Outsource", group_label_style))
-            story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
-            _spacer(4)
-            story.append(Paragraph("Summary Agent Commission by Customer", sub_section_style))
-            _spacer(6)
-            story.append(Paragraph(f"<b>{month_name} 2026</b>", ParagraphStyle("MonthHdr", parent=styles["Normal"], fontSize=9.5, fontName=FONT_BOLD, textColor=_rl_color("#1A365D"), spaceBefore=6, spaceAfter=4)))
-
-            # Metadata block — count from actual table rows to match agent summary page
-            agents = set()
-            customers = set()
-            for r in rows:
-                if len(r) > 0 and r[0]: agents.add(str(r[0]).strip())
-                if len(r) > 1 and r[1]: customers.add(str(r[1]).strip())
-
-            story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(customers)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#CBD5E0\" size=\"11\">&bull;</font> OGM &nbsp;&nbsp; <font color=\"#E2E8F0\" size=\"11\">&bull;</font> OUM &nbsp;&nbsp; <font color=\"#F7FAFC\" size=\"11\">&bull;</font> OSA", meta_style))
-            _spacer(4)
-
-            # BCG-style note if no OGM agent is present
-            has_ogm = any(get_outsource_agent_tier(agent) == "OGM" for agent in agents)
-            if not has_ogm:
-                story.append(Paragraph("<i><b>Performance Note:</b> There are no active OGM agents recorded for this commission cycle.</i>", ParagraphStyle("OgmNotice", parent=meta_style, fontName=FONT_REGULAR, fontSize=8.5, leading=11, textColor=_rl_color("#4A5568"))))
-                _spacer(4)
-
-            # Check if Safwan column should be kept or removed
-            local_headers = list(out_cust_headers_july if m >= 7 else out_cust_headers)
-            _pkg_idx = 6 if m >= 7 else 5
-            local_rows = [list(r) for r in rows]
-            has_factory = any("factory" in str(r[_pkg_idx]).lower() for r in local_rows if len(r) > _pkg_idx)
-            if not has_factory:
-                lower_hdrs = [h.lower().strip() for h in local_headers]
-                if "safwan (rm)" in lower_hdrs:
-                    safwan_idx = lower_hdrs.index("safwan (rm)")
-                    local_headers.pop(safwan_idx)
-                    for r in local_rows:
-                        if len(r) > safwan_idx:
-                            r.pop(safwan_idx)
-
-            t = _build_customer_summary_table_rl(
-                f"Summary Outsource Agent Commission by Customer — {month_name}",
-                local_headers,
-                local_rows,
-                CONTENT_W,
-                is_outsource=True
-            )
-            story.append(t)
-            # Resolve rates dynamically for month m
-            try:
-                import basic_commission_rates
-                m_oum_val = basic_commission_rates.get_basic_rate("Outsource", "oum", m)
-                m_osa_val = basic_commission_rates.get_basic_rate("Outsource", "osa/osa1", m)
-                m_oum_str = f"{m_oum_val * 100:.2f}%".replace(".00", "")
-                m_osa_str = f"{m_osa_val * 100:.2f}%".replace(".00", "")
-            except Exception:
-                m_oum_str = "5.5%" if m >= 6 else "5%"
-                m_osa_str = "5.5%" if m >= 6 else "4.5%"
-
-            m_notes = ["<b>Basic Commission:</b>"]
-            if m <= 5:
-                m_notes.extend([
-                    "&bull;&nbsp;&nbsp;Basic Commission is for every Full Payment",
-                    "&bull;&nbsp;&nbsp;Total Amount - EPP Price (if applicable) = Sales Price",
-                    f"&bull;&nbsp;&nbsp;Sales Price x Rate % = Basic Commission (OUM - {m_oum_str}, OSA - {m_osa_str})",
-                    "&bull;&nbsp;&nbsp;Basic Commission payout condition: given out to Agent once Payment = 100%"
-                ])
-            else:
-                m_notes.extend([
-                    "&bull;&nbsp;&nbsp;Total Amount - EPP Price (if applicable) = Sales Price",
-                    f"&bull;&nbsp;&nbsp;Sales Price x Rate % = Basic Commission (OUM - {m_oum_str}, OSA - {m_osa_str})",
-                    "&bull;&nbsp;&nbsp;Basic Commission payout condition: i. Payment = 5% then Agent get RM300, ii. Payment = 75% then Agent get Balance Basic Commission"
-                ])
-
-            m_notes.extend([
-                "<b>Referral Fee:</b>",
-                "&bull;&nbsp;&nbsp;All Residential and non-residential: 1% (Before Mar 2026), 2% (From Mar 2026), Additional 0.5% (Mar Specials 2026)",
-                "&bull;&nbsp;&nbsp;Referral fee eligibility excludes spouses",
-                "<b>NFP Commission:</b>",
-                "&bull;&nbsp;&nbsp;NFP Commission distributions are contingent upon the receipt of 100% full payment.",
-                "&bull;&nbsp;&nbsp;Three types of Net Floor Price Commission:",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales above Net Floor Price:</b> Sales Price > Net Floor Price. Formula: (Sales Price - Net Floor Price) x 25% = NFP Commission",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales above System Price:</b> System Price > Net Floor Price. Formula: (System Price - Net Floor Price) x 100% = NFP Commission",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales below Net Floor price:</b> Sales Price < Net Floor Price. Formula: (Sales Price - Net Floor Price) x Bears 25% = NFP Commission",
-                "&bull;&nbsp;&nbsp;Effective October 1, 2025, NFP computations are applicable exclusively to invoices issued on or after this date. Invoices predating this period are structurally excluded from NFP allocations."
-            ])
-            _add_note_paragraphs(m_notes)
-            story.append(PageBreak())
-    if not has_out_cust_data:
-        story.append(PageTracker("out_cust", page_registry))
-        story.append(Paragraph("Outsource", group_label_style))
-        story.append(Paragraph("Basic Commission and Net Floor Price Commission", section_title_style))
-        _spacer(4)
-        story.append(Paragraph("Summary Agent Commission by Customer", sub_section_style))
-        _spacer(6)
-        story.append(Paragraph("No outsource customer commission data available.", body_style))
-        story.append(PageBreak())
-
-    # ----------------------------------------------------------------
-    # ANP Commission (Outsource) by Customer — comes AFTER Basic/NFP
-    # ----------------------------------------------------------------
-    has_out_anp_data = False
-    for m in range(1, 13):
-        if month is not None and m != month:
-            continue
-        month_name = MONTH_NAMES[m]
-        anp_cust_rows = out_customer_anp_rows.get(m, []) if out_customer_anp_rows else []
-        if anp_cust_rows:
-            if not has_out_anp_data:
-                story.append(PageTracker("out_anp", page_registry))
-            has_out_anp_data = True
-            story.append(Paragraph("Outsource", group_label_style))
-            story.append(Paragraph("ANP Commission", section_title_style))
-            _spacer(6)
-            story.append(Paragraph("ANP Commission by Customer", sub_section_style))
-            _spacer(6)
-            story.append(Paragraph(f"<b>{month_name} 2026</b>", ParagraphStyle("MonthHdr", parent=styles["Normal"], fontSize=9.5, fontName=FONT_BOLD, textColor=_rl_color("#1A365D"), spaceBefore=6, spaceAfter=4)))
-
-            month_anp_detail = [r for r in out_anp_detail if _parse_month(r.get("invoice_date")) == m]
-            agents = set(r.get("agent_name", "").strip() for r in month_anp_detail if r.get("agent_name"))
-            customers = set((r.get("customer_name") or "").strip() for r in month_anp_detail if r.get("customer_name"))
-            story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(customers)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#CBD5E0\" size=\"11\">&bull;</font> OGM &nbsp;&nbsp; <font color=\"#E2E8F0\" size=\"11\">&bull;</font> OUM &nbsp;&nbsp; <font color=\"#F7FAFC\" size=\"11\">&bull;</font> OSA", meta_style))
-            _spacer(4)
-
-            out_anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Commission Price", "Clawback"]
-            t_anp = _build_customer_summary_table_rl(
-                f"ANP Commission by Customer — {month_name}",
-                out_anp_headers,
-                anp_cust_rows,
-                CONTENT_W,
-                is_outsource=True
-            )
-            story.append(t_anp)
-            _add_note_paragraphs([
-                "&bull;&nbsp;&nbsp;Internal agents only",
-                "&bull;&nbsp;&nbsp;Requires at least RM0.01 paid",
-                "&bull;&nbsp;&nbsp;ANP Commission will be rewarded the next month of case issuance",
-                "&bull;&nbsp;&nbsp;EP Point Recognition Structure:",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- <b>Residence &amp; Shop Lot:</b> 100% recognition rate",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- <b>Factory:</b> Prior to May 2026: 100% recognition. Effective May 2026 onwards: 100% recognition for the first RM 40,000, 40% recognition for the balance amount (unless factory has less than 36pcs, in which case it follows Residence rate).",
-                "&bull;&nbsp;&nbsp;Commission Tiers based on Accumulated Total Sales:",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- RM 0 - 59k qualifies for RM 0",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- RM 60k - 179k qualifies for RM 500",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- RM 180k - 359k qualifies for RM 1000",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Above RM 360k qualifies for RM 1500",
-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Above RM 720k qualifies for RM 2000",
-            ])
-            story.append(PageBreak())
-    if not has_out_anp_data:
-        story.append(PageTracker("out_anp", page_registry))
-
-    # ----------------------------------------------------------------
-    # ii. EGA/ESA Awards (Outsource) — Summary by Agent, then YTD by Customer on next page
-    # ----------------------------------------------------------------
-    story.append(PageTracker("out_ega", page_registry))
-
-    _out_ega_notes = [
-        "&bull;&nbsp;&nbsp;<b>EGA Targets (Standard):</b> EP Points > 720,000. <b>Early Bird EGA:</b> Feb &ge; 420,000 | Mar &ge; 480,000 | Apr &ge; 540,000 | May &ge; 600,000",
-        "&bull;&nbsp;&nbsp;<b>ESA Targets (Standard):</b> EP Points > 1,560,000. <b>Early Bird ESA:</b> Oct &ge; 1,360,000 | Nov &ge; 1,460,000",
-        "&bull;&nbsp;&nbsp;EP Point Recognition Structure:",
-        "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Requires a minimum 5% payment",
-        "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Residential / Shop Lot / Commercial: 100% recognition rate",
-        "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Factory / Corporate Projects (Prior to May 2026): 100% recognition rate (unless factory has less than 36pcs, in which case it follows Residence rate)",
-        "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- Factory / Corporate Projects (Effective May 2026 onwards): 100% recognition for the initial RM 40,000; 40% recognition for subsequent amounts (unless factory has less than 36pcs, in which case it follows Residence rate)"
-    ]
-
-    if out_ega_t1 and out_ega_h1:
-        story.append(Paragraph("Outsource", group_label_style))
-        story.append(Paragraph("EGA / ESA Awards", section_title_style))
-        _spacer(6)
-        story.append(Paragraph("Summary Agent Award", sub_section_style))
-        _spacer(4)
-        agents = set(r[0] for r in out_ega_t1 if r[0])
-        story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#CBD5E0\" size=\"11\">&bull;</font> OGM &nbsp;&nbsp; <font color=\"#E2E8F0\" size=\"11\">&bull;</font> OUM &nbsp;&nbsp; <font color=\"#F7FAFC\" size=\"11\">&bull;</font> OSA", meta_style))
-        _spacer(4)
-        t = _build_ega_table_rl(out_ega_h1, out_ega_t1, CONTENT_W)
-        story.append(t)
-        story.append(PageBreak())
-    else:
-        story.append(Paragraph("Outsource", group_label_style))
-        story.append(Paragraph("EGA / ESA Awards", section_title_style))
-        _spacer(6)
-        story.append(Paragraph("No outsource award data available.", body_style))
-        story.append(PageBreak())
-
-    # EGA/ESA Awards (YTD) by Customer — all invoice types, separate page
-    _out_ega_all = (out_ega_t2 or []) + (out_ega_t3 or [])
-    if _out_ega_all:
-        _out_ega_ytd_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package", "Sales Price", "Accumulated EP", "Eligibility"]
-        _out_ega_ytd_rows = []
-        for _er in sorted(_out_ega_all, key=lambda x: (str(x[0]).lower() if x else "", str(x[4]) if len(x) > 4 else "")):
-            if len(_er) >= 8:
-                inv_key = str(_er[2]).strip()
-                dates = invoice_dates_map.get(inv_key) if invoice_dates_map else None
-                inv_date = dates[0] if dates else str(_er[4]).strip()
-                first_pay_dt = dates[1] if dates else ""
-                _out_ega_ytd_rows.append([
-                    to_title_case(str(_er[0]).strip()),  # agent
-                    to_title_case(str(_er[1]).strip()),  # customer
-                    inv_date,                             # invoice_date
-                    first_pay_dt,                         # 1st payment date
-                    str(_er[3]).strip(),                  # package
-                    str(_er[5]).strip(),                  # sales_price
-                    str(_er[6]).strip(),                  # accum_ep
-                    str(_er[7]).strip(),                  # eligibility
-                ])
-        if _out_ega_ytd_rows:
-            story.append(Paragraph("Outsource", group_label_style))
-            story.append(Paragraph("EGA / ESA Awards", section_title_style))
-            _spacer(6)
-            story.append(Paragraph("Summary Agent Award by Customer", sub_section_style))
-            _spacer(4)
-            _ytd_agents = set(r[0] for r in _out_ega_ytd_rows)
-            _ytd_customers = set(r[1] for r in _out_ega_ytd_rows)
-            story.append(Paragraph(f"<b>Total Agents:</b> {len(_ytd_agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(_ytd_customers)} &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <b>Legend:</b> <font color=\"#CBD5E0\" size=\"11\">&bull;</font> OGM &nbsp;&nbsp; <font color=\"#E2E8F0\" size=\"11\">&bull;</font> OUM &nbsp;&nbsp; <font color=\"#F7FAFC\" size=\"11\">&bull;</font> OSA", meta_style))
-            _spacer(4)
-            t_ytd = _build_ega_table_rl(_out_ega_ytd_headers, _out_ega_ytd_rows, CONTENT_W)
-            story.append(t_ytd)
-            _add_note_paragraphs(_out_ega_notes)
-            story.append(PageBreak())
-
-    # ----------------------------------------------------------------
-    # iv. Production Bonus (Outsource)
-    # ----------------------------------------------------------------
-    story.append(PageTracker("out_prod", page_registry))
-
-    if out_prod_data:
-        oum_summary = out_prod_data.get("oum_summary", [])
-        ogm_summary = out_prod_data.get("ogm_summary", [])
-        team_detail = out_prod_data.get("team_detail", [])
-        pb_headers = out_prod_data.get("headers", {})
-
-        _pb_notes = [
-            "&bull;&nbsp;&nbsp;Production Bonus is calculated on cumulative invoices from January through the report month (YTD).",
-            "&bull;&nbsp;&nbsp;<b>OUM Bonus:</b> 0.5% of Team Total Sales — qualifies when Team Total Sales &ge; RM 2,000,000 AND Personal Sales &ge; RM 300,000.",
-            "&bull;&nbsp;&nbsp;<b>OGM Bonus:</b> 0.75% of OSA Sales + 0.25% of OUM Sales — qualifies when Team Total Sales &ge; RM 8,000,000.",
-            "&bull;&nbsp;&nbsp;Sales Price = Total Amount &minus; EPP Interest (where applicable).",
-            "&bull;&nbsp;&nbsp;Applies across ALL package types (Residential, Shop Lot, Factory, etc.).",
+        # Right: Effective Rate as a gauge -- it's a rate against a range,
+        # not a headcount, so a dial reads more honestly than a flat number.
+        gauge = _gauge_drawing(ov["effective_rate"], max_pct=6.0, size=170)
+        right_col = [
+            Paragraph("EFFECTIVE COMMISSION RATE", gauge_title_style),
+            Spacer(1, 4),
+            gauge,
+            # Pulls the value text up into the gauge's own blank bottom half
+            # instead of stacking below the Drawing's full declared height.
+            Spacer(1, -96),
+            Paragraph(f"{ov['effective_rate']:.2f}%", gauge_value_style),
+            Paragraph(eff_txt, ParagraphStyle("GaugeDelta", parent=styles["Normal"], fontSize=9.5,
+                                               fontName=FONT_BOLD, alignment=TA_CENTER,
+                                               textColor=_rl_color(eff_color), spaceBefore=2, spaceAfter=8)),
+            Paragraph("Commission Paid &divide; Sales Value &times; 100. Rising faster than sales is worth a "
+                      "closer look; steady or falling means payout is keeping pace with revenue.",
+                      gauge_caption_style),
         ]
 
-        if oum_summary and pb_headers.get("oum"):
-            story.append(Paragraph("Outsource", group_label_style))
-            story.append(Paragraph("Production Bonus", section_title_style))
-            _spacer(6)
-            story.append(Paragraph("Production Bonus Summary", sub_section_style))
-            _spacer(4)
+        es_grid = Table([[left_col, right_col]], colWidths=[CONTENT_W * 0.58, CONTENT_W * 0.42])
+        es_grid.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ALIGN", (1, 0), (1, 0), "CENTER"),
+            ("LINEBEFORE", (1, 0), (1, 0), 0.75, _rl_color("#E7EBEF")),
+            ("LEFTPADDING", (1, 0), (1, 0), 24), ("RIGHTPADDING", (0, 0), (0, 0), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        story.append(es_grid)
+        story.append(PageBreak())
 
-            agents = set(r[0] for r in oum_summary if r[0])
-            # Customer count from team_detail (same data as Table 2 / by-Customer page)
-            customers_from_detail = set(r[1] for r in team_detail if len(r) > 1 and r[1])
-            story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(customers_from_detail)}", meta_style))
-            _spacer(4)
+        # --- Top Performers & Concentration ---
+        story.append(PageTracker("top_performers", page_registry))
+        top_n = min(10, len(report_overview["unified_current"]))
+        story.append(_band_header(
+            "Overview", "Top Performers &amp; Concentration",
+            f"Top {top_n} of {ov['agents']} active agents, by total commission (Basic + NFP + ANP) &middot; {period_label}"))
+        _spacer(14)
 
-            t = _build_ega_table_rl(pb_headers["oum"], oum_summary, CONTENT_W)
-            story.append(t)
-            story.append(PageBreak())
+        unified_current = report_overview["unified_current"]
+        rank_changes = report_overview["rank_changes"]
 
-        if ogm_summary and pb_headers.get("ogm"):
-            story.append(Paragraph("Outsource", group_label_style))
-            story.append(Paragraph("Production Bonus", section_title_style))
-            _spacer(6)
-            story.append(Paragraph("Production Bonus — OGM Summary", sub_section_style))
-            _spacer(4)
+        if top_n == 0:
+            story.append(Paragraph("No agents with commission this month.", body_style))
+        else:
+            top_rows = unified_current[:top_n]
+            podium_rows = top_rows[:3]
+            rest_rows = top_rows[3:]
 
-            agents = set(r[0] for r in ogm_summary if r[0])
-            # Customer count from team_detail (same data as Table 2 / by-Customer page)
-            customers_from_detail = set(r[1] for r in team_detail if len(r) > 1 and r[1])
-            story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(customers_from_detail)}", meta_style))
-            _spacer(4)
+            def _podium_card(rank, r, dark):
+                rank_style = podium_rank_style if dark else podium_rank_style_light
+                name_style = podium_name_style if dark else podium_name_style_light
+                amt_style = podium_amt_style if dark else podium_amt_style_light
+                tag_color = ("#8FB3A8" if dark else "#0B6350") if r["type"] == "Internal" else ("#F4C9A8" if dark else "#B54A1D")
+                tag_label = "INTERNAL" if r["type"] == "Internal" else "OUTSOURCE"
+                badge_txt, badge_color = _rank_badge_text(rank_changes.get(r["agent"], "flat"))
+                cell = [
+                    Paragraph(f"RANK {rank:02d}", rank_style),
+                    Spacer(1, 5),
+                    Paragraph(r["agent"], name_style),
+                    Paragraph(f'<font color="{tag_color}"><b>{tag_label}</b></font>',
+                              ParagraphStyle(f"PodTag{rank}", parent=styles["Normal"], fontSize=7.5, fontName=FONT_BOLD)),
+                    Spacer(1, 8),
+                    Paragraph(f'RM {r["total"]:,.0f}', amt_style),
+                    Paragraph(badge_txt, ParagraphStyle(f"PodChg{rank}", parent=styles["Normal"], fontSize=8.5,
+                                                         fontName=FONT_BOLD, spaceBefore=3,
+                                                         textColor=_rl_color(badge_color if dark else badge_color))),
+                ]
+                return cell
 
-            t = _build_ega_table_rl(pb_headers["ogm"], ogm_summary, CONTENT_W)
-            story.append(t)
-            story.append(PageBreak())
+            podium_cells = [_podium_card(i + 1, r, dark=(i == 0)) for i, r in enumerate(podium_rows)]
+            while len(podium_cells) < 3:
+                podium_cells.append([Paragraph("", body_style)])
+            podium = Table([podium_cells], colWidths=[(CONTENT_W - 24) / 3.0] * 3)
+            p_styles = [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 14), ("RIGHTPADDING", (0, 0), (-1, -1), 14),
+                ("TOPPADDING", (0, 0), (-1, -1), 14), ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
+                ("BACKGROUND", (0, 0), (0, 0), _rl_color(BAND_BG)),
+            ]
+            if len(podium_rows) > 1:
+                p_styles += [("BACKGROUND", (1, 0), (1, 0), _rl_color("#F5F8F7")),
+                             ("BOX", (1, 0), (1, 0), 0.75, _rl_color("#E7EBEF"))]
+            if len(podium_rows) > 2:
+                p_styles += [("BACKGROUND", (2, 0), (2, 0), _rl_color("#F5F8F7")),
+                             ("BOX", (2, 0), (2, 0), 0.75, _rl_color("#E7EBEF"))]
+            podium.setStyle(TableStyle(p_styles))
+            story.append(podium)
+            _spacer(14)
 
-        if team_detail and pb_headers.get("detail"):
-            story.append(Paragraph("Outsource", group_label_style))
-            story.append(Paragraph("Production Bonus", section_title_style))
-            _spacer(6)
-            story.append(Paragraph("Production Bonus Summary by customer", sub_section_style))
-            _spacer(4)
+            if rest_rows:
+                rest_data = []
+                for i, r in enumerate(rest_rows):
+                    rank = i + 4
+                    tag_color = "#0B6350" if r["type"] == "Internal" else "#B54A1D"
+                    tag_label = "INT" if r["type"] == "Internal" else "OUT"
+                    name_para = Paragraph(
+                        f'<font color="{tag_color}"><b>{tag_label}</b></font>&nbsp;&nbsp;{r["agent"]}', rest_name_style)
+                    amt_para = Paragraph(f'RM {r["total"]:,.2f}', rest_amt_style)
+                    badge_txt, badge_color = _rank_badge_text(rank_changes.get(r["agent"], "flat"))
+                    chg_para = Paragraph(badge_txt, ParagraphStyle(f"RestChg{i}", parent=styles["Normal"], fontSize=9,
+                                                                    fontName=FONT_BOLD, alignment=TA_RIGHT,
+                                                                    textColor=_rl_color(badge_color)))
+                    rest_data.append([Paragraph(f"{rank:02d}", toc_num_style), name_para, amt_para, chg_para])
+                rest_table = Table(rest_data, colWidths=[26, CONTENT_W - 26 - 130 - 90, 130, 90])
+                rest_table.setStyle(TableStyle([
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LINEBELOW", (0, 0), (-1, -1), 0.5, _rl_color("#E7EBEF")),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                ]))
+                story.append(rest_table)
 
-            agents = set(r[0] for r in team_detail if len(r) > 0 and r[0])
-            customers = set(r[1] for r in team_detail if len(r) > 1 and r[1])
-            story.append(Paragraph(f"<b>Total Agents:</b> {len(agents)} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Total Customers:</b> {len(customers)}", meta_style))
-            _spacer(4)
+            top_total = sum(r["total"] for r in top_rows)
+            pct_of_total = (top_total / ov["total"] * 100.0) if ov["total"] else 0.0
+            pct_of_roster = (len(top_rows) / ov["agents"] * 100.0) if ov["agents"] else 0.0
+            watch_line = ("Worth a standing watch: if that share keeps climbing, payout is riding on fewer people."
+                          if pct_of_total >= 30 else
+                          "A broad base right now &mdash; payout isn't concentrated in a small group.")
+            _add_note_paragraphs([
+                f"<b>Concentration.</b> The top {len(top_rows)} agents ({pct_of_roster:.0f}% of the active roster) "
+                f"generated RM {top_total:,.2f} &mdash; {pct_of_total:.0f}% of all Basic+NFP+ANP commission paid this month.",
+                watch_line,
+            ])
+        story.append(PageBreak())
 
-            t = _build_ega_table_rl(pb_headers["detail"], team_detail, CONTENT_W)
-            story.append(t)
-            _add_note_paragraphs(_pb_notes)
-            story.append(PageBreak())
-    else:
-        story.append(Paragraph("Outsource", group_label_style))
-        story.append(Paragraph("Production Bonus", section_title_style))
-        _spacer(6)
-        story.append(Paragraph("No production bonus data available.", body_style))
+        # --- Total Commission Payout by Type ---
+        story.append(PageTracker("payout_type", page_registry))
+        story.append(_band_header("Overview", "Total Commission Payout by Type",
+                                   f"All Agents combined &middot; {period_label}"))
+        _spacer(16)
+
+        prod_bonus_total = float(report_overview.get("prod_bonus_total", 0.0))
+        team_bonus_total = float(report_overview.get("team_bonus_total", 0.0))
+        ega_eligible = int(report_overview.get("ega_eligible", 0))
+        grand_all_types = ov["total"] + prod_bonus_total + team_bonus_total
+
+        segs = [
+            ("Basic Commission", ov["basic"], "#0E7C66"),
+            ("NFP Commission", ov["nfp"], "#1B9A81"),
+            ("ANP Commission", ov["anp"], "#33B79B"),
+            ("Production Bonus", prod_bonus_total, "#5CCEB4"),
+            ("Team Championship / Achievement", team_bonus_total, "#93E1CC"),
+        ]
+        # A single stacked bar instead of a donut -- reads left-to-right and
+        # scales to 5+ categories far better than a thin ring of slices does.
+        story.append(_proportion_bar(segs, CONTENT_W, height=34))
+        _spacer(18)
+
+        legend_cells = []
+        for name, val, color in segs:
+            pct = (val / grand_all_types * 100.0) if grand_all_types else 0.0
+            legend_cells.append([
+                Paragraph(name, type_item_name_style),
+                Spacer(1, 3),
+                Paragraph(f"RM {val:,.2f}", type_item_amt_style),
+                Paragraph(f"{pct:.1f}%", type_item_pct_style),
+            ])
+        if ega_eligible:
+            legend_cells.append([
+                Paragraph("EGA / ESA Awards", ParagraphStyle("EgaName", parent=type_item_name_style, textColor=_rl_color("#8B95A3"))),
+                Spacer(1, 3),
+                Paragraph(f"{ega_eligible} eligible", ParagraphStyle("EgaAmt", parent=type_item_amt_style, textColor=_rl_color("#8B95A3"))),
+                Paragraph("non-cash award", type_item_pct_style),
+            ])
+        legend_colors = [c for _, _, c in segs] + (["#E7EBEF"] if ega_eligible else [])
+        legend_row1 = legend_cells[:3]
+        legend_row2 = legend_cells[3:]
+        legend_grid_rows = [legend_row1]
+        legend_border_row1 = [("LINEABOVE", (i, 0), (i, 0), 2.5, _rl_color(legend_colors[i])) for i in range(len(legend_row1))]
+        border_styles = list(legend_border_row1)
+        if legend_row2:
+            legend_grid_rows.append(legend_row2 + [[Paragraph("", type_item_name_style)]] * (3 - len(legend_row2)))
+            border_styles += [("LINEABOVE", (i, 1), (i, 1), 2.5, _rl_color(legend_colors[3 + i]))
+                              for i in range(len(legend_row2))]
+        legend_grid = Table(legend_grid_rows, colWidths=[CONTENT_W / 3.0] * 3)
+        legend_grid.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 16),
+        ] + border_styles))
+        story.append(legend_grid)
+
+        grand_line = Table([[Paragraph("GRAND TOTAL, ALL TYPES", grand_label_style),
+                             Paragraph(f"RM {grand_all_types:,.2f}", grand_value_style)]],
+                           colWidths=[CONTENT_W - 200, 200])
+        grand_line.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LINEABOVE", (0, 0), (-1, 0), 1.2, _rl_color("#141A1F")),
+            ("TOPPADDING", (0, 0), (-1, -1), 10), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        story.append(grand_line)
+        _payout_notes = [
+            "The Executive Summary total covers commission proper (Basic + NFP + ANP). "
+            "This page adds Production Bonus and Team Championship / Achievement Bonus for the full payout picture.",
+            "Production Bonus accumulates from January through the report month (year-to-date).",
+        ]
+        if ega_eligible:
+            _payout_notes.append(
+                f"EGA / ESA Awards: {ega_eligible} agent{'s' if ega_eligible != 1 else ''} currently eligible. "
+                "These are non-cash awards (recognition trips), so they carry no ringgit value in this chart.")
+        _add_note_paragraphs(_payout_notes)
         story.append(PageBreak())
 
     # ----------------------------------------------------------------
-    # June Monthly Contest (company-wide — not agent-type specific)
+    # Commission Detail: Summary Agent Commission (all agents, unified)
+    #
+    # The per-invoice/per-customer ledgers (dates, rates, overrides, referral
+    # fees) were removed from the PDF on request -- the Download Excel export
+    # still carries all of them for reconciliation.
     # ----------------------------------------------------------------
-    story.append(PageTracker("contest", page_registry))
+    story.append(PageTracker("agent_summary", page_registry))
+    _asc_sub = ""
+    if report_overview is not None and report_overview.get("unified_current"):
+        _asc_sub = (f"All {len(report_overview['unified_current'])} agents, ranked by total commission "
+                   f"(Basic + NFP + ANP) &middot; {report_overview.get('period_label', '')}")
+    story.append(_band_header("Commission Detail", "Summary Agent Commission", _asc_sub))
+    _spacer(14)
+    if report_overview is not None and report_overview.get("unified_current"):
+        unified = report_overview["unified_current"]
+        ov_det = report_overview["overview_current"]
 
-    _contest_notes = [
-        "&bull;&nbsp;&nbsp;<b>Team Ranking Rewards:</b> Champion = RM 5,000 | Runner-up = RM 3,000 | Third Place = RM 2,000",
-        "&bull;&nbsp;&nbsp;<b>Golden Boot Award</b> (Top 3 Individuals): Champion = RM 3,000 | Runner-up = RM 2,000 | Third Place = RM 1,000",
-        "&bull;&nbsp;&nbsp;<b>Eligibility:</b> At least 3 cases completed, Monthly sales &ge; RM 150,000, Meets company performance recognition standards",
-        "&bull;&nbsp;&nbsp;<b>Team Achievement Bonus:</b> Team target achieved, every member completes at least 1 deal &mdash; Reward for all qualified members: RM 2,000",
-        "&bull;&nbsp;&nbsp;<b>Fast Start Award:</b> Complete 2 deals &mdash; Reward: Xiaomi Smart Watch (RM 250)",
-    ]
+        det_rows = [[
+            Paragraph("AGENT", ledger_hdr_style),
+            Paragraph("BASIC (RM)", ledger_hdr_right_style),
+            Paragraph("NFP (RM)", ledger_hdr_right_style),
+            Paragraph("ANP (RM)", ledger_hdr_right_style),
+            Paragraph("TOTAL (RM)", ledger_hdr_right_style),
+        ]]
+        for r in unified:
+            tag_color = "#0B6350" if r["type"] == "Internal" else "#B54A1D"
+            tag_label = "INT" if r["type"] == "Internal" else "OUT"
+            det_rows.append([
+                Paragraph(f'<font color="{tag_color}"><b>[{tag_label}]</b></font>&nbsp;&nbsp;{r["agent"]}', ledger_row_style),
+                Paragraph(f'{r["basic"]:,.2f}' if r["basic"] else "&ndash;", ledger_num_style),
+                Paragraph(f'{r["nfp"]:,.2f}' if r["nfp"] else "&ndash;", ledger_num_style),
+                Paragraph(f'{r["anp"]:,.2f}' if r["anp"] else "&ndash;", ledger_num_style),
+                Paragraph(f'{r["total"]:,.2f}', ledger_tot_style),
+            ])
+        det_rows.append([
+            Paragraph("GRAND TOTAL", ledger_grand_label_style),
+            Paragraph(f'{ov_det["basic"]:,.2f}', ledger_grand_style),
+            Paragraph(f'{ov_det["nfp"]:,.2f}', ledger_grand_style),
+            Paragraph(f'{ov_det["anp"]:,.2f}', ledger_grand_style),
+            Paragraph(f'{ov_det["total"]:,.2f}', ledger_grand_style),
+        ])
 
-    if contest_t1_headers and contest_t1_rows:
-        story.append(Paragraph(contest_title, section_title_style))
-        _spacer(6)
-        story.append(Paragraph("Team Championship and Team Achievement Bonus", sub_section_style))
-        _spacer(4)
-        t1 = _build_ega_table_rl(contest_t1_headers, contest_t1_rows, CONTENT_W)
-        story.append(t1)
-        story.append(PageBreak())
-
-        story.append(Paragraph(contest_title, section_title_style))
-        _spacer(6)
-        story.append(Paragraph("Summary of Cases and Awards by Agent", sub_section_style))
-        _spacer(4)
-        t3 = _build_ega_table_rl(contest_t3_headers, contest_t3_rows, CONTENT_W)
-        story.append(t3)
-        _add_note_paragraphs(_contest_notes)
-        story.append(PageBreak())
+        num_w = 110
+        det_tbl = Table(det_rows, colWidths=[CONTENT_W - 4 * num_w, num_w, num_w, num_w, num_w],
+                        repeatRows=1, splitByRow=1)
+        det_tbl.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LINEBELOW", (0, 0), (-1, 0), 1.2, _rl_color("#141A1F")),
+            ("LINEBELOW", (0, 1), (-1, -2), 0.4, _rl_color("#E7EBEF")),
+            ("LINEABOVE", (0, -1), (-1, -1), 1.2, _rl_color("#141A1F")),
+            ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(det_tbl)
+        _add_note_paragraphs([
+            "This page totals commission per agent. Invoice-level detail (dates, rates, "
+            "overrides, referral fees) is available in the Excel export from the dashboard.",
+        ])
     else:
-        story.append(Paragraph(contest_title, section_title_style))
-        _spacer(6)
-        story.append(Paragraph("No monthly contest data available.", body_style))
-        story.append(PageBreak())
+        story.append(Paragraph("No commission data available for this period.", body_style))
+    story.append(PageBreak())
 
     # ----------------------------------------------------------------
     # Build PDF
@@ -4846,6 +4930,12 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         basic_mod = _load_module("int_basic_commission", basic_path)
     invoice_dates_map = fetch_invoice_dates(year, basic_mod)
 
+    # Full-year copy kept aside before the month filter below mutates
+    # int_anp_detail -- the Top Performers "vs last month" comparison needs
+    # the previous month's rows too, and re-fetching just for that would cost
+    # another network round-trip for no reason (the data's already here).
+    int_anp_detail_full = list(int_anp_detail)
+
     # If a specific month is requested, keep ANP detail for that month only and
     # re-scope the highlight metas. Basic/NFP lines intentionally stay
     # full-year: build_internal_summary_tables() buckets them per month via
@@ -4864,7 +4954,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
                         "invoices": len(_m_nfp),
                         "total_commission": Decimal(str(round(sum(float(r.nfp_commission) for r in _m_nfp), 2)))}
 
-    int_agent_summary_rows, int_customer_summary_rows, int_agent_anp_rows, int_customer_anp_rows = build_internal_summary_tables(
+    int_agent_summary_rows, int_customer_summary_rows, int_agent_anp_rows, int_customer_anp_rows, int_agent_totals_by_month = build_internal_summary_tables(
         basic_t1=int_basic_t1,
         basic_lines=int_basic_lines,
         basic_t4=int_basic_t4,
@@ -4887,6 +4977,9 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         if inv_num:
             invoice_package_map[inv_num] = get_invoice_package(inv_num, ln)
 
+    # Same reasoning as int_anp_detail_full above.
+    out_anp_detail_full = list(out_anp_detail)
+
     # Same month handling as the internal side above: only ANP detail is
     # pre-filtered; Basic/NFP lines stay full-year for milestone bucketing.
     if month is not None:
@@ -4905,7 +4998,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     # Build outsource summary tables
 
     print("  Building outsource summary tables...")
-    out_agent_summary_rows, out_customer_summary_rows, out_customer_anp_rows = build_outsource_summary_tables(
+    out_agent_summary_rows, out_customer_summary_rows, out_customer_anp_rows, out_agent_totals_by_month = build_outsource_summary_tables(
         basic_t1=out_basic_t1,
         basic_lines=out_basic_lines,
         basic_meta=out_basic_meta,
@@ -4920,6 +5013,137 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     )
     print(f"    Agent summary: {len(out_agent_summary_rows)} rows")
     print(f"    Customer summary: {len(out_customer_summary_rows)} rows")
+
+    # ----------------------------------------------------------------
+    # Unified (Internal + Outsource combined) report overview: Executive
+    # Summary totals + Effective Commission Rate, the Top Performers &
+    # Concentration ranking, the Payout by Type donut, and the unified
+    # Summary Agent Commission page. For the H1/no-month pack the totals
+    # aggregate across every month present (no prior-period deltas).
+    # ----------------------------------------------------------------
+    _MN = {1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
+           7: "July", 8: "August", 9: "September", 10: "October", 11: "November", 12: "December"}
+
+    # Cash bonus totals for the Payout by Type page. EGA/ESA is a non-cash
+    # award (eligibility for a recognition trip), so it contributes a count,
+    # not a ringgit segment.
+    def _sum_last_money_col(rows: list) -> float:
+        total = 0.0
+        for r in rows or []:
+            if not r or str(r[0]).strip().lower().startswith(("total", "grand")):
+                continue
+            total += float(_parse_rm(r[-1]))
+        return total
+
+    prod_bonus_total = 0.0
+    if out_prod_data:
+        prod_bonus_total = (_sum_last_money_col(out_prod_data.get("oum_summary"))
+                            + _sum_last_money_col(out_prod_data.get("ogm_summary")))
+
+    team_bonus_total = 0.0
+    if contest_t1_headers and contest_t1_rows:
+        _lc_hdrs = [str(h).strip().lower() for h in contest_t1_headers]
+        _bonus_cols = [i for i, h in enumerate(_lc_hdrs)
+                       if "award (rm)" in h or "bonus (rm)" in h]
+        for r in contest_t1_rows:
+            if not r or str(r[0]).strip().lower().startswith(("total", "grand")):
+                continue
+            for i in _bonus_cols:
+                if i < len(r):
+                    team_bonus_total += float(_parse_rm(r[i]))
+
+    ega_eligible = sum(
+        1 for r in (list(int_ega_t1 or []) + list(out_ega_t1 or []))
+        if r and len(r) >= 4 and str(r[3]).strip() not in ("", "-")
+    )
+
+    print("  Building unified report overview (all agents, Basic+NFP+ANP)...")
+    if month is not None:
+        out_anp_by_agent = _max_anp_by_agent_for_month(out_anp_detail_full, month)
+        unified_current = _unified_agent_totals(
+            int_agent_totals_by_month.get(month, {}),
+            out_agent_totals_by_month.get(month, {}),
+            out_anp_by_agent,
+        )
+        period_label = f"{_MN[month]} {year}"
+    else:
+        # H1/no-month pack: aggregate the per-month unified totals per agent.
+        _acc: dict[tuple[str, str], dict] = {}
+        _months = sorted(set(int_agent_totals_by_month) | set(out_agent_totals_by_month))
+        for _m in _months:
+            for r in _unified_agent_totals(
+                    int_agent_totals_by_month.get(_m, {}),
+                    out_agent_totals_by_month.get(_m, {}),
+                    _max_anp_by_agent_for_month(out_anp_detail_full, _m)):
+                a = _acc.setdefault((r["agent"], r["type"]), {
+                    "agent": r["agent"], "type": r["type"],
+                    "basic": 0.0, "nfp": 0.0, "anp": 0.0,
+                    "sales": 0.0, "invoices": 0, "total": 0.0,
+                })
+                for k in ("basic", "nfp", "anp", "sales", "invoices", "total"):
+                    a[k] += r[k]
+        unified_current = sorted(_acc.values(), key=lambda r: r["total"], reverse=True)
+        period_label = (f"{_MN[_months[0]]} to {_MN[_months[-1]]} {year}"
+                        if _months else f"{year}")
+    overview_current = _report_overview_totals(unified_current)
+
+    prev_month = (month - 1 if month is not None and month > 1 else None)
+    unified_prev: list[dict] = []
+    overview_prev = None
+    if prev_month is not None:
+        _, _, _, _, int_totals_prev = build_internal_summary_tables(
+            basic_t1=int_basic_t1,
+            basic_lines=int_basic_lines,
+            basic_t4=int_basic_t4,
+            nfp_agent_rows=int_nfp_agent,
+            nfp_rows=int_nfp_rows,
+            nfp_by_inv_all=int_nfp_by_inv_all,
+            anp_summary_rows=int_anp_summary_for_table,
+            anp_detail=int_anp_detail_full,
+            year=year,
+            invoice_dates_map=invoice_dates_map,
+            month=prev_month,
+        )
+        _, _, _, out_totals_prev = build_outsource_summary_tables(
+            basic_t1=out_basic_t1,
+            basic_lines=out_basic_lines,
+            basic_meta=out_basic_meta,
+            nfp_agent_rows=out_nfp_agent,
+            nfp_rows=out_nfp_rows,
+            nfp_by_inv_all=out_nfp_by_inv_all,
+            anp_summary_rows=[],
+            anp_detail=out_anp_detail_full,
+            year=year,
+            invoice_dates_map=invoice_dates_map,
+            month=prev_month,
+        )
+        out_anp_by_agent_prev = _max_anp_by_agent_for_month(out_anp_detail_full, prev_month)
+        unified_prev = _unified_agent_totals(
+            int_totals_prev.get(prev_month, {}),
+            out_totals_prev.get(prev_month, {}),
+            out_anp_by_agent_prev,
+        )
+        overview_prev = _report_overview_totals(unified_prev)
+
+    report_overview = {
+        "month": month,
+        "prev_month": prev_month,
+        "period_label": period_label,
+        "prev_period_label": (f"{_MN[prev_month]} {year}" if prev_month is not None else None),
+        "unified_current": unified_current,
+        "overview_current": overview_current,
+        "unified_prev": unified_prev,
+        "overview_prev": overview_prev,
+        "rank_changes": _rank_changes(unified_current, unified_prev),
+        "prod_bonus_total": prod_bonus_total,
+        "team_bonus_total": team_bonus_total,
+        "ega_eligible": ega_eligible,
+    }
+    print(f"    {len(unified_current)} agents ranked, "
+          f"RM {overview_current['total']:,.2f} total commission"
+          + (f", vs RM {overview_prev['total']:,.2f} last month" if overview_prev else "")
+          + f"; bonus: prod RM {prod_bonus_total:,.2f}, team RM {team_bonus_total:,.2f}, "
+          + f"EGA/ESA eligible: {ega_eligible}")
 
     # --- Build Excel or PDF ---
     if str(output_path).lower().endswith(".xlsx"):
@@ -4997,6 +5221,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         contest_t1_headers=contest_t1_headers, contest_t1_rows=contest_t1_rows,
         contest_t2_headers=contest_t2_headers, contest_t2_rows=contest_t2_rows,
         contest_t3_headers=contest_t3_headers, contest_t3_rows=contest_t3_rows,
+        report_overview=report_overview,
         page_nums_dict=None,
         page_registry=page_registry,
         month=month,
@@ -5048,6 +5273,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         contest_t1_headers=contest_t1_headers, contest_t1_rows=contest_t1_rows,
         contest_t2_headers=contest_t2_headers, contest_t2_rows=contest_t2_rows,
         contest_t3_headers=contest_t3_headers, contest_t3_rows=contest_t3_rows,
+        report_overview=report_overview,
         page_nums_dict=page_registry,
         page_registry=None,
         month=month,
