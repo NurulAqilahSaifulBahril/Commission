@@ -8,7 +8,7 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --win --dir"
+    "dist": "electron-builder --win --mac --dir"
   },
   "devDependencies": {
     "electron": "^37.0.0",
@@ -25,6 +25,11 @@
     "win": {
       "target": "dir",
       "icon": "assets/icon.ico"
+    },
+    "mac": {
+      "target": ["dir"],
+      "icon": "assets/logo-mark-black.png",
+      "category": "public.app-category.finance"
     }
   }
 }

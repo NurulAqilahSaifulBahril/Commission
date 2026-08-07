@@ -10,6 +10,7 @@ const { spawn, execSync } = require("child_process");
 const fs = require("fs");
 const net = require("net");
 const path = require("path");
+const os = require("os");
 
 const PORT = 5001;
 const DASHBOARD_URL = `http://127.0.0.1:${PORT}`;
@@ -31,17 +32,28 @@ function findCommissionRoot() {
 
 function freePort() {
   try {
-    const out = execSync(`netstat -ano | findstr ":${PORT} " | findstr "LISTENING"`, {
-      shell: "cmd.exe",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).toString();
-    const pids = new Set(
-      out.split(/\r?\n/).map((l) => l.trim().split(/\s+/).pop()).filter((p) => /^\d+$/.test(p))
-    );
-    for (const pid of pids) {
-      try { execSync(`taskkill /PID ${pid} /F`, { stdio: "ignore" }); } catch {}
+    if (os.platform() === "win32") {
+      const out = execSync(`netstat -ano | findstr ":${PORT} " | findstr "LISTENING"`, {
+        shell: "cmd.exe",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).toString();
+      const pids = new Set(
+        out.split(/\r?\n/).map((l) => l.trim().split(/\s+/).pop()).filter((p) => /^\d+$/.test(p))
+      );
+      for (const pid of pids) {
+        try { execSync(`taskkill /PID ${pid} /F`, { stdio: "ignore" }); } catch {}
+      }
+    } else {
+      // macOS/Linux: use lsof to find processes using the port
+      try {
+        const out = execSync(`lsof -i :${PORT} -t`, { stdio: "pipe" }).toString();
+        const pids = out.trim().split(/\s+/).filter((p) => /^\d+$/.test(p));
+        for (const pid of pids) {
+          try { execSync(`kill -9 ${pid}`, { stdio: "ignore" }); } catch {}
+        }
+      } catch {}
     }
-  } catch {} // findstr exits 1 when nothing is listening — port already free
+  } catch {}
 }
 
 function waitForPort(timeoutMs) {
@@ -72,11 +84,20 @@ function startFlask(root) {
   // dependencies, so nothing needs to be on the machine. .venv is the fallback
   // for installs made before the runtime was bundled, and for running from a
   // source checkout; bare "python" is the last resort.
-  const candidates = [
-    path.join(root, "runtime", "python.exe"),
-    path.join(root, ".venv", "Scripts", "python.exe"),
-  ];
-  const python = candidates.find((p) => fs.existsSync(p)) || "python";
+  let candidates;
+  if (os.platform() === "win32") {
+    candidates = [
+      path.join(root, "runtime", "python.exe"),
+      path.join(root, ".venv", "Scripts", "python.exe"),
+    ];
+  } else {
+    // macOS/Linux
+    candidates = [
+      path.join(root, "runtime", "bin", "python3"),
+      path.join(root, ".venv", "bin", "python3"),
+    ];
+  }
+  const python = candidates.find((p) => fs.existsSync(p)) || "python3";
 
   // The server's own words, kept. With stdio "ignore" a crash-on-boot (missing
   // access keys, a broken .env) left nothing behind, so the timeout dialog
@@ -107,7 +128,13 @@ function startupLogTail(root, maxLines = 12) {
 
 function stopFlask() {
   if (flaskProc && !flaskProc.killed) {
-    try { execSync(`taskkill /PID ${flaskProc.pid} /T /F`, { stdio: "ignore" }); } catch {}
+    try {
+      if (os.platform() === "win32") {
+        execSync(`taskkill /PID ${flaskProc.pid} /T /F`, { stdio: "ignore" });
+      } else {
+        execSync(`kill -9 ${flaskProc.pid}`, { stdio: "ignore" });
+      }
+    } catch {}
   }
   flaskProc = null;
 }
@@ -186,7 +213,10 @@ async function launch() {
       hint = "The access keys are missing or wrong. Ask IT for your keys and " +
         "add them to the .env file in the install folder, then open this app again.";
     } else if (!hasInterpreter) {
-      hint = "No Python environment was found — run \"Setup Environment.bat\" " +
+      const setupCmd = os.platform() === "win32"
+        ? "\"Setup Environment.bat\""
+        : "the setup script";
+      hint = `No Python environment was found — run ${setupCmd} ` +
         "in the install folder, then open this app again.";
     } else {
       hint = "Check \"8. Web Dashboard\\shell-startup.log\" and " +

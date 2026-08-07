@@ -150,14 +150,12 @@ def is_busy() -> bool:
 
 # ── Update detection ──────────────────────────────────────────────────────────
 def _pick_asset(release: dict) -> dict | None:
-    """The update payload asset — the code-only zip, not the installer exe."""
+    """The update payload asset — the code-only zip, not the installer/app bundle."""
     assets = release.get("assets") or []
+    # Always prefer the "update" package (platform-agnostic Flask code)
     for asset in assets:
         name = str(asset.get("name", "")).lower()
         if name.endswith(".zip") and "update" in name:
-            return asset
-    for asset in assets:
-        if str(asset.get("name", "")).lower().endswith(".zip"):
             return asset
     return None
 
