@@ -73,6 +73,8 @@ versions by itself and tells you when one is ready.
 A **Software Update** box appears at the **bottom of the left-hand menu**,
 showing the new version number.
 
+![The Software Update panel, showing a new version available with an Install Update button](update_panel_screenshot.png)
+
 **If you see an "Install Update" button:**
 
 1. Click **Install Update**.

@@ -519,8 +519,18 @@ document.addEventListener("DOMContentLoaded", () => {
         });
 
         // Download actions
-        downloadPdfBtn.addEventListener("click", () => triggerDownload("pdf"));
+        downloadPdfBtn.addEventListener("click", () => showPdfModal());
         downloadExcelBtn.addEventListener("click", () => triggerDownload("excel"));
+
+        // PDF Modal handlers
+        document.getElementById("pdfModalClose").addEventListener("click", closePdfModal);
+        document.getElementById("pdfCloseBtn").addEventListener("click", closePdfModal);
+        document.getElementById("pdfDownloadBtn").addEventListener("click", () => triggerDownload("pdf"));
+
+        // Close modal when clicking outside
+        document.getElementById("pdfModal").addEventListener("click", (e) => {
+            if (e.target.id === "pdfModal") closePdfModal();
+        });
 
         // Sync cache action
         if (syncDataBtn) {
@@ -1462,6 +1472,46 @@ modalPackageType.value = defaults.pkg || "-";
         } catch (err) {
             console.error("Error saving profit sharing rates:", err);
         }
+    }
+
+    async function showPdfModal() {
+        const modal = document.getElementById("pdfModal");
+        const viewer = document.getElementById("pdfViewer");
+
+        try {
+            const pdfUrl = `/api/download/pdf?year=${state.activeYear}&month=${state.activeMonth}`;
+            const response = await fetch(pdfUrl);
+
+            if (!response.ok) {
+                alert("Failed to load PDF");
+                return;
+            }
+
+            const blob = await response.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            viewer.src = blobUrl;
+            modal.style.display = "flex";
+
+            // Store the blob URL for cleanup later
+            modal.dataset.blobUrl = blobUrl;
+        } catch (error) {
+            console.error("Error loading PDF:", error);
+            alert("Error loading PDF: " + error.message);
+        }
+    }
+
+    function closePdfModal() {
+        const modal = document.getElementById("pdfModal");
+        const viewer = document.getElementById("pdfViewer");
+
+        // Clean up blob URL
+        if (modal.dataset.blobUrl) {
+            URL.revokeObjectURL(modal.dataset.blobUrl);
+            modal.dataset.blobUrl = "";
+        }
+
+        modal.style.display = "none";
+        viewer.src = "";
     }
 
     function triggerDownload(format) {

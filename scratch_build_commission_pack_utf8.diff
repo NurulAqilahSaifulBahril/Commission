@@ -1,0 +1,462 @@
+diff --git a/7. Presentation/build_commission_pack.py b/7. Presentation/build_commission_pack.py
+index cf43e88..7908aad 100644
+--- a/7. Presentation/build_commission_pack.py	
++++ b/7. Presentation/build_commission_pack.py	
+@@ -1244,11 +1244,31 @@ def build_internal_summary_tables(
+         referral_name_by_agent = {}
+         safwan_rate_by_agent = {}
+ 
+-        month_basic_lines = [ln for ln in basic_lines if _parse_month(ln.full_payment_date) == m]
++        if m < 6:
++            month_basic_lines = [ln for ln in basic_lines if _parse_month(ln.full_payment_date) == m]
++        else:
++            month_basic_lines = [
++                ln for ln in basic_lines
++                if _parse_month(getattr(ln, "first_payment_date", "")) == m
++                or _parse_month(ln.full_payment_date) == m
++            ]
++
+         for ln in month_basic_lines:
+             agent = ln.agent_name.strip()
+-            comm = float(ln.basic_commission)
+-            basic_comm_by_agent[agent] = basic_comm_by_agent.get(agent, 0.0) + comm
++            
++            # Calculate payout for ln in month m
++            if m < 6:
++                payout_m = float(ln.basic_commission)
++            else:
++                payout_m = 0.0
++                first_pay_month = _parse_month(getattr(ln, "first_payment_date", ""))
++                full_pay_month = _parse_month(ln.full_payment_date)
++                if first_pay_month == m:
++                    payout_m += 300.0
++                if full_pay_month == m:
++                    payout_m += (float(ln.basic_commission) - 300.0)
++            
++            basic_comm_by_agent[agent] = basic_comm_by_agent.get(agent, 0.0) + payout_m
+ 
+             rate_val = float(ln.commission_rate) * 100
+             rate_str = f"{rate_val:g}%"
+@@ -1260,8 +1280,9 @@ def build_internal_summary_tables(
+                 basic_rate_by_agent[agent] = (existing + "<br/>" + rate_str).lstrip("<br/>")
+ 
+             # Senior override
++            full_pay_month = _parse_month(ln.full_payment_date)
+             senior = _int_get_reporting_senior(ln.agent_name)
+-            if senior:
++            if (m < 6 or full_pay_month == m) and senior:
+                 senior = to_title_case(senior)
+                 override = float(ln.net_base) * 0.0025
+                 exec_name = to_title_case(ln.agent_name)
+@@ -1269,7 +1290,7 @@ def build_internal_summary_tables(
+                 basic_override_by_agent[senior] = basic_override_by_agent.get(senior, 0.0) + override
+ 
+             # Referral fee
+-            if basic._is_valid_referral(ln.referral_name):
++            if (m < 6 or full_pay_month == m) and basic._is_valid_referral(ln.referral_name):
+                 sales_price = float(ln.sales_price)
+                 rate = float(basic._referral_rate(ln.invoice_date))
+                 fee = sales_price * rate
+@@ -1280,7 +1301,7 @@ def build_internal_summary_tables(
+                     referral_name_by_agent[agent] = (existing_ref + ", " + ref_name).lstrip(", ")
+ 
+             # Safwan override
+-            if getattr(ln, "package", "") == "Factory":
++            if (m < 6 or full_pay_month == m) and getattr(ln, "package", "") == "Factory":
+                 senior_fac = _int_get_reporting_senior(ln.agent_name)
+                 if senior_fac and "safwan" in senior_fac.lower():
+                     ps = float(getattr(ln, "profit_sharing", 0)) * 100
+@@ -1349,11 +1370,11 @@ def build_internal_summary_tables(
+                 if not nfp_invs and anp_dates[0] != "-":
+                     nfp_dates = (anp_dates[0], "-", "-")
+ 
+-            basic_sales = sum(float(ln.sales_price) for ln in month_basic_lines if ln.agent_name.strip() == agent)
++            basic_sales = sum(float(ln.sales_price) for ln in month_basic_lines if ln.agent_name.strip() == agent and (m < 6 or _parse_month(ln.full_payment_date) == m))
+             nfp_sales = sum(float(r.sales_price) for r in month_nfp_rows if r.agent_name.strip() == agent)
+ 
+-            basic_system = sum(float(nfp_by_inv[ln.invoice_number.strip()].system_price) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
+-            basic_nfp = sum(float(nfp_by_inv[ln.invoice_number.strip()].net_floor_price or 0.0) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
++            basic_system = sum(float(nfp_by_inv[ln.invoice_number.strip()].system_price) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv and (m < 6 or _parse_month(ln.full_payment_date) == m))
++            basic_nfp = sum(float(nfp_by_inv[ln.invoice_number.strip()].net_floor_price or 0.0) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv and (m < 6 or _parse_month(ln.full_payment_date) == m))
+ 
+             nfp_system = sum(float(r.system_price) for r in month_nfp_rows if r.agent_name.strip() == agent)
+             nfp_nfp = sum(float(r.net_floor_price or 0.0) for r in month_nfp_rows if r.agent_name.strip() == agent)
+@@ -1495,31 +1516,66 @@ def build_internal_summary_tables(
+                     cust_nfp_pkgs = set(get_invoice_package(r.invoice_number, r) for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer)
+                     cust_nfp_pkg_str = "<br/>".join(sorted(cust_nfp_pkgs)) if cust_nfp_pkgs else "-"
+ 
+-                    basic_comm_val = f"{basic_info['comm']:,.2f}" if basic_info['comm'] != 0 else ("pending full payment" if basic_dates[0] and "2026" in str(basic_dates[0]) else "-")
+-                    customer_rows.append([
+-                        show_agent, customer, basic_dates[0], basic_dates[1], basic_dates[2],
+-                        cust_basic_pkg_str,
+-                        ensure_rm_prefix(f"{basic_info['system_price']:,.2f}" if basic_info['system_price'] != 0 else "-"),
+-                        ensure_rm_prefix(f"{basic_info['net_floor_price']:,.2f}" if basic_info['net_floor_price'] != 0 else "-"),
+-                        ensure_rm_prefix(f"{basic_info['sales']:,.2f}" if basic_info['sales'] != 0 else "-"),
+-                        "Basic Commission", ensure_rm_prefix(basic_comm_val),
+-                        to_title_case(row_referral_label), ensure_rm_prefix(f"{cust_referral_rm:,.2f}" if cust_referral_rm != 0 else "-"),
+-                        ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-")
+-                    ])
++                    if m < 6:
++                        basic_comm_val = f"{basic_info['comm']:,.2f}" if basic_info['comm'] != 0 else ("pending full payment" if basic_dates[0] and "2026" in str(basic_dates[0]) else "-")
++                        customer_rows.append([
++                            show_agent, customer, basic_dates[0], basic_dates[1], basic_dates[2],
++                            cust_basic_pkg_str,
++                            ensure_rm_prefix(f"{basic_info['system_price']:,.2f}" if basic_info['system_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{basic_info['net_floor_price']:,.2f}" if basic_info['net_floor_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{basic_info['sales']:,.2f}" if basic_info['sales'] != 0 else "-"),
++                            "Basic Commission", ensure_rm_prefix(basic_comm_val),
++                            to_title_case(row_referral_label), ensure_rm_prefix(f"{cust_referral_rm:,.2f}" if cust_referral_rm != 0 else "-"),
++                            ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-")
++                        ])
++                    else:
++                        has_1st_pay = basic_dates[1] and basic_dates[1] != "-"
++                        basic_300_str = "RM 300.00" if has_1st_pay else "-"
++                        
++                        has_75_pay = basic_dates[2] and basic_dates[2] != "-"
++                        basic_dates_75_val = basic_dates[2] if has_75_pay else "-"
++                        
++                        if has_75_pay:
++                            basic_comm_val = f"{basic_info['comm'] - 300.0:,.2f}"
++                        else:
++                            basic_comm_val = "pending 75% payment" if has_1st_pay else "-"
++
++                        customer_rows.append([
++                            show_agent, customer, basic_dates[0], basic_dates[1], basic_300_str, basic_dates_75_val,
++                            cust_basic_pkg_str,
++                            ensure_rm_prefix(f"{basic_info['system_price']:,.2f}" if basic_info['system_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{basic_info['net_floor_price']:,.2f}" if basic_info['net_floor_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{basic_info['sales']:,.2f}" if basic_info['sales'] != 0 else "-"),
++                            "Basic Commission", ensure_rm_prefix(basic_comm_val),
++                            to_title_case(row_referral_label), ensure_rm_prefix(f"{cust_referral_rm:,.2f}" if cust_referral_rm != 0 else "-"),
++                            ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-")
++                        ])
++
+                     show_agent = ""
+ 
+                     is_before_oct_25 = is_before_october_2025(basic_dates[0]) or is_before_october_2025(nfp_dates[0])
+                     nfp_comm_val = f"{nfp_info['comm']:,.2f}" if nfp_info['comm'] != 0 else ("pending full payment" if nfp_dates[0] and "2026" in str(nfp_dates[0]) else ("invoice before Oct 25" if is_before_oct_25 else "-"))
+ 
+-                    customer_rows.append([
+-                        show_agent, customer, nfp_dates[0], nfp_dates[1], nfp_dates[2],
+-                        cust_nfp_pkg_str,
+-                        ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
+-                        ensure_rm_prefix(f"{nfp_info['net_floor_price']:,.2f}" if nfp_info['net_floor_price'] != 0 else "-"),
+-                        ensure_rm_prefix(f"{nfp_info['sales']:,.2f}" if nfp_info['sales'] != 0 else "-"),
+-                        "Net Floor Price Commission", ensure_rm_prefix(nfp_comm_val),
+-                        "-", "-", "-"
+-                    ])
++                    if m < 6:
++                        customer_rows.append([
++                            show_agent, customer, nfp_dates[0], nfp_dates[1], nfp_dates[2],
++                            cust_nfp_pkg_str,
++                            ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{nfp_info['net_floor_price']:,.2f}" if nfp_info['net_floor_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{nfp_info['sales']:,.2f}" if nfp_info['sales'] != 0 else "-"),
++                            "Net Floor Price Commission", ensure_rm_prefix(nfp_comm_val),
++                            "-", "-", "-"
++                        ])
++                    else:
++                        customer_rows.append([
++                            show_agent, customer, nfp_dates[0], nfp_dates[1], "-", nfp_dates[2] if (nfp_dates[2] and nfp_dates[2] != "-") else "-",
++                            cust_nfp_pkg_str,
++                            ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{nfp_info['net_floor_price']:,.2f}" if nfp_info['net_floor_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{nfp_info['sales']:,.2f}" if nfp_info['sales'] != 0 else "-"),
++                            "Net Floor Price Commission", ensure_rm_prefix(nfp_comm_val),
++                            "-", "-", "-"
++                        ])
+ 
+         # Build ANP customer rows: one row per customer per agent (from int_anp_detail)
+         anp_by_cust = defaultdict(float)  # (agent, customer) -> max accumulated commission
+@@ -1628,49 +1684,73 @@ def build_outsource_summary_tables(
+         out_override_breakdown = defaultdict(lambda: defaultdict(float))
+         gan_lai_soon_by_agent = {}
+ 
+-        month_basic_lines = [ln for ln in basic_lines if _parse_month(ln.full_payment_date) == m]
++        if m < 6:
++            month_basic_lines = [ln for ln in basic_lines if _parse_month(ln.full_payment_date) == m]
++        else:
++            month_basic_lines = [
++                ln for ln in basic_lines
++                if _parse_month(getattr(ln, "first_payment_date", "")) == m
++                or _parse_month(ln.full_payment_date) == m
++            ]
++
+         for ln in month_basic_lines:
+             agent = ln.agent_name.strip()
+-            basic_comm_by_agent[agent] = basic_comm_by_agent.get(agent, 0.0) + ln.basic_commission
++            
++            # Calculate payout for ln in month m
++            if m < 6:
++                payout_m = float(ln.basic_commission)
++            else:
++                payout_m = 0.0
++                first_pay_month = _parse_month(getattr(ln, "first_payment_date", ""))
++                full_pay_month = _parse_month(ln.full_payment_date)
++                if first_pay_month == m:
++                    payout_m += 300.0
++                if full_pay_month == m:
++                    payout_m += (float(ln.basic_commission) - 300.0)
++
++            basic_comm_by_agent[agent] = basic_comm_by_agent.get(agent, 0.0) + payout_m
+ 
+             info = basic.get_agent_hierarchy_info(agent)
+             if not info:
+                 info = {"canonical_name": agent, "tier": "OUM", "osa_parent": None, "oum_parent": None}
+             canonical_name = to_title_case(info["canonical_name"])
+ 
+-            # Calculate Gan Lai Soon OGM override commission
+-            gls_comm = getattr(ln, "gan_lai_soon", 0.0)
+-            if gls_comm > 0:
+-                basic_override_by_agent["Gan Lai Soon"] = basic_override_by_agent.get("Gan Lai Soon", 0.0) + gls_comm
+-                gan_lai_soon_by_agent[agent] = gan_lai_soon_by_agent.get(agent, 0.0) + gls_comm
+-
+-            if getattr(ln, "is_factory", False) or getattr(ln, "package", "") == "Factory":
+-                sales_price = float(ln.sales_price)
+-                sharing = float(getattr(ln, "profit_sharing", 0.0))
+-
+-                if not agent.lower() == "safwan":
+-                    safwan_override = sales_price * (0.005 + sharing)
+-                    basic_override_by_agent[canonical_name] = basic_override_by_agent.get(canonical_name, 0.0) + safwan_override
+-                    out_override_breakdown[canonical_name]["Safwan"] += safwan_override
+-
+-                    if info.get("tier") in ("OSA", "OSA 1") and sharing > 0:
+-                        oum_p = info.get("oum_parent")
+-                        if oum_p:
+-                            oum_p = to_title_case(oum_p)
+-                            oum_override_fac = sales_price * sharing * 0.20
+-                            basic_override_by_agent[oum_p] = basic_override_by_agent.get(oum_p, 0.0) + oum_override_fac
+-                            out_override_breakdown[oum_p][agent] += oum_override_fac
+-                        ogm_override_fac = sales_price * sharing * 0.10
+-                        basic_override_by_agent["OGM Pool"] = basic_override_by_agent.get("OGM Pool", 0.0) + ogm_override_fac
+-                        out_override_breakdown["OGM Pool"][agent] += ogm_override_fac
+-            else:
+-                oum_parent = info.get("oum_parent")
+-                if oum_parent:
+-                    oum_parent = to_title_case(oum_parent)
+-                    own_comm = float(ln.basic_commission)
+-                    oum_override = own_comm * 0.005
+-                    out_override_breakdown[oum_parent][agent] += oum_override
+-                    basic_override_by_agent[oum_parent] = basic_override_by_agent.get(oum_parent, 0.0) + oum_override
++            # Overrides are only eligible when full/75% payment is reached
++            full_pay_month = _parse_month(ln.full_payment_date)
++            if m < 6 or full_pay_month == m:
++                # Calculate Gan Lai Soon OGM override commission
++                gls_comm = getattr(ln, "gan_lai_soon", 0.0)
++                if gls_comm > 0:
++                    basic_override_by_agent["Gan Lai Soon"] = basic_override_by_agent.get("Gan Lai Soon", 0.0) + gls_comm
++                    gan_lai_soon_by_agent[agent] = gan_lai_soon_by_agent.get(agent, 0.0) + gls_comm
++
++                if getattr(ln, "is_factory", False) or getattr(ln, "package", "") == "Factory":
++                    sales_price = float(ln.sales_price)
++                    sharing = float(getattr(ln, "profit_sharing", 0.0))
++
++                    if not agent.lower() == "safwan":
++                        safwan_override = sales_price * (0.005 + sharing)
++                        basic_override_by_agent[canonical_name] = basic_override_by_agent.get(canonical_name, 0.0) + safwan_override
++                        out_override_breakdown[canonical_name]["Safwan"] += safwan_override
++
++                        if info.get("tier") in ("OSA", "OSA 1") and sharing > 0:
++                            oum_p = info.get("oum_parent")
++                            if oum_p:
++                                oum_p = to_title_case(oum_p)
++                                oum_override_fac = sales_price * sharing * 0.20
++                                basic_override_by_agent[oum_p] = basic_override_by_agent.get(oum_p, 0.0) + oum_override_fac
++                                out_override_breakdown[oum_p][agent] += oum_override_fac
++                            ogm_override_fac = sales_price * sharing * 0.10
++                            basic_override_by_agent["OGM Pool"] = basic_override_by_agent.get("OGM Pool", 0.0) + ogm_override_fac
++                            out_override_breakdown["OGM Pool"][agent] += ogm_override_fac
++                else:
++                    oum_parent = info.get("oum_parent")
++                    if oum_parent:
++                        oum_parent = to_title_case(oum_parent)
++                        own_comm = float(ln.basic_commission)
++                        oum_override = own_comm * 0.005
++                        out_override_breakdown[oum_parent][agent] += oum_override
++                        basic_override_by_agent[oum_parent] = basic_override_by_agent.get(oum_parent, 0.0) + oum_override
+ 
+         # NFP commission
+         nfp_comm_by_agent = {}
+@@ -1695,11 +1775,11 @@ def build_outsource_summary_tables(
+             basic_total = basic_comm
+             nfp_comm = nfp_comm_by_agent.get(agent, 0.0)
+             gan_lai_soon = gan_lai_soon_by_agent.get(agent, 0.0)
+-            basic_sales = sum(float(ln.sales_price) for ln in month_basic_lines if ln.agent_name.strip() == agent)
++            basic_sales = sum(float(ln.sales_price) for ln in month_basic_lines if ln.agent_name.strip() == agent and (m < 6 or _parse_month(ln.full_payment_date) == m))
+             nfp_sales = sum(float(r.sales_price) for r in month_nfp_rows if r.agent_name.strip() == agent)
+ 
+-            basic_system = sum(float(nfp_by_inv[ln.invoice_number.strip()].system_price) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
+-            basic_nfp = sum(float(nfp_by_inv[ln.invoice_number.strip()].net_floor_price or 0.0) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
++            basic_system = sum(float(nfp_by_inv[ln.invoice_number.strip()].system_price) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv and (m < 6 or _parse_month(ln.full_payment_date) == m))
++            basic_nfp = sum(float(nfp_by_inv[ln.invoice_number.strip()].net_floor_price or 0.0) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv and (m < 6 or _parse_month(ln.full_payment_date) == m))
+ 
+             nfp_system = sum(float(r.system_price) for r in month_nfp_rows if r.agent_name.strip() == agent)
+             nfp_nfp = sum(float(r.net_floor_price or 0.0) for r in month_nfp_rows if r.agent_name.strip() == agent)
+@@ -1820,30 +1900,64 @@ def build_outsource_summary_tables(
+                     cust_nfp_pkgs = set(get_invoice_package(r.invoice_number, r) for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer)
+                     cust_nfp_pkg_str = "<br/>".join(sorted(cust_nfp_pkgs)) if cust_nfp_pkgs else "-"
+ 
+-                    basic_comm_val = f"{basic_info['comm']:,.2f}" if basic_info['comm'] != 0 else ("pending full payment" if basic_dates[0] and "2026" in str(basic_dates[0]) else "-")
+-                    customer_rows.append([
+-                        show_agent, customer, basic_dates[0], basic_dates[1], basic_dates[2],
+-                        cust_basic_pkg_str,
+-                        ensure_rm_prefix(f"{basic_info['system_price']:,.2f}" if basic_info['system_price'] != 0 else "-"),
+-                        ensure_rm_prefix(f"{basic_info['net_floor_price']:,.2f}" if basic_info['net_floor_price'] != 0 else "-"),
+-                        ensure_rm_prefix(f"{basic_info['sales']:,.2f}" if basic_info['sales'] != 0 else "-"),
+-                        "Basic Commission", ensure_rm_prefix(basic_comm_val),
+-                        "-", "-", ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"), ensure_rm_prefix(f"{row_gan_lai_soon:,.2f}" if row_gan_lai_soon != 0 else "-")
+-                    ])
++                    if m < 6:
++                        basic_comm_val = f"{basic_info['comm']:,.2f}" if basic_info['comm'] != 0 else ("pending full payment" if basic_dates[0] and "2026" in str(basic_dates[0]) else "-")
++                        customer_rows.append([
++                            show_agent, customer, basic_dates[0], basic_dates[1], basic_dates[2],
++                            cust_basic_pkg_str,
++                            ensure_rm_prefix(f"{basic_info['system_price']:,.2f}" if basic_info['system_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{basic_info['net_floor_price']:,.2f}" if basic_info['net_floor_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{basic_info['sales']:,.2f}" if basic_info['sales'] != 0 else "-"),
++                            "Basic Commission", ensure_rm_prefix(basic_comm_val),
++                            "-", "-", ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"), ensure_rm_prefix(f"{row_gan_lai_soon:,.2f}" if row_gan_lai_soon != 0 else "-")
++                        ])
++                    else:
++                        has_1st_pay = basic_dates[1] and basic_dates[1] != "-"
++                        basic_300_str = "RM 300.00" if has_1st_pay else "-"
++                        
++                        has_75_pay = basic_dates[2] and basic_dates[2] != "-"
++                        basic_dates_75_val = basic_dates[2] if has_75_pay else "-"
++                        
++                        if has_75_pay:
++                            basic_comm_val = f"{basic_info['comm'] - 300.0:,.2f}"
++                        else:
++                            basic_comm_val = "pending 75% payment" if has_1st_pay else "-"
++
++                        customer_rows.append([
++                            show_agent, customer, basic_dates[0], basic_dates[1], basic_300_str, basic_dates_75_val,
++                            cust_basic_pkg_str,
++                            ensure_rm_prefix(f"{basic_info['system_price']:,.2f}" if basic_info['system_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{basic_info['net_floor_price']:,.2f}" if basic_info['net_floor_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{basic_info['sales']:,.2f}" if basic_info['sales'] != 0 else "-"),
++                            "Basic Commission", ensure_rm_prefix(basic_comm_val),
++                            "-", "-", ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"), ensure_rm_prefix(f"{row_gan_lai_soon:,.2f}" if row_gan_lai_soon != 0 else "-")
++                        ])
++
+                     show_agent = ""
+ 
+                     is_before_oct_25 = is_before_october_2025(basic_dates[0]) or is_before_october_2025(nfp_dates[0])
+                     nfp_comm_val = f"{nfp_info['comm']:,.2f}" if nfp_info['comm'] != 0 else ("pending full payment" if nfp_dates[0] and "2026" in str(nfp_dates[0]) else ("invoice before Oct 25" if is_before_oct_25 else "-"))
+ 
+-                    customer_rows.append([
+-                        show_agent, customer, nfp_dates[0], nfp_dates[1], nfp_dates[2],
+-                        cust_nfp_pkg_str,
+-                        ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
+-                        ensure_rm_prefix(f"{nfp_info['net_floor_price']:,.2f}" if nfp_info['net_floor_price'] != 0 else "-"),
+-                        ensure_rm_prefix(f"{nfp_info['sales']:,.2f}" if nfp_info['sales'] != 0 else "-"),
+-                        "Net Floor Price Commission", ensure_rm_prefix(nfp_comm_val),
+-                        "-", "-", "-", "-"
+-                    ])
++                    if m < 6:
++                        customer_rows.append([
++                            show_agent, customer, nfp_dates[0], nfp_dates[1], nfp_dates[2],
++                            cust_nfp_pkg_str,
++                            ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{nfp_info['net_floor_price']:,.2f}" if nfp_info['net_floor_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{nfp_info['sales']:,.2f}" if nfp_info['sales'] != 0 else "-"),
++                            "Net Floor Price Commission", ensure_rm_prefix(nfp_comm_val),
++                            "-", "-", "-", "-"
++                        ])
++                    else:
++                        customer_rows.append([
++                            show_agent, customer, nfp_dates[0], nfp_dates[1], "-", nfp_dates[2] if (nfp_dates[2] and nfp_dates[2] != "-") else "-",
++                            cust_nfp_pkg_str,
++                            ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{nfp_info['net_floor_price']:,.2f}" if nfp_info['net_floor_price'] != 0 else "-"),
++                            ensure_rm_prefix(f"{nfp_info['sales']:,.2f}" if nfp_info['sales'] != 0 else "-"),
++                            "Net Floor Price Commission", ensure_rm_prefix(nfp_comm_val),
++                            "-", "-", "-", "-"
++                        ])
+ 
+         if customer_rows:
+             customer_summary_by_month[m] = customer_rows
+@@ -2145,6 +2259,8 @@ def _build_customer_summary_table_rl(title: str, headers: list[str], rows: list[
+         "invoice date": 1.2,
+         "1st payment date": 1.2,
+         "full payment date": 1.2,
++        "75% payment date": 1.2,
++        "basic commission (rm300)": 1.3,
+         "package type": 1.4,
+         "system price": 1.4,
+         "netfloor price": 1.4,
+@@ -3043,9 +3159,12 @@ def build_commission_pdf(
+             _spacer(4)
+ 
+             # Check if Safwan column should be kept or removed
+-            local_headers = list(int_cust_headers)
++            if m >= 6:
++                local_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Referral Name", "Referral Fee", "Safwan (RM)"]
++            else:
++                local_headers = list(int_cust_headers)
+             local_rows = [list(r) for r in rows]
+-            has_factory = any("factory" in str(r[5]).lower() for r in local_rows if len(r) > 5)
++            has_factory = any("factory" in str(r[6 if m >= 6 else 5]).lower() for r in local_rows if len(r) > (6 if m >= 6 else 5))
+             if not has_factory:
+                 lower_hdrs = [h.lower().strip() for h in local_headers]
+                 if "safwan (rm)" in lower_hdrs:
+@@ -3360,9 +3479,12 @@ def build_commission_pdf(
+                 _spacer(4)
+ 
+             # Check if Safwan column should be kept or removed
+-            local_headers = list(out_cust_headers)
++            if m >= 6:
++                local_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
++            else:
++                local_headers = list(out_cust_headers)
+             local_rows = [list(r) for r in rows]
+-            has_factory = any("factory" in str(r[5]).lower() for r in local_rows if len(r) > 5)
++            has_factory = any("factory" in str(r[6 if m >= 6 else 5]).lower() for r in local_rows if len(r) > (6 if m >= 6 else 5))
+             if not has_factory:
+                 lower_hdrs = [h.lower().strip() for h in local_headers]
+                 if "safwan (rm)" in lower_hdrs:
+@@ -3415,7 +3537,7 @@ def build_commission_pdf(
+                 "&bull;&nbsp;&nbsp;Three types of Net Floor Price Commission:",
+                 "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales above Net Floor Price:</b> Sales Price > Net Floor Price. Formula: (Sales Price - Net Floor Price) x 25% = NFP Commission",
+                 "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales above System Price:</b> System Price > Net Floor Price. Formula: (System Price - Net Floor Price) x 100% = NFP Commission",
+-                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales below Net Floor price:</b> Sales Price < Net Floor Price. Formula: (Sales Price - Net Floor Price) x Bears 25% = NFP Commission",
++                "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;* <b>Sales below Net Floor price:</b> Sales Price < Net Floor Price. Formula: (Sales Price - Net Floor Price) x Bears 20% = NFP Commission",
+                 "&bull;&nbsp;&nbsp;Effective October 1, 2025, NFP computations are applicable exclusively to invoices issued on or after this date. Invoices predating this period are structurally excluded from NFP allocations."
+             ])
+             # _add_note_paragraphs(m_notes)
+@@ -3801,14 +3923,18 @@ def build_commission_excel(
+     for m in months_to_export:
+         rows = int_customer_summary_rows.get(m, [])
+         if rows:
+-            curr_row = write_block(ws, curr_row, f"{MONTH_NAMES[m]} 2026 - Summary Internal Agent Commission by Customer", int_cust_headers, rows)
++            if m >= 6:
++                m_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Referral Name", "Referral Fee", "Safwan (RM)"]
++            else:
++                m_headers = int_cust_headers
++            curr_row = write_block(ws, curr_row, f"{MONTH_NAMES[m]} 2026 - Summary Internal Agent Commission by Customer", m_headers, rows)
+     if curr_row == 1:
+         curr_row = write_block(ws, curr_row, "Summary Internal Agent Commission by Customer", int_cust_headers, [])
+     autofit_cols(ws)
+ 
+     # 3. Int ANP Details
+     ws = wb.create_sheet("Int ANP Details")
+-    int_anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Sales Price", "Commission Price", "Clawback"]
++    int_anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Commission Price", "Clawback"]
+     curr_row = 1
+     for m in months_to_export:
+         rows = int_customer_anp_rows.get(m, []) if int_customer_anp_rows else []
+@@ -3837,9 +3963,12 @@ def build_commission_excel(
+     for m in months_to_export:
+         rows = out_customer_summary_rows.get(m, [])
+         if rows:
+-            local_headers = list(out_cust_headers)
++            if m >= 6:
++                local_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
++            else:
++                local_headers = list(out_cust_headers)
+             local_rows = [list(r) for r in rows]
+-            has_factory = any("factory" in str(r[5]).lower() for r in local_rows if len(r) > 5)
++            has_factory = any("factory" in str(r[6 if m >= 6 else 5]).lower() for r in local_rows if len(r) > (6 if m >= 6 else 5))
+             if not has_factory:
+                 lower_hdrs = [h.lower().strip() for h in local_headers]
+                 if "safwan (rm)" in lower_hdrs:

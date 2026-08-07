@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard",
+      "runtimeExecutable": "C:\\Users\\User\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe",
+      "runtimeArgs": ["8. Web Dashboard/app.py"],
+      "port": 5001,
+      "autoPort": true
+    }
+  ]
+}

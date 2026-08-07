@@ -1,22 +1,57 @@
-Agent Type,Hierarchy,,Rate,,,,,,,,
-,,Senior Override Rate %,Jan,Feb,Mac,Jun,Jul,Profit Sharing Rate % ,,,
-Internal,Senior,0.25 from Executive,3.25,3.25,3.25,4.25,,2 + x,,,
-,Executive,-,3,3,3,4,,2 + x,,,
+Residential/ Commercial/ Shop Lot,,,,,,,,,,,,,,Factory/ NGO Project/ Goverment Project,,,,,,,,,,,,
+Agent Type,Roles,,Rate %,,,,,,,,,,,Agent Type,Hierarchy,,Rate% + Profit Sharing %,,,,,,,,,
+,,Senior Override Rate %,Jan,Feb,Mac,Jun,Jul,Aug,Sep,Oct,Nov,Dec,,,,Senior Override Rate %,Jan,Feb,Mac,Jun,Jul,Aug,Sep,Oct,Nov,Dec
+Internal,Senior,0.25 from Executive,3.25,3.25,3.25,4.25,4.25,,,,,,,Internal,Senior,0.25 from Executive,2 + x,2 + x,2 + x,2 + x,2 + x,,,,,
+,Executive,-,3,3,3,4,4,,,,,,,,Executive,-,2 + x,2 + x,2 + x,2 + x,2 + x,,,,,
+,Regional Sales Director,0.25,,,,,,5.75,5.75,5.75,5.75,5.75,,,Regional Sales Director,0.25,,,,,0.5,0.5,0.5,0.5,0.5,0.5
+,Senior Branch Director,0.25,,,,,,5.25,5.25,5.25,5.25,5.25,,,Senior Branch Director,0.25,,,,,0.5,0.5,0.5,0.5,0.5,0.5
+,Branch Sales Manager,0.25,,,,,,4.75,4.75,4.75,4.75,4.75,,,Branch Sales Manager,0.25,,,,,0.5,0.5,0.5,0.5,0.5,0.5
+,Sales Development Manager,"0.25 from Senior Sales Consultant
+0.5 from Sales Consultant",,,,,,4.5,4.5,4.5,4.5,4.5,,,Sales Development Manager,"0.25 from Senior Sales Consultant
+0.5 from Sales Consultant",,,,,0.5,0.5,0.5,0.5,0.5,0.5
+,Sales Team Manager ,0.5,,,,,,4.5,4.5,4.5,4.5,4.5,,,Sales Team Manager ,0.5,,,,,0.5,0.5,0.5,0.5,0.5,0.5
+,Senior Sales Consultant,0.5,,,,,,4.25,4.25,4.25,4.25,4.25,,,Senior Sales Consultant,0.5,,,,,0.5,0.5,0.5,0.5,0.5,0.5
+,Sales Consultant ,-,,,,,,4,4,4,4,4,,,Sales Consultant ,-,,,,,0.5,0.5,0.5,0.5,0.5,0.5
 Outsource,OGM,"0.75 from OSA
 0.25 from OUM
 0.15 from OGM
-",5,5,5,6,,,,,
+",5,5,5,6,6,6,6,6,6,6,,Outsource,OGM,"0.75 from OSA
+0.25 from OUM
+0.15 from OGM
+",,,,,,,,,,
 ,OUM,"0.5 from OSA
-0.25 from OUM",4.5,4.5,4.5,5.5,,2.5 + x,,,
-,OSA/OSA1,,4.5,4.5,4.5,5.5,,2.5 + x,,,
-,,,,,,,,,,,Formula:
-,,,,,,,,,,,Sales Price = Total Amount - EPP
-,,,,,,,,,,,Basic Commission = Sales Price x Rate %
-,,,,,,,,,,,
-,,,,,,,,,,,
-,,,,,,,,,,,Note:
-,,,,,,,,,,,1. x value to be inserted
-,,,,,,,,,,,2. From Jan to May Basic Commission given out to Agent once Payment = 100%
-,,,,,,,,,,,"3. From Jun Basic Commission given out to Agent once 
-i. Payment = 5% then Agent get RM300
-ii. Payment = 75% then Agent get Balance Basic Commission"
+0.25 from OUM",4.5,4.5,4.5,5.5,5.5,5.5,5.5,5.5,5.5,5.5,,,OUM,"0.5 from OSA
+0.25 from OUM",2.5 + x,2.5 + x,2.5 + x,2.5 + x,2.5 + x,2.5 + x,2.5 + x,2.5 + x,2.5 + x,2.5 + x
+,OSA/OSA1,,4.5,4.5,4.5,5.5,5.5,5.5,5.5,5.5,5.5,5.5,,,OSA/OSA1,,2.5 + x,2.5 + x,2.5 + x,2.5 + x,2.5 + x,2.5 + x,2.5 + x,2.5 + x,2.5 + x,2.5 + x
+,,,,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,,,
+Formula:,,,,,,,,,,,,,,,,,,,,,,,,,,
+Sales Price = Total Amount - EPP,,,,,,,,,,,,,,,,,,,,,,,,,,
+"Residential/ Commercial/ Shop Lot:
+Basic Commission = Sales Price x Rate %
+
+Factory/ NGO Project/ Goverment Project:
+Basic Commission = Sales Price x (Rate % + Profit Sharing%)",,,,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,,,
+,,,,,,,,,,,,,,,,,,,,,,,,,,
+Note:,,,,,,,,,,,,,,,,,,,,,,,,,,
+"1. x value to be inserted as ""Isert Profit Sharing""",,,,,,,,,,,,,,,,,,,,,,,,,,
+"2. Pre July Invoices Case
+i. From Jan to Jun Basic Commission given out to Agent once Payment = 100%",,,,,,,,,,,,,,,,,,,,,,,,,,
+3. From Jun Basic Commission Rate given out to Agent +1%,,,,,,,,,,,,,,,,,,,,,,,,,,
+"4. Post July Invoices Case
+i. upon Payment = 5% then Agent get RM300
+ii. upon  Payment = 75% then Agent get Balance Basic Commission
+scenario:
+- 1st payment must be in focus month
+- full payment not necessarily in focus month
+- if full payment is in focus month, check if 1st payment in the same focus month, if not do not include RM 300
+- refferal fee / Safwan / Gan Lai Soon only when paid = 100%",,,,,,,,,,,,,,,,,,,,,,,,,,
+"5. For Full Payment in July but invoice before July, condition as Pre July Invoices Case",,,,,,,,,,,,,,,,,,,,,,,,,,
+"6. Agent Roles Update
+i. Sarting July Regional Sales Director, Senior Branch Director, Branch Sales Manager, Sales Development Manager, Sales Team Manager, Senior Sales Consultant and Sales Consultant  will replace Senior Agent roles
+ii.  All Johor Bahru Internal Agent that is not in the Internal list for 'Start July 20206' will be under Sunny
+iii. For Sales Development Manager, Agent Name = Sunny, Rate (%) = 5
+iv. Kent eligible to override Louis by 0.1 %",,,,,,,,,,,,,,,,,,,,,,,,,,

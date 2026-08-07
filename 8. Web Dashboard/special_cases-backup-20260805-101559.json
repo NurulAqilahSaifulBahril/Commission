@@ -1,0 +1,79 @@
+[
+  {
+    "id": 1,
+    "year": "2026",
+    "month": "5",
+    "agent_type": "outsource",
+    "data_json": "{\"agent\": \"Caryn Dong\", \"customer\": \"DURAPOWER SDN BHD (ATAP - Commercial)\", \"pkg\": \"Factory\", \"system\": 374600, \"nfp\": 0, \"sales\": 374600, \"rate\": 3.5, \"remarks\": \"Special Case\", \"profitSharingPct\": 2, \"caseType\": \"customer\"}",
+    "created_by": "(migrated)",
+    "created_at": "2026-07-09T04:09:41.525544+00:00",
+    "updated_by": "(migrated)",
+    "updated_at": "2026-07-09T04:09:41.525544+00:00"
+  },
+  {
+    "id": 5,
+    "year": "2026",
+    "month": "5",
+    "agent_type": "internal",
+    "data_json": "{\"agent\": \"Sunny Tan\", \"customer\": \"Ching Chin Min (Atap)\", \"pkg\": \"Residential\", \"system\": 33221, \"nfp\": 26782, \"sales\": 28000, \"rate\": 2.25, \"remarks\": \"Special Case\", \"profitSharingPct\": 0, \"caseType\": \"standard\"}",
+    "created_by": "(smoketest-cleanup)",
+    "created_at": "2026-07-09T04:11:06.592967+00:00",
+    "updated_by": "(smoketest-cleanup)",
+    "updated_at": "2026-07-09T04:11:06.592967+00:00"
+  },
+  {
+    "id": 55,
+    "year": "2026",
+    "month": "6",
+    "agent_type": "internal",
+    "data_json": "{\"agent\": \"Sunny Tan\", \"customer\": \"Ding Gar Ging (Atap)\", \"pkg\": \"Residential\", \"system\": 41961, \"nfp\": 31423.7, \"sales\": 31000, \"rate\": 4.25, \"remarks\": \"\", \"profitSharingPct\": 0, \"caseType\": \"standard\", \"specialCaseType\": \"fee_waiver\", \"feeWaiver\": 84.74, \"adjustedSalesPrice\": null, \"rowKind\": \"nfp\"}",
+    "created_by": "IT Admin",
+    "created_at": "2026-07-29T06:13:06.464493+00:00",
+    "updated_by": "IT Admin",
+    "updated_at": "2026-07-29T06:13:06.464493+00:00"
+  },
+  {
+    "id": 84,
+    "year": "2026",
+    "month": "5",
+    "agent_type": "all",
+    "data_json": "{\"agent\": \"Sunny Tan\", \"customer\": \"Ching Chin Min (Atap)\", \"pkg\": \"Residential\", \"system\": 33221, \"nfp\": 26782, \"sales\": 28000, \"rate\": 2.25, \"remarks\": \"Special Case\", \"profitSharingPct\": 0, \"caseType\": \"standard\", \"specialCaseType\": null, \"feeWaiver\": null, \"adjustedSalesPrice\": null, \"rowKind\": null, \"ganOverridePct\": null}",
+    "created_by": "IT Admin",
+    "created_at": "2026-08-04T09:09:11.915679+00:00",
+    "updated_by": "IT Admin",
+    "updated_at": "2026-08-04T09:09:11.915679+00:00"
+  },
+  {
+    "id": 85,
+    "year": "2026",
+    "month": "5",
+    "agent_type": "all",
+    "data_json": "{\"agent\": \"Caryn Dong\", \"customer\": \"DURAPOWER SDN BHD (ATAP - Commercial)\", \"pkg\": \"Factory\", \"system\": 374600, \"nfp\": 0, \"sales\": 374600, \"rate\": 3.5, \"remarks\": \"Special Case\", \"profitSharingPct\": 2, \"caseType\": \"customer\", \"specialCaseType\": \"adjusted_nfp\", \"feeWaiver\": 0, \"adjustedSalesPrice\": null, \"rowKind\": \"gan\", \"ganOverridePct\": \"0.5\"}",
+    "created_by": "IT Admin",
+    "created_at": "2026-08-04T09:09:11.915679+00:00",
+    "updated_by": "IT Admin",
+    "updated_at": "2026-08-04T09:09:11.915679+00:00"
+  },
+  {
+    "id": 86,
+    "year": "2026",
+    "month": "5",
+    "agent_type": "all",
+    "data_json": "{\"agent\": \"Chan Wing On\", \"customer\": \"Liew Miu Yoong (Atap)\", \"pkg\": \"Residential\", \"system\": 54765, \"nfp\": 46031, \"sales\": 48000, \"rate\": 5, \"remarks\": \"RM 48000-RM 3000\", \"profitSharingPct\": 0, \"caseType\": \"standard\", \"specialCaseType\": \"adjusted_sales_price\", \"feeWaiver\": 0, \"adjustedSalesPrice\": 45000, \"rowKind\": null, \"ganOverridePct\": null}",
+    "created_by": "IT Admin",
+    "created_at": "2026-08-04T09:09:11.915679+00:00",
+    "updated_by": "IT Admin",
+    "updated_at": "2026-08-04T09:09:11.915679+00:00"
+  },
+  {
+    "id": 87,
+    "year": "2026",
+    "month": "5",
+    "agent_type": "all",
+    "data_json": "{\"agent\": \"Caryn Dong\", \"customer\": \"Thong Peik Choo (Atap)\", \"pkg\": \"Residential\", \"system\": 36414, \"nfp\": 27829.16, \"sales\": 26994, \"rate\": 5, \"remarks\": \"RM118+RM688 (lucky draw ang pow)\", \"profitSharingPct\": 0, \"caseType\": \"standard\", \"specialCaseType\": \"adjusted_sales_price\", \"feeWaiver\": 0, \"adjustedSalesPrice\": 27800, \"rowKind\": \"basic\", \"ganOverridePct\": null}",
+    "created_by": "IT Admin",
+    "created_at": "2026-08-04T09:09:11.915679+00:00",
+    "updated_by": "IT Admin",
+    "updated_at": "2026-08-04T09:09:11.915679+00:00"
+  }
+]

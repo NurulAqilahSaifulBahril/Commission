@@ -28,7 +28,6 @@
     },
     "mac": {
       "target": ["dir"],
-      "icon": "assets/logo-mark-black.png",
       "category": "public.app-category.finance"
     }
   }
