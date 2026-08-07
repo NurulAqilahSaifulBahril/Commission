@@ -23,11 +23,11 @@
       "assets/**/*"
     ],
     "win": {
-      "target": "dir",
+      "target": ["portable"],
       "icon": "assets/icon.ico"
     },
     "mac": {
-      "target": ["dir"],
+      "target": ["zip"],
       "category": "public.app-category.finance"
     }
   }

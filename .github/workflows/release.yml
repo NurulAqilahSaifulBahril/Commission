@@ -3,11 +3,7 @@ name: Release
 # Push a version tag to cut a release:
 #   git tag v1.2.0 && git push origin v1.2.0
 #
-# Publishes platform-specific assets:
-#   CommissionDashboard-Setup-<ver>.exe         Windows installer
-#   CommissionDashboard-Setup-<ver>-macos.zip   macOS app bundle
-#   CommissionDashboard-update-<ver>.zip        OTA package (both platforms)
-# plus SHA256SUMS.txt for integrity verification.
+# Publishes platform-specific assets for Windows and macOS users.
 
 on:
   push:
@@ -23,7 +19,7 @@ permissions:
   contents: write
 
 jobs:
-  # Shared: Build the platform-agnostic update package once
+  # Build update package (platform-agnostic Flask code)
   build-update-package:
     runs-on: windows-latest
     outputs:
@@ -61,86 +57,55 @@ jobs:
           path: dist/CommissionDashboard-update-*.zip
           retention-days: 1
 
-  # Windows: Build installer
+  # Build Windows desktop app
   build-windows:
     runs-on: windows-latest
     needs: build-update-package
 
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      - name: Build Electron shell (Windows)
-        shell: pwsh
+      - name: Build Electron app (Windows)
         working-directory: 10. Electron App/app
         run: |
           npm ci
           npm run dist
 
-      - name: Install Inno Setup
-        shell: pwsh
-        run: choco install innosetup --no-progress -y
-
-      - name: Build Windows installer
-        shell: pwsh
-        run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (!(Test-Path $iscc)) { $iscc = "$env:ProgramFiles\Inno Setup 6\ISCC.exe" }
-          & $iscc `
-            /DAppVersion=${{ needs.build-update-package.outputs.version }} `
-            "installer\CommissionDashboard.iss"
-
-      - name: Upload Windows installer
+      - name: Upload Windows app
         uses: actions/upload-artifact@v4
         with:
-          name: windows-installer
-          path: dist/CommissionDashboard-Setup-*.exe
+          name: windows-app
+          path: 10. Electron App/app/dist/CommissionDashboard *.exe
           retention-days: 1
 
-  # macOS: Build app bundle
+  # Build macOS desktop app
   build-macos:
     runs-on: macos-latest
     needs: build-update-package
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      - name: Build Electron shell (macOS)
+      - name: Build Electron app (macOS)
         working-directory: 10. Electron App/app
         run: |
           npm ci
           npm run dist
 
-      - name: Package macOS app
-        shell: bash
-        run: |
-          VERSION="${{ needs.build-update-package.outputs.version }}"
-          SOURCE="10. Electron App/app/dist/mac/Commission Portal.app"
-          OUTPUT="dist/CommissionDashboard-Setup-${VERSION}-macos.zip"
-          mkdir -p dist
-          cd "10. Electron App/app/dist"
-          zip -r "../../../${OUTPUT}" "Commission Portal.app"
-          ls -lh "../../../${OUTPUT}"
-
-      - name: Upload macOS bundle
+      - name: Upload macOS app
         uses: actions/upload-artifact@v4
         with:
-          name: macos-bundle
-          path: dist/CommissionDashboard-Setup-*-macos.zip
+          name: macos-app
+          path: 10. Electron App/app/dist/CommissionDashboard-*.zip
           retention-days: 1
 
-  # Publish: Combine all artifacts and create release
+  # Create release with all artifacts
   publish:
     runs-on: ubuntu-latest
     needs: [build-update-package, build-windows, build-macos]
@@ -155,36 +120,36 @@ jobs:
           path: artifacts
 
       - name: Organize artifacts
-        shell: bash
         run: |
           mkdir -p dist
-          mv artifacts/update-package/* dist/ 2>/dev/null || true
-          mv artifacts/windows-installer/* dist/ 2>/dev/null || true
-          mv artifacts/macos-bundle/* dist/ 2>/dev/null || true
+          # Update package
+          find artifacts/update-package -name "*.zip" -exec mv {} dist/ \;
+          # Windows app
+          find artifacts/windows-app -name "*.exe" -exec mv {} dist/ \;
+          # macOS app
+          find artifacts/macos-app -name "*.zip" -exec mv {} dist/CommissionDashboard-${{ needs.build-update-package.outputs.version }}-macos.zip \;
           ls -lh dist/
 
       - name: Generate checksums
-        shell: bash
         run: |
           cd dist
-          sha256sum * > SHA256SUMS.txt || true
+          sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Publish release
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.build-update-package.outputs.tag }}
           name: ${{ needs.build-update-package.outputs.tag }}
           generate_release_notes: true
           body: |
-            ## Finance Commission Dashboard ${{ needs.build-update-package.outputs.tag }}
+            ## Commission Dashboard ${{ needs.build-update-package.outputs.tag }}
 
-            **New here?**
-            - **Windows**: Download **CommissionDashboard-Setup-${{ needs.build-update-package.outputs.version }}.exe** and run it.
-            - **macOS**: Download **CommissionDashboard-Setup-${{ needs.build-update-package.outputs.version }}-macos.zip**, extract it, and run Commission Portal.app.
+            **Download for your platform:**
+            - **Windows**: CommissionDashboard-Setup-${{ needs.build-update-package.outputs.version }}.exe
+            - **macOS**: CommissionDashboard-Setup-${{ needs.build-update-package.outputs.version }}-macos.zip
 
-            **Already installed?** Do nothing — the dashboard detects this release
-            on its own and shows an **Install Update** button in the sidebar.
+            Existing users: Auto-update is enabled in the dashboard.
           files: |
             dist/CommissionDashboard-Setup-*.exe
             dist/CommissionDashboard-Setup-*-macos.zip
