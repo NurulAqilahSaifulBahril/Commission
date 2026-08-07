@@ -82,7 +82,7 @@ jobs:
         working-directory: 10. Electron App/app
         run: |
           npm ci
-          npm run dist
+          npx electron-builder --win --dir
 
       - name: Install Inno Setup
         shell: pwsh
@@ -120,7 +120,7 @@ jobs:
         working-directory: 10. Electron App/app
         run: |
           npm ci
-          npm run dist
+          npx electron-builder --mac --dir
 
       - name: Package macOS app
         shell: bash
