@@ -546,39 +546,7 @@ g.platform_block("MAC", DARK, [
     "is normal for apps outside the App Store.",
 ])
 
-g.step_heading("key", "Step 3 — Add your access keys")
-g.para("The Portal needs keys to reach the company data. **Ask IT for your "
-       "access keys** — they will send you a few lines of text that look "
-       "like `SOMETHING=a-long-code`.")
-g.platform_block("WINDOWS", ACCENT, [
-    "Open the Portal's folder. The installer shows you where it is — the "
-    "folder is called **Commission Dashboard**.",
-    "Find the file named `.env` and open it with Notepad (right-click → "
-    "**Open with** → **Notepad**).",
-    "Go to the end of the file and paste in the lines IT sent you, each on "
-    "its own line.",
-    "Save (**Ctrl+S**) and close Notepad.",
-])
-g.platform_block("MAC", DARK, [
-    "Open **Finder** → **Applications**.",
-    "Right-click **Commission Portal.app** → **Show Package Contents**.",
-    "Go to `Contents/Resources/` and open the **Commission Dashboard** folder.",
-    "Open `.env` with **TextEdit** (right-click → **Open With** → "
-    "**TextEdit**).",
-    "Go to the end of the file and paste in the lines IT sent you, each on "
-    "its own line.",
-    "Save (**Cmd+S**) and close TextEdit.",
-])
-g.callout([
-    "Keep these keys private. Do not email them or send them in a chat "
-    "message.",
-    "**Note for IT:** accounts live in the shared database and are issued "
-    "before the install, so the installer never asks for one. Use "
-    "`create_admin.py` to add or reset an account, and seed `.env` during the "
-    "install rather than leaving the keys to the user.",
-])
-
-g.step_heading("check", "Step 4 — Open the Portal")
+g.step_heading("check", "Step 3 — Open the Portal")
 g.para("**Windows:** Start Menu → **Finance Commission Dashboard** (or the "
        "desktop shortcut).")
 g.para("**Mac:** **Applications** → **Commission Portal**.")
@@ -607,10 +575,10 @@ g.para("**If you do not see a button**, the box says \"*Ask an admin to "
        "install it.*\" — there is nothing for you to do. Let your admin know.")
 g.sub_heading("Things worth knowing", keep=130)
 g.green_cards([
-    "**Nothing of yours is lost.** Your login, your access key, your Excel "
-    "files, saved reports and any rates you edited all stay exactly as they "
-    "are. An update only replaces the program itself.",
-    "**You never download the installer again.** Steps 1–4 above are one "
+    "**Nothing of yours is lost.** Your login, your Excel files, saved "
+    "reports and any rates you edited all stay exactly as they are. An "
+    "update only replaces the program itself.",
+    "**You never download the installer again.** Steps 1–3 above are one "
     "time only.",
     "**To check your version:** look at the bottom-left corner of the menu.",
     "**If an update fails**, the Portal puts the old version back by itself "
@@ -622,7 +590,6 @@ g.rule()
 g.part_heading("TROUBLESHOOTING", "If something goes wrong",
                icon_kind="warning", color=RED)
 g.trouble_table([
-    ("\"Token expired\"", "Ask IT for a new access key, then redo Step 3"),
     ("The Portal will not open",
      "Tell IT — ask them to check `dashboard.log` in the Portal's folder"),
     ("**Mac:** \"cannot be opened because it is from an unidentified "

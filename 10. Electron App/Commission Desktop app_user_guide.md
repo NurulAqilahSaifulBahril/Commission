@@ -44,39 +44,7 @@ brings everything it needs with it.
    app, choose **Open**, then click **Open** again. This is normal for apps
    outside the App Store.
 
-### Step 3 — Add your access keys
-
-The Portal needs keys to reach the company data. **Ask IT for your access keys** —
-they will send you a few lines of text that look like `SOMETHING=a-long-code`.
-
-**Windows**
-
-1. Open the Portal's folder. The installer shows you where it is — the folder is
-   called **Commission Dashboard**.
-2. Find the file named `.env` and open it with Notepad
-   (right-click → **Open with** → **Notepad**).
-3. Go to the end of the file and paste in the lines IT sent you, each on its own
-   line.
-4. Save (**Ctrl+S**) and close Notepad.
-
-**Mac**
-
-1. Open **Finder** → **Applications**.
-2. Right-click **Commission Portal.app** → **Show Package Contents**.
-3. Go to `Contents/Resources/` and open the **Commission Dashboard** folder.
-4. Open `.env` with **TextEdit** (right-click → **Open With** → **TextEdit**).
-5. Go to the end of the file and paste in the lines IT sent you, each on its own
-   line.
-6. Save (**Cmd+S**) and close TextEdit.
-
-> Keep these keys private. Do not email them or send them in a chat message.
->
-> **Note for IT:** accounts live in the shared database and are issued before
-> the install, so the installer never asks for one. Use
-> `8. Web Dashboard\create_admin.py` to add or reset an account, and seed `.env`
-> during the install rather than leaving the keys to the user.
-
-### Step 4 — Open the Portal
+### Step 3 — Open the Portal
 
 **Windows:** Start Menu → **Finance Commission Dashboard** (or the desktop
 shortcut).
@@ -115,10 +83,10 @@ there is nothing for you to do. Let your admin know.
 
 ### Things worth knowing
 
-- **Nothing of yours is lost.** Your login, your access key, your Excel files,
-  saved reports and any rates you edited all stay exactly as they are. An update
-  only replaces the program itself.
-- **You never download the installer again.** Steps 1–4 above are one time only.
+- **Nothing of yours is lost.** Your login, your Excel files, saved reports and
+  any rates you edited all stay exactly as they are. An update only replaces
+  the program itself.
+- **You never download the installer again.** Steps 1–3 above are one time only.
 - **To check your version:** look at the bottom-left corner of the menu.
 - **If an update fails**, the Portal puts the old version back by itself and
   keeps working. Tell IT so they can look into it.
@@ -129,7 +97,6 @@ there is nothing for you to do. Let your admin know.
 
 | What you see | What to do |
 |---|---|
-| "Token expired" | Ask IT for a new access key, then redo Step 3 |
 | The Portal will not open | Tell IT — ask them to check `dashboard.log` in the Portal's folder |
 | **Mac:** "cannot be opened because it is from an unidentified developer" | Right-click **Commission Portal.app** and choose **Open**, then click **Open** again. You only need to do this the first time. |
 | **Mac:** "Commission Portal is damaged and can't be opened" | The download did not finish cleanly. Delete the app, download the `-macos.zip` again from the release page, and open it with right-click → **Open**. |
