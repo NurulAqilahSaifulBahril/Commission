@@ -18,7 +18,7 @@ dependencies already installed, so nothing needs to be on the machine first.
 📄 **[Install & Update as a PDF](docs/Commission-Portal-User-Guide.pdf)** — printable, and attached to every release.
 
 <a href="docs/Commission-Portal-User-Guide.pdf">
-  <img src="docs/img/user-guide-cover.png" width="320"
+  <img src="docs/img/user-guide-cover.png" width="200"
        alt="Cover page of the Commission Portal Install &amp; Update guide">
 </a>
 
