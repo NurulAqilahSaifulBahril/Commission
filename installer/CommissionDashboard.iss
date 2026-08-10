@@ -15,7 +15,12 @@
 #define AppName "Finance Commission Dashboard"
 #define Publisher "Eternalgy"
 #define LaunchBat "Launch Dashboard.bat"
-#define ShellExe "shell\Commission Portal.exe"
+; Must match "productName" in "10. Electron App/app/package.json" -- that is
+; what names the exe electron-builder drops into win-unpacked, which
+; build_package.py copies verbatim to shell\. The two drifted apart once
+; (productName became CommissionDashboard, this line kept saying "Commission
+; Portal") and every shortcut the installer made pointed at nothing.
+#define ShellExe "shell\CommissionDashboard.exe"
 
 [Setup]
 AppId={{9C2F4B71-6D3E-4A55-9F80-3A17C6E2D5B4}
@@ -57,10 +62,12 @@ Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#ShellExe}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-; Generates FLASK_SECRET_KEY and prompts for the first admin account. The
-; payload ships its own Python under runtime\, so this no longer builds a .venv
-; or runs pip -- it finishes in seconds. Still a console window, because it
-; prompts for the admin username/password and shows the access-key reminder.
+; Generates FLASK_SECRET_KEY. The payload ships its own Python under runtime\,
+; so this no longer builds a .venv or runs pip -- it finishes in seconds. It no
+; longer asks for a username and password either: accounts are issued by IT in
+; the shared database, so the installer has nothing to create. On a seeded
+; build (--seed-env) the console has nothing to say and closes by itself; it
+; only stops on a pause when the access keys are genuinely missing.
 Filename: "{cmd}"; Parameters: "/c """"{app}\Setup Environment.bat"""""; WorkingDir: "{app}"; StatusMsg: "Finishing setup..."; Flags: waituntilterminated
 Filename: "{app}\{#ShellExe}"; Description: "Start the dashboard now"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent
 

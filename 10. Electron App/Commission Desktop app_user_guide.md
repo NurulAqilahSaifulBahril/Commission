@@ -43,12 +43,7 @@ brings everything it needs with it.
    app, choose **Open**, then click **Open** again. This is normal for apps
    outside the App Store.
 
-### Step 3 — Create your login
-
-A window opens briefly and asks you to create an account. Type a **username**
-and a **password** and press Enter. Write them down — this is how you log in.
-
-### Step 4 — Add your access keys
+### Step 3 — Add your access keys
 
 The Portal needs keys to reach the company data. **Ask IT for your access keys** —
 they will send you a few lines of text that look like `SOMETHING=a-long-code`.
@@ -75,20 +70,21 @@ they will send you a few lines of text that look like `SOMETHING=a-long-code`.
 
 > Keep these keys private. Do not email them or send them in a chat message.
 >
-> **Note for IT:** the account-creation step above (Step 3) already needs
-> `PG_MIRROR_TOKEN` to reach the shared database, so the keys have to be in
-> place *before* that step, not after. In practice, seed `.env` during the
-> install rather than leaving it to the user.
+> **Note for IT:** accounts live in the shared database and are issued before
+> the install, so the installer never asks for one. Use
+> `8. Web Dashboard\create_admin.py` to add or reset an account, and seed `.env`
+> during the install rather than leaving the keys to the user.
 
-### Step 5 — Open the Portal
+### Step 4 — Open the Portal
 
 **Windows:** Start Menu → **Finance Commission Dashboard** (or the desktop
 shortcut).
 
 **Mac:** **Applications** → **Commission Portal**.
 
-Log in with the username and password from Step 3. The first load takes a moment
-while it fetches the year's data. **You are done.**
+Log in with the **username and password IT gave you**. There is no account to
+create — yours already exists. The first load takes a moment while it fetches
+the year's data. **You are done.**
 
 ---
 
@@ -121,7 +117,7 @@ there is nothing for you to do. Let your admin know.
 - **Nothing of yours is lost.** Your login, your access key, your Excel files,
   saved reports and any rates you edited all stay exactly as they are. An update
   only replaces the program itself.
-- **You never download the installer again.** Steps 1–5 above are one time only.
+- **You never download the installer again.** Steps 1–4 above are one time only.
 - **To check your version:** look at the bottom-left corner of the menu.
 - **If an update fails**, the Portal puts the old version back by itself and
   keeps working. Tell IT so they can look into it.
@@ -132,7 +128,7 @@ there is nothing for you to do. Let your admin know.
 
 | What you see | What to do |
 |---|---|
-| "Token expired" | Ask IT for a new access key, then redo Step 4 |
+| "Token expired" | Ask IT for a new access key, then redo Step 3 |
 | The Portal will not open | Tell IT — ask them to check `dashboard.log` in the Portal's folder |
 | **Mac:** "cannot be opened because it is from an unidentified developer" | Right-click **Commission Portal.app** and choose **Open**, then click **Open** again. You only need to do this the first time. |
 | **Mac:** "Commission Portal is damaged and can't be opened" | The download did not finish cleanly. Delete the app, download the `-macos.zip` again from the release page, and open it with right-click → **Open**. |

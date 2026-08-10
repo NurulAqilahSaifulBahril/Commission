@@ -58,35 +58,56 @@ echo.
 
 :haveenv
 :: -- Session secret ---------------------------------------------------------
-:: Flask refuses to start without FLASK_SECRET_KEY. Generate one per install so
-:: sessions from one machine are never valid on another.
+:: Generate one per install so sessions from one machine are never valid on
+:: another.
+::
+:: Deliberately NOT `for /f ('"%PYEXE%" -c "..."')`. That form re-parses the
+:: inner quotes and hands cmd 'runtime\python.exe" -c "import' as the command,
+:: so every install printed a raw "is not recognized" error into the setup
+:: console and wrote no key at all; usebackq does not save it either. Running
+:: the interpreter as a plain command and reading the result back through a
+:: file quotes correctly whatever the path looks like. Written without a
+:: parenthesised block so %SECRET% is not expanded before set /p fills it.
+::
+:: app.py generates and persists a key on first boot when this is missing, so
+:: the only real damage was that error line during an otherwise silent setup.
 findstr /b /c:"FLASK_SECRET_KEY=" ".env" >nul 2>&1
-if errorlevel 1 (
-    echo Generating a session secret ...
-    for /f %%k in ('"%PYEXE%" -c "import secrets;print(secrets.token_hex(32))"') do (
-        echo FLASK_SECRET_KEY=%%k>> ".env"
-    )
-)
+if not errorlevel 1 goto havesecret
+echo Generating a session secret ...
+set "SECRETTMP=%TEMP%\commission-secret.tmp"
+"%PYEXE%" -c "import secrets;print(secrets.token_hex(32))" > "%SECRETTMP%"
+set "SECRET="
+set /p SECRET=<"%SECRETTMP%"
+del "%SECRETTMP%" >nul 2>&1
+if defined SECRET echo FLASK_SECRET_KEY=%SECRET%>> ".env"
+:havesecret
 
-:: -- First admin account ----------------------------------------------------
-:: Needs the access keys: accounts live in the shared database, and without
-:: PG_MIRROR_TOKEN create_admin.py can only die in a traceback. Skip with
-:: instructions instead - the Portal itself now shows a setup page explaining
-:: the same thing, and this file can simply be run again once keys are in.
+:: -- Accounts ---------------------------------------------------------------
+:: Deliberately nothing to do here. Accounts live in the shared database and
+:: are issued by IT ahead of time, so this used to prompt every installer for a
+:: username and password that the person had already been given - creating a
+:: second, unwanted account (or silently resetting the real one's password when
+:: the names happened to match). Sign in with the credentials IT sent instead.
+:: IT can still run "8. Web Dashboard\create_admin.py" by hand to add or reset
+:: an account.
+
+:: -- Closing message --------------------------------------------------------
+:: Only ask for access keys when they are actually missing. An installer built
+:: with --seed-env ships .env already filled in, and telling that user to go
+:: and paste keys sent them hunting for a step that was already done - then
+:: made them dismiss a "press any key" for it. With keys present there is
+:: nothing to say and nothing to wait for, so say it briefly and get out.
 findstr /b /c:"PG_MIRROR_TOKEN=" ".env" >nul 2>&1
-if errorlevel 1 (
+if not errorlevel 1 (
     echo.
-    echo NOTE: no access keys in .env yet, so the first admin account cannot
-    echo be created now. Add the keys IT gave you to the .env file in this
-    echo folder, then run this file again to create the account.
-    goto keysmissing
-)
-if not exist "8. Web Dashboard\dashboard.db" (
+    echo ============================================================
+    echo  Setup complete. Start the dashboard from the Start Menu
+    echo  shortcut and sign in with the username and password IT
+    echo  gave you.
+    echo ============================================================
     echo.
-    echo No user database yet - create the first administrator account.
-    "%PYEXE%" "8. Web Dashboard\create_admin.py"
+    goto done
 )
-:keysmissing
 
 echo.
 echo ============================================================
@@ -98,8 +119,11 @@ echo  file in this folder, for example:
 echo.
 echo      PG_PROXY_TOKEN=your-token-here
 echo.
-echo  Then start the dashboard from the Start Menu shortcut.
+echo  Then start the dashboard from the Start Menu shortcut and
+echo  sign in with the username and password IT gave you.
 echo ============================================================
 echo.
 pause
+
+:done
 endlocal

@@ -545,12 +545,7 @@ g.platform_block("MAC", DARK, [
     "is normal for apps outside the App Store.",
 ])
 
-g.step_heading("person", "Step 3 — Create your login")
-g.para("A window opens briefly and asks you to create an account. Type a "
-       "**username** and a **password** and press Enter. Write them down — "
-       "this is how you log in.")
-
-g.step_heading("key", "Step 4 — Add your access keys")
+g.step_heading("key", "Step 3 — Add your access keys")
 g.para("The Portal needs keys to reach the company data. **Ask IT for your "
        "access keys** — they will send you a few lines of text that look "
        "like `SOMETHING=a-long-code`.")
@@ -576,18 +571,19 @@ g.platform_block("MAC", DARK, [
 g.callout([
     "Keep these keys private. Do not email them or send them in a chat "
     "message.",
-    "**Note for IT:** the account-creation step above (Step 3) already needs "
-    "`PG_MIRROR_TOKEN` to reach the shared database, so the keys have to be "
-    "in place *before* that step, not after. In practice, seed `.env` during "
-    "the install rather than leaving it to the user.",
+    "**Note for IT:** accounts live in the shared database and are issued "
+    "before the install, so the installer never asks for one. Use "
+    "`create_admin.py` to add or reset an account, and seed `.env` during the "
+    "install rather than leaving the keys to the user.",
 ])
 
-g.step_heading("check", "Step 5 — Open the Portal")
+g.step_heading("check", "Step 4 — Open the Portal")
 g.para("**Windows:** Start Menu → **Finance Commission Dashboard** (or the "
        "desktop shortcut).")
 g.para("**Mac:** **Applications** → **Commission Portal**.")
-g.para("Log in with the username and password from Step 3. The first load "
-       "takes a moment while it fetches the year's data. **You are done.**")
+g.para("Log in with the **username and password IT gave you**. There is no "
+       "account to create — yours already exists. The first load takes a "
+       "moment while it fetches the year's data. **You are done.**")
 g.rule()
 
 # ── Part 2 ────────────────────────────────────────────────────────────────────
@@ -613,7 +609,7 @@ g.green_cards([
     "**Nothing of yours is lost.** Your login, your access key, your Excel "
     "files, saved reports and any rates you edited all stay exactly as they "
     "are. An update only replaces the program itself.",
-    "**You never download the installer again.** Steps 1–5 above are one "
+    "**You never download the installer again.** Steps 1–4 above are one "
     "time only.",
     "**To check your version:** look at the bottom-left corner of the menu.",
     "**If an update fails**, the Portal puts the old version back by itself "
@@ -625,7 +621,7 @@ g.rule()
 g.part_heading("TROUBLESHOOTING", "If something goes wrong",
                icon_kind="warning", color=RED)
 g.trouble_table([
-    ("\"Token expired\"", "Ask IT for a new access key, then redo Step 4"),
+    ("\"Token expired\"", "Ask IT for a new access key, then redo Step 3"),
     ("The Portal will not open",
      "Tell IT — ask them to check `dashboard.log` in the Portal's folder"),
     ("**Mac:** \"cannot be opened because it is from an unidentified "
