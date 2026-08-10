@@ -22,7 +22,7 @@ OUT = os.path.join(HERE, "Commission Desktop app_user_guide.pdf")
 LOGO = os.path.join(HERE, "assets", "logo-header.png")
 SCREENSHOT = os.path.join(HERE, "update_panel_screenshot.png")
 
-VERSION = "1.2.9"
+VERSION = "1.2.12"
 DATE_LINE = "August 2026"
 RELEASES_URL = "https://github.com/NurulAqilahSaifulBahril/Commission/releases/latest"
 
