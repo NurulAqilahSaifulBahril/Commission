@@ -22,6 +22,13 @@ name: Release
 #      PG_MIRROR_SCHEMA), and
 #   2. the repository is PRIVATE.
 #
+# UPDATE_GITHUB_TOKEN belongs with them: a private repo answers 404 to an
+# unauthenticated updater, so an install without that token never sees another
+# release, and .env is precisely what an OTA package is forbidden to touch.
+# Use a fine-grained PAT scoped to this repository with Contents:read -- it is
+# far less sensitive than the database tokens sitting beside it, but it does
+# expire, and auto-update dies quietly the day it does.
+#
 # Release assets inherit repository visibility, so a seeded installer on a
 # public repo hands live database credentials to anyone who finds the URL. If
 # the secrets are set while the repo is still public the build FAILS rather
@@ -101,8 +108,10 @@ jobs:
         shell: pwsh
         env:
           HAS_KEYS: ${{ secrets.PG_MIRROR_TOKEN != '' }}
+          HAS_UPDATE_TOKEN: ${{ secrets.UPDATE_GITHUB_TOKEN != '' }}
           IS_PRIVATE: ${{ github.event.repository.private }}
         run: |
+          "update_token=$($env:HAS_UPDATE_TOKEN)" >> $env:GITHUB_OUTPUT
           if ($env:HAS_KEYS -ne 'true') {
             Write-Host "No PG_* secrets configured - building a key-free installer."
             "seed=false" >> $env:GITHUB_OUTPUT
@@ -113,6 +122,9 @@ jobs:
           }
           Write-Host "Repository is private and keys are configured - seeding the installer."
           "seed=true" >> $env:GITHUB_OUTPUT
+          if ($env:HAS_UPDATE_TOKEN -ne 'true') {
+            Write-Warning "UPDATE_GITHUB_TOKEN is not set. A private repo answers 404 to the updater, so installs from this release will never see another update. Add the secret and re-tag."
+          }
 
       # Values arrive as env vars so they are never written into the command
       # line, and only the count is printed. Actions masks them in logs either
@@ -146,6 +158,22 @@ jobs:
             $seedArg = @("--seed-env", "ci-seed.env")
           }
           python tools/build_package.py --version ${{ steps.ver.outputs.version }} @seedArg
+
+      # Appended rather than seeded because stage_seed_env()'s allowlist only
+      # copies PG_* lines. It has to be here all the same: once the repo is
+      # private the releases API answers 404 to an unauthenticated updater, so
+      # without this every install goes permanently stale, and .env is exactly
+      # the thing an OTA package cannot repair.
+      - name: Add the update token to the staged .env
+        if: steps.seed.outputs.seed == 'true' && steps.seed.outputs.update_token == 'true'
+        shell: pwsh
+        env:
+          UPDATE_GITHUB_TOKEN: ${{ secrets.UPDATE_GITHUB_TOKEN }}
+        run: |
+          $envFile = "dist/payload/.env"
+          if (-not (Test-Path $envFile)) { throw "$envFile is missing - staging did not seed it." }
+          Add-Content -Path $envFile -Value "UPDATE_GITHUB_TOKEN=$env:UPDATE_GITHUB_TOKEN" -Encoding ascii
+          Write-Host "Appended UPDATE_GITHUB_TOKEN to the staged .env."
 
       # The runner is ephemeral, but the file has served its purpose the moment
       # build_package.py has copied it into the payload.
