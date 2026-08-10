@@ -3,7 +3,23 @@ name: Release
 # Push a version tag to cut a release:
 #   git tag v1.2.0 && git push origin v1.2.0
 #
-# Publishes platform-specific assets for Windows and macOS users.
+# Publishes the Windows installer and the code-only OTA update package.
+#
+# The Windows asset is the Inno installer compiled from
+# installer/CommissionDashboard.iss over dist/payload -- NOT electron-builder's
+# output. That distinction matters: this workflow used to publish the portable
+# shell exe renamed to "...-Setup-<ver>.exe", which is the Electron window and
+# nothing else. It carries no "8. Web Dashboard", no Python runtime, so
+# main.js's findCommissionRoot() found no app.py and every download died on
+# "Could not find the dashboard files". A real installer is ~120 MB against the
+# shell's ~80 MB; if this asset ever comes out at 80 MB again, ISCC did not run.
+#
+# macOS is deliberately NOT published. tools/build_package.py carries constants
+# for it (SHELL_BUILD_MAC, PYTHON_MAC_URL, MAC_APP_NAME) but nothing references
+# them -- there is no code path that stages the dashboard and an arm64 runtime
+# next to the .app the way the Windows payload does. Zipping the bare .app just
+# reproduces the failure described above on a platform that cannot even fall
+# back to "Launch Dashboard.bat", so it is better to ship nothing than that.
 
 on:
   push:
@@ -19,8 +35,7 @@ permissions:
   contents: write
 
 jobs:
-  # Build update package (platform-agnostic Flask code)
-  build-update-package:
+  build:
     runs-on: windows-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
@@ -42,116 +57,119 @@ jobs:
           "tag=v$v" >> $env:GITHUB_OUTPUT
           Write-Host "Building version $v"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Build update package
+      # Must precede build_package.py: it copies dist/win-unpacked into the
+      # payload as shell/, and check_shell_fresh() aborts the build if that
+      # folder is older than main.js.
+      - name: Build Electron shell
+        working-directory: 10. Electron App/app
+        run: |
+          npm ci
+          npm run dist
+
+      # No --seed-env here. That flag bakes live access keys into the installer
+      # and this artifact is public; keys reach staff through IT, and the
+      # dashboard shows a setup page explaining that when .env is empty.
+      - name: Stage payload and OTA package
         shell: pwsh
         run: python tools/build_package.py --version ${{ steps.ver.outputs.version }}
 
-      - name: Upload update package
-        uses: actions/upload-artifact@v4
-        with:
-          name: update-package
-          path: dist/CommissionDashboard-update-*.zip
-          retention-days: 1
-
-  # Build Windows desktop app
-  build-windows:
-    runs-on: windows-latest
-    needs: build-update-package
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Build Electron app (Windows)
-        working-directory: 10. Electron App/app
+      - name: Locate Inno Setup
+        id: inno
+        shell: pwsh
         run: |
-          npm ci
-          npm run dist
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            Write-Host "Inno Setup is not on the runner image - installing it."
+            choco install innosetup --no-progress -y
+            $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup." }
+          Write-Host "Using $iscc"
+          "iscc=$iscc" >> $env:GITHUB_OUTPUT
 
-      - name: Upload Windows app
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-app
-          path: 10. Electron App/app/dist/CommissionDashboard *.exe
-          retention-days: 1
+      - name: Compile Windows installer
+        shell: pwsh
+        run: >
+          & "${{ steps.inno.outputs.iscc }}"
+          /DAppVersion=${{ steps.ver.outputs.version }}
+          "installer\CommissionDashboard.iss"
 
-  # Build macOS desktop app
-  build-macos:
-    runs-on: macos-latest
-    needs: build-update-package
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Build Electron app (macOS)
-        working-directory: 10. Electron App/app
+      # The installer is the whole point of the release, and a shell-only exe
+      # looks identical to a working one in the assets list. Fail the build
+      # rather than publish that again.
+      - name: Verify the installer carries a payload
+        shell: pwsh
         run: |
-          npm ci
-          npm run dist
+          $exe = "dist\CommissionDashboard-Setup-${{ steps.ver.outputs.version }}.exe"
+          if (-not (Test-Path $exe)) { throw "ISCC produced no installer at $exe" }
+          $mb = [math]::Round((Get-Item $exe).Length / 1MB)
+          Write-Host "Installer: $exe ($mb MB)"
+          if ($mb -lt 100) {
+            throw "Installer is ${mb} MB - too small to contain the bundled Python runtime. It is probably the bare Electron shell."
+          }
 
-      - name: Upload macOS app
+      # build_package.py wrote SHA256SUMS.txt before the installer existed;
+      # this folds the installer in. updater.py matches lines by exact asset
+      # name, so this has to cover everything the release publishes.
+      - name: Refresh checksums
+        shell: pwsh
+        run: python tools/build_package.py --checksums-only
+
+      - name: Upload release assets
         uses: actions/upload-artifact@v4
         with:
-          name: macos-app
-          path: 10. Electron App/app/dist/CommissionDashboard-*.zip
+          name: release-assets
+          path: |
+            dist/CommissionDashboard-Setup-*.exe
+            dist/CommissionDashboard-update-*.zip
+            dist/SHA256SUMS.txt
           retention-days: 1
 
-  # Create release with all artifacts
   publish:
     runs-on: ubuntu-latest
-    needs: [build-update-package, build-windows, build-macos]
-    if: always() && needs.build-update-package.result == 'success'
+    needs: build
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
+      - name: Download release assets
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          name: release-assets
+          path: dist
 
-      - name: Organize artifacts
-        run: |
-          mkdir -p dist
-          # Update package (keep original name)
-          cp artifacts/update-package/*.zip dist/
-          # Windows app
-          cp artifacts/windows-app/*.exe dist/CommissionDashboard-Setup-${{ needs.build-update-package.outputs.version }}.exe
-          # macOS app (rename from CommissionDashboard-*.zip to follow naming convention)
-          cp artifacts/macos-app/*.zip dist/CommissionDashboard-Setup-${{ needs.build-update-package.outputs.version }}-macos.zip
-          ls -lh dist/
-
-      - name: Generate checksums
-        run: |
-          cd dist
-          sha256sum * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+      - name: List what is being published
+        run: ls -lh dist/
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.build-update-package.outputs.tag }}
-          name: ${{ needs.build-update-package.outputs.tag }}
+          tag_name: ${{ needs.build.outputs.tag }}
+          name: ${{ needs.build.outputs.tag }}
           generate_release_notes: true
           body: |
-            ## Commission Dashboard ${{ needs.build-update-package.outputs.tag }}
+            ## Commission Dashboard ${{ needs.build.outputs.tag }}
 
-            **Download for your platform:**
-            - **Windows**: CommissionDashboard-Setup-${{ needs.build-update-package.outputs.version }}.exe
-            - **macOS**: CommissionDashboard-Setup-${{ needs.build-update-package.outputs.version }}-macos.zip
+            **Windows**: CommissionDashboard-Setup-${{ needs.build.outputs.version }}.exe
 
-            Existing users: Auto-update is enabled in the dashboard.
+            Sign in with the username and password IT gave you — the installer
+            does not ask you to create an account. Ask IT for your access keys
+            and add them to `.env` in the install folder.
+
+            macOS is not available for download yet.
+
+            Existing users: auto-update is enabled in the dashboard.
           files: |
             dist/CommissionDashboard-Setup-*.exe
-            dist/CommissionDashboard-Setup-*-macos.zip
             dist/CommissionDashboard-update-*.zip
             dist/SHA256SUMS.txt

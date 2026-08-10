@@ -21,7 +21,8 @@ brings everything it needs with it.
 1. Go to the [Commission Portal download page](https://github.com/NurulAqilahSaifulBahril/Commission/releases/latest).
 2. Scroll down to the **Assets** list.
 3. **Windows:** click `CommissionDashboard-Setup-….exe` to download it.
-4. **Mac:** click `CommissionDashboard-Setup-…-macos.zip` to download it.
+4. **Mac:** there is no Mac download yet. The Mac steps below are written and
+   ready for when one is published — until then, use a Windows PC.
 
 ### Step 2 — Install
 

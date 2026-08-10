@@ -524,8 +524,9 @@ g.numbered(1, f"Go to the [Commission Portal download page]({RELEASES_URL}).")
 g.numbered(2, "Scroll down to the **Assets** list.")
 g.numbered(3, "**Windows:** click `CommissionDashboard-Setup-….exe` to "
               "download it.")
-g.numbered(4, "**Mac:** click `CommissionDashboard-Setup-…-macos.zip` to "
-              "download it.")
+g.numbered(4, "**Mac:** there is no Mac download yet. The Mac steps below are "
+              "written and ready for when one is published — until then, use "
+              "a Windows PC.")
 
 g.step_heading("play", "Step 2 — Install")
 g.platform_block("WINDOWS", ACCENT, [
