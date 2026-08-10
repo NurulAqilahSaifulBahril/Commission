@@ -14,6 +14,25 @@ name: Release
 # "Could not find the dashboard files". A real installer is ~120 MB against the
 # shell's ~80 MB; if this asset ever comes out at 80 MB again, ISCC did not run.
 #
+# ACCESS KEYS. The installer can ship with .env pre-filled so staff never paste
+# tokens. That is off unless BOTH hold:
+#
+#   1. the PG_* repository secrets exist (PG_PROXY_URL, PG_PROXY_TOKEN,
+#      PG_PROXY_DB, PG_MIRROR_TOKEN, PG_MIRROR_DB, optionally
+#      PG_MIRROR_SCHEMA), and
+#   2. the repository is PRIVATE.
+#
+# Release assets inherit repository visibility, so a seeded installer on a
+# public repo hands live database credentials to anyone who finds the URL. If
+# the secrets are set while the repo is still public the build FAILS rather
+# than publishing them -- deliberately, because the tempting order of
+# operations is to add the secrets first and flip visibility afterwards. With
+# no secrets set the build simply produces a key-free installer, which is what
+# every release up to v1.2.10 was.
+#
+# The OTA zip is never affected: it is built from the code file list, where
+# *.env is excluded.
+#
 # macOS is deliberately NOT published. tools/build_package.py carries constants
 # for it (SHELL_BUILD_MAC, PYTHON_MAC_URL, MAC_APP_NAME) but nothing references
 # them -- there is no code path that stages the dashboard and an arm64 runtime
@@ -40,6 +59,7 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
       tag: ${{ steps.ver.outputs.tag }}
+      seeded: ${{ steps.seed.outputs.seed }}
 
     steps:
       - uses: actions/checkout@v4
@@ -74,12 +94,65 @@ jobs:
           npm ci
           npm run dist
 
-      # No --seed-env here. That flag bakes live access keys into the installer
-      # and this artifact is public; keys reach staff through IT, and the
-      # dashboard shows a setup page explaining that when .env is empty.
+      # Never trust the tag author to have flipped visibility first. See the
+      # header: secrets present + public repo is a hard failure, not a warning.
+      - name: Decide whether to seed access keys
+        id: seed
+        shell: pwsh
+        env:
+          HAS_KEYS: ${{ secrets.PG_MIRROR_TOKEN != '' }}
+          IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if ($env:HAS_KEYS -ne 'true') {
+            Write-Host "No PG_* secrets configured - building a key-free installer."
+            "seed=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          if ($env:IS_PRIVATE -ne 'true') {
+            throw "PG_* secrets are configured but this repository is PUBLIC. A seeded installer attached to a public release exposes live database credentials to anyone who finds the URL. Make the repository private before tagging, or remove the secrets."
+          }
+          Write-Host "Repository is private and keys are configured - seeding the installer."
+          "seed=true" >> $env:GITHUB_OUTPUT
+
+      # Values arrive as env vars so they are never written into the command
+      # line, and only the count is printed. Actions masks them in logs either
+      # way, but a masked secret in an argv is still a secret in an argv.
+      - name: Write seed .env from secrets
+        if: steps.seed.outputs.seed == 'true'
+        shell: pwsh
+        env:
+          PG_PROXY_URL: ${{ secrets.PG_PROXY_URL }}
+          PG_PROXY_TOKEN: ${{ secrets.PG_PROXY_TOKEN }}
+          PG_PROXY_DB: ${{ secrets.PG_PROXY_DB }}
+          PG_MIRROR_TOKEN: ${{ secrets.PG_MIRROR_TOKEN }}
+          PG_MIRROR_DB: ${{ secrets.PG_MIRROR_DB }}
+          PG_MIRROR_SCHEMA: ${{ secrets.PG_MIRROR_SCHEMA }}
+        run: |
+          $names = 'PG_PROXY_URL','PG_PROXY_TOKEN','PG_PROXY_DB',
+                   'PG_MIRROR_TOKEN','PG_MIRROR_DB','PG_MIRROR_SCHEMA'
+          $lines = @()
+          foreach ($n in $names) {
+            $v = [Environment]::GetEnvironmentVariable($n)
+            if ($v) { $lines += "$n=$v" }
+          }
+          Set-Content -Path "ci-seed.env" -Value $lines -Encoding ascii
+          Write-Host "Wrote ci-seed.env with $($lines.Count) key line(s)."
+
       - name: Stage payload and OTA package
         shell: pwsh
-        run: python tools/build_package.py --version ${{ steps.ver.outputs.version }}
+        run: |
+          $seedArg = @()
+          if ("${{ steps.seed.outputs.seed }}" -eq "true") {
+            $seedArg = @("--seed-env", "ci-seed.env")
+          }
+          python tools/build_package.py --version ${{ steps.ver.outputs.version }} @seedArg
+
+      # The runner is ephemeral, but the file has served its purpose the moment
+      # build_package.py has copied it into the payload.
+      - name: Remove the seed file
+        if: always()
+        shell: pwsh
+        run: Remove-Item "ci-seed.env" -Force -ErrorAction SilentlyContinue
 
       - name: Locate Inno Setup
         id: inno
@@ -163,8 +236,9 @@ jobs:
             **Windows**: CommissionDashboard-Setup-${{ needs.build.outputs.version }}.exe
 
             Sign in with the username and password IT gave you — the installer
-            does not ask you to create an account. Ask IT for your access keys
-            and add them to `.env` in the install folder.
+            does not ask you to create an account.
+
+            ${{ needs.build.outputs.seeded == 'true' && 'Your access keys are already included, so there is nothing to paste. Do not forward this installer outside the company — it carries live database credentials.' || 'Ask IT for your access keys and add them to `.env` in the install folder.' }}
 
             macOS is not available for download yet.
 
