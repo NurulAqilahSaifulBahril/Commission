@@ -3,49 +3,34 @@ name: Release
 # Push a version tag to cut a release:
 #   git tag v1.2.0 && git push origin v1.2.0
 #
-# Publishes the Windows installer and the code-only OTA update package.
+# Publishes a Windows installer, a macOS disk image, and the code-only OTA
+# update package.
+#
+# EACH PLATFORM JOB BUILDS ITS OWN PAYLOAD. That is not redundancy, it is the
+# fix for the way this broke: the payload used to be staged in one job and the
+# installer compiled in another, on a different runner with a different
+# filesystem. dist/payload simply did not exist when ISCC ran, and a Windows
+# build that had worked for several releases failed at "Compile Windows
+# installer" for no reason visible in the step name. Nothing crosses a job
+# boundary here except finished artifacts.
 #
 # The Windows asset is the Inno installer compiled from
 # installer/CommissionDashboard.iss over dist/payload -- NOT electron-builder's
-# output. That distinction matters: this workflow used to publish the portable
-# shell exe renamed to "...-Setup-<ver>.exe", which is the Electron window and
-# nothing else. It carries no "8. Web Dashboard", no Python runtime, so
-# main.js's findCommissionRoot() found no app.py and every download died on
+# output. An earlier workflow published the portable shell exe renamed to
+# "...-Setup-<ver>.exe": the Electron window with no "8. Web Dashboard" and no
+# Python, so findCommissionRoot() found no app.py and every download died on
 # "Could not find the dashboard files". A real installer is ~120 MB against the
-# shell's ~80 MB; if this asset ever comes out at 80 MB again, ISCC did not run.
+# shell's ~80 MB, and both platform jobs assert on that size.
 #
 # ACCESS KEYS. The installer can ship with .env pre-filled so staff never paste
-# tokens. That is off unless BOTH hold:
+# tokens. That is off unless BOTH hold: the PG_* repository secrets exist, and
+# the repository is PRIVATE. Release assets inherit repository visibility, so a
+# seeded installer on a public repo hands live database credentials to anyone
+# who finds the URL -- secrets present on a public repo is a hard failure, not
+# a warning. With no secrets set the build produces a key-free installer.
 #
-#   1. the PG_* repository secrets exist (PG_PROXY_URL, PG_PROXY_TOKEN,
-#      PG_PROXY_DB, PG_MIRROR_TOKEN, PG_MIRROR_DB, optionally
-#      PG_MIRROR_SCHEMA), and
-#   2. the repository is PRIVATE.
-#
-# UPDATE_GITHUB_TOKEN belongs with them: a private repo answers 404 to an
-# unauthenticated updater, so an install without that token never sees another
-# release, and .env is precisely what an OTA package is forbidden to touch.
-# Use a fine-grained PAT scoped to this repository with Contents:read -- it is
-# far less sensitive than the database tokens sitting beside it, but it does
-# expire, and auto-update dies quietly the day it does.
-#
-# Release assets inherit repository visibility, so a seeded installer on a
-# public repo hands live database credentials to anyone who finds the URL. If
-# the secrets are set while the repo is still public the build FAILS rather
-# than publishing them -- deliberately, because the tempting order of
-# operations is to add the secrets first and flip visibility afterwards. With
-# no secrets set the build simply produces a key-free installer, which is what
-# every release up to v1.2.10 was.
-#
-# The OTA zip is never affected: it is built from the code file list, where
-# *.env is excluded.
-#
-# macOS is deliberately NOT published. tools/build_package.py carries constants
-# for it (SHELL_BUILD_MAC, PYTHON_MAC_URL, MAC_APP_NAME) but nothing references
-# them -- there is no code path that stages the dashboard and an arm64 runtime
-# next to the .app the way the Windows payload does. Zipping the bare .app just
-# reproduces the failure described above on a platform that cannot even fall
-# back to "Launch Dashboard.bat", so it is better to ship nothing than that.
+# The OTA zip is never seeded: it is built from the code file list, where *.env
+# is excluded.
 
 on:
   push:
@@ -61,48 +46,46 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    runs-on: windows-latest
+  version:
+    runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
       tag: ${{ steps.ver.outputs.tag }}
-      seeded: ${{ steps.seed.outputs.seed }}
-
     steps:
-      - uses: actions/checkout@v4
-
       - name: Resolve version
         id: ver
-        shell: pwsh
         run: |
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            $v = "${{ github.event.inputs.version }}".TrimStart("v")
-          } else {
-            $v = "${{ github.ref_name }}".TrimStart("v")
-          }
-          "version=$v" >> $env:GITHUB_OUTPUT
-          "tag=v$v" >> $env:GITHUB_OUTPUT
-          Write-Host "Building version $v"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            v="${{ github.event.inputs.version }}"
+          else
+            v="${{ github.ref_name }}"
+          fi
+          v="${v#v}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+          echo "Building version $v"
 
+  windows:
+    runs-on: windows-latest
+    needs: version
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       # Must precede build_package.py: it copies dist/win-unpacked into the
-      # payload as shell/, and check_shell_fresh() aborts the build if that
-      # folder is older than main.js.
+      # payload as shell/, and check_shell_fresh() aborts if that folder is
+      # older than main.js.
       - name: Build Electron shell
         working-directory: 10. Electron App/app
         run: |
           npm ci
           npm run dist
 
-      # Never trust the tag author to have flipped visibility first. See the
-      # header: secrets present + public repo is a hard failure, not a warning.
       - name: Decide whether to seed access keys
         id: seed
         shell: pwsh
@@ -120,15 +103,8 @@ jobs:
           if ($env:IS_PRIVATE -ne 'true') {
             throw "PG_* secrets are configured but this repository is PUBLIC. A seeded installer attached to a public release exposes live database credentials to anyone who finds the URL. Make the repository private before tagging, or remove the secrets."
           }
-          Write-Host "Repository is private and keys are configured - seeding the installer."
           "seed=true" >> $env:GITHUB_OUTPUT
-          if ($env:HAS_UPDATE_TOKEN -ne 'true') {
-            Write-Warning "UPDATE_GITHUB_TOKEN is not set. A private repo answers 404 to the updater, so installs from this release will never see another update. Add the secret and re-tag."
-          }
 
-      # Values arrive as env vars so they are never written into the command
-      # line, and only the count is printed. Actions masks them in logs either
-      # way, but a masked secret in an argv is still a secret in an argv.
       - name: Write seed .env from secrets
         if: steps.seed.outputs.seed == 'true'
         shell: pwsh
@@ -150,6 +126,8 @@ jobs:
           Set-Content -Path "ci-seed.env" -Value $lines -Encoding ascii
           Write-Host "Wrote ci-seed.env with $($lines.Count) key line(s)."
 
+      # The step whose absence broke the previous attempt: it creates
+      # dist/payload, which the .iss compiles and the OTA zip is cut from.
       - name: Stage payload and OTA package
         shell: pwsh
         run: |
@@ -157,13 +135,8 @@ jobs:
           if ("${{ steps.seed.outputs.seed }}" -eq "true") {
             $seedArg = @("--seed-env", "ci-seed.env")
           }
-          python tools/build_package.py --version ${{ steps.ver.outputs.version }} @seedArg
+          python tools/build_package.py --version ${{ needs.version.outputs.version }} @seedArg
 
-      # Appended rather than seeded because stage_seed_env()'s allowlist only
-      # copies PG_* lines. It has to be here all the same: once the repo is
-      # private the releases API answers 404 to an unauthenticated updater, so
-      # without this every install goes permanently stale, and .env is exactly
-      # the thing an OTA package cannot repair.
       - name: Add the update token to the staged .env
         if: steps.seed.outputs.seed == 'true' && steps.seed.outputs.update_token == 'true'
         shell: pwsh
@@ -173,10 +146,7 @@ jobs:
           $envFile = "dist/payload/.env"
           if (-not (Test-Path $envFile)) { throw "$envFile is missing - staging did not seed it." }
           Add-Content -Path $envFile -Value "UPDATE_GITHUB_TOKEN=$env:UPDATE_GITHUB_TOKEN" -Encoding ascii
-          Write-Host "Appended UPDATE_GITHUB_TOKEN to the staged .env."
 
-      # The runner is ephemeral, but the file has served its purpose the moment
-      # build_package.py has copied it into the payload.
       - name: Remove the seed file
         if: always()
         shell: pwsh
@@ -192,86 +162,128 @@ jobs:
           )
           $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $iscc) {
-            Write-Host "Inno Setup is not on the runner image - installing it."
             choco install innosetup --no-progress -y
             $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
           }
           if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup." }
-          Write-Host "Using $iscc"
           "iscc=$iscc" >> $env:GITHUB_OUTPUT
 
       - name: Compile Windows installer
         shell: pwsh
         run: >
           & "${{ steps.inno.outputs.iscc }}"
-          /DAppVersion=${{ steps.ver.outputs.version }}
+          /DAppVersion=${{ needs.version.outputs.version }}
           "installer\CommissionDashboard.iss"
 
-      # The installer is the whole point of the release, and a shell-only exe
-      # looks identical to a working one in the assets list. Fail the build
-      # rather than publish that again.
       - name: Verify the installer carries a payload
         shell: pwsh
         run: |
-          $exe = "dist\CommissionDashboard-Setup-${{ steps.ver.outputs.version }}.exe"
+          $exe = "dist\CommissionDashboard-Setup-${{ needs.version.outputs.version }}.exe"
           if (-not (Test-Path $exe)) { throw "ISCC produced no installer at $exe" }
           $mb = [math]::Round((Get-Item $exe).Length / 1MB)
           Write-Host "Installer: $exe ($mb MB)"
           if ($mb -lt 100) {
-            throw "Installer is ${mb} MB - too small to contain the bundled Python runtime. It is probably the bare Electron shell."
+            throw "Installer is ${mb} MB - too small to contain the bundled Python runtime."
           }
 
-      # build_package.py wrote SHA256SUMS.txt before the installer existed;
-      # this folds the installer in. updater.py matches lines by exact asset
-      # name, so this has to cover everything the release publishes.
-      - name: Refresh checksums
-        shell: pwsh
-        run: python tools/build_package.py --checksums-only
-
-      - name: Upload release assets
+      - name: Upload Windows assets
         uses: actions/upload-artifact@v4
         with:
-          name: release-assets
+          name: windows-assets
           path: |
             dist/CommissionDashboard-Setup-*.exe
             dist/CommissionDashboard-update-*.zip
-            dist/SHA256SUMS.txt
+          retention-days: 1
+
+  macos:
+    runs-on: macos-latest
+    needs: version
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Electron app bundle
+        working-directory: 10. Electron App/app
+        run: |
+          npm ci
+          npm run dist
+
+      # electron-builder's output directory depends on target arch and config.
+      # Print it rather than assume: guessing wrong fails deep inside packaging
+      # with a message that does not name the real problem.
+      - name: Show what electron-builder produced
+        run: ls -la "10. Electron App/app/dist"
+
+      - name: Build macOS disk image
+        run: python3 tools/build_package.py --version ${{ needs.version.outputs.version }} --platform macos
+
+      - name: Verify the disk image carries a payload
+        run: |
+          dmg="dist/CommissionDashboard-Setup-${{ needs.version.outputs.version }}-macos.dmg"
+          if [ ! -f "$dmg" ]; then echo "No disk image at $dmg"; exit 1; fi
+          mb=$(( $(stat -f%z "$dmg") / 1048576 ))
+          echo "Disk image: $dmg (${mb} MB)"
+          if [ "$mb" -lt 100 ]; then
+            echo "Disk image is ${mb} MB - too small to contain the bundled runtime."
+            exit 1
+          fi
+
+      - name: Upload macOS assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-assets
+          path: dist/CommissionDashboard-Setup-*-macos.dmg
           retention-days: 1
 
   publish:
     runs-on: ubuntu-latest
-    needs: build
-
+    needs: [version, windows, macos]
     steps:
-      - name: Download release assets
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: release-assets
-          path: dist
+          path: artifacts
 
-      - name: List what is being published
-        run: ls -lh dist/
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          cp artifacts/windows-assets/* dist/
+          cp artifacts/macos-assets/* dist/
+          ls -lh dist/
+
+      # updater.py matches SHA256SUMS lines by exact asset name, so this has to
+      # cover everything the release publishes.
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.build.outputs.tag }}
-          name: ${{ needs.build.outputs.tag }}
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
           generate_release_notes: true
           body: |
-            ## Commission Dashboard ${{ needs.build.outputs.tag }}
+            ## Commission Dashboard ${{ needs.version.outputs.tag }}
 
-            **Windows**: CommissionDashboard-Setup-${{ needs.build.outputs.version }}.exe
+            **Download for your platform:**
+            - **Windows**: CommissionDashboard-Setup-${{ needs.version.outputs.version }}.exe
+            - **macOS** (Apple Silicon): CommissionDashboard-Setup-${{ needs.version.outputs.version }}-macos.dmg
 
             Sign in with the username and password IT gave you — the installer
-            does not ask you to create an account.
-
-            ${{ needs.build.outputs.seeded == 'true' && 'Your access keys are already included, so there is nothing to paste. Do not forward this installer outside the company — it carries live database credentials.' || 'Ask IT for your access keys and add them to `.env` in the install folder.' }}
-
-            macOS is not available for download yet.
+            does not ask you to create an account. Ask IT for your access keys
+            and add them to `.env` in the install folder.
 
             Existing users: auto-update is enabled in the dashboard.
           files: |
             dist/CommissionDashboard-Setup-*.exe
+            dist/CommissionDashboard-Setup-*-macos.dmg
             dist/CommissionDashboard-update-*.zip
             dist/SHA256SUMS.txt

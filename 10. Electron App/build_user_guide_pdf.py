@@ -524,9 +524,8 @@ g.numbered(1, f"Go to the [Commission Portal download page]({RELEASES_URL}).")
 g.numbered(2, "Scroll down to the **Assets** list.")
 g.numbered(3, "**Windows:** click `CommissionDashboard-Setup-….exe` to "
               "download it.")
-g.numbered(4, "**Mac:** there is no Mac download yet. The Mac steps below are "
-              "written and ready for when one is published — until then, use "
-              "a Windows PC.")
+g.numbered(4, "**Mac:** click `CommissionDashboard-Setup-…-macos.dmg` to "
+              "download it.")
 
 g.step_heading("play", "Step 2 — Install")
 g.platform_block("WINDOWS", ACCENT, [
@@ -539,11 +538,12 @@ g.platform_block("WINDOWS", ACCENT, [
     "Click **Install**.",
 ])
 g.platform_block("MAC", DARK, [
-    "Open the `.zip` file you just downloaded (it usually unzips by itself).",
-    "Drag **Commission Portal.app** into your **Applications** folder.",
+    "Open the `.dmg` file you just downloaded.",
+    "Drag **Commission Dashboard.app** into your **Applications** folder.",
     "**If macOS says the app is from an unidentified developer:** "
     "right-click the app, choose **Open**, then click **Open** again. This "
     "is normal for apps outside the App Store.",
+    "Close the installer window.",
 ])
 
 g.step_heading("check", "Step 3 — Open the Portal")

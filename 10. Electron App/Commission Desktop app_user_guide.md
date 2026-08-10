@@ -21,8 +21,7 @@ brings everything it needs with it.
 1. Go to the [Commission Portal download page](https://github.com/NurulAqilahSaifulBahril/Commission/releases/latest).
 2. Scroll down to the **Assets** list.
 3. **Windows:** click `CommissionDashboard-Setup-….exe` to download it.
-4. **Mac:** there is no Mac download yet. The Mac steps below are written and
-   ready for when one is published — until then, use a Windows PC.
+4. **Mac:** click `CommissionDashboard-Setup-…-macos.dmg` to download it.
 
 ### Step 2 — Install
 
@@ -38,11 +37,12 @@ brings everything it needs with it.
 
 **Mac**
 
-1. Open the `.zip` file you just downloaded (it usually unzips by itself).
-2. Drag **Commission Portal.app** into your **Applications** folder.
+1. Open the `.dmg` file you just downloaded.
+2. Drag **Commission Dashboard.app** into your **Applications** folder.
 3. **If macOS says the app is from an unidentified developer:** right-click the
    app, choose **Open**, then click **Open** again. This is normal for apps
    outside the App Store.
+4. Close the installer window.
 
 ### Step 3 — Open the Portal
 
