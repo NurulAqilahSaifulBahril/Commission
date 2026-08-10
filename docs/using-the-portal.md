@@ -1,7 +1,7 @@
 # Using the Commission Portal
 
 How to read and work the reports once the Portal is installed.
-For installing and updating, see [USER_GUIDE.md](../USER_GUIDE.md).
+For installing and updating, see [Install & Update](install-and-update.md).
 
 ## The report screen
 

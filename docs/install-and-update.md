@@ -5,9 +5,11 @@ You install it **once**. After that it keeps itself up to date.
 
 *(Once it is running, see [Using the Commission Portal](using-the-portal.md).)*
 
-> The PDF version of this guide is generated from this file by
-> `build_user_guide_pdf.py`. Edit this file, then re-run that script so the two
-> stay in step.
+> A printable copy lives at
+> [Commission-Portal-User-Guide.pdf](Commission-Portal-User-Guide.pdf). Its
+> content is laid out by `10. Electron App/build_user_guide_pdf.py`, which does
+> **not** read this file — edit both, then re-run that script so the two stay in
+> step.
 
 ---
 
@@ -68,7 +70,7 @@ Windows and Mac.
 A **Software Update** box appears at the **bottom of the left-hand menu**,
 showing the new version number.
 
-![The Software Update panel, showing a new version available with an Install Update button](update_panel_screenshot.png)
+![The Software Update panel, showing a new version available with an Install Update button](img/update-panel.png)
 
 **If you see an "Install Update" button:**
 

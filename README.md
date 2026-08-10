@@ -11,8 +11,18 @@ On that page, grab **`CommissionDashboard-Setup-<version>.exe`** and run it.
 **No prerequisites** — the installer bundles its own Python runtime with the
 dependencies already installed, so nothing needs to be on the machine first.
 
-📖 **[Install & Update guide](USER_GUIDE.md)** — step by step, written for non-technical users.
+## 📖 User guide
+
+📖 **[Install & Update](docs/install-and-update.md)** — step by step, written for non-technical users.
 📖 **[Using the Portal](docs/using-the-portal.md)** — reading the reports, filters, special cases, the Data page.
+📄 **[Install & Update as a PDF](docs/Commission-Portal-User-Guide.pdf)** — printable, and attached to every release.
+
+<a href="docs/Commission-Portal-User-Guide.pdf">
+  <img src="docs/img/user-guide-cover.png" width="320"
+       alt="Cover page of the Commission Portal Install &amp; Update guide">
+</a>
+
+<sup>The thumbnail is decoration — the links above it are the ones that matter.</sup>
 
 You only ever run the installer once; after that the dashboard updates itself from
 GitHub Releases and an admin installs the update from the sidebar. Nothing of yours

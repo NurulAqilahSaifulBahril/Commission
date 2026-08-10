@@ -244,6 +244,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: [version, windows, macos]
     steps:
+      # Must precede download-artifact: checkout defaults to clean:true, which
+      # git-cleans untracked paths and would delete artifacts/ out from under
+      # the next step. Needed here only for docs/Commission-Portal-User-Guide.pdf.
+      - uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -254,6 +259,16 @@ jobs:
           mkdir -p dist
           cp artifacts/windows-assets/* dist/
           cp artifacts/macos-assets/* dist/
+          # The user guide ships alongside the installer: staff land on the
+          # Releases page to download, and that is where they need it. It is
+          # committed rather than built here, so no reportlab/font toolchain
+          # has to exist on this runner.
+          guide="docs/Commission-Portal-User-Guide.pdf"
+          if [ ! -f "$guide" ]; then
+            echo "$guide is missing - the release would ship without a user guide."
+            exit 1
+          fi
+          cp "$guide" dist/
           ls -lh dist/
 
       # updater.py matches SHA256SUMS lines by exact asset name, so this has to
@@ -277,6 +292,9 @@ jobs:
             - **Windows**: CommissionDashboard-Setup-${{ needs.version.outputs.version }}.exe
             - **macOS** (Apple Silicon): CommissionDashboard-Setup-${{ needs.version.outputs.version }}-macos.dmg
 
+            **New here?** Read `Commission-Portal-User-Guide.pdf` below — it
+            walks through installing and updating, step by step.
+
             Sign in with the username and password IT gave you — the installer
             does not ask you to create an account. Ask IT for your access keys
             and add them to `.env` in the install folder.
@@ -286,4 +304,5 @@ jobs:
             dist/CommissionDashboard-Setup-*.exe
             dist/CommissionDashboard-Setup-*-macos.dmg
             dist/CommissionDashboard-update-*.zip
+            dist/Commission-Portal-User-Guide.pdf
             dist/SHA256SUMS.txt

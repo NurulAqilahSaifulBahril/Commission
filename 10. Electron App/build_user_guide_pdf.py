@@ -1,4 +1,4 @@
-"""Generate 'Commission Desktop app_user_guide.pdf' in the Eternalgy house style.
+"""Generate 'docs/Commission-Portal-User-Guide.pdf' in the Eternalgy house style.
 
 Reproduces the original guide design (dark cover band, blue accent, pill
 badges, numbered chips, amber callout, green cards, red troubleshooting
@@ -18,9 +18,19 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas as _canvas
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "Commission Desktop app_user_guide.pdf")
+# The guide is published from docs/ so GitHub renders it and the README can
+# link to a stable, space-free URL. Only the build inputs stay next to this
+# script.
+DOCS = os.path.join(os.path.dirname(HERE), "docs")
+OUT = os.path.join(DOCS, "Commission-Portal-User-Guide.pdf")
+# Page 1 rendered to PNG. A README cannot preview a PDF -- GitHub strips
+# <iframe>/<object>/<embed> and renders images only -- so the cover thumbnail
+# is what makes the guide visible there. Regenerated with the PDF so it cannot
+# drift.
+COVER = os.path.join(DOCS, "img", "user-guide-cover.png")
+COVER_DPI = 150
 LOGO = os.path.join(HERE, "assets", "logo-header.png")
-SCREENSHOT = os.path.join(HERE, "update_panel_screenshot.png")
+SCREENSHOT = os.path.join(DOCS, "img", "update-panel.png")
 
 VERSION = "1.2.12"
 DATE_LINE = "August 2026"
@@ -607,3 +617,22 @@ g.trouble_table([
 
 g.save()
 print("Wrote", OUT)
+
+
+def write_cover_thumbnail() -> None:
+    """Render page 1 of the finished PDF to COVER."""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        print("PyMuPDF not installed - skipped the cover thumbnail. "
+              "Install it with:  pip install pymupdf")
+        return
+
+    os.makedirs(os.path.dirname(COVER), exist_ok=True)
+    with fitz.open(OUT) as doc:
+        page = doc.load_page(0)
+        page.get_pixmap(dpi=COVER_DPI).save(COVER)
+    print("Wrote", COVER)
+
+
+write_cover_thumbnail()
