@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v=20260813-sidebar-match-v1">
 </head>
 <body class="report-page">
     <div class="app-container">
@@ -49,12 +49,19 @@
             </div>
 
             <div class="sidebar-group">
+                <label class="group-label">Navigation</label>
+                <a href="/" class="nav-page-link">
+                    <span class="bullet"></span> Overview
+                </a>
+            </div>
+
+            <div class="sidebar-group">
                 <label class="group-label">Commission Section</label>
                 <ul class="nav-list" id="sectionList">
                     <!-- Dynamic Sub-Tabs go here -->
                 </ul>
             </div>
-            
+
             <div class="sidebar-group" id="dataGroup">
                 <label class="group-label">Data Management</label>
                 <a href="/data" id="dataPageLink" class="btn btn-secondary" style="width: 100%; text-decoration: none; justify-content: center;">
@@ -164,9 +171,6 @@
                     <div class="table-actions">
                         <span class="row-count-badge" id="rowCount">0 rows</span>
                     </div>
-                </div>
-                <div class="legend-card-inline" id="legendCard">
-                    <!-- Dynamic legend goes here -->
                 </div>
                 <div class="table-container">
                     <table class="dashboard-table" id="dataTable">
@@ -363,6 +367,21 @@
             </div>
         </div>
     </div>
+    <!-- Payment slips behind one Collected Payment figure. Opened by clicking
+         the amount: the cell is a sum, and this is what it is a sum of. Also
+         where a refund's bank details live — the slip names the bank and the
+         account holder, which no column in the database does. -->
+    <div id="paymentSlipsModal" class="modal hidden">
+        <div class="modal-content card" style="width: 92%; max-width: 900px; max-height: 90vh;">
+            <div class="modal-header">
+                <h3 id="paymentSlipsTitle">Payments</h3>
+                <button id="closePaymentSlipsBtn" class="btn-close">&times;</button>
+            </div>
+            <div class="modal-body" id="paymentSlipsBody" style="overflow-y:auto; max-height:calc(90vh - 120px); padding:20px;">
+            </div>
+        </div>
+    </div>
+
     <!-- Factory Rate Modal -->
     <div id="factoryRateModal" class="modal hidden">
         <div class="modal-content card">
@@ -418,6 +437,10 @@
                         <span><span id="factoryTargetLabel">Agent</span> Commission (<span id="factoryFormula">2.0% base + 0% sharing</span>):</span>
                         <strong id="previewFactoryComm">RM 0.00</strong>
                     </div>
+                    <!-- OSA/OUM/OGM split breakdown, populated by
+                         updateFactoryModalCalculations() -- empty and hidden
+                         when the target is Safwan or no split applies. -->
+                    <div id="factorySplitBreakdown"></div>
                 </div>
             </div>
             <div class="modal-footer">
@@ -513,7 +536,11 @@
                 <h2>Report Preview</h2>
                 <button class="modal-close" id="pdfModalClose">&times;</button>
             </div>
-            <div class="modal-body">
+            <div class="modal-body" style="position:relative;">
+                <div id="pdfLoadingOverlay" class="loader-overlay hidden">
+                    <div class="spinner"></div>
+                    <p>Building report&hellip;</p>
+                </div>
                 <iframe id="pdfViewer" src="" style="width:100%; height:100%; border:none;"></iframe>
             </div>
             <div class="modal-footer">
@@ -525,7 +552,7 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=20260807-system-details-v1"></script>
+    <script src="/static/app.js?v=20260813-role-hover-v3"></script>
     <script src="/static/updater.js?v=20260731-ota-v1"></script>
 </body>
 </html>

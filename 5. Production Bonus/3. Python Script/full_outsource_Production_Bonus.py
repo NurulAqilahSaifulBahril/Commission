@@ -7,8 +7,10 @@ Rules:
     year through today — invoice_date itself is not a filter, so an invoice
     issued earlier still counts once a payment lands in the window. Not
     just invoices that have reached 100% paid.
-  Sales Price = payments received in that window for the invoice, minus its
-    total EPP interest. EPP interest is read, per invoice, in priority order:
+  Collected Payment = every payment received for the invoice, whenever it was
+    made, minus its total EPP interest. The window above decides which
+    invoices count as this year's production, not how much of each one does.
+    EPP interest is read, per invoice, in priority order:
     1) the invoice's own "EPP Interest (RM... x N%) ... Months" line item(s)
        (the real-world source of truth — usually one such line per EPP
        instalment payment); 2) payment.epp_cost summed across its payments
@@ -322,10 +324,13 @@ _EXCLUDED_PAYMENT_IDS_SQL = "(101334, 104412, 101333, 104413, 4899)"
 def _invoices_sql(year: int) -> str:
     """Any invoice, regardless of its own invoice_date, that has received at
     least one real payment dated Jan 1 of `year` through today — an old
-    invoice with a fresh payment still counts. Sales Price is built from only
-    those in-window payments (not the invoice's full total_amount), so an
-    invoice appears — and its figure grows — as soon as, and as much as,
-    money actually comes in, rather than only once it reaches 100% paid."""
+    invoice with a fresh payment still counts.
+
+    Collected Payment is every payment on such an invoice, whenever it was
+    made, less its EPP interest. The year decides WHICH invoices are this
+    year's production; it does not carve up the money within one. A partly
+    paid invoice contributes only what has come in, and its figure grows as
+    further payments land — there is no "wait until 100% paid" gate."""
     return f"""
 WITH candidates AS (
   SELECT
@@ -348,6 +353,13 @@ WITH candidates AS (
           ELSE 0
         END, 0), 0
     )::numeric AS paid_epp_total,
+    -- The invoice's own Sales Price, the figure Basic & NFP reports: the whole
+    -- invoice less its whole EPP interest, with no payment window applied. It
+    -- sits beside the collected figure rather than replacing it -- one says what
+    -- the deal is worth, the other what has actually come in, and the bonus is
+    -- still earned on the latter.
+    (COALESCE(i.total_amount, 0) - COALESCE(invoice_epp.epp_cost, 0))::numeric
+                                                      AS invoice_sales_price,
     COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name, '(unknown)') AS customer_name,
     COALESCE(NULLIF(TRIM(a.name), ''), '(unknown)')   AS agent_name,
     a.agent_type,
@@ -382,26 +394,27 @@ WITH candidates AS (
   LEFT JOIN SEDA_registration sr_back ON i.bubble_id = ANY(sr_back.linked_invoice)
   LEFT JOIN referral ref ON ref.bubble_id = i.linked_referral
   LEFT JOIN LATERAL (
-    -- Total amount actually paid IN THE WINDOW (payment_date, not invoice
-    -- date — an old invoice with a fresh payment still counts), and the sum
-    -- of payment.epp_cost across those payments (rarely populated in
-    -- practice — see epp_items below, the real-world source of truth).
+    -- EVERYTHING collected on the invoice, whenever it was paid, and the sum of
+    -- payment.epp_cost across those payments (rarely populated in practice --
+    -- see epp_items below, the real-world source of truth). The report year
+    -- decides which invoices appear (see the EXISTS below), not how much of
+    -- each one counts: an invoice that took a deposit in December and the rest
+    -- in January is one deal, and splitting it across two reports made the
+    -- collected figure smaller than the money the customer had handed over.
     SELECT
       COALESCE(SUM(p.amount), 0)::numeric AS paid_amount,
       COALESCE(SUM(COALESCE(p.epp_cost, 0)), 0)::numeric AS paid_epp_cost_sum
     FROM payment p
     WHERE p.linked_invoice = i.bubble_id
       AND p.id NOT IN {_EXCLUDED_PAYMENT_IDS_SQL}
-      AND p.payment_date >= '{int(year)}-01-01'
-      AND p.payment_date <= NOW()
   ) pay ON TRUE
   LEFT JOIN LATERAL (
     -- EPP interest booked as its own invoice line item (e.g. "EPP Interest
     -- (RM15,179.32 x 6%) 36 Months PBB") — one such line typically appears
-    -- per EPP instalment payment, created around the same time as that
-    -- payment, so this sums to the EPP interest for the payments actually
-    -- counted above (bounded by the same window via the item's created_at,
-    -- the closest available proxy since line items have no payment_date).
+    -- per EPP instalment payment. Unbounded, matching the payments above: the
+    -- date window used to sit here too, so that both sides covered the same
+    -- period. Keeping it while the payments went unbounded would deduct one
+    -- year's interest from every year's money.
     SELECT COALESCE(SUM(ii_dedup.epp_interest_amount), 0) AS epp_interest
     FROM (
       SELECT MAX(
@@ -410,8 +423,6 @@ WITH candidates AS (
       ) AS epp_interest_amount
       FROM invoice_item ii
       WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
-        AND ii.created_at >= '{int(year)}-01-01'
-        AND ii.created_at <= NOW()
       GROUP BY TRIM(
         REGEXP_REPLACE(
           REGEXP_REPLACE(
@@ -427,8 +438,56 @@ WITH candidates AS (
       )
     ) ii_dedup
   ) epp_items ON TRUE
+  LEFT JOIN LATERAL (
+    -- The invoice's WHOLE EPP, unbounded by the payment window -- what Basic &
+    -- NFP subtracts from total_amount. Same shape as their epp_items: the line
+    -- items' own `epp` field when any carries one, else their EPP interest
+    -- amounts, deduplicated on the normalised description because the same
+    -- line is repeated per instalment.
+    SELECT COALESCE(
+             NULLIF(SUM(CASE WHEN COALESCE(d.epp_val, 0) > 0 THEN d.epp_val ELSE 0 END), 0),
+             SUM(d.epp_interest_amount),
+             0
+           )::numeric AS epp_cost
+    FROM (
+      SELECT
+        MAX(COALESCE(ii.epp, 0)) AS epp_val,
+        MAX(
+          CASE WHEN COALESCE(ii.description, '') ILIKE '%%epp%%interest%%'
+                    OR COALESCE(ii.description, '') ILIKE '%%epp interest%%'
+               THEN COALESCE(ii.amount, ii.unit_price, 0) ELSE 0 END
+        ) AS epp_interest_amount
+      FROM invoice_item ii
+      WHERE (ii.linked_invoice = i.bubble_id OR ii.bubble_id = ANY(i.linked_invoice_item))
+      GROUP BY TRIM(
+        REGEXP_REPLACE(
+          REGEXP_REPLACE(
+            REGEXP_REPLACE(COALESCE(ii.description, ''), 'moths', 'months', 'gi'),
+            '(\\d+)\\s*months',
+            '\\1months',
+            'gi'
+          ),
+          '\\s+',
+          ' ',
+          'g'
+        )
+      )
+    ) d
+  ) invoice_epp ON TRUE
   WHERE COALESCE(i.is_deleted, FALSE) IS NOT TRUE
     AND pay.paid_amount > 0
+    -- The report year gate, and the only place it applies: the invoice has to
+    -- have seen money this year to be this year's production. Without it every
+    -- invoice ever paid would join the report -- 219 more of them, enough to
+    -- push a team over its threshold and pay a bonus on business done last year.
+    AND EXISTS (
+      SELECT 1
+      FROM payment p2
+      WHERE p2.linked_invoice = i.bubble_id
+        AND p2.id NOT IN {_EXCLUDED_PAYMENT_IDS_SQL}
+        AND p2.payment_date >= '{int(year)}-01-01'
+        AND p2.payment_date <= NOW()
+    )
 )
 SELECT * FROM candidates WHERE rn = 1
 ORDER BY agent_name ASC, invoice_date ASC NULLS LAST, invoice_number ASC NULLS LAST
@@ -515,7 +574,8 @@ def build_report(year: int) -> dict | None:
     print(f"  {len(rows)} invoice rows fetched.\n")
 
     # Accumulate agent sales across ALL packages
-    agent_sales: dict[str, Decimal] = {}
+    agent_sales: dict[str, Decimal] = {}          # collected payment, drives the bonus
+    agent_invoice_sales: dict[str, Decimal] = {}   # invoiced Sales Price, reported only
     agent_details: dict[str, list] = {}  # agent_name -> list of detail rows
 
     total_invoices = 0
@@ -546,7 +606,12 @@ def build_report(year: int) -> dict | None:
         prop_type = classify_property_type(r)
         paid_amount = Decimal(str(r.get("paid_amount") or 0))
         paid_epp    = Decimal(str(r.get("paid_epp_total") or 0))
+        # What has actually come in, less its EPP interest. This is the figure
+        # the bonus is earned on, and the one the tables call Collected Payment.
         sales_price = paid_amount - paid_epp
+        # What the deal is worth: the invoice's own Sales Price, as Basic & NFP
+        # states it. Reported alongside, never used in the bonus maths.
+        invoice_sales = Decimal(str(r.get("invoice_sales_price") or 0))
 
         customer_name  = str(r.get("customer_name") or "(unknown)").strip()
         invoice_number = str(r.get("invoice_number") or "").strip()
@@ -558,6 +623,10 @@ def build_report(year: int) -> dict | None:
             agent_sales[norm] = Decimal(0)
         agent_sales[norm] += sales_price
 
+        if norm not in agent_invoice_sales:
+            agent_invoice_sales[norm] = Decimal(0)
+        agent_invoice_sales[norm] += invoice_sales
+
         if raw_name not in agent_details:
             agent_details[raw_name] = []
         agent_details[raw_name].append({
@@ -566,7 +635,8 @@ def build_report(year: int) -> dict | None:
             "invoice_number": invoice_number,
             "prop_type": prop_type,
             "invoice_date": invoice_date,
-            "sales_price": sales_price
+            "sales_price": sales_price,
+            "invoice_sales_price": invoice_sales
         })
 
     # OUM Bonus Calculation
@@ -588,13 +658,17 @@ def build_report(year: int) -> dict | None:
         oum_names = [_norm_name(n) for n in team_name.split("/")]
         personal_sales = sum(agent_sales.get(n, Decimal(0)) for n in oum_names)
         team_total = sum(agent_sales.get(member, Decimal(0)) for member in team_members)
-        
+        # Reported beside the collected figure; qualification and the bonus below
+        # are untouched by it — both still turn on money actually received.
+        personal_invoice_sales = sum(agent_invoice_sales.get(n, Decimal(0)) for n in oum_names)
+
         qualified = "Yes" if (team_total >= OUM_TEAM_THRESHOLD and personal_sales >= OUM_PERSONAL_THRESHOLD) else "No"
         bonus = (team_total * OUM_BONUS_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if qualified == "Yes" else Decimal(0)
 
         oum_summary.append([
             team_name,
             _fmt_money(personal_sales),
+            _fmt_money(personal_invoice_sales),
             _fmt_money(team_total),
             qualified,
             _fmt_money(bonus)
@@ -615,6 +689,7 @@ def build_report(year: int) -> dict | None:
                             d["prop_type"],
                             d["invoice_date"],
                             _fmt_money(d["sales_price"]),
+                            _fmt_money(d["invoice_sales_price"]),
                             _fmt_money(row_bonus)
                         ])
                         
@@ -647,9 +722,15 @@ def build_report(year: int) -> dict | None:
         ])
         processed_ogms.add(team_name)
 
-    T1_HEADERS = ["OUM Name", "Personal Sales", "Team Total Sales", "Qualified", "Production Bonus"]
+    # "Collected Payment" is what these figures have always been -- payments
+    # received in the window, less EPP interest -- so they are named for it
+    # rather than for "Sales", which now means the invoiced Sales Price sitting
+    # next to them. The OGM table keeps its original wording.
+    T1_HEADERS = ["OUM Name", "Personal Collected Payment", "Personal Sales Price",
+                  "Team Total Sales", "Qualified", "Production Bonus"]
     T1_OGM_HEADERS = ["OGM Name", "Team Total Sales", "OSA Sales", "OUM Sales", "Qualified", "Production Bonus"]
-    T2_HEADERS = ["Agent Name", "Customer Name", "Invoice Number", "Package", "Invoice Date", "Sales Price", "Production Bonus"]
+    T2_HEADERS = ["Agent Name", "Customer Name", "Invoice Number", "Package", "Invoice Date",
+                  "Collected Payment", "Sales Price", "Production Bonus"]
 
     oum_summary.sort(key=lambda x: str(x[0]).lower())
     ogm_summary.sort(key=lambda x: str(x[0]).lower())

@@ -11,10 +11,14 @@ Formulas:
   Sales Price  = invoice total_amount - epp_cost
   System Price = main package line unit_price
   Sales Price    = total_amount - EPP interest (always)
-  Commission a   = (Sales Price - NFP) * 25%  when Sales Price > NFP
-  Commission b   = (System Price - NFP) * 100% when System Price > NFP (audit only)
-  Commission c   = (NFP - Sales Price) * 20%  when Sales Price < NFP (deduction)
+  Commission a   = (Sales Price - NFP) * tier rate   when Sales Price > NFP
+  Commission b   = (System Price - NFP) * tier rate  when System Price > NFP (audit only)
+  Commission c   = (NFP - Sales Price) * tier rate   when Sales Price < NFP (deduction)
   NFP Commission = a - c   (sales-price component only; b is not added)
+
+  Tier rates come from the dashboard Data page (Net Floor Price section),
+  resolved on the invoice month per agent. Tiers with nothing entered fall back
+  to the built-ins this report has always used: 25% / 100% / 20%.
 
 Net Floor Price:
   - invoice_date before Oct 2025 -> no NFP
@@ -434,27 +438,83 @@ class InvoiceCommission:
     nfp_commission: float
     package_description: Optional[str] = None
     pct75_date: Optional[str] = None
+    # The month this commission is recognised in. Equal to full_payment_date
+    # unless a Data page tier states a different payment stage, so consumers
+    # bucket on this and full_payment_date keeps meaning "paid in full".
+    payout_date: Optional[str] = None
+    payout_trigger_pct: Optional[float] = None
 
+
+
+# The tier rates the engine falls back to when the Data page has nothing entered
+# for a tier. Kept as plain strings so calc_commission stays usable with no
+# dashboard database in reach.
+NFP_TIER_DEFAULTS = {
+    "sales_above": Decimal("0.25"),
+    "system_above": Decimal("1.00"),
+    "sales_below": Decimal("0.20"),
+}
+
+def nfp_tier_rates_for(agent_name: str, agent_type: str,
+                       month: Optional[int], year: Optional[int]) -> Optional[dict]:
+    """Tier rates from the Data page for this agent and invoice month, or None
+    to leave the built-in rates in charge.
+
+    Resolved on the INVOICE month, matching how basic commission reads its rate:
+    the Data page's Invoice Month is the month a value takes effect from, not
+    the month the money is paid out in.
+
+    Deliberately not memoised here. basic_commission_rates already caches the
+    tables it reads and drops them on reset_cache(), which the dashboard calls
+    the moment a rate is saved -- a second cache in this module would survive
+    that call and keep paying the old rate until the process restarted.
+
+    A rate lookup must never be the thing that breaks a report, so every failure
+    (no dashboard module, unreachable database, an older module without the
+    resolver) falls back to the built-ins rather than raising.
+    """
+    if not month or not year:
+        return None
+    bcr = _rates_module()
+    if bcr is None or not hasattr(bcr, "get_nfp_tier_rates"):
+        return None
+    try:
+        role = bcr.get_agent_role(agent_name, month, year=year,
+                                  agent_type=agent_type)
+    except Exception:
+        role = None
+    try:
+        return bcr.get_nfp_tier_rates(agent_type, month, year=year,
+                                      agent=agent_name, hierarchy=role)
+    except Exception:
+        return None
 
 
 def calc_commission(
     sales_price: Decimal,
     system_price: Decimal,
     net_floor: Optional[Decimal],
+    tier_rates: Optional[dict] = None,
 ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
     if net_floor is None:
         return Decimal("0"), Decimal("0"), Decimal("0"), Decimal("0")
+
+    rates = dict(NFP_TIER_DEFAULTS)
+    if tier_rates:
+        for k, v in tier_rates.items():
+            if k in rates and v is not None:
+                rates[k] = Decimal(str(v))
 
     a = Decimal("0")
     b = Decimal("0")
     c = Decimal("0")
 
     if sales_price > net_floor:
-        a = (sales_price - net_floor) * Decimal("0.25")
+        a = (sales_price - net_floor) * rates["sales_above"]
     if system_price > net_floor:
-        b = (system_price - net_floor) * Decimal("1.00")
+        b = (system_price - net_floor) * rates["system_above"]
     if sales_price < net_floor:
-        c = (net_floor - sales_price) * Decimal("0.20")
+        c = (net_floor - sales_price) * rates["sales_below"]
 
     # NFP commission = sales-side only (a - c). Component b is kept for audit, not summed here.
     nfp_total = a - c
@@ -503,10 +563,111 @@ def is_three_phase_from_seda(phase_type: Optional[str]) -> bool:
     return False
 
 
+# ── Payout condition (dashboard "Net Floor Price Rate Tiers") ────────────────
+# NFP used to recognise strictly at 100% payment. The tier rows on the Data page
+# can now state a payment stage instead, so the month an invoice's NFP commission
+# lands in follows that trigger. With nothing entered every invoice still lands
+# on its 100% date, exactly as before.
+#
+# The main query already returns the 75% and 100% dates; any other percentage a
+# tier asks for is computed by one extra pass, built from the same SQL the basic
+# engine uses so the two cannot drift apart on what "reached N%" means.
+
+_PCT_75 = Decimal("75")
+_PCT_100 = Decimal("100")
+
+
+def _extra_milestone_dates(year: int) -> Dict[str, Dict[Decimal, str]]:
+    """{invoice bubble_id: {threshold: date}} for the NFP payout thresholds the
+    main query does not already compute. Empty when nothing beyond 75/100 is
+    asked for, which is the normal case."""
+    bcr = _rates_module()
+    if bcr is None or not hasattr(bcr, "nfp_payout_thresholds_in_use"):
+        return {}
+    try:
+        wanted = [t for t in bcr.nfp_payout_thresholds_in_use()
+                  if Decimal(t) not in (_PCT_75, _PCT_100)]
+    except Exception:
+        return {}
+    if not wanted:
+        return {}
+    try:
+        ctes, selects, _joins = bcr.milestone_sql_parts(wanted)
+        cols = [(Decimal(t), bcr.milestone_column(t)) for t in wanted]
+        joins = "\n".join(
+            f"  LEFT JOIN pct_{bcr._threshold_slug(t)} "
+            f"ON pct_{bcr._threshold_slug(t)}.linked_invoice = i.bubble_id"
+            for t, _c in cols)
+        select_cols = "\n".join(f"    pct_{bcr._threshold_slug(t)}.{c}," for t, c in cols)
+        sql = f"""
+WITH target_invoices AS (
+  SELECT *
+  FROM invoice
+  WHERE total_amount > 0
+    AND (
+      extract(year from invoice_date) = {year}
+      OR bubble_id IN (SELECT linked_invoice FROM payment WHERE extract(year from payment_date) = {year})
+    )
+),
+{ctes}
+SELECT
+    i.bubble_id,
+{select_cols}
+    i.bubble_id AS _tail
+FROM target_invoices i
+{joins}
+"""
+        out: Dict[str, Dict[Decimal, str]] = {}
+        for r in q(sql):
+            key = str(r.get("bubble_id") or "")
+            out[key] = {t: str(r.get(c) or "")[:10] for t, c in cols}
+        return out
+    except Exception as e:
+        print(f"[NFP] Warning: extra milestone dates unavailable ({e}); "
+              f"payout conditions other than 75% / 100% fall back to 100%.")
+        return {}
+
+
+def _payout_trigger_for(row: dict) -> Decimal:
+    """The percentage this invoice's NFP commission is recognised at, from the
+    Data page tier rows for its agent and invoice month."""
+    bcr = _rates_module()
+    if bcr is None or not hasattr(bcr, "get_nfp_payout_trigger"):
+        return _PCT_100
+    inv_date = parse_date(row.get("invoice_date"))
+    if not inv_date:
+        return _PCT_100
+    try:
+        role = bcr.get_agent_role(row.get("agent_name"), inv_date.month,
+                                  year=inv_date.year,
+                                  agent_type=row.get("agent_type"))
+    except Exception:
+        role = None
+    try:
+        return Decimal(bcr.get_nfp_payout_trigger(
+            row.get("agent_type"), inv_date.month, year=inv_date.year,
+            agent=row.get("agent_name"), hierarchy=role))
+    except Exception:
+        return _PCT_100
+
+
+def _recognition_date(row: dict, trigger: Decimal,
+                      extra: Dict[str, Dict[Decimal, str]]) -> Optional[date]:
+    """The date this invoice reached the trigger, or None if it never has."""
+    if trigger == _PCT_100:
+        return parse_date(row.get("full_payment_date"))
+    if trigger == _PCT_75:
+        return parse_date(row.get("pct75_date"))
+    raw = (extra.get(str(row.get("bubble_id") or "")) or {}).get(trigger)
+    return parse_date(raw) if raw else None
+
+
 def _effective_nfp_date(row: dict) -> Optional[date]:
-    """Return the effective NFP eligibility date for a row.
-    NFP commission strictly requires 100% payment.
-    """
+    """The date this row's NFP commission is recognised — the payout trigger's
+    milestone, resolved into the row by build_report, or the 100% date for a row
+    that has not been through it."""
+    if "_nfp_payout_date" in row:
+        return row["_nfp_payout_date"]
     return parse_date(row.get("full_payment_date"))
 
 
@@ -516,6 +677,14 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[InvoiceCo
     sql = INVOICES_SQL.format(year=year, agent_types=types_sql,
                               agent_type_overrides=_agent_type_override_sql())
     rows = [r for r in q(sql) if _is_internal_row(r)]
+    # Resolve each invoice's payout trigger and the date it was reached BEFORE
+    # the month filter: the trigger decides which month a row belongs to, so it
+    # cannot be applied after the rows for the month have been chosen.
+    extra_milestones = _extra_milestone_dates(year)
+    for r in rows:
+        trigger = _payout_trigger_for(r)
+        r["_nfp_trigger"] = trigger
+        r["_nfp_payout_date"] = _recognition_date(r, trigger, extra_milestones)
     if month is not None:
         rows = [r for r in rows if _effective_nfp_date(r) and _effective_nfp_date(r).month == month]
     # Net floor prices come from the price list in the system (nfp_prices).
@@ -573,16 +742,28 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[InvoiceCo
         else:
             nfp_source = "missing_panel_qty_or_rating"
 
-        a, b, c, total_comm = calc_commission(sales, system, nfp_value)
+        a, b, c, total_comm = calc_commission(
+            sales, system, nfp_value,
+            nfp_tier_rates_for(row.get("agent_name"), row.get("agent_type"),
+                               inv_date.month if inv_date else None,
+                               inv_date.year if inv_date else None))
 
         inv_num = str(row.get("invoice_number") or "").strip()
         row_fp = str(row.get("full_payment_date") or "")[:10] or None
         row_p75 = str(row.get("pct75_date") or "")[:10] or None
         
+        row_trigger = row.get("_nfp_trigger") or _PCT_100
+        row_payout = row.get("_nfp_payout_date")
+        row_payout = row_payout.isoformat() if row_payout else None
+
         NOT_FULLY_PAID_INVS = {'1008316', '1007905'}
         if inv_num in NOT_FULLY_PAID_INVS:
             row_fp = None
             row_p75 = None
+            # These are held back regardless of what stage they have reached, so
+            # the payout date has to go with them or the trigger would let them
+            # back into a month through the side door.
+            row_payout = None
 
         results.append(
             InvoiceCommission(
@@ -610,6 +791,8 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[InvoiceCo
                 nfp_commission=float(money(total_comm)),
                 package_description=row.get("package_description"),
                 pct75_date=row_p75,
+                payout_date=row_payout,
+                payout_trigger_pct=float(row_trigger),
             )
         )
 

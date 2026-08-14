@@ -173,6 +173,18 @@ def _load_module(name: str, path: Path):
 # Date helpers
 # ---------------------------------------------------------------------------
 
+def _nfp_payout_date(line: Any) -> Any:
+    """The date an NFP line is recognised on.
+
+    Equal to full_payment_date unless a Net Floor Price tier on the Data page
+    states a different payment stage, in which case the engine resolves the
+    milestone for that stage and puts it here. Falls back to full_payment_date
+    for lines built before the field existed, so bucketing is unchanged for
+    anything that does not carry it.
+    """
+    return getattr(line, "payout_date", None) or getattr(line, "full_payment_date", None)
+
+
 def _parse_month(date_val: Any) -> int | None:
     if not date_val:
         return None
@@ -955,9 +967,9 @@ def fetch_internal_nfp(year: int, h1_only: bool = True):
         raise RuntimeError(nfp_paths.proxy_token_help())
     rows, summary = nfp.build_report(year)
     nfp_by_inv_all = {r.invoice_number.strip(): r for r in rows if r.invoice_number}
-    rows = [r for r in rows if r.full_payment_date]
+    rows = [r for r in rows if _nfp_payout_date(r)]
     if h1_only:
-        rows = [r for r in rows if _parse_month(r.full_payment_date) in range(1, 7)]
+        rows = [r for r in rows if _parse_month(_nfp_payout_date(r)) in range(1, 7)]
     agents_filtered = {r.agent_name for r in rows if r.agent_name}
     accumulated = {}
     for r in rows:
@@ -1122,22 +1134,59 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
             ogm_comm = Decimal("0")
 
         if prop_type == "Factory":
-            rate = Decimal("0.02")
-            sharing = Decimal("0")
+            base_rate = Decimal("0.02")
 
-            factory_rate_info = basic.get_factory_rates([r])
-            if factory_rate_info:
-                first_key = next(iter(factory_rate_info), None)
-                if first_key:
-                    sharing = Decimal(str(factory_rate_info[first_key].get("sharing", 0)))
+            # The dashboard saves a Factory rate under whatever month the
+            # invoice was being viewed as, i.e. its recognition month
+            # (pay_dt) -- the same month raw_rows was filtered by above.
+            rate_month = _parse_month(pay_dt) or (month if month is not None else _parse_month(inv_dt))
+            dash_rate = basic.get_dashboard_factory_rate(agent_name, customer_name, year, rate_month) \
+                if rate_month else None
+            agent_sharing = dash_rate["agent_rate"] if dash_rate else Decimal("0")
+            safwan_sharing = dash_rate["safwan_rate"] if dash_rate else Decimal("0")
 
-            own_comm = sales_price * rate
+            full_commission = sales_price * (base_rate + agent_sharing)
+
+            # Confirmed split, applied to the WHOLE Agent Commission (base +
+            # sharing), read from the Agent Roles & Hierarchy Data page:
+            #   OSA -> OUM found:      OSA 70% / OUM 20% / OGM 10%
+            #   OSA -> OGM directly:   OSA 70% / OGM 10%, 20% unpaid
+            #   OSA -> no report:      OSA 70%, 30% unpaid
+            #   agent is the OUM:      OUM 20%, 80% unpaid
+            # Only applies once profit sharing is actually set (> 0); at 0%
+            # the agent keeps the flat 2% base alone, same as before.
+            hier = basic.resolve_factory_split_hierarchy(canonical_name)
+            factory_tier = hier["tier"]
+
+            own_comm = full_commission
+            factory_oum_name = None
+            factory_oum_cut = Decimal("0")
+            factory_ogm_cut = Decimal("0")
+
+            if agent_sharing > 0:
+                if factory_tier in ("OSA", "OSA 1", "OSA1"):
+                    own_comm = full_commission * Decimal("0.70")
+                    if hier["oum_name"]:
+                        factory_oum_name = hier["oum_name"]
+                        factory_oum_cut = full_commission * Decimal("0.20")
+                    if hier["ogm_name"]:
+                        factory_ogm_cut = full_commission * Decimal("0.10")
+                elif factory_tier == "OUM":
+                    own_comm = full_commission * Decimal("0.20")
+
             agent_own_commissions[canonical_name] += own_comm
             agent_sales_totals[canonical_name] += sales_price
+            if factory_oum_name:
+                override_commissions[factory_oum_name] += factory_oum_cut
+            if factory_ogm_cut > 0:
+                override_commissions["Gan Lai Soon"] += factory_ogm_cut
 
-            # Safwan/OUM override for factory
-            safwan_override = sales_price * (Decimal("0.005") + sharing)
-            override_commissions[canonical_name] += safwan_override
+            # Safwan's own separate profit-sharing cut on this invoice,
+            # independent of the agent's own rate above.
+            safwan_comm = Decimal("0")
+            if not agent_name.lower() == "safwan":
+                safwan_comm = sales_price * (Decimal("0.005") + safwan_sharing)
+                override_commissions["Safwan"] += safwan_comm
 
             obj = SimpleNamespace(
                 agent_name=canonical_name,
@@ -1146,11 +1195,14 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
                 invoice_date=inv_dt,
                 full_payment_date=pay_dt,
                 sales_price=float(sales_price),
-                rate=float(rate),
-                profit_sharing=float(sharing),
+                rate=float(base_rate),
+                profit_sharing=float(agent_sharing),
                 basic_commission=float(own_comm),
                 is_factory=True,
-                gan_lai_soon=float(ogm_comm),
+                gan_lai_soon=float(ogm_comm + factory_ogm_cut),
+                senior_override=float(factory_oum_cut),
+                senior_override_name=factory_oum_name,
+                safwan_override=float(safwan_comm),
                 package=prop_type,
                 pct5_date=pct5_str,
                 pct75_date=pct75_str,
@@ -1248,9 +1300,9 @@ def fetch_outsource_nfp(year: int, h1_only: bool = True):
         raise RuntimeError(nfp_paths.proxy_token_help())
     rows, summary = nfp.build_report(year)
     nfp_by_inv_all = {r.invoice_number.strip(): r for r in rows if r.invoice_number}
-    rows = [r for r in rows if r.full_payment_date]
+    rows = [r for r in rows if _nfp_payout_date(r)]
     if h1_only:
-        rows = [r for r in rows if _parse_month(r.full_payment_date) in range(1, 7)]
+        rows = [r for r in rows if _parse_month(_nfp_payout_date(r)) in range(1, 7)]
     accumulated = {}
     for r in rows:
         if not r.agent_name:
@@ -1847,7 +1899,7 @@ def build_internal_summary_tables(
         # NFP commission
         nfp_comm_by_agent = {}
         nfp_rate_by_agent = {}
-        month_nfp_rows = [r for r in nfp_rows if _parse_month(r.full_payment_date) == m]
+        month_nfp_rows = [r for r in nfp_rows if _parse_month(_nfp_payout_date(r)) == m]
         for r in month_nfp_rows:
             agent = r.agent_name.strip()
             nfp_comm_by_agent[agent] = nfp_comm_by_agent.get(agent, 0.0) + float(r.nfp_commission)
@@ -1912,6 +1964,7 @@ def build_internal_summary_tables(
             agent_totals_by_month.setdefault(m, {})[agent] = {
                 "basic": basic_total, "nfp": nfp_comm, "anp": anp_comm,
                 "sales": basic_sales + nfp_sales, "invoices": total_invoices_count,
+                "referral": referral_rm,
             }
 
             basic_system = sum(float(nfp_by_inv[ln.invoice_number.strip()].system_price) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
@@ -2300,27 +2353,24 @@ def build_outsource_summary_tables(
                 out_override_breakdown["Gan Lai Soon"][agent] += gls_comm
 
             if getattr(ln, "is_factory", False) or getattr(ln, "package", "") == "Factory":
-                sales_price = float(ln.sales_price)
-                sharing = float(getattr(ln, "profit_sharing", 0.0))
-
-                if not agent.lower() == "safwan":
-                    safwan_override = sales_price * (0.005 + sharing)
-                    basic_override_by_agent[canonical_name] = basic_override_by_agent.get(canonical_name, 0.0) + safwan_override
-                    out_override_breakdown[canonical_name]["Safwan"] += safwan_override
+                # The OSA/OUM/OGM split (and Safwan's own cut) is computed
+                # once, in fetch_outsource_basic(), and attached to the line
+                # there -- read it back instead of re-deriving it here, so
+                # this table can never disagree with what was actually paid.
+                # (Gan Lai Soon's OGM cut is already folded into ln.gan_lai_soon
+                # above, alongside the same-invoice 0.75% override.)
+                safwan_override = getattr(ln, "safwan_override", 0.0)
+                if safwan_override:
+                    basic_override_by_agent["Safwan"] = basic_override_by_agent.get("Safwan", 0.0) + safwan_override
+                    out_override_breakdown["Safwan"][agent] += safwan_override
                     out_override_by_customer[agent][customer]["Safwan"] += safwan_override
 
-                    if info.get("tier") in ("OSA", "OSA 1") and sharing > 0:
-                        oum_p = info.get("oum_parent")
-                        if oum_p:
-                            oum_p = to_title_case(oum_p)
-                            oum_override_fac = sales_price * sharing * 0.20
-                            basic_override_by_agent[oum_p] = basic_override_by_agent.get(oum_p, 0.0) + oum_override_fac
-                            out_override_breakdown[oum_p][agent] += oum_override_fac
-                            out_override_by_customer[agent][customer][oum_p] += oum_override_fac
-                        ogm_override_fac = sales_price * sharing * 0.10
-                        basic_override_by_agent["OGM Pool"] = basic_override_by_agent.get("OGM Pool", 0.0) + ogm_override_fac
-                        out_override_breakdown["OGM Pool"][agent] += ogm_override_fac
-                        out_override_by_customer[agent][customer]["OGM Pool"] += ogm_override_fac
+                oum_cut = getattr(ln, "senior_override", 0.0)
+                oum_name = getattr(ln, "senior_override_name", None)
+                if oum_name and oum_cut:
+                    basic_override_by_agent[oum_name] = basic_override_by_agent.get(oum_name, 0.0) + oum_cut
+                    out_override_breakdown[oum_name][agent] += oum_cut
+                    out_override_by_customer[agent][customer][oum_name] += oum_cut
             else:
                 oum_parent = info.get("oum_parent")
                 if oum_parent:
@@ -2333,7 +2383,7 @@ def build_outsource_summary_tables(
 
         # NFP commission
         nfp_comm_by_agent = {}
-        month_nfp_rows = [r for r in nfp_rows if _parse_month(r.full_payment_date) == m]
+        month_nfp_rows = [r for r in nfp_rows if _parse_month(_nfp_payout_date(r)) == m]
         for r in month_nfp_rows:
             agent = r.agent_name.strip()
             nfp_comm_by_agent[agent] = nfp_comm_by_agent.get(agent, 0.0) + float(r.nfp_commission)
@@ -2490,16 +2540,15 @@ def build_outsource_summary_tables(
 
                     row_gan_lai_soon = sum(getattr(ln, "gan_lai_soon", 0.0) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer and not getattr(ln, "_skip_override", False))
 
-                    # Safwan override for this customer in outsource
-                    row_safwan_rm = 0.0
-                    for ln in month_basic_lines:
-                        if getattr(ln, "_skip_override", False):
-                            continue
-                        if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer:
-                            if getattr(ln, "is_factory", False) or getattr(ln, "package", "") == "Factory":
-                                sales_price = float(ln.sales_price)
-                                sharing = float(getattr(ln, "profit_sharing", 0.0))
-                                row_safwan_rm += sales_price * (0.005 + sharing)
+                    # Safwan override for this customer in outsource -- read
+                    # back what fetch_outsource_basic() already computed,
+                    # rather than re-deriving it here.
+                    row_safwan_rm = sum(
+                        getattr(ln, "safwan_override", 0.0)
+                        for ln in month_basic_lines
+                        if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer
+                        and not getattr(ln, "_skip_override", False)
+                    )
 
                     # Customer specific package type
                     cust_basic_pkgs = set(get_invoice_package(ln.invoice_number, ln) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer)
@@ -3491,7 +3540,7 @@ def build_commission_pdf(
     PAGE_W, PAGE_H = landscape(A4)
     MARGIN = int(0.55 * inch)  # ~39.6 pt
     CONTENT_W = PAGE_W - 2 * MARGIN
-    LOGO_PATH = Path(__file__).resolve().parent.parent / "assets" / "eternalgy_logo.png"
+    LOGO_PATH = Path(__file__).resolve().parent.parent / "9. assets" / "eternalgy_logo.png"
 
     # Styles
     styles = getSampleStyleSheet()
@@ -3583,7 +3632,7 @@ def build_commission_pdf(
                                          textColor=_rl_color("#8B95A3"), alignment=TA_RIGHT)
 
     # ---- Style revision: full-bleed band header + gauge/podium/ledger ----
-    BAND_BG = "#0B211C"       # near-black emerald -- the band every interior page opens with
+    BAND_BG = "#0F1922"       # matches the dashboard sidebar's background -- the band every interior page opens with
     BAND_INK = "#EAF3EF"
     BAND_MUTED = "#8FB3A8"
     ACCENT = "#FF7A45"        # coral, spent on exactly one number per page
@@ -3803,7 +3852,7 @@ def build_commission_pdf(
         # Cover page (1) is full-bleed dark -- painted before the frame's
         # flowables land on top of it, per BaseDocTemplate.handle_pageBegin.
         if doc.page == 1:
-            canvas.setFillColor(_rl_color("#0B211C"))
+            canvas.setFillColor(_rl_color(BAND_BG))
             canvas.rect(0, 0, PAGE_W, PAGE_H, fill=1, stroke=0)
         # Footer
         canvas.setFont(FONT_REGULAR, 9)
@@ -4064,9 +4113,9 @@ def build_commission_pdf(
     story.append(Paragraph("All Agents &mdash; Internal &amp; Outsource, Combined", cover_sub_style))
     period_pill = Table([[Paragraph(sub_title_text.upper(), ParagraphStyle(
         "PeriodPill", parent=styles["Normal"], fontSize=10.5, leading=13, fontName=FONT_BOLD,
-        textColor=_rl_color("#1A0F08")))]], colWidths=[None])
+        textColor=_rl_color("#1A365D")))]], colWidths=[None])
     period_pill.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), _rl_color("#FF7A45")),
+        ("BACKGROUND", (0, 0), (-1, -1), _rl_color("#C3DAF2")),
         ("LEFTPADDING", (0, 0), (-1, -1), 12), ("RIGHTPADDING", (0, 0), (-1, -1), 12),
         ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
@@ -4944,7 +4993,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     if month is not None:
         int_anp_detail = [r for r in int_anp_detail if _parse_month(r.get("invoice_date")) == month]
         _m_lines = _expand_basic_lines_for_month(int_basic_lines, month)
-        _m_nfp = [r for r in int_nfp_rows if _parse_month(r.full_payment_date) == month]
+        _m_nfp = [r for r in int_nfp_rows if _parse_month(_nfp_payout_date(r)) == month]
         int_basic_meta = {**int_basic_meta,
                           "agents": len({ln.agent_name.strip() for ln in _m_lines}),
                           "invoices": len(_m_lines),
@@ -4985,7 +5034,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     if month is not None:
         out_anp_detail = [r for r in out_anp_detail if _parse_month(r.get("invoice_date")) == month]
         _m_out_lines = _expand_basic_lines_for_month(out_basic_lines, month)
-        _m_out_nfp = [r for r in out_nfp_rows if _parse_month(r.full_payment_date) == month]
+        _m_out_nfp = [r for r in out_nfp_rows if _parse_month(_nfp_payout_date(r)) == month]
         out_basic_meta = {**out_basic_meta,
                           "agents": len({ln.agent_name.strip() for ln in _m_out_lines}),
                           "invoices": len(_m_out_lines),

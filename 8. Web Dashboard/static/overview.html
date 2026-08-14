@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Overview — Finance Commission Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css?v=20260813-sidebar-match-v1">
+</head>
+<body class="report-page">
+    <div class="app-container">
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <img src="/static/logo.jpg" alt="Eternalgy" class="sidebar-logo">
+                <span class="portal-eyebrow neon-white">Commission Portal</span>
+            </div>
+
+            <div class="sidebar-group">
+                <label class="group-label">Scope</label>
+                <div class="select-wrapper">
+                    <select id="yearSelect">
+                        <option value="2026" selected>Year 2026</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="sidebar-group">
+                <label class="group-label">Reporting Period</label>
+                <div class="select-wrapper">
+                    <select id="monthSelect">
+                        <option value="1">January 2026</option>
+                        <option value="2">February 2026</option>
+                        <option value="3">March 2026</option>
+                        <option value="4">April 2026</option>
+                        <option value="5">May 2026</option>
+                        <option value="6">June 2026</option>
+                        <option value="7">July 2026</option>
+                        <option value="8" selected>August 2026</option>
+                        <option value="9">September 2026</option>
+                        <option value="10">October 2026</option>
+                        <option value="11">November 2026</option>
+                        <option value="12">December 2026</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Same groups, labels and controls as the report page's sidebar,
+                 so the two read as one navigation rather than two designs. The
+                 only difference is which item carries .active: Overview here,
+                 the chosen section there. -->
+            <div class="sidebar-group">
+                <label class="group-label">Navigation</label>
+                <ul class="nav-list">
+                    <li class="active"><span class="bullet"></span> Overview</li>
+                    <li class="nav-link-item"><a href="/sales-report"><span class="bullet"></span> Sales Report</a></li>
+                </ul>
+            </div>
+
+            <div class="sidebar-group">
+                <label class="group-label">Commission Section</label>
+                <ul class="nav-list">
+                    <li class="nav-link-item"><a href="/report?section=basic_nfp"><span class="bullet"></span> Basic &amp; Net Floor Price Commission</a></li>
+                    <li class="nav-link-item"><a href="/report?section=anp"><span class="bullet"></span> ANP Commission</a></li>
+                    <li class="nav-link-item"><a href="/report?section=ega_esa"><span class="bullet"></span> EGA/ESA Award</a></li>
+                    <li class="nav-link-item"><a href="/report?section=production_bonus"><span class="bullet"></span> Production Bonus</a></li>
+                    <li class="nav-link-item"><a href="/report?section=monthly_contest"><span class="bullet"></span> Monthly Contest</a></li>
+                </ul>
+            </div>
+
+            <div class="sidebar-group" id="dataGroup">
+                <label class="group-label">Data Management</label>
+                <a href="/data" id="dataPageLink" class="btn btn-secondary" style="width: 100%; text-decoration: none; justify-content: center;">
+                    <span class="icon">🗂️</span> Data
+                </a>
+            </div>
+
+            <div class="sidebar-group" id="accountGroup">
+                <label class="group-label">Account</label>
+                <div class="status-text" id="accountWhoami" style="margin-bottom: 8px;"></div>
+                <button id="logoutBtn" class="btn btn-secondary" style="width: 100%;">Logout</button>
+                <a href="/admin" id="adminLink" class="btn btn-warning" style="display:none; text-decoration:none; width: 100%; margin-top: 8px; justify-content: center;">
+                    <span class="icon">⚙️</span> Admin
+                </a>
+            </div>
+
+            <!-- Hidden until an update exists, same as the report page.
+                 updater.js is already loaded here but bails out when this
+                 markup is missing (`if (!group || !installBtn) return`), so
+                 without it the landing page could never show an update. -->
+            <div class="sidebar-group update-group" id="updateGroup" style="display:none;">
+                <label class="group-label">Software Update</label>
+                <div class="update-card" id="updateCard">
+                    <div class="update-headline" id="updateHeadline">Update available</div>
+                    <div class="update-sub" id="updateSub"></div>
+                    <div class="update-progress" id="updateProgress" style="display:none;">
+                        <div class="update-progress-bar" id="updateProgressBar"></div>
+                    </div>
+                    <button id="updateInstallBtn" class="btn btn-warning" style="width:100%; margin-top:10px; justify-content:center;">
+                        <span class="icon">⬇️</span> Install Update
+                    </button>
+                    <a href="#" id="updateNotesLink" class="update-notes-link" target="_blank" rel="noopener">Release notes</a>
+                </div>
+            </div>
+
+            <div class="sidebar-footer">
+                <span class="status-indicator online"></span>
+                <span class="status-text">Connected to PG Proxy</span>
+                <span class="app-version" id="appVersion" title="Installed version"></span>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <header class="content-header">
+                <div class="header-title">
+                    <h2 class="section-title-header">Overview</h2>
+                    <h1 id="overviewPeriod">August 2026</h1>
+                    <p id="overviewSubHeader">Sales &amp; commission analysis — all agents</p>
+                </div>
+                <div class="header-actions">
+                    <a href="/sales-report" class="btn btn-secondary" style="text-decoration:none;">
+                        <span class="icon">📋</span> Sales Report
+                    </a>
+                    <a href="/report" class="btn btn-primary" style="text-decoration:none;">
+                        <span class="icon">📄</span> Commission Report
+                    </a>
+                </div>
+            </header>
+
+            <section class="metrics-row" id="overviewCards"></section>
+
+            <section class="overview-grid">
+                <div class="card overview-panel">
+                    <div class="card-header"><h3>Commission by Type</h3></div>
+                    <div class="payout-bar" id="payoutBar"></div>
+                    <div class="payout-legend" id="payoutLegend"></div>
+                </div>
+
+                <div class="card overview-panel">
+                    <div class="card-header"><h3>Top Performers</h3></div>
+                    <div class="top-performers" id="topPerformers"></div>
+                </div>
+            </section>
+
+            <div id="overviewLoader" class="loader-overlay hidden" style="position:relative; min-height:160px;">
+                <div class="spinner"></div>
+                <p>Loading overview…</p>
+            </div>
+            <div id="overviewEmpty" class="empty-state hidden">
+                <div class="empty-icon">📊</div>
+                <h4>Overview not ready yet</h4>
+                <p id="overviewEmptyMsg">Commission data is still being prepared. Refresh shortly.</p>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/overview.js?v=20260812-overview-v2"></script>
+    <script src="/static/updater.js?v=20260731-ota-v1"></script>
+</body>
+</html>

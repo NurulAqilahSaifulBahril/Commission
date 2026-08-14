@@ -160,14 +160,38 @@ def load_disk_cache():
                 _data_cache = {}
 
 def save_disk_cache():
+    """Write the cache atomically: full pickle to a temp file alongside it, then
+    one rename over the real path.
+
+    Pickling straight into CACHE_FILE truncates it on open and only refills it
+    as the dump proceeds, so anything that interrupts the write -- a kill, a
+    crash, the machine losing power -- leaves a half-written file that
+    unpickles as EOFError. load_disk_cache() then falls back to an empty cache
+    and the next request rebuilds from scratch, silently, for minutes.
+    os.replace() is atomic on Windows and POSIX alike, so a reader sees either
+    the previous good cache or the new one, never a partial one."""
     with _disk_cache_lock:
+        tmp_path = None
         try:
             CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(CACHE_FILE, "wb") as f:
+            fd, tmp_path = tempfile.mkstemp(dir=str(CACHE_FILE.parent),
+                                            prefix=CACHE_FILE.name + ".", suffix=".tmp")
+            with os.fdopen(fd, "wb") as f:
                 pickle.dump(_data_cache, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, CACHE_FILE)
+            tmp_path = None
             _log("Saved cache to disk.")
         except Exception as e:
             _log(f"Failed to save cache to disk: {e}\n" + traceback.format_exc())
+        finally:
+            # A failed attempt must not leave stray .tmp files behind.
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
 def get_cached_data(year, agent_type):
     """Retrieve cached data for a given year and agent type."""
@@ -910,14 +934,26 @@ if not has_main_keys and not FAST_START:
 elif not has_main_keys:
     _log("Fast-start enabled: skipping startup pre-fetch so the dashboard can open immediately.")
 
-@app.route("/")
-@login_required
-def index():
-    resp = make_response(send_from_directory(str(CURRENT_DIR / "static"), "index.html"))
+def _no_store(resp):
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
     return resp
+
+
+@app.route("/")
+@login_required
+def index():
+    """Landing page: the sales and commission overview."""
+    return _no_store(make_response(send_from_directory(str(CURRENT_DIR / "static"), "overview.html")))
+
+
+@app.route("/report")
+@login_required
+def report_page():
+    """The commission report tables -- served from "/" until the overview took
+    that slot, so any link still pointing at "/" now lands on the overview."""
+    return _no_store(make_response(send_from_directory(str(CURRENT_DIR / "static"), "index.html")))
 
 @app.route("/api/boot-id")
 def boot_id():
@@ -935,6 +971,30 @@ def api_version():
         "channel": info.get("channel", "stable"),
         "repo": info.get("repo", updater.DEFAULT_REPO),
     })
+
+
+@app.route("/api/agent-role-maps")
+@login_required
+def agent_role_maps_api():
+    """Just the two role maps /api/commission embeds, for one month.
+
+    The browser keeps a commission payload in localStorage for up to six hours
+    and renders it before the network refresh lands. Roles are edited on the
+    Data page without rebuilding commissions, so an edit made during that
+    window is invisible in the report until the payload expires -- and if the
+    background refresh fails (it is deliberately silent), until it is cleared
+    by hand. These maps are cheap, so the client re-fetches them whenever it
+    renders from cache rather than trusting the copy baked into the payload."""
+    year = request.args.get("year", 2026, type=int)
+    month = request.args.get("month", 8, type=int)
+    try:
+        return jsonify({
+            "agent_roles": _agent_roles_for_month(year, month),
+            "agent_role_history": _agent_role_history(),
+        })
+    except Exception as e:
+        _log("[AGENT ROLE MAPS ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/update/check")
@@ -1437,6 +1497,569 @@ def _build_system_details(nfp_by_inv_all: dict) -> dict:
     return details
 
 
+def _agent_roles_for_month(year: int, month: int) -> dict[str, dict]:
+    """{normalised agent name: {"role", "agent_type"}} as at this month.
+
+    One row per agent wins -- the latest effective_from among the rows whose
+    range actually covers the month, which is the same "latest row wins" rule
+    basic_commission_rates uses to price them. Keyed on the same normalised
+    form agent_names.resolve() uses so the browser can match a displayed name
+    (which may be a nickname or full name) back to its role.
+    """
+    try:
+        rates_dir = str(REPO_ROOT / "1. Basic Commission" / "3. Python Script")
+        if rates_dir not in sys.path:
+            sys.path.append(rates_dir)
+        from basic_commission_rates import split_effective_range
+        target = f"{year}-{month:02d}"
+
+        best: dict[str, tuple[str, dict]] = {}
+        for r in db.list_agent_roles():
+            if r.get("hidden"):
+                continue
+            agent = str(r.get("agent") or "").strip()
+            if not agent:
+                continue
+            start, end = split_effective_range(str(r.get("effective_from") or ""))
+            if not start or not (start <= target <= end):
+                continue
+            display = agent_names.resolve(agent)
+            key = agent_names.normalize_key(display)
+            prev = best.get(key)
+            if prev is None or start > prev[0]:
+                best[key] = (start, {
+                    "agent": display,
+                    "role": str(r.get("hierarchy") or "").strip(),
+                    "agent_type": str(r.get("agent_type") or "").strip(),
+                })
+        return {k: v[1] for k, v in best.items()}
+    except Exception:
+        # A tinting aid must never take the commission table down with it.
+        _log("[AGENT ROLES FOR MONTH]\n" + traceback.format_exc())
+        return {}
+
+
+def _agent_role_history() -> dict[str, list[dict]]:
+    """{normalised agent name: [{"role", "agent_type", "start", "end"}, ...]},
+    every effective range on file, latest start first.
+
+    _agent_roles_for_month() collapses this to a single role as at the *report*
+    month, which misstates any row whose invoice predates a role change: an
+    invoice dated January that only reaches full payment in August lands on the
+    August report, and the role it should read is January's. Shipping the whole
+    history lets the browser resolve each row against its own Invoice Date --
+    the same "latest row wins among those covering the month" rule
+    _agent_roles_for_month() applies, just evaluated per row instead of once.
+    """
+    try:
+        rates_dir = str(REPO_ROOT / "1. Basic Commission" / "3. Python Script")
+        if rates_dir not in sys.path:
+            sys.path.append(rates_dir)
+        from basic_commission_rates import split_effective_range
+
+        history: dict[str, list[dict]] = {}
+        for r in db.list_agent_roles():
+            if r.get("hidden"):
+                continue
+            agent = str(r.get("agent") or "").strip()
+            if not agent:
+                continue
+            start, end = split_effective_range(str(r.get("effective_from") or ""))
+            if not start:
+                continue
+            display = agent_names.resolve(agent)
+            history.setdefault(agent_names.normalize_key(display), []).append({
+                "agent": display,
+                "role": str(r.get("hierarchy") or "").strip(),
+                "agent_type": str(r.get("agent_type") or "").strip(),
+                "start": start,
+                "end": end,
+            })
+        for entries in history.values():
+            entries.sort(key=lambda e: e["start"], reverse=True)
+        return history
+    except Exception:
+        # A hover aid must never take the commission table down with it.
+        _log("[AGENT ROLE HISTORY]\n" + traceback.format_exc())
+        return {}
+
+
+def _parse_money_text(value) -> float:
+    """Sum of every RM amount in a rendered cell. One Other Commission cell can
+    hold several credits joined by <br/>, so the leading figure alone would
+    under-count it."""
+    text = str(value or "").strip()
+    if not text or text == "-":
+        return 0.0
+    amounts = re.findall(r"-?\s*RM\s*-?\s*[\d,]+(?:\.\d+)?", text, flags=re.IGNORECASE)
+    if not amounts:
+        return 0.0
+    total = 0.0
+    for a in amounts:
+        try:
+            total += float(re.sub(r"[^0-9.\-]", "", a))
+        except ValueError:
+            pass
+    return total
+
+
+def _overview_scope_agent() -> str | None:
+    """The agent this user may see, or None for a whole-company view.
+
+    NOTE: the users table carries only role ('admin' / 'staff') -- there is no
+    per-user agent mapping server side, so today this always returns None and
+    the overview is company-wide for every signed-in user. The single-agent
+    scoping that exists (USER_ROLES.filterAgentName in app.js) is a client-side
+    display filter, not an access boundary: /api/commission already returns
+    every agent's figures to anyone signed in. This hook is where that scoping
+    belongs once users gain an agent column, so the landing page does not have
+    to be retrofitted then.
+    """
+    return None
+
+
+def _overview_unified_for_month(year: int, month: int):
+    """(unified_agent_rows, overview_totals) for one month, across Internal and
+    Outsource together.
+
+    Built from the SAME helpers the PDF's Executive Summary uses
+    (_unified_agent_totals / _report_overview_totals) and fed by the same
+    per-agent totals build_*_summary_tables already returns -- app.py was
+    already computing those and discarding them. Reusing them is what keeps the
+    landing page and the PDF from ever quoting different numbers.
+
+    Returns (None, None) when the cache has not been populated yet: this is the
+    landing page, so it must never kick off a fresh multi-minute build.
+    """
+    needed = ("basic", "anp", "nfp")
+
+    def _bundles():
+        return get_cached_data(year, "internal"), get_cached_data(year, "outsource")
+
+    def _usable(bundle):
+        return bool(bundle) and all(k in bundle for k in needed)
+
+    int_cached, out_cached = _bundles()
+    if not _usable(int_cached) or not _usable(out_cached):
+        # The in-memory cache is empty for a few seconds after a restart, while
+        # the disk copy is already complete -- re-reading it here turns what was
+        # a dead "not ready" page into a normal load.
+        load_disk_cache()
+        int_cached, out_cached = _bundles()
+
+    if not _usable(int_cached) or not _usable(out_cached):
+        missing = [name for name, b in (("internal", int_cached), ("outsource", out_cached))
+                   if not _usable(b)]
+        _log(f"[OVERVIEW] {year}-{month:02d} not ready; no cached bundle for: {', '.join(missing)}")
+        return None, None
+
+    invoice_dates_map = int_cached.get("invoice_dates") or out_cached.get("invoice_dates") or {}
+
+    int_basic_t1, _t2, _t3, int_basic_t4, _meta, int_basic_lines = int_cached["basic"]
+    int_anp_summary, int_anp_detail, _int_anp_meta = int_cached["anp"]
+    int_nfp_agent, _int_nfp_detail, _int_nfp_meta, int_nfp_rows, int_nfp_by_inv_all = int_cached["nfp"]
+
+    out_basic_t1, _o2, _o3, out_basic_meta, out_basic_lines = out_cached["basic"]
+    _out_anp_summary, out_anp_detail, _out_anp_meta = out_cached["anp"]
+    out_nfp_agent, _out_nfp_detail, _out_nfp_meta, out_nfp_rows, out_nfp_by_inv_all = out_cached["nfp"]
+
+    (int_agent_summary, int_customer_summary, _iaa, _ica,
+     int_totals_by_month) = build_commission_pack.build_internal_summary_tables(
+        basic_t1=int_basic_t1, basic_lines=int_basic_lines, basic_t4=int_basic_t4,
+        nfp_agent_rows=int_nfp_agent, nfp_rows=int_nfp_rows,
+        nfp_by_inv_all=int_nfp_by_inv_all,
+        anp_summary_rows=int_anp_summary,
+        anp_detail=[r for r in int_anp_detail
+                    if build_commission_pack._parse_month(r.get("invoice_date")) == month],
+        year=year, invoice_dates_map=invoice_dates_map, month=month,
+    )
+    (out_agent_summary, out_customer_summary, _oca,
+     out_totals_by_month) = build_commission_pack.build_outsource_summary_tables(
+        basic_t1=out_basic_t1, basic_lines=out_basic_lines, basic_meta=out_basic_meta,
+        nfp_agent_rows=out_nfp_agent, nfp_rows=out_nfp_rows,
+        nfp_by_inv_all=out_nfp_by_inv_all,
+        anp_summary_rows=[],
+        anp_detail=[r for r in out_anp_detail
+                    if build_commission_pack._parse_month(r.get("invoice_date")) == month],
+        year=year, invoice_dates_map=invoice_dates_map, month=month,
+    )
+
+    unified = build_commission_pack._unified_agent_totals(
+        int_totals_by_month.get(month, {}),
+        out_totals_by_month.get(month, {}),
+        build_commission_pack._max_anp_by_agent_for_month(out_anp_detail, month),
+    )
+    totals = build_commission_pack._report_overview_totals(unified)
+
+    # The remaining report-page cards. Customers are counted per (agent,
+    # customer) pair the same way the report page's Total Customers card does,
+    # so the two can't disagree; Other Commission is the agent_summary rollup's
+    # own last column.
+    customers = set()
+    for rows in (int_customer_summary.get(month, []), out_customer_summary.get(month, [])):
+        current_agent = ""
+        for row in rows:
+            agent = str((row or [""])[0] or "").strip() or current_agent
+            current_agent = agent
+            customer = str(row[1] or "").strip() if len(row) > 1 else ""
+            low = f"{agent} {customer}".lower()
+            if not customer or customer == "-" or "total" in low or "summary" in low or "grand" in low:
+                continue
+            customers.add((agent.lower(), customer.lower()))
+
+    other_commission = 0.0
+    for rows in (int_agent_summary.get(month, []), out_agent_summary.get(month, [])):
+        current_agent = ""
+        for row in rows:
+            agent = str((row or [""])[0] or "").strip() or current_agent
+            current_agent = agent
+            low = agent.lower()
+            if not agent or "total" in low or "summary" in low or "grand" in low:
+                continue
+            if len(row) >= 8:
+                other_commission += _parse_money_text(row[7])
+
+    referral_fee = sum(v.get("referral", 0.0) for v in int_totals_by_month.get(month, {}).values())
+    referral_fee += sum(v.get("referral", 0.0) for v in out_totals_by_month.get(month, {}).values())
+
+    totals["customers"] = len(customers)
+    totals["other_commission"] = other_commission
+    totals["referral_fee"] = referral_fee
+    return unified, totals
+
+
+@app.route("/api/overview")
+@login_required
+def get_overview():
+    """Sales and commission analysis for the landing page."""
+    year = request.args.get("year", 2026, type=int)
+    month = request.args.get("month", 8, type=int)
+
+    try:
+        unified, totals = _overview_unified_for_month(year, month)
+        if unified is None:
+            _trigger_background_refresh(year, "internal")
+            _trigger_background_refresh(year, "outsource")
+            return jsonify({"ready": False,
+                            "message": "Commission data is still being prepared. Refresh shortly."})
+
+        # An agent-scoped user must never see the company-wide roll-up, so the
+        # whole overview is narrowed to their own row before any total is taken.
+        scope_agent = _overview_scope_agent()
+        if scope_agent:
+            target = _normalize_search_text(scope_agent)
+            unified = [r for r in unified if _normalize_search_text(r.get("agent")) == target]
+            totals = build_commission_pack._report_overview_totals(unified)
+
+        prev_month = month - 1 if month > 1 else None
+        prev_unified, prev_totals = (None, None)
+        if prev_month:
+            prev_unified, prev_totals = _overview_unified_for_month(year, prev_month)
+            if prev_unified is not None and scope_agent:
+                target = _normalize_search_text(scope_agent)
+                prev_unified = [r for r in prev_unified
+                                if _normalize_search_text(r.get("agent")) == target]
+                prev_totals = build_commission_pack._report_overview_totals(prev_unified)
+
+        rank_changes = (build_commission_pack._rank_changes(unified, prev_unified)
+                        if prev_unified else {})
+
+        return jsonify({
+            "ready": True,
+            "year": year,
+            "month": month,
+            "scoped_to_agent": scope_agent,
+            "totals": totals,
+            "prev_totals": prev_totals,
+            "top_performers": [
+                {**r, "rank_change": rank_changes.get(r["agent"], "flat")}
+                for r in unified[:10]
+            ],
+            "agent_count": len(unified),
+        })
+    except Exception as e:
+        _log("[OVERVIEW ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+# â”€â”€ Sales Report (EGA half-year sales table) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+#
+# Rebuilds the printed "ETERNALGY SALES REPORT" ledger from the database: per
+# agent, cases and net sales for each month of the EGA half year, the June split
+# either side of the campaign cut-off, then EP point and the balance left to
+# qualify. Company-wide first, then one block per branch, as the print does.
+
+SALES_REPORT_LAST_MONTH = 6      # the EGA half year closes 30 June
+SALES_REPORT_SPLIT_DAY = 10      # June is shown as 1-10 / 11-30, per the campaign
+SALES_REPORT_TARGETS = {"Internal": 600000.0, "Outsource": 720000.0}
+
+
+def _sales_report_targets(year: int) -> dict[str, float]:
+    """EGA qualifying thresholds, from the Data page where it has them."""
+    targets = dict(SALES_REPORT_TARGETS)
+    for key, agent_type in (("Internal", "internal"), ("Outsource", "outsource")):
+        try:
+            payload = db.get_ega_rules(str(year), agent_type)
+            raw = str((payload.get("rules") or {}).get("ega_threshold") or "").replace(",", "")
+            if raw:
+                targets[key] = float(raw)
+        except Exception:
+            # A missing or unreadable rules row must not take the page down; the
+            # defaults above are the thresholds the printed report used.
+            _log(f"[SALES REPORT] could not read {agent_type} ega_rules; using default threshold")
+    return targets
+
+
+def _sales_report_role_index() -> dict[str, dict]:
+    """agent_roles keyed by every name it is known under, preferring a row that
+    actually names a branch so an agent with several role rows still lands in
+    the right block."""
+    index: dict[str, dict] = {}
+    for r in db.list_agent_roles():
+        branch = str(r.get("branch") or "").strip()
+        for field in ("agent", "nick_name", "full_name"):
+            key = agent_names.normalize_key(str(r.get(field) or ""))
+            if not key:
+                continue
+            prev = index.get(key)
+            if prev is None or (branch and not str(prev.get("branch") or "").strip()):
+                index[key] = r
+    return index
+
+
+def _sales_report_lookup_role(raw: str, index: dict[str, dict]) -> dict:
+    """The agent_roles row for `raw`, tolerating the spelling drift between the
+    ERP and the roles table ("Olivier Koh Chong Lee" vs "...Cong Lee"). Only a
+    very close match counts, so two different agents can never merge."""
+    key = agent_names.normalize_key(raw)
+    if not key:
+        return {}
+    if key in index:
+        return index[key]
+    import difflib
+    close = difflib.get_close_matches(key, list(index), n=1, cutoff=0.9)
+    return index[close[0]] if close else {}
+
+
+def _is_initials_of(word: str, words: list[str]) -> bool:
+    """Whether `word` spells out the initials of `words`, in order.
+
+    "ZH" against "Ching Zhe Hang" does (Z-he H-ang) and the printed report drops
+    it; "CJ" against "Loo Chew Yin" does not, and the report keeps it. Length is
+    no guide -- both are two letters -- so this is the test that separates them."""
+    if len(word) > 3:
+        return False
+    initials = [w[0] for w in words if w]
+    i = 0
+    for ch in word:
+        while i < len(initials) and initials[i] != ch:
+            i += 1
+        if i == len(initials):
+            return False
+        i += 1
+    return True
+
+
+def _sales_report_display_name(raw: str, role: dict) -> str:
+    """Nickname followed by full name, in the printed report's style.
+
+    A nickname word is dropped when it adds nothing to the full name: it repeats
+    a word already there ("Louis Ng" + "Ng Zhan Yi" -> "LOUIS NG ZHAN YI"), it
+    misspells one ("Oliver Koh" against "Olivier Koh Cong Lee" must not print as
+    "OLIVER OLIVIER KOH CONG LEE"), it abbreviates one ("Zul" -> "Zulkarnain"),
+    or it is just the person's initials ("Zh", "LK"). Everything else is kept,
+    which is how "AH ZHU CHOONG YE HONG" and "CJ LOO CHEW YIN" stay intact."""
+    import difflib
+    full = (str(role.get("full_name") or "").strip() or str(raw or "").strip()).upper()
+    nick = str(role.get("nick_name") or "").strip().upper()
+    if not nick:
+        return full
+    words = full.split()
+
+    def redundant(word: str) -> bool:
+        if difflib.get_close_matches(word, words, n=1, cutoff=0.8):
+            return True
+        if len(word) >= 3 and any(w.startswith(word) for w in words):
+            return True
+        return _is_initials_of(word, words)
+
+    lead = [w for w in nick.split() if not redundant(w)]
+    return " ".join(lead + [full]) if lead else full
+
+
+def _sales_report_payload(year: int) -> dict | None:
+    """Per-agent sales ledger for Jan..June of `year`, or None when the cache is
+    cold. Like the overview, this is a page people land on -- it reads whatever
+    the prefetch already built rather than starting a multi-minute job."""
+    from decimal import Decimal
+
+    bundle = get_cached_data(year, "outsource")
+    if not bundle or "ega_raw" not in bundle:
+        load_disk_cache()
+        bundle = get_cached_data(year, "outsource")
+    if not bundle or "ega_raw" not in bundle:
+        _log(f"[SALES REPORT] {year} not ready; no cached outsource ega_raw")
+        return None
+
+    # The outsource EGA query carries no agent_type filter, so its rows are the
+    # whole company; the internal one is pre-filtered and would under-count.
+    rows = bundle.get("ega_raw") or []
+
+    int_mod = sys.modules.get("int_ega_esa")
+    out_mod = sys.modules.get("out_ega_esa")
+    if int_mod is None or out_mod is None:
+        ega_dir = REPO_ROOT / "4. EGA ESA Awards" / "3. Python script"
+        int_mod = int_mod or build_commission_pack._load_module(
+            "int_ega_esa", ega_dir / "full_internal_EGA_ESA_Awards.py")
+        out_mod = out_mod or build_commission_pack._load_module(
+            "out_ega_esa", ega_dir / "outsource_EGA_ESA_Awards.py")
+
+    roles = _sales_report_role_index()
+    targets = _sales_report_targets(year)
+    zero = Decimal("0")
+    agents: dict[str, dict] = {}
+    seen_bubble: set = set()
+    prop_counts: dict[str, int] = {}
+
+    for r in rows:
+        bubble = r.get("bubble_id")
+        if bubble in seen_bubble:
+            continue
+        seen_bubble.add(bubble)
+
+        when = int_mod._parse_invoice_date(r.get("invoice_date"))
+        if when is None or when.month > SALES_REPORT_LAST_MONTH:
+            continue
+
+        raw = str(r.get("agent_name") or "").strip()
+        sales = (Decimal(str(r.get("total_amount") or 0))
+                 - Decimal(str(r.get("epp_interest") or 0)))
+        prop = int_mod.classify_property_type(r)
+        prop_counts[prop] = prop_counts.get(prop, 0) + 1
+        kind = "RES" if prop.lower().startswith("resid") else "COM"
+
+        entry = agents.get(raw)
+        if entry is None:
+            role = _sales_report_lookup_role(raw, roles)
+            branch = str(role.get("branch") or "").strip().replace("Team-", "")
+            entry = agents[raw] = {
+                "agent": _sales_report_display_name(raw, role),
+                "branch": branch or "(unassigned)",
+                "channel": ("Outsource" if out_mod.is_outsource_agent(
+                    raw, r.get("agent_type"), r.get("invoice_date")) else "Internal"),
+                "lines": {},              # kind -> month -> [noc, ans]
+                "jun": {},                # kind -> [1-10, 11-30]
+                "campaign_cases": 0, "campaign_ans": zero,
+                "acc_noc": 0, "acc_ans": zero, "ep": zero, "ep_rows": [],
+            }
+
+        months = entry["lines"].setdefault(kind, {})
+        cell = months.setdefault(when.month, [0, zero])
+        cell[0] += 1
+        cell[1] += sales
+        if when.month == SALES_REPORT_LAST_MONTH:
+            split = entry["jun"].setdefault(kind, [zero, zero])
+            split[0 if when.day <= SALES_REPORT_SPLIT_DAY else 1] += sales
+        # Campaign window: 1 May through 10 June.
+        if when.month == 5 or (when.month == SALES_REPORT_LAST_MONTH
+                               and when.day <= SALES_REPORT_SPLIT_DAY):
+            entry["campaign_cases"] += 1
+            entry["campaign_ans"] += sales
+
+        entry["acc_noc"] += 1
+        entry["acc_ans"] += sales
+        entry["ep_rows"].append((
+            when.strftime("%Y-%m-%d"),
+            int_mod.calc_ep_points(sales, prop, r.get("invoice_date"),
+                                   int(r.get("panel_qty") or 0)),
+        ))
+
+    scope_agent = _overview_scope_agent()
+    if scope_agent:
+        target = _normalize_search_text(scope_agent)
+        agents = {k: v for k, v in agents.items()
+                  if _normalize_search_text(v["agent"]) == target
+                  or _normalize_search_text(k) == target}
+
+    out_agents = []
+    for entry in agents.values():
+        entry["ep"] = sum((ep for _, ep in entry["ep_rows"]), zero)
+        threshold = Decimal(str(targets.get(entry["channel"], 720000.0)))
+        qualified = entry["ep"] >= threshold
+        types = [k for k in ("RES", "COM") if entry["lines"].get(k)]
+        out_agents.append({
+            "agent": entry["agent"],
+            "branch": entry["branch"],
+            "channel": entry["channel"],
+            "types": [{
+                "type": kind,
+                "months": [
+                    {"noc": entry["lines"][kind].get(m, [0, zero])[0],
+                     "ans": float(entry["lines"][kind].get(m, [0, zero])[1])}
+                    for m in range(1, SALES_REPORT_LAST_MONTH + 1)
+                ],
+                "jun_early": float(entry["jun"].get(kind, [zero, zero])[0]),
+                "jun_late": float(entry["jun"].get(kind, [zero, zero])[1]),
+                "total_noc": sum(v[0] for v in entry["lines"][kind].values()),
+                "total_ans": float(sum((v[1] for v in entry["lines"][kind].values()), zero)),
+            } for kind in types],
+            "acc_noc": entry["acc_noc"],
+            "acc_ans": float(entry["acc_ans"]),
+            "campaign_cases": entry["campaign_cases"],
+            "campaign_ans": float(entry["campaign_ans"]),
+            "ep": float(entry["ep"]),
+            "qualified": qualified,
+            "balance": 0.0 if qualified else float(threshold - entry["ep"]),
+            "status": int_mod.determine_eligibility(entry["ep_rows"]) if qualified else "",
+        })
+
+    out_agents.sort(key=lambda a: a["ep"], reverse=True)
+    branches = sorted({a["branch"] for a in out_agents})
+    return {
+        "ready": True,
+        "year": year,
+        "last_month": SALES_REPORT_LAST_MONTH,
+        "split_day": SALES_REPORT_SPLIT_DAY,
+        "scoped_to_agent": scope_agent,
+        "targets": targets,
+        "branches": branches,
+        "agents": out_agents,
+        "totals": {
+            "cases": sum(a["acc_noc"] for a in out_agents),
+            "sales": sum(a["acc_ans"] for a in out_agents),
+            "agents": len(out_agents),
+        },
+        # Surfaced so the page can say why the RES/COM split looks thin: the
+        # classifier falls back to Residential whenever SEDA nem type, referral
+        # project type and the package fields are all silent.
+        "property_mix": prop_counts,
+    }
+
+
+@app.route("/sales-report")
+@login_required
+def sales_report_page():
+    """The sales ledger behind the EGA award, in the printed report's layout."""
+    return _no_store(make_response(
+        send_from_directory(str(CURRENT_DIR / "static"), "sales_report.html")))
+
+
+@app.route("/api/sales-report")
+@login_required
+def get_sales_report():
+    year = request.args.get("year", 2026, type=int)
+    try:
+        payload = _sales_report_payload(year)
+        if payload is None:
+            _trigger_background_refresh(year, "outsource")
+            return jsonify({"ready": False,
+                            "message": "Sales data is still being prepared. Refresh shortly."})
+        return jsonify(payload)
+    except Exception as e:
+        _log("[SALES REPORT ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/commission")
 @login_required
 def get_commission():
@@ -1450,7 +2073,15 @@ def get_commission():
             age = time.time() - float(cached_response.get("generated_at") or 0.0)
             if age >= _RESPONSE_CACHE_TTL_SECONDS:
                 _trigger_background_refresh(year, agent_type)
-            return jsonify(cached_response.get("payload") or {})
+            cached_payload = cached_response.get("payload") or {}
+            # Roles are read fresh rather than served from the cached body:
+            # they are cheap, they are edited on the Data page without
+            # rebuilding commissions, and a response cached before this field
+            # existed carries none at all.
+            if isinstance(cached_payload, dict):
+                cached_payload["agent_roles"] = _agent_roles_for_month(year, month)
+                cached_payload["agent_role_history"] = _agent_role_history()
+            return jsonify(cached_payload)
 
         cached = get_cached_data(year, agent_type)
         if not cached or not cached.get("invoice_dates"):
@@ -1602,6 +2233,10 @@ def get_commission():
                 ega_dir = REPO_ROOT / "4. EGA ESA Awards" / "3. Python script"
                 int_ega_mod = build_commission_pack._load_module("int_ega_esa", ega_dir / "full_internal_EGA_ESA_Awards.py")
 
+            # These rows come from cache, so no fetch necessarily ran this
+            # process to apply the Data page's thresholds. Without this the
+            # award grades against the constants hardcoded in the script.
+            int_ega_mod.ensure_rules_applied(year)
             lines, agent_ep, agent_sales, agent_eligibility = int_ega_mod.build_report(filtered_ega_raw)
 
             # Build Table 1: Agent Name, Customer Count, Accumulated Sales Price, Accumulated EP Point, Eligibility
@@ -1812,6 +2447,10 @@ def get_commission():
                 ega_dir = REPO_ROOT / "4. EGA ESA Awards" / "3. Python script"
                 out_ega_mod = build_commission_pack._load_module("out_ega_esa", ega_dir / "outsource_EGA_ESA_Awards.py")
 
+            # These rows come from cache, so no fetch necessarily ran this
+            # process to apply the Data page's thresholds. Without this the
+            # award grades against the constants hardcoded in the script.
+            out_ega_mod.ensure_rules_applied(year)
             lines, agent_ep, agent_sales, agent_eligibility = out_ega_mod.build_report(filtered_ega_raw)
 
             # Build Table 1: Agent Name, Customer Count, Accumulated Sales Price, Accumulated EP Point, Eligibility
@@ -1930,7 +2569,14 @@ def get_commission():
                 "total_agents": len(agents_set),
                 "total_customers": len(customers_set)
             },
-            "sections": sections
+            "sections": sections,
+            # Each agent's role as at this month -- the fallback the agent-name
+            # hover uses on tables that carry no invoice date of their own.
+            "agent_roles": _agent_roles_for_month(year, month),
+            # Full role history, so a row whose invoice predates a role change
+            # can be resolved against its own Invoice Date rather than the
+            # report month it happens to be paid in.
+            "agent_role_history": _agent_role_history(),
         }
         set_cached_commission_response(year, month, agent_type, payload)
         return jsonify(payload)
@@ -2064,6 +2710,115 @@ def special_cases_api():
         return jsonify({"error": str(e)}), 500
 
 
+def _pg_query(sql: str):
+    """Run one read-only query against Postgres through the proxy."""
+    token, base_url, db_name = build_commission_pack._resolve_proxy_credentials()
+    if not token:
+        raise RuntimeError("Postgres proxy token not found. Set PG_PROXY_TOKEN in .env")
+    anp_mod = sys.modules.get("int_anp_commission")
+    if anp_mod is None:
+        anp_mod = build_commission_pack._load_module(
+            "int_anp_commission", build_commission_pack._anp_script_path())
+    client = anp_mod.PostgresProxyClient(
+        base_url.rstrip("/").replace("/api/sql", ""), token, db_name)
+    return client.query(sql)
+
+
+@app.route("/api/invoice-payments")
+@login_required
+def invoice_payments_api():
+    """Every payment behind one invoice, with its deposit slip.
+
+    Backs the click-through on a Collected Payment figure: that cell is a sum,
+    and without this nothing on the page says what it is a sum of. It is also
+    where a refund's bank details actually live -- the slip names the bank and
+    the account holder, which no column in this database does.
+    """
+    invoice_number = str(request.args.get("invoice_number", "") or "").strip()
+    if not invoice_number:
+        return jsonify({"error": "invoice_number is required"}), 400
+    # Only ever interpolated as a quoted literal, and quotes are doubled: this
+    # value arrives from the query string.
+    safe = invoice_number.replace("'", "''")
+    try:
+        rows = _pg_query(f"""
+            SELECT p.id, p.payment_date, p.amount,
+                   COALESCE(p.payment_method, '')    AS payment_method,
+                   COALESCE(p.issuer_bank, '')       AS issuer_bank,
+                   COALESCE(p.remark, '')            AS remark,
+                   COALESCE(p.attachment, ARRAY[]::text[]) AS attachment
+            FROM payment p
+            JOIN invoice i ON i.bubble_id = p.linked_invoice
+            WHERE TRIM(i.invoice_number) = '{safe}'
+              AND p.id NOT IN (101334, 104412, 101333, 104413, 4899)
+            ORDER BY p.payment_date, p.id
+        """)
+        payments, total = [], 0.0
+        for r in rows:
+            try:
+                amount = float(r.get("amount") or 0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            total += amount
+            # Bubble stores some attachments protocol-relative ("//cdn…/x.jpg").
+            # Left as-is the browser resolves them against the dashboard's own
+            # http://localhost, and the image never loads.
+            slips = []
+            for u in (r.get("attachment") or []):
+                u = str(u or "").strip()
+                if not u:
+                    continue
+                if u.startswith("//"):
+                    u = "https:" + u
+                slips.append(u)
+            payments.append({
+                "id": r.get("id"),
+                "payment_date": str(r.get("payment_date") or "")[:10],
+                "amount": amount,
+                "payment_method": str(r.get("payment_method") or "").strip(),
+                "issuer_bank": str(r.get("issuer_bank") or "").strip(),
+                "remark": str(r.get("remark") or "").strip(),
+                "slips": slips,
+            })
+        return jsonify({"invoice_number": invoice_number, "payments": payments,
+                        "total": round(total, 2)})
+    except Exception as e:
+        _log("[INVOICE PAYMENTS ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": _public_error_message(e, "Could not load payments"),
+                        "payments": []}), 500
+
+
+@app.route("/api/pb-refunds", methods=["GET", "POST"])
+@login_required
+def pb_refunds_api():
+    """Refunds owed where a Production Bonus invoice collected more than it was
+    worth. Any signed-in user may record one — this is finance housekeeping, not
+    a rate change — and who ticked it is stamped on the row and audited."""
+    if request.method == "GET":
+        try:
+            return jsonify({"refunds": db.list_pb_refunds()})
+        except Exception as e:
+            _log("[PB REFUNDS LOAD ERROR]\n" + traceback.format_exc())
+            return jsonify({"refunds": {}, "error": str(e)}), 200
+
+    user = auth.current_user()
+    payload = request.json or {}
+    invoice_number = str(payload.get("invoice_number") or "").strip()
+    if not invoice_number:
+        return jsonify({"error": "invoice_number is required"}), 400
+    try:
+        saved = db.save_pb_refund(
+            invoice_number,
+            str(payload.get("bank_account") or "").strip(),
+            bool(payload.get("refund_done")),
+            user["username"],
+        )
+        return jsonify({"status": "success", "invoice_number": invoice_number, "refund": saved})
+    except Exception as e:
+        _log("[PB REFUND SAVE ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/factory-rates", methods=["GET", "POST"])
 @login_required
 def factory_rates_api():
@@ -2087,6 +2842,25 @@ def factory_rates_api():
         _log("[FACTORY RATES SAVE ERROR]\n" + traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
+
+@app.route("/api/factory-split-hierarchy")
+@login_required
+def factory_split_hierarchy_api():
+    """OSA/OUM/OGM tier and who to credit for the Factory profit-sharing
+    70/20/10 split, for one agent -- read from the Agent Roles & Hierarchy
+    Data page. Backs the "Calculated Commissions Preview" breakdown in the
+    Profit Sharing popup, so the popup's math can never disagree with what
+    build_commission_pack.py actually pays out."""
+    agent = (request.args.get("agent") or "").strip()
+    if not agent:
+        return jsonify({"error": "agent is required"}), 400
+    try:
+        out_basic_path = REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "outsource_basic_commission.py"
+        basic = build_commission_pack._load_module("out_basic_commission", out_basic_path)
+        return jsonify(basic.resolve_factory_split_hierarchy(agent))
+    except Exception as e:
+        _log("[FACTORY SPLIT HIERARCHY ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 
 def _rates_module():
@@ -2689,7 +3463,7 @@ def _rules_endpoint(loader, saver, key_name, key_pattern, child_keys, list_args)
 @login_required
 def anp_rules_api():
     return _rules_endpoint(db.get_anp_rules, db.save_anp_rules,
-                           "effective_from", r"\d{4}-\d{2}", ["tiers"],
+                           "effective_from", r"\d{4}-\d{2}( to \d{4}-\d{2})?", ["tiers"],
                            ("anp_rules", "effective_from"))
 
 
@@ -2705,8 +3479,8 @@ def ega_rules_api():
 
     if request.method == "GET":
         year = (request.args.get("year") or "").strip()
-        if not re.fullmatch(r"\d{4}", year):
-            return jsonify({"error": "year must be YYYY"}), 400
+        if not re.fullmatch(r"\d{4}( to \d{4})?", year):
+            return jsonify({"error": "year must be YYYY or YYYY to YYYY"}), 400
         try:
             payload = db.get_ega_rules(year, agent_type)
             payload["saved_periods"] = db.list_rule_periods("ega_rules", "year")
@@ -2720,8 +3494,8 @@ def ega_rules_api():
         return jsonify({"error": "Admin access required"}), 403
     body = request.json or {}
     year = str(body.get("year") or "").strip()
-    if not re.fullmatch(r"\d{4}", year):
-        return jsonify({"error": "year must be YYYY"}), 400
+    if not re.fullmatch(r"\d{4}( to \d{4})?", year):
+        return jsonify({"error": "year must be YYYY or YYYY to YYYY"}), 400
     try:
         db.save_ega_rules(year, body.get("rules") or {}, body.get("months") or [],
                           user["username"], agent_type=agent_type)
@@ -2732,11 +3506,23 @@ def ega_rules_api():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/ega-rule-sets")
+@login_required
+def ega_rule_sets_api():
+    """Every saved EGA/ESA rule set, for the landing list that shows Internal
+    and Outsource together."""
+    try:
+        return jsonify(db.list_ega_rule_sets())
+    except Exception as e:
+        _log("[EGA RULE SETS LOAD ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/production-bonus-rules", methods=["GET", "POST"])
 @login_required
 def production_bonus_rules_api():
     return _rules_endpoint(db.get_production_bonus_rules, db.save_production_bonus_rules,
-                           "effective_from", r"\d{4}-\d{2}", [],
+                           "effective_from", r"\d{4}-\d{2}( to \d{4}-\d{2})?", [],
                            ("production_bonus_rules", "effective_from"))
 
 
@@ -3220,6 +4006,17 @@ def basic_rates_resolved_api():
         target_year = 2026
         target = "all" if is_all else f"{target_year:04d}-{month:02d}"
 
+    def _eff_start(eff_str):
+        """The month a row starts applying -- what "the latest row wins" sorts
+        on. Ranking the raw cell puts "2026-07 to 2026-08" above the plain
+        "2026-07" it starts in, purely because it is a longer string."""
+        s = str(eff_str or "").strip()
+        if " to " in s:
+            return s.split(" to ")[0].strip()
+        if ".." in s:
+            return s.split("..")[0].strip()
+        return s
+
     def _eff_covers(eff_str, tgt):
         """Return True if eff_str (single YYYY-MM or 'YYYY-MM to YYYY-MM') covers tgt."""
         if tgt == "all":
@@ -3460,16 +4257,31 @@ def basic_rates_resolved_api():
                 "property_type": "", "unit": "RM", "source": "default",
             })
 
-        # NFP tier rates: resolve per (agent_type, role, agent, condition) so each
-        # tier keeps its own effective-dated lineage.
+        # NFP tier rates. Under a specific month only the row that governs it is
+        # shown, resolved per (agent_type, role, agent, condition) so each tier
+        # keeps its own effective-dated lineage. Under "All Months" every entered
+        # row is listed instead -- same as the Basic grid above, and the only way
+        # to see a revision you have just entered for a future month, or the one
+        # it supersedes.
         best_nfp = {}
+        all_nfp = []
         for src, rows in (("legacy", db.list_basic_rates()),
                           ("unified", db.list_commission_rates())):
             for r in rows:
                 if str(r.get("rate_type") or "").strip() != "Net Floor Price Rate":
                     continue
                 eff = str(r.get("effective_from") or "")
-                if not eff or eff > target:
+                if not eff:
+                    continue
+                if is_all:
+                    r = dict(r)
+                    r["_src"] = src
+                    all_nfp.append(r)
+                    continue
+                # A closed range ("2025-01 to 2026-06") stops applying after its
+                # end month. Comparing the raw cell would keep it forever, since
+                # "2025-01 to 2026-06" sorts below every later single month.
+                if not _eff_covers(eff, target):
                     continue
                 key = (str(r.get("agent_type") or "").strip(),
                        str(r.get("hierarchy") or "").strip(),
@@ -3477,26 +4289,64 @@ def basic_rates_resolved_api():
                        str(r.get("condition") or "").strip())
                 prev = best_nfp.get(key)
                 # Unified rows outrank legacy ones; among equals the latest wins.
+                # Rank on the month a row starts, not the cell as written.
                 if prev is None or (src == "unified" and prev.get("_src") != "unified") \
-                        or eff > str(prev.get("effective_from") or ""):
+                        or _eff_start(eff) > _eff_start(str(prev.get("effective_from") or "")):
                     r = dict(r)
                     r["_src"] = src
                     best_nfp[key] = r
         nfp_rates = []
-        for r in best_nfp.values():
+        for r in (all_nfp if is_all else list(best_nfp.values())):
             try:
                 pct = float(str(r.get("rate_pct")).replace("%", "").strip())
             except (TypeError, ValueError):
                 continue
             nfp_rates.append({
+                "id": r.get("id"),
+                # Stated explicitly: the edit form falls back to "Basic
+                # Commission" for a row that does not name its type, which would
+                # aim a tier's save (and its delete) at the Basic rows instead.
+                "rate_type": "Net Floor Price Rate",
                 "agent_type": r.get("agent_type"),
                 "hierarchy": r.get("hierarchy"),
                 "agent": r.get("agent") or "",
                 "condition": r.get("condition") or "",
                 "rate_pct": pct,
+                # An NFP row keeps the tier in `condition`, so its payout stages
+                # go in `label` -- same text the Basic grid renders, and enough
+                # for the edit form to rebuild the stage rows from.
+                "label": r.get("label") or "",
+                "property_type": r.get("property_type") or "",
+                "trigger_pct": r.get("trigger_pct") or "",
+                "rule_type": r.get("rule_type") or "",
+                "amount_rm": r.get("amount_rm") or "",
+                "invoice_date_from": r.get("invoice_date_from") or "",
+                "effective_from": r.get("effective_from") or "",
+                "remarks": r.get("remarks") or "",
                 "source": r.get("_src") or "legacy",
             })
         nfp_rates.sort(key=lambda x: (x["agent_type"], x["condition"]))
+
+        # Nothing has ever been entered for NFP, so without this the Net Floor
+        # Price page reads as "no rates exist" when in fact three tiers are hard
+        # coded in the engine (nfp_commission.calc_commission) and paying out
+        # every month. They ship as "Built-in default" rows -- the same badge the
+        # Basic page uses -- so the page states what is actually in force and an
+        # admin can take control of a tier by revising it.
+        if not nfp_rates:
+            _default_tier = lambda cond, pct: {
+                "id": None, "rate_type": "Net Floor Price Rate",
+                "agent_type": "All", "hierarchy": "All", "agent": "",
+                "condition": cond, "rate_pct": pct, "label": "",
+                "property_type": "", "trigger_pct": "", "rule_type": "",
+                "amount_rm": "", "invoice_date_from": "", "effective_from": "",
+                "remarks": "", "source": "default",
+            }
+            nfp_rates = [
+                _default_tier("Sales Price > Net Floor Price", 25.0),
+                _default_tier("System Price > Net Floor Price", 100.0),
+                _default_tier("Sales Price < Net Floor Price", 20.0),
+            ]
 
         return jsonify({"month": month, "rates": rates, "rules": rules, "nfp_rates": nfp_rates})
     except Exception as e:

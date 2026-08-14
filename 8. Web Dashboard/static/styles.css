@@ -178,6 +178,26 @@ body {
     transform: scale(1.3);
 }
 
+/* The report page drives its section list in JS, so those items are bare <li>.
+   The overview page has to navigate, so its items wrap an <a> -- which would
+   otherwise render as a default blue underlined link sitting inside the item's
+   padding rather than filling it. The item hands its padding to the anchor so
+   the two sidebars stay pixel-identical and the whole row stays clickable,
+   not just the text. */
+.nav-list li.nav-link-item {
+    padding: 0;
+}
+
+.nav-list li.nav-link-item > a {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 1;
+    padding: 12px 16px;
+    color: inherit;
+    text-decoration: none;
+}
+
 .sidebar-footer {
     margin-top: auto;
     display: flex;
@@ -627,13 +647,27 @@ body {
     cursor: default;
 }
 
-/* Agent Tier Background Colors */
+/* Agent Tier Background Colors.
+   Internal rows are tinted by role band, read from the Agent Roles & Hierarchy
+   page. "executive-bg" is kept as an alias of the Consultant band so any older
+   markup still resolves to the same colour. */
 .senior-bg td {
     background-color: #E0F2FE !important;
 }
 
+.management-bg td {
+    background-color: #BAE6FD !important;
+}
+
+.consultant-bg td,
 .executive-bg td {
     background-color: #F0F9FF !important;
+}
+
+/* No role on the Data page: the agent is priced by a built-in fallback rather
+   than anything anyone entered, so the row is flagged rather than shaded. */
+.unset-bg td {
+    background-color: #FEF3C7 !important;
 }
 
 /* Outsource tiers: navy at three alphas so the tint sits in the same
@@ -1257,8 +1291,8 @@ body {
 .dashboard-table td.special-case-remarks-cell {
     text-align: center !important;
     vertical-align: middle;
-    /* Background is set inline from JS to match the row's own tier color
-       (Agent Tiers Legend) — not fixed here, so it never fights that logic. */
+    /* No background of its own — it inherits the row, so it stays level with
+       its neighbours whether or not there's a remark to show. */
 }
 
 .special-case-referral-fee {
@@ -1275,7 +1309,7 @@ body {
 }
 
 .profit-sharing-value {
-    color: #16a34a !important;
+    color: #9A3412 !important;
     font-weight: 600;
     text-decoration: none;
 }
@@ -1352,7 +1386,10 @@ body {
 
 /* Tier row colours – match main table */
 .agent-summary-inline-table .senior-bg td  { background-color: #E0F2FE !important; }
+.agent-summary-inline-table .management-bg td { background-color: #BAE6FD !important; }
+.agent-summary-inline-table .consultant-bg td,
 .agent-summary-inline-table .executive-bg td { background-color: #F0F9FF !important; }
+.agent-summary-inline-table .unset-bg td { background-color: #FEF3C7 !important; }
 .agent-summary-inline-table .ogm-bg td  { background-color: rgba(30, 58, 138, 0.28) !important; }
 .agent-summary-inline-table .oum-bg td  { background-color: rgba(30, 58, 138, 0.16) !important; }
 .agent-summary-inline-table .osa-bg td  { background-color: rgba(30, 58, 138, 0.07) !important; }
@@ -1675,6 +1712,15 @@ body {
 }
 .captain-bg:hover td {
     background-color: #FEF9E7 !important; /* Slightly darker amber on hover */
+}
+
+/* Agent-name cells carrying a role hover. The dotted underline is the only
+   hint that a role is available -- without it the tooltip is undiscoverable,
+   since the legend that used to advertise the roles is gone. */
+.agent-role-hover {
+    cursor: help;
+    text-decoration: underline dotted rgba(100, 116, 139, 0.65);
+    text-underline-offset: 3px;
 }
 
 /* Calculation Hover Breakdown Tooltip */
@@ -2124,3 +2170,204 @@ body {
         page-break-inside: avoid;
     }
 }
+
+/* ── Overview landing page ────────────────────────────────────────────────── */
+.nav-page-link {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 16px;
+    font-weight: 500;
+    color: #cbd5e1;
+    text-decoration: none;
+    margin-bottom: 4px;
+    transition: var(--transition);
+}
+
+.nav-page-link:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+    color: #f8fafc;
+}
+
+.nav-badge {
+    margin-left: auto;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: #fbbf24;
+    background: rgba(245, 158, 11, 0.22);
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+
+.nav-sublist {
+    list-style: none;
+    margin: 0 0 8px 22px;
+    padding-left: 14px;
+    border-left: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.nav-sublist a {
+    display: block;
+    padding: 6px 0;
+    font-size: 13.5px;
+    color: #94a3b8;
+    text-decoration: none;
+    transition: var(--transition);
+}
+
+.nav-sublist a:hover { color: #f1f5f9; }
+
+.metric-delta {
+    display: block;
+    margin-top: 4px;
+    font-size: 12px;
+    font-weight: 600;
+}
+.metric-delta.up { color: #1F8A4C; }
+.metric-delta.down { color: #C6432E; }
+.metric-delta.flat { color: var(--text-muted); }
+
+.overview-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 24px;
+}
+
+.overview-panel { padding-bottom: 18px; }
+
+.payout-bar {
+    display: flex;
+    height: 12px;
+    border-radius: 6px;
+    overflow: hidden;
+    margin: 0 24px 16px;
+}
+
+.payout-seg { height: 100%; }
+
+.payout-legend { padding: 0 24px; }
+
+.payout-legend-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 0;
+    font-size: 13.5px;
+    border-bottom: 1px solid var(--border-color);
+}
+.payout-legend-row:last-child { border-bottom: none; }
+
+.payout-dot { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+.payout-name { flex: 1; color: var(--text-main); }
+.payout-pct { color: var(--text-muted); font-size: 12.5px; min-width: 46px; text-align: right; }
+.payout-amt { min-width: 108px; text-align: right; font-variant-numeric: tabular-nums; }
+
+.top-performers { padding: 0 24px; }
+
+.top-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 0;
+    font-size: 13.5px;
+    border-bottom: 1px solid var(--border-color);
+}
+.top-row:last-child { border-bottom: none; }
+
+.top-rank { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.top-tag { font-size: 10.5px; font-weight: 700; letter-spacing: 0.4px; }
+.top-tag.int { color: #0B6350; }
+.top-tag.out { color: #B54A1D; }
+.top-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.top-amt { font-variant-numeric: tabular-nums; }
+
+.rank-badge { font-size: 11.5px; font-weight: 700; min-width: 34px; text-align: right; }
+.rank-badge.up { color: #1F8A4C; }
+.rank-badge.down { color: #C6432E; }
+.rank-badge.new { color: #B5651D; }
+.rank-badge.flat { color: #94a3b8; }
+
+/* ── Sales Report ─────────────────────────────────────────────────────────────
+   The printed ledger has 24 columns, so this table opts out of the fixed
+   layout every other dashboard table uses and sizes to its content instead,
+   scrolling sideways inside .table-container rather than crushing the months. */
+
+.sr-section-title {
+    font-family: 'Outfit', sans-serif;
+    font-size: 17px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--text-muted);
+    margin: 28px 0 12px;
+}
+.sr-section-title:first-child { margin-top: 4px; }
+
+.sr-block { margin-bottom: 18px; }
+
+.sr-table {
+    table-layout: auto;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.sr-table th,
+.sr-table td {
+    white-space: nowrap;
+    overflow-wrap: normal;
+    padding: 5px 8px;
+    text-align: right;
+}
+
+/* Grouped month headers sit above their own NOC/ANS pair, so they centre. */
+.sr-table thead tr:first-child th { text-align: center; }
+
+.sr-table th.sr-no,
+.sr-table td.sr-no { width: 38px; text-align: center; }
+
+.sr-table th.sr-name,
+.sr-table td.sr-name {
+    text-align: left;
+    min-width: 190px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.sr-table td.sr-type {
+    text-align: center;
+    font-weight: 600;
+    color: var(--text-muted);
+    letter-spacing: 0.4px;
+}
+
+.sr-table td.sr-strong { font-weight: 700; }
+
+.sr-table td.sr-qualified {
+    text-align: center;
+    font-weight: 700;
+    color: #0B6350;
+    background-color: #E7F5F0;
+}
+
+.sr-table td.sr-short { color: #B54A1D; }
+
+.sr-table tr.sr-subtotal td {
+    font-weight: 700;
+    background-color: #f1f5f9;
+    border-top: 2px solid #cbd5e1;
+}
+
+.sr-caveat {
+    background-color: #FFF8E6;
+    border-left: 3px solid #D9A441;
+    border-radius: 6px;
+    padding: 14px 18px;
+    margin-bottom: 20px;
+    font-size: 13px;
+    line-height: 1.55;
+    color: #5C4813;
+}
+.sr-caveat strong { font-weight: 700; }

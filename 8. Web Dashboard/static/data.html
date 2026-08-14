@@ -81,7 +81,8 @@
            unreachable. Making the content a column and letting the body be the
            only flexible track puts the scrollbar on the body, so the header and
            footer stay pinned however short the viewport gets. */
-        #contestModal .modal-content {
+        #contestModal .modal-content,
+        #egaModal .modal-content {
             display: flex;
             flex-direction: column;
             width: 92%;
@@ -94,9 +95,15 @@
                spare. The header, body and footer span the full width instead. */
             padding: 0;
         }
+        /* The EGA/ESA form is two threshold pairs and a six-row ladder — a
+           1020px popup would leave it stranded in white space. */
+        #egaModal .modal-content { max-width: 760px; }
         #contestModal .modal-header,
-        #contestModal .modal-footer { flex: 0 0 auto; }
-        #contestModal .modal-body {
+        #contestModal .modal-footer,
+        #egaModal .modal-header,
+        #egaModal .modal-footer { flex: 0 0 auto; }
+        #contestModal .modal-body,
+        #egaModal .modal-body {
             flex: 1 1 auto;
             min-height: 0;
             overflow-y: auto;
@@ -104,7 +111,8 @@
         }
         /* The teams grid is the one wide thing here; it scrolls sideways on its
            own rather than widening the popup. */
-        #contestModal .table-container { overflow-x: auto; }
+        #contestModal .table-container,
+        #egaModal .table-container { overflow-x: auto; }
 
         @media (max-width: 900px) {
             #contestModal .modal-content { width: 96%; }
@@ -284,7 +292,8 @@
                 <label class="group-label">Data Section</label>
                 <ul class="nav-list" id="dataSectionList">
                     <li data-section="roles" class="active"><span class="bullet"></span> Agent Roles & Hierarchy</li>
-                    <li data-section="basic_nfp"><span class="bullet"></span> Basic & Net Floor Price Commission</li>
+                    <li data-section="basic"><span class="bullet"></span> Basic Commission</li>
+                    <li data-section="nfp"><span class="bullet"></span> Net Floor Price</li>
                     <li data-section="anp"><span class="bullet"></span> ANP Commission</li>
                     <li data-section="ega_esa"><span class="bullet"></span> EGA/ESA Award</li>
                     <li data-section="production_bonus"><span class="bullet"></span> Production Bonus</li>
@@ -325,10 +334,6 @@
                     <div class="card-header">
                         <h3>Basic Commission</h3>
                         <div style="display:flex; gap:12px;">
-                            <!-- Moved here when the Net Floor Price Commission
-                                 card was removed; this is now the only way to
-                                 open the price list on this page. -->
-                            <button class="btn btn-secondary" id="nfpListBtn">📋 View Net Floor Price List</button>
                             <button class="btn btn-primary" id="editModeBtn" style="display:none;">➕ Add entry</button>
                         </div>
                     </div>
@@ -409,7 +414,7 @@
                                 <col style="width:8%"><col style="width:5%">
                             </colgroup>
                             <thead>
-                                <tr><th>Commission Type</th><th>Invoice Month</th><th>Agent Type</th><th>Role</th><th>Property Type</th><th>Rate %</th><th>Condition</th><th>Formula</th><th>Source</th><th></th></tr>
+                                <tr><th>Commission Type</th><th>Invoice Date</th><th>Agent Type</th><th>Role</th><th>Property Type</th><th>Rate %</th><th>Condition</th><th>Formula</th><th>Source</th><th></th></tr>
                             </thead>
                             <tbody id="previewBody"></tbody>
                         </table>
@@ -417,12 +422,93 @@
                     <!-- Pagination -->
                     <div id="previewPagination" style="display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:8px 0;"></div>
                     <div class="section-hint" style="padding-bottom:16px;">
-                        <strong>Invoice Month</strong> is the month (or range) the value takes effect from, not
+                        <strong>Invoice Date</strong> is the month (or range) the value takes effect from, not
                         the month selected above — a rate entered for Jan 2025 still governs July 2026 until
                         something later replaces it.
                         &nbsp;·&nbsp; <strong>Source:</strong> "Data page" = entered here.
                         "Legacy table" / "Sheet fallback" / "Built-in default" = nothing has been
                         entered for that row yet, so a fallback is supplying the number.
+                    </div>
+                </section>
+
+                <!-- ── NET FLOOR PRICE (own section) ───────────────────────── -->
+                <!-- Split out of the old "Basic & Net Floor Price Commission"
+                     section so the tier rates have a page of their own instead
+                     of hiding behind the Basic grid. -->
+                <section class="card table-card" id="nfpCard" style="display:none;">
+                    <div class="card-header">
+                        <h3>Net Floor Price Rate Tiers</h3>
+                        <div style="display:flex; gap:12px;">
+                            <button class="btn btn-secondary" id="nfpListBtn">📋 View Net Floor Price List</button>
+                            <button class="btn btn-primary" id="nfpAddBtn" style="display:none;">➕ Add entry</button>
+                        </div>
+                    </div>
+                    <!-- .rules-head only gets its flex layout inside #rulesPanel,
+                         so this copy states it inline. -->
+                    <div style="padding:12px 24px 0; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+                        <span class="wire-badge active" style="display:inline; margin:0;">Active — used in calculation</span>
+                        <span style="font-size:12px; color:var(--text-muted);">
+                            A tier entered here is the rate the NFP engine applies, matched on the
+                            invoice month. Tiers left as Built-in default keep 25% / 100% / 20%.
+                            The Payout stage decides which month the commission lands in; NFP pays
+                            as one figure, so when tiers state different stages the latest governs.
+                            With no stage entered it stays at 100% payment, as it always has.
+                        </span>
+                    </div>
+                    <div class="section-hint">
+                        <strong>Variables:</strong>
+                        c = Sales Price &nbsp;·&nbsp; d = Net Floor Price &nbsp;·&nbsp; z = Rate %
+                        &nbsp;&nbsp;|&nbsp;&nbsp; <strong>NFP Commission</strong> = (c − d) × z
+                        &nbsp;&nbsp;|&nbsp;&nbsp; a sale below the floor price carries a negative rate,
+                        so the tier becomes a deduction.
+                    </div>
+                    <div class="data-toolbar" style="flex-wrap:wrap; gap:16px; align-items:center;">
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <label for="nfpPreviewYear" style="font-weight:600;">Year</label>
+                            <select id="nfpPreviewYear" style="padding:6px 10px; border-radius:6px; border:1px solid var(--border-color);">
+                                <option value="">All Years</option>
+                                <option value="2026">2026</option>
+                                <option value="2025">2025</option>
+                            </select>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <label for="nfpPreviewMonth" style="font-weight:600;">Month</label>
+                            <select id="nfpPreviewMonth" style="padding:6px 10px; border-radius:6px; border:1px solid var(--border-color);">
+                                <option value="">All Months</option>
+                                <option value="01">Jan</option>
+                                <option value="02">Feb</option>
+                                <option value="03">Mar</option>
+                                <option value="04">Apr</option>
+                                <option value="05">May</option>
+                                <option value="06">Jun</option>
+                                <option value="07">Jul</option>
+                                <option value="08">Aug</option>
+                                <option value="09">Sep</option>
+                                <option value="10">Oct</option>
+                                <option value="11">Nov</option>
+                                <option value="12">Dec</option>
+                            </select>
+                        </div>
+                        <span class="row-count-badge" id="nfpPreviewCount">0 tiers</span>
+                    </div>
+                    <div class="table-container">
+                        <table class="dashboard-table aligned-table">
+                            <colgroup>
+                                <col style="width:12%"><col style="width:12%"><col style="width:8%"><col style="width:12%">
+                                <col style="width:6%"><col style="width:17%"><col style="width:13%"><col style="width:11%">
+                                <col style="width:6%"><col style="width:3%">
+                            </colgroup>
+                            <thead>
+                                <tr><th>Commission Type</th><th>Invoice Date</th><th>Agent Type</th><th>Role</th><th>Rate %</th><th>Condition</th><th>Payout</th><th>Formula</th><th>Source</th><th></th></tr>
+                            </thead>
+                            <tbody id="nfpPreviewBody"></tbody>
+                        </table>
+                    </div>
+                    <div class="section-hint" style="padding-bottom:16px;">
+                        Each tier keeps its own effective-dated lineage, so the Year/Month above picks
+                        which revision applies — not the month a sale was invoiced in.
+                        &nbsp;·&nbsp; <strong>Source:</strong> "Data page" = entered here;
+                        "Legacy table" = still coming from the older rates table.
                     </div>
                 </section>
 
@@ -525,6 +611,11 @@
                                 <option value="Sales">Sales</option>
                             </select>
                         </div>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <label for="rolesMonthFilter" style="font-weight:600; font-size:13px;">Invoice Date</label>
+                            <input type="month" id="rolesMonthFilter" title="Show only the rows that govern this month — the same rows the commission calculation would use for an invoice dated then. A row dated 2026-01 with no end month still counts for every later month." style="padding:6px 12px; border-radius:8px; border:1px solid var(--border-color); font-size:13px; background:#f8fafc; color:var(--text-main);">
+                            <button class="btn btn-secondary" id="rolesMonthClearBtn" style="font-size:12px; padding:5px 12px; display:none;">Clear</button>
+                        </div>
                         <label style="display:flex; align-items:center; gap:6px; font-weight:600; font-size:13px; cursor:pointer;" title="Show only rows flagged with a drift/removed/expired/mismatch warning below the Role badge.">
                             <input type="checkbox" id="rolesNeedsReviewFilter"> Needs review only
                         </label>
@@ -543,7 +634,7 @@
                     <div class="table-container">
                         <table class="dashboard-table" style="table-layout:auto;">
                             <thead>
-                                <tr><th>Effective Month</th><th>Agent Name (from eeAdmin)</th><th>Full Name</th><th>Nick Name</th><th>IC No.</th><th>Agent Type</th><th>Role</th><th>Reports To</th><th>Branch</th><th></th></tr>
+                                <tr><th>Invoice Date</th><th>Agent Name (from eeAdmin)</th><th>Full Name</th><th>Nick Name</th><th>IC No.</th><th>Agent Type</th><th>Role</th><th>Reports To</th><th>Branch</th><th></th></tr>
                             </thead>
                             <tbody id="rolesBody"></tbody>
                         </table>
@@ -612,8 +703,15 @@
                         </div>
                     </div>
                     <div class="data-toolbar">
-                        <label for="anpPeriod" style="font-weight:600; font-size:13px;">Effective from</label>
-                        <input type="month" id="anpPeriod">
+                        <label style="font-weight:600; font-size:13px;">Invoice Date</label>
+                        <span style="font-size:12px; color:var(--text-muted); font-weight:600;">From</span>
+                        <input type="month" id="anpPeriodFrom">
+                        <span style="font-size:12px; color:var(--text-muted); font-weight:600;">To</span>
+                        <input type="month" id="anpPeriodTo">
+                        <label for="anpPeriodPresent" style="display:flex; align-items:center; gap:6px; font-size:12.5px; font-weight:600; cursor:pointer; white-space:nowrap;">
+                            <input type="checkbox" id="anpPeriodPresent" checked style="cursor:pointer;">
+                            Present
+                        </label>
                         <button class="btn btn-secondary" id="anpAddTierBtn" style="display:none;">+ Add tier</button>
                         <button class="btn btn-primary" id="anpSaveBtn" style="display:none;">Save</button>
                     </div>
@@ -636,47 +734,33 @@
                 </section>
 
                 <!-- ── EGA / ESA AWARD RULES ───────────────────────────────── -->
+                <!-- Landing list only. Internal and Outsource sit side by side
+                     here on purpose: the edit form shows one agent type at a
+                     time, so a scheme saved under the wrong one is invisible
+                     until both are on screen together. Click a row to edit. -->
                 <section class="card table-card" id="egaCard" style="display:none;">
                     <div class="card-header">
                         <h3>EGA / ESA Award Rules</h3>
                         <div style="display:flex; gap:12px; align-items:center;">
-                            <span class="source-badge" id="egaSavedBadge"></span>
-                            <span class="save-status" id="egaStatus"></span>
+                            <span class="save-status" id="egaListStatus"></span>
+                            <button class="btn btn-primary" id="egaNewBtn" style="display:none;">➕ New rule set</button>
                         </div>
                     </div>
-                    <div class="data-toolbar">
-                        <label for="egaYear" style="font-weight:600; font-size:13px;">Year</label>
-                        <input type="number" id="egaYear" style="width:100px;" min="2020" max="2099">
-                        <label for="egaAgentType" style="font-weight:600; font-size:13px;">Agent type</label>
-                        <select id="egaAgentType">
-                            <option value="internal">Internal</option>
-                            <option value="outsource">Outsource</option>
-                        </select>
-                        <button class="btn btn-secondary" id="egaAddMonthBtn" style="display:none;">+ Add month</button>
-                        <button class="btn btn-primary" id="egaSaveBtn" style="display:none;">Save</button>
-                    </div>
-                    <h4 class="contest-heading">Full-year thresholds</h4>
-                    <div class="contest-fields">
-                        <label>EGA threshold (EP)<input type="number" id="ega_ega_threshold"></label>
-                        <label>ESA threshold (EP)<input type="number" id="ega_esa_threshold"></label>
-                    </div>
-                    <h4 class="contest-heading">Month-by-month qualifying ladder</h4>
                     <div class="table-container">
-                        <table class="dashboard-table unified-grid" style="table-layout:auto;">
-                            <thead><tr><th>Month</th><th>EP threshold</th><th>Label</th><th></th></tr></thead>
-                            <tbody id="egaMonthsBody"></tbody>
+                        <table class="dashboard-table" style="table-layout:auto;">
+                            <thead>
+                                <tr>
+                                    <th>Scheme</th>
+                                    <th>EGA threshold</th>
+                                    <th>ESA threshold</th>
+                                    <th>Early Bird EGA</th>
+                                    <th>Early Bird ESA</th>
+                                    <th>Last Updated</th>
+                                </tr>
+                            </thead>
+                            <tbody id="egaListBody"></tbody>
                         </table>
                     </div>
-                    <h4 class="contest-heading">Factory EP recognition</h4>
-                    <div class="contest-fields">
-                        <label>Applies from<input type="month" id="ega_factory_from"></label>
-                        <label>First block (RM)<input type="number" id="ega_factory_first_block"></label>
-                        <label>Balance rate (%)<input type="number" id="ega_factory_balance_rate"></label>
-                        <label>Minimum panels<input type="number" id="ega_factory_min_panels"></label>
-                    </div>
-                    <p class="section-hint" style="padding:8px 24px 20px;">
-                        Below the minimum panel count a factory case follows the Residential rules instead.
-                    </p>
                 </section>
 
                 <!-- ── PRODUCTION BONUS RULES ──────────────────────────────── -->
@@ -689,8 +773,15 @@
                         </div>
                     </div>
                     <div class="data-toolbar">
-                        <label for="pbPeriod" style="font-weight:600; font-size:13px;">Effective from</label>
-                        <input type="month" id="pbPeriod">
+                        <label style="font-weight:600; font-size:13px;">Invoice Date</label>
+                        <span style="font-size:12px; color:var(--text-muted); font-weight:600;">From</span>
+                        <input type="month" id="pbPeriodFrom">
+                        <span style="font-size:12px; color:var(--text-muted); font-weight:600;">To</span>
+                        <input type="month" id="pbPeriodTo">
+                        <label for="pbPeriodPresent" style="display:flex; align-items:center; gap:6px; font-size:12.5px; font-weight:600; cursor:pointer; white-space:nowrap;">
+                            <input type="checkbox" id="pbPeriodPresent" checked style="cursor:pointer;">
+                            Present
+                        </label>
                         <button class="btn btn-primary" id="pbSaveBtn" style="display:none;">Save</button>
                     </div>
                     <h4 class="contest-heading">Qualifying</h4>
@@ -784,6 +875,84 @@
                 </section>
             </div>
         </main>
+    </div>
+
+    <!-- EGA/ESA rule set — one (year, agent type) scheme: full-year thresholds,
+         the Early Bird ladder and the factory EP settings. Opened by clicking a
+         row on the EGA/ESA landing table, or by "New rule set". The field ids
+         are the ones RULE_SECTIONS.ega already drives, so load and save are
+         unchanged — only where the fields live has moved. -->
+    <div id="egaModal" class="modal hidden">
+        <div class="modal-content card">
+            <div class="modal-header">
+                <h3 id="egaModalTitle">EGA / ESA Award Rules</h3>
+                <button id="egaModalCloseBtn" class="btn-close">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 0 0 12px; gap: 0; overflow-y: auto;">
+                <div class="data-toolbar">
+                    <label style="font-weight:600; font-size:13px;">Invoice Date</label>
+                    <span style="font-size:12px; color:var(--text-muted); font-weight:600;">From</span>
+                    <input type="number" id="egaYearFrom" style="width:90px;" min="2020" max="2099">
+                    <span style="font-size:12px; color:var(--text-muted); font-weight:600;">To</span>
+                    <input type="number" id="egaYearTo" style="width:90px;" min="2020" max="2099">
+                    <label for="egaYearPresent" style="display:flex; align-items:center; gap:6px; font-size:12.5px; font-weight:600; cursor:pointer; white-space:nowrap;">
+                        <input type="checkbox" id="egaYearPresent" checked style="cursor:pointer;">
+                        Present
+                    </label>
+                    <label for="egaAgentType" style="font-weight:600; font-size:13px;">Agent type</label>
+                    <select id="egaAgentType">
+                        <option value="internal">Internal</option>
+                        <option value="outsource">Outsource</option>
+                    </select>
+                    <span class="source-badge" id="egaSavedBadge"></span>
+                </div>
+                <p class="section-hint" style="padding:0 24px 10px;">
+                    Internal and Outsource are separate rule sets. Changing the agent type here
+                    loads that scheme — check the badge above before saving.
+                </p>
+
+                <h4 class="contest-heading">Full-year thresholds</h4>
+                <div class="contest-fields">
+                    <label>EGA threshold (EP)<input type="number" id="ega_ega_threshold"></label>
+                    <label>ESA threshold (EP)<input type="number" id="ega_esa_threshold"></label>
+                </div>
+
+                <h4 class="contest-heading">Month-by-month qualifying ladder
+                    <button class="btn btn-secondary" id="egaAddMonthBtn"
+                            style="display:none; float:right; font-size:11px; padding:3px 10px; text-transform:none; letter-spacing:0;">+ Add month</button>
+                </h4>
+                <p class="section-hint" style="padding:0 24px 10px;">
+                    Early Bird: an agent whose cumulative EP by the END of that month clears the
+                    threshold wins the award early. A label naming ESA feeds the ESA ladder;
+                    every other label feeds EGA. These rows replace the built-in ladder outright,
+                    so a month deleted here stops qualifying early.
+                </p>
+                <div class="table-container">
+                    <table class="dashboard-table unified-grid" style="table-layout:auto;">
+                        <thead><tr><th>Month</th><th>EP threshold</th><th>Label</th><th style="width:56px;"></th></tr></thead>
+                        <tbody id="egaMonthsBody"></tbody>
+                    </table>
+                </div>
+
+                <h4 class="contest-heading">Factory EP recognition</h4>
+                <div class="contest-fields">
+                    <label>Applies from<input type="month" id="ega_factory_from"></label>
+                    <label>First block (RM)<input type="number" id="ega_factory_first_block"></label>
+                    <label>Balance rate (%)<input type="number" id="ega_factory_balance_rate"></label>
+                    <label>Minimum panels<input type="number" id="ega_factory_min_panels"></label>
+                </div>
+                <p class="section-hint" style="padding:8px 24px 0;">
+                    Below the minimum panel count a factory case follows the Residential rules instead.
+                </p>
+            </div>
+            <div class="modal-footer">
+                <div class="modal-footer-actions">
+                    <span class="save-status" id="egaStatus"></span>
+                    <button class="btn btn-secondary" id="egaCancelBtn">Cancel</button>
+                    <button class="btn btn-primary" id="egaSaveBtn" style="display:none;">Save</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Data Edit Entry Modal Pop-Up -->
@@ -899,7 +1068,14 @@
                 <button id="closeDataEditModalBtn" class="btn-close">&times;</button>
             </div>
             <div class="modal-body" style="padding: 24px; gap: 18px; overflow-y: auto;">
-                
+
+                <!-- Which rate type this entry belongs to. Set by openAddModal /
+                     openDataEditModal and read back on save: without it a new
+                     entry has nothing to state its type and every Add lands as
+                     a Basic Commission row, whichever section it was opened
+                     from. Not editable — the section decides the type. -->
+                <input type="hidden" id="modalType" value="Basic Commission">
+
                 <!-- Row 1: Invoice Month -->
                 <div class="form-row">
                     <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Invoice Month</label>
@@ -933,7 +1109,7 @@
                         <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Role</label>
                         <select id="modalRole" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px;"></select>
                     </div>
-                    <div class="form-row" style="flex:1.6; min-width:280px;">
+                    <div class="form-row" id="modalPropertyRow" style="flex:1.6; min-width:280px;">
                         <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Property Type <span id="modalPropertySelectedText" style="font-weight:600; color:#2563eb; margin-left:8px; font-size:12px;"></span></label>
                         <div id="modalPropertyChipsContainer" class="prop-chips-box">
                             <span class="prop-chip" data-val="All Types">+ All Types</span>
@@ -957,20 +1133,32 @@
                     </div>
                 </div>
 
+                <!-- Row 2c: NFP tier — only for Net Floor Price Rate entries.
+                     An NFP row is identified by its tier, not by a payment
+                     stage, so this is what fills `condition` for that type. -->
+                <div class="form-row" id="modalNfpTierRow" style="display:none;">
+                    <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">NFP Tier</label>
+                    <select id="modalNfpTier" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px;">
+                        <option value="Sales Price &gt; Net Floor Price">Sales Price &gt; Net Floor Price — pays (Sales − NFP) × rate</option>
+                        <option value="System Price &gt; Net Floor Price">System Price &gt; Net Floor Price — pays (System − NFP) × rate</option>
+                        <option value="Sales Price &lt; Net Floor Price">Sales Price &lt; Net Floor Price — deducts (NFP − Sales) × rate</option>
+                    </select>
+                </div>
+
                 <!-- Row 3: Rate % & Profit Sharing % -->
                 <div class="form-group-row" style="display:flex; gap:14px; flex-wrap:wrap;">
                     <div class="form-row" style="flex:1; min-width:140px;">
                         <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Rate (%)</label>
                         <input type="number" id="modalRatePct" step="0.05" placeholder="e.g. 3.25" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px;">
                     </div>
-                    <div class="form-row" style="flex:1; min-width:150px;">
+                    <div class="form-row" id="modalProfitSharingRow" style="flex:1; min-width:150px;">
                         <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Profit Sharing (%)</label>
                         <input type="text" id="modalProfitSharingRatePct" placeholder="— (or x)" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px;">
                     </div>
                 </div>
 
                 <!-- Row 3.5: Override Rules (Override Rate % & Override From Adder) -->
-                <div class="form-row" style="margin-top:10px; padding:12px; background:#f8fafc; border:1px solid var(--border-color); border-radius:8px;">
+                <div class="form-row" id="modalOverrideRulesRow" style="margin-top:10px; padding:12px; background:#f8fafc; border:1px solid var(--border-color); border-radius:8px;">
                     <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
                         <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Override Rules <span style="font-weight:400; color:var(--text-muted);">(Optional - e.g. OUM overrides OSA & OUM)</span></label>
                         <button type="button" id="addOverrideRuleBtn" class="btn btn-secondary" style="padding:3px 10px; font-size:11.5px;">+ Add Override Rule</button>
@@ -979,7 +1167,7 @@
                 </div>
 
                 <!-- Row 4: Payment Rules (Payment ≥ % & Rule Adder) -->
-                <div class="form-row">
+                <div class="form-row" id="modalPaymentRulesRow">
                     <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
                         <label style="font-size:11.5px; font-weight:600; color:var(--text-muted);">Payment Rules (Payment ≥ %)</label>
                         <button type="button" id="addPaymentRuleBtn" class="btn btn-secondary" style="padding:3px 10px; font-size:11.5px;">+ Add Payment Stage</button>
@@ -1052,10 +1240,10 @@
                     </select>
                 </div>
 
-                <!-- Effective Month — single (open-ended) or a closed range,
+                <!-- Invoice Date — single (open-ended) or a closed range,
                      the same two shapes the Basic Commission Data page uses. -->
                 <div class="form-row">
-                    <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Effective Month</label>
+                    <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Invoice Date</label>
                     <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
                         <span style="font-size:12px; color:var(--text-muted); font-weight:600;">From</span>
                         <input type="month" id="roleModalMonthFrom" style="padding:8px 12px; font-size:13.5px; width:150px; border:1px solid var(--border-color); border-radius:6px;">
@@ -1107,6 +1295,6 @@
         </div>
     </div>
 
-    <script src="/static/data.js?v=20260805_role_tombstone_v1"></script>
+    <script src="/static/data.js?v=20260813_eff_present_v1"></script>
 </body>
 </html>

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sales Report — Finance Commission Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="report-page">
+    <div class="app-container">
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <img src="/static/logo.jpg" alt="Eternalgy" class="sidebar-logo">
+                <span class="portal-eyebrow neon-white">Commission Portal</span>
+            </div>
+
+            <div class="sidebar-group">
+                <label class="group-label">Scope</label>
+                <div class="select-wrapper">
+                    <select id="yearSelect">
+                        <option value="2026" selected>Year 2026</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Same groups, labels and controls as the overview and report
+                 sidebars, so all three read as one navigation. Only the
+                 .active item differs: Sales Report here. -->
+            <div class="sidebar-group">
+                <label class="group-label">Navigation</label>
+                <ul class="nav-list">
+                    <li class="nav-link-item"><a href="/"><span class="bullet"></span> Overview</a></li>
+                    <li class="active"><span class="bullet"></span> Sales Report</li>
+                </ul>
+            </div>
+
+            <div class="sidebar-group">
+                <label class="group-label">Commission Section</label>
+                <ul class="nav-list">
+                    <li class="nav-link-item"><a href="/report?section=basic_nfp"><span class="bullet"></span> Basic &amp; Net Floor Price Commission</a></li>
+                    <li class="nav-link-item"><a href="/report?section=anp"><span class="bullet"></span> ANP Commission</a></li>
+                    <li class="nav-link-item"><a href="/report?section=ega_esa"><span class="bullet"></span> EGA/ESA Award</a></li>
+                    <li class="nav-link-item"><a href="/report?section=production_bonus"><span class="bullet"></span> Production Bonus</a></li>
+                    <li class="nav-link-item"><a href="/report?section=monthly_contest"><span class="bullet"></span> Monthly Contest</a></li>
+                </ul>
+            </div>
+
+            <div class="sidebar-group" id="dataGroup">
+                <label class="group-label">Data Management</label>
+                <a href="/data" id="dataPageLink" class="btn btn-secondary" style="width: 100%; text-decoration: none; justify-content: center;">
+                    <span class="icon">🗂️</span> Data
+                </a>
+            </div>
+
+            <div class="sidebar-group" id="accountGroup">
+                <label class="group-label">Account</label>
+                <div class="status-text" id="accountWhoami" style="margin-bottom: 8px;"></div>
+                <button id="logoutBtn" class="btn btn-secondary" style="width: 100%;">Logout</button>
+                <a href="/admin" id="adminLink" class="btn btn-warning" style="display:none; text-decoration:none; width: 100%; margin-top: 8px; justify-content: center;">
+                    <span class="icon">⚙️</span> Admin
+                </a>
+            </div>
+
+            <div class="sidebar-footer">
+                <span class="status-indicator online"></span>
+                <span class="status-text">Connected to PG Proxy</span>
+                <span class="app-version" id="appVersion" title="Installed version"></span>
+            </div>
+        </aside>
+
+        <main class="main-content">
+            <header class="content-header">
+                <div class="header-title">
+                    <h2 class="section-title-header">Sales Report</h2>
+                    <h1 id="srPeriod">January – June 2026</h1>
+                    <p id="srSubHeader">Cases and net sales per agent, with EGA qualification</p>
+                </div>
+                <div class="header-actions">
+                    <button id="srExport" class="btn btn-secondary">
+                        <span class="icon">⬇️</span> Export CSV
+                    </button>
+                    <a href="/" class="btn btn-primary" style="text-decoration:none;">
+                        <span class="icon">📊</span> Overview
+                    </a>
+                </div>
+            </header>
+
+            <section class="metrics-row" id="srCards"></section>
+
+            <div class="sr-caveat" id="srCaveat" hidden></div>
+
+            <section id="srSections"></section>
+
+            <div id="srLoader" class="loader-overlay hidden" style="position:relative; min-height:160px;">
+                <div class="spinner"></div>
+                <p>Loading sales report…</p>
+            </div>
+            <div id="srEmpty" class="empty-state hidden">
+                <div class="empty-icon">📋</div>
+                <h4>Sales report not ready yet</h4>
+                <p id="srEmptyMsg">Sales data is still being prepared. Refresh shortly.</p>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/sales_report.js?v=20260813-sales-v1"></script>
+    <script src="/static/updater.js?v=20260731-ota-v1"></script>
+</body>
+</html>

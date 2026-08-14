@@ -137,11 +137,81 @@ def _load_ega_rules(year):
     return payload
 
 
+_rules_applied_for: set = set()
+
+
+def ensure_rules_applied(year) -> None:
+    """Push the Data page's rules for `year` into this module, once per process.
+
+    Building the SQL used to be the only thing that did this, which was fine for
+    the CLI and the export pack -- they fetch and report in one breath. The
+    dashboard does not: it reports off cached invoice rows, so on a warm cache
+    no fetch runs, nothing applies the rules, and the report silently grades
+    against the constants hardcoded above. Every entry point that computes a
+    figure calls this instead, so the source of truth is the same either way.
+
+    Memoised because the report path runs per request and the rules are a
+    database round trip. Sitting in module state means it is discarded exactly
+    when it should be: clear_commission_cache() drops this module from
+    sys.modules on save, so the next import starts clean.
+    """
+    key = str(year)
+    if key in _rules_applied_for:
+        return
+    payload = _load_ega_rules(year)
+    if payload:
+        _apply_ega_rules(payload)
+    # Recorded even when nothing was saved: the answer for this year is "the
+    # built-in constants stand", and re-asking the database every request would
+    # not change it.
+    _rules_applied_for.add(key)
+
+
+def _apply_early_bird_rows(months) -> None:
+    """Rebuild the Early Bird ladders from the Data page's month rows.
+
+    The page is the source of truth, so its rows replace the built-in ladders
+    outright -- a month deleted there stops qualifying early. Rows are sorted
+    into the two ladders by label: anything naming ESA is an ESA row, everything
+    else is EGA. Rows missing a month or a threshold are skipped rather than
+    taking the whole ladder down with them.
+    """
+    global EGA_EARLY_BIRD, ESA_EARLY_BIRD
+
+    ega_ladder: dict[int, tuple[Decimal, str]] = {}
+    esa_ladder: dict[int, tuple[Decimal, str]] = {}
+    for row in months or []:
+        try:
+            month = int(str(row.get("month") or "").strip())
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= month <= 12:
+            continue
+        raw = str(row.get("ep_threshold") or "").replace(",", "").strip()
+        if not raw:
+            continue
+        try:
+            threshold = Decimal(raw)
+        except Exception:
+            continue
+        label = (str(row.get("label") or "").strip()
+                 or f"EGA ({datetime(2000, month, 1).strftime('%b')})")
+        ladder = esa_ladder if "ESA" in label.upper() else ega_ladder
+        ladder[month] = (threshold, label)
+
+    # An empty table means "nothing saved" rather than "no early bird at all",
+    # so the built-in ladders stand until at least one usable row arrives.
+    if ega_ladder or esa_ladder:
+        EGA_EARLY_BIRD = ega_ladder
+        ESA_EARLY_BIRD = esa_ladder
+
+
 def _apply_ega_rules(payload) -> None:
     global EGA_THRESHOLD, ESA_THRESHOLD, FACTORY_CUTOFF_DATE
     global FACTORY_FIRST_BLOCK, FACTORY_BALANCE_RATE, FACTORY_MIN_PANELS
 
     rules = payload.get("rules") or {}
+    _apply_early_bird_rows(payload.get("months"))
 
     def _dec(key, current):
         raw = str(rules.get(key) or "").replace(",", "").strip()
@@ -288,9 +358,7 @@ def _get_token() -> str | None:
 def _invoices_sql(year: int, may_only: bool = False, upto_month: int | None = None) -> str:
     # Both the CLI and the commission pack call this first, so it is the one
     # place the year is known before any figure is computed.
-    _payload = _load_ega_rules(year)
-    if _payload:
-        _apply_ega_rules(_payload)
+    ensure_rules_applied(year)
     if upto_month is None and may_only:
         upto_month = 5
     if upto_month is not None:
@@ -511,10 +579,37 @@ def calc_ep_points(
     invoice_date_val: Any,
     panel_qty: int,
 ) -> Decimal:
+    """EP points for one invoice, per the Rate % table on the Outsource 2026
+    sheet of "1. EGA ASA Awards.xlsx":
+
+        Residence              1 pt per RM1, before and after the cutoff
+        Shop Lot / Commercial  1 pt per RM1, before and after the cutoff
+        Factory, < 36 pcs      "price follows residence" -> 1 pt per RM1
+        Factory, >= 36 pcs     before the cutoff: 1 pt per RM1
+                               from the cutoff:   first RM40,000 at 100%,
+                                                  the balance at 40%
+
+    Every figure above (block size, balance rate, panel minimum, cutoff month)
+    comes from the Data page via ensure_rules_applied(); only which package
+    types the reduced rate applies to is fixed here.
     """
-    Accumulate EP points directly by Sales Price (1 pt per RM1 of Sales Price).
-    """
-    return sales_price
+    # Anything that is not a large factory job earns a point per ringgit.
+    if prop_type != "Factory" or int(panel_qty or 0) < FACTORY_MIN_PANELS:
+        return sales_price
+
+    when = _parse_invoice_date(invoice_date_val)
+    if when is None:
+        # No date means no way to place it either side of the cutoff. Award the
+        # full rate rather than quietly docking points on a missing field.
+        return sales_price
+    # Compared at month granularity: the cutoff is always the 1st of a month,
+    # and this sidesteps naive/aware datetime comparisons on the invoice date.
+    if (when.year, when.month) < (FACTORY_CUTOFF_DATE.year, FACTORY_CUTOFF_DATE.month):
+        return sales_price
+
+    if sales_price <= FACTORY_FIRST_BLOCK:
+        return sales_price
+    return FACTORY_FIRST_BLOCK + (sales_price - FACTORY_FIRST_BLOCK) * FACTORY_BALANCE_RATE
 
 # ---------------------------------------------------------------------------
 # Eligibility -- Early Bird cumulative logic

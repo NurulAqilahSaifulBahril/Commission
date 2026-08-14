@@ -56,13 +56,22 @@ document.addEventListener("DOMContentLoaded", () => {
     // -------------------------------------------------------------
     // State Management
     // -------------------------------------------------------------
+    // The overview page's sub-nav links here as /report?section=<id>, so the
+    // requested section is what opens. Anything unrecognised falls back to
+    // Basic & NFP rather than leaving the page on a section that renders
+    // nothing.
+    const VALID_SECTIONS = new Set([
+        "basic_nfp", "anp", "ega_esa", "production_bonus", "monthly_contest",
+    ]);
+    const requestedSection = new URLSearchParams(window.location.search).get("section");
+
     let state = {
         currentUser: "finance_shuyee",
         isAdmin: false,   // set by initAccountBar(); gates editing the slip's IC
         activeYear: "2026",
         activeAgentType: "internal",
         activeMonth: "5", // May
-        activeSection: "basic_nfp",
+        activeSection: VALID_SECTIONS.has(requestedSection) ? requestedSection : "basic_nfp",
         rawData: null,
         filters: {
             search: "",
@@ -602,10 +611,11 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function getCommissionCacheKey() {
-        // v3: v2 payloads predate the basic_nfp "system_details" map, and the
-        // client cache lives for 6 hours -- without the bump a returning
-        // browser keeps rendering a payload with no panel/phase data.
-        return `commission_api_cache_v3:${state.activeYear}:${state.activeMonth}:${state.activeAgentType}`;
+        // v5: v4 payloads predate "agent_role_history", so a returning browser
+        // would fall back to the report-month role on every agent hover for up
+        // to six hours -- silently wrong for invoices that predate a role
+        // change. (v4 did the same for "agent_roles", v3 for "system_details".)
+        return `commission_api_cache_v5:${state.activeYear}:${state.activeMonth}:${state.activeAgentType}`;
     }
 
     function loadCachedCommissionPayload() {
@@ -718,6 +728,30 @@ document.addEventListener("DOMContentLoaded", () => {
         renderActiveSection();
     }
 
+    /** Re-read the role maps for the selected month and re-render if they
+     *  changed. Cheap enough to run on every cache-rendered load, and it is
+     *  what makes a Data page role edit show up in the report immediately
+     *  instead of whenever the payload cache happens to expire. */
+    async function refreshAgentRoleMaps() {
+        if (!state.rawData) return;
+        try {
+            const res = await fetch(`/api/agent-role-maps?year=${encodeURIComponent(state.activeYear)}`
+                                  + `&month=${encodeURIComponent(state.activeMonth)}`);
+            if (!res.ok) return;
+            const maps = await res.json();
+            if (!maps || maps.error || !state.rawData) return;
+            const changed =
+                JSON.stringify(state.rawData.agent_roles || null) !== JSON.stringify(maps.agent_roles || null) ||
+                JSON.stringify(state.rawData.agent_role_history || null) !== JSON.stringify(maps.agent_role_history || null);
+            if (!changed) return;
+            state.rawData.agent_roles = maps.agent_roles;
+            state.rawData.agent_role_history = maps.agent_role_history;
+            renderActiveSection();
+        } catch (_) {
+            // Stale roles are a display nuisance, not a reason to fail the page.
+        }
+    }
+
     function normalizeApiErrorMessage(message) {
         const text = String(message || "").trim();
         const lower = text.toLowerCase();
@@ -774,8 +808,27 @@ document.addEventListener("DOMContentLoaded", () => {
         const alias = headerAlias || (h => h);
         const parts = [sectionA, sectionB].filter(s => s && s.headers && s.rows);
         if (parts.length === 0) return { headers: [], rows: [] };
+        // A column only one side has goes where that side keeps it -- directly
+        // after the column it follows there -- not on the end of the table.
+        // Outsource's "Gan Lai Soon" sits between "Safwan (RM)" and "Referral
+        // Name"; appending it instead stranded it past Remarks, which broke the
+        // "Other Commission" group header (see renderTable): that scan collects
+        // a contiguous run, so it produced one group over OVERRIDE + Safwan and
+        // a second, orphaned one over Gan Lai Soon at the far right.
         const unionHeaders = [];
-        parts.forEach(s => s.headers.forEach(h => { const ah = alias(h); if (!unionHeaders.includes(ah)) unionHeaders.push(ah); }));
+        parts.forEach(s => {
+            let anchor = -1;   // where this part's previous column landed
+            s.headers.forEach(h => {
+                const ah = alias(h);
+                const at = unionHeaders.indexOf(ah);
+                if (at !== -1) {
+                    anchor = at;
+                    return;
+                }
+                anchor += 1;
+                unionHeaders.splice(anchor, 0, ah);
+            });
+        });
         const rows = [];
         parts.forEach(s => {
             const idxMap = s.headers.map(h => unionHeaders.indexOf(alias(h)));
@@ -939,7 +992,15 @@ document.addEventListener("DOMContentLoaded", () => {
                 production_bonus: mergeProductionBonusSections(internalData?.sections?.production_bonus, outsourceData?.sections?.production_bonus),
                 monthly_contest: outsourceData?.sections?.monthly_contest || internalData?.sections?.monthly_contest
             },
-            agentTypeMap: buildAgentTypeMap(internalData, outsourceData)
+            agentTypeMap: buildAgentTypeMap(internalData, outsourceData),
+            // Both maps are identical on either response -- they are keyed by
+            // agent and cover every type -- but have to be re-attached
+            // explicitly, since this object is rebuilt from scratch and would
+            // otherwise drop them. Losing agent_role_history here is invisible
+            // except that every agent-name hover in the combined view reports
+            // "no role", which is exactly what happened.
+            agent_roles: internalData?.agent_roles || outsourceData?.agent_roles || null,
+            agent_role_history: internalData?.agent_role_history || outsourceData?.agent_role_history || null
         };
     }
 
@@ -985,6 +1046,13 @@ document.addEventListener("DOMContentLoaded", () => {
             showLoader(false);
             noDataView.classList.add("hidden");
             await applyCommissionPayload(cachedPayload, { persistCache: false });
+            // A cached payload carries the roles as they stood when it was
+            // saved -- up to six hours ago, and from before any Data page edit
+            // made since. Roles are cheap and are edited without rebuilding
+            // commissions, so re-read them rather than showing a stale answer;
+            // the full refresh below is silent, so it cannot be relied on to
+            // correct this.
+            void refreshAgentRoleMaps();
             if (!commissionRefreshInFlight) {
                 commissionRefreshInFlight = true;
                 void fetchCommissionPayload({ showErrors: false, persistCache: true }).finally(() => {
@@ -1477,6 +1545,13 @@ modalPackageType.value = defaults.pkg || "-";
     async function showPdfModal() {
         const modal = document.getElementById("pdfModal");
         const viewer = document.getElementById("pdfViewer");
+        const overlay = document.getElementById("pdfLoadingOverlay");
+
+        // Open the popup and show the spinner immediately, instead of making
+        // the user stare at the dashboard while the PDF builds server-side.
+        viewer.style.visibility = "hidden";
+        overlay.classList.remove("hidden");
+        modal.style.display = "flex";
 
         try {
             const pdfUrl = `/api/download/pdf?year=${state.activeYear}&month=${state.activeMonth}`;
@@ -1484,25 +1559,29 @@ modalPackageType.value = defaults.pkg || "-";
 
             if (!response.ok) {
                 alert("Failed to load PDF");
+                closePdfModal();
                 return;
             }
 
             const blob = await response.blob();
             const blobUrl = URL.createObjectURL(blob);
             viewer.src = blobUrl;
-            modal.style.display = "flex";
+            viewer.style.visibility = "visible";
+            overlay.classList.add("hidden");
 
             // Store the blob URL for cleanup later
             modal.dataset.blobUrl = blobUrl;
         } catch (error) {
             console.error("Error loading PDF:", error);
             alert("Error loading PDF: " + error.message);
+            closePdfModal();
         }
     }
 
     function closePdfModal() {
         const modal = document.getElementById("pdfModal");
         const viewer = document.getElementById("pdfViewer");
+        const overlay = document.getElementById("pdfLoadingOverlay");
 
         // Clean up blob URL
         if (modal.dataset.blobUrl) {
@@ -1512,6 +1591,7 @@ modalPackageType.value = defaults.pkg || "-";
 
         modal.style.display = "none";
         viewer.src = "";
+        overlay.classList.add("hidden");
     }
 
     function triggerDownload(format) {
@@ -1840,7 +1920,8 @@ modalPackageType.value = defaults.pkg || "-";
         const stats = new Map();
         const entryFor = (key) => {
             if (!stats.has(key)) {
-                stats.set(key, { commission: 0, basic: 0, nfp: 0, other: 0, customers: new Set(), ownRows: 0 });
+                stats.set(key, { commission: 0, basic: 0, nfp: 0, other: 0, otherBy: new Map(),
+                                 customers: new Set(), ownRows: 0 });
             }
             return stats.get(key);
         };
@@ -1875,7 +1956,19 @@ modalPackageType.value = defaults.pkg || "-";
         // not hide it -- and both spellings credit the RECIPIENT, never the row.
         (creditProcessed || []).forEach(p => {
             if (p.isTotalRow) return;
-            const credit = (agentKey, amount) => { entryFor(agentKey).other += amount; };
+            // Both spellings credit the recipient, and in both the money was
+            // earned on THIS row -- so the row's own agent is the source the
+            // rollup names in "RM x override from <source>".
+            const sourceName = resolveAgentName(p.fullAgentName);
+            const credit = (agentKey, amount) => {
+                const entry = entryFor(agentKey);
+                entry.other += amount;
+                // Keep who it came from, not just the running total: the cell
+                // itemises each source when unfiltered, and collapsing it to
+                // one figure under a filter drops the only place that
+                // attribution is shown.
+                if (sourceName) entry.otherBy.set(sourceName, (entry.otherBy.get(sourceName) || 0) + amount);
+            };
             if (otherIdx !== -1) {
                 creditOtherCommissionCell(p.rawRow[otherIdx], String(p.fullAgentName).toLowerCase().trim(), credit);
             }
@@ -1885,6 +1978,21 @@ modalPackageType.value = defaults.pkg || "-";
             });
         });
         return stats;
+    }
+
+    // Mirrors format_senior_override_cell() in build_commission_pack.py, so a
+    // filtered Other Commission cell reads exactly like the server rollup it
+    // stands in for -- one "RM x override from <agent>" line per source,
+    // ordered by name.
+    function formatOtherCommissionBreakdown(agentStats) {
+        if (!agentStats || !agentStats.other) return "-";
+        const parts = [...(agentStats.otherBy || new Map()).entries()]
+            .filter(([, amount]) => amount > 0)
+            .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+            .map(([name, amount]) => `${formatRM(amount)} override from ${escapeHtml(name)}`);
+        // No named source survived (negative-only, or a spelling this build
+        // doesn't attribute) -- the total is still true, so show that.
+        return parts.length ? parts.join("<br/>") : formatRM(agentStats.other);
     }
 
     // The three commission totals are a whole-month figure, not a property of
@@ -1926,15 +2034,29 @@ modalPackageType.value = defaults.pkg || "-";
         rateCardsContainer.innerHTML = "";
         rateCardsContainer.classList.remove("hidden");
 
-        let totalCommission = 0, totalOtherCommission = 0, totalReferralFee = 0;
+        let totalCommission = 0, totalOtherCommission = 0, totalReferralFee = 0, totalSales = 0;
 
         const commPriceIdx = headers.findIndex(h => h.toLowerCase().trim() === "commission price");
         const otherCommIdx = headers.findIndex(h => h.toLowerCase().trim() === "override");
         const referralFeeIdx = headers.findIndex(h => h.toLowerCase().trim() === "referral fee");
+        const salesIdx = headers.findIndex(h => {
+            const n = String(h).toLowerCase().trim();
+            return n === "sales price" || n === "total amount";
+        });
         const commIdx = headers.findIndex(h => {
             const n = String(h).toLowerCase().trim();
             return n === "commission" || n === "commission type";
         });
+
+        // Every invoice contributes TWO rows -- a "Basic Commission" row and a
+        // paired "Net Floor Price Commission" row -- and both carry the same
+        // Sales Price. Summing the column blind would double-count every
+        // invoice, so Total Sales counts the Basic row only. A customer with
+        // NFP-only source rows still gets a Basic row (its shared columns are
+        // backfilled server-side), so nothing is missed. Matches "New Basic
+        // Commission" too, which is how a special case restates the pair.
+        const isBasicRow = (p) => commIdx !== -1
+            && String(p.rawRow[commIdx] || "").toLowerCase().includes("basic");
         const stageIdx = payoutStageIndexes(headers);
         const rm300ColIdx = stageIdx.rm300;
 
@@ -1971,11 +2093,21 @@ modalPackageType.value = defaults.pkg || "-";
             totalCommission = sumAgentSummaryColumn(agSummary, "commission price");
             totalOtherCommission = sumAgentSummaryColumn(agSummary, "other commission");
             totalReferralFee = sumAgentSummaryColumn(agSummary, "referral fee");
+            // One row per agent in the rollup, so this can't double-count.
+            totalSales = sumAgentSummaryColumn(agSummary, "sales price");
 
             (processed || []).forEach(p => {
-                if (p.isTotalRow || commPriceIdx === -1) return;
-                if (p.isSpecialCase) totalCommission += parseMoneyValue(p.rawRow[commPriceIdx]);
-                else if (isReplaced(p)) totalCommission -= parseMoneyValue(p.rawRow[commPriceIdx]);
+                if (p.isTotalRow) return;
+                if (commPriceIdx !== -1) {
+                    if (p.isSpecialCase) totalCommission += parseMoneyValue(p.rawRow[commPriceIdx]);
+                    else if (isReplaced(p)) totalCommission -= parseMoneyValue(p.rawRow[commPriceIdx]);
+                }
+                // A special case can restate the sales price (Adjusted Sales
+                // Price), so apply the same add-new / remove-replaced delta.
+                if (salesIdx !== -1 && isBasicRow(p)) {
+                    if (p.isSpecialCase) totalSales += parseMoneyValue(p.rawRow[salesIdx]);
+                    else if (isReplaced(p)) totalSales -= parseMoneyValue(p.rawRow[salesIdx]);
+                }
             });
         } else {
             // With a filter active (or a single agent type), the rollup above
@@ -1992,6 +2124,9 @@ modalPackageType.value = defaults.pkg || "-";
                 }
                 if (otherCommIdx !== -1 && !agentStats) totalOtherCommission += parseMoneyValue(p.rawRow[otherCommIdx]);
                 if (referralFeeIdx !== -1) totalReferralFee += parseMoneyValue(p.rawRow[referralFeeIdx]);
+                // Not stage-capped: an invoice's sales value is the same
+                // figure whether the advance or the balance is being paid.
+                if (salesIdx !== -1 && isBasicRow(p)) totalSales += parseMoneyValue(p.rawRow[salesIdx]);
             });
 
             // Other Commission follows the RECIPIENT, not the row it sits on:
@@ -2017,6 +2152,7 @@ modalPackageType.value = defaults.pkg || "-";
             return card;
         }
 
+        rateCardsContainer.appendChild(makeTotalCard("Total Sales (RM)", totalSales));
         rateCardsContainer.appendChild(makeTotalCard("Total Commission (RM)", totalCommission));
         rateCardsContainer.appendChild(makeTotalCard("Total Other Commission (RM)", totalOtherCommission));
         rateCardsContainer.appendChild(makeTotalCard("Total Referral Fee (RM)", totalReferralFee));
@@ -2028,13 +2164,55 @@ modalPackageType.value = defaults.pkg || "-";
         return getInternalAgentTier(agentName);
     }
 
+    // Internal roles grouped into the bands the rate cards price on -- seven
+    // roles share three basic rates, so the band is what a rate lookup needs.
+    // "Senior" / "Executive" are the retired labels rows saved before July 2026
+    // still hold -- same rename _HIERARCHY_ALIASES absorbs on the rate side, so
+    // they have to land in the same band as their new names.
+    const INTERNAL_ROLE_BANDS = {
+        seniorbranchdirector: "Management",
+        regionalsalesdirector: "Management",
+        branchsalesmanager: "Management",
+        salesdevelopmentmanager: "Management",
+        salesteammanager: "Management",
+        seniorsalesconsultant: "Senior",
+        salessenior: "Senior",
+        senior: "Senior",
+        salesconsultant: "Consultant",
+        salesexecutive: "Consultant",
+        executive: "Consultant",
+    };
+
+    function normRoleKey(role) {
+        return String(role || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    }
+
+    /** The rate band an internal agent is priced on, from the role on the
+     *  Agent Roles & Hierarchy page as at the selected month.
+     *
+     *  Falls back to the old hardcoded first-name split only when no role data
+     *  reached the browser at all (an older cached payload, or the lookup
+     *  failed server side) -- otherwise the rate cards would lose their figures
+     *  entirely on a stale response. */
     function getInternalAgentTier(agentName) {
         if (!agentName) return "";
         const n = agentName.toLowerCase().trim();
         if (n.includes("total") || n.includes("summary") || n.includes("grand")) return "";
+
+        const roles = state.rawData?.agent_roles;
+        if (roles) {
+            const entry = roles[normalizeAgentKey(agentName)];
+            const role = entry ? String(entry.role || "").trim() : "";
+            // No row for this agent, a blank role, or a role this build does
+            // not recognise all mean the same thing for pricing: nothing on the
+            // Data page governs them, so they read as unset rather than being
+            // quietly shaded as though they were priced.
+            return role ? (INTERNAL_ROLE_BANDS[normRoleKey(role)] || "Unset") : "Unset";
+        }
+
         const seniors = ["sunny", "martin", "kent", "zhe hang", "ching zhe hang", "teng kah kent", "sunny tan", "martin hing"];
         if (seniors.some(s => n.includes(s))) return "Senior";
-        return "Executive";
+        return "Consultant";
     }
 
     function getOutsourceAgentTier(agentName) {
@@ -2047,53 +2225,201 @@ modalPackageType.value = defaults.pkg || "-";
         return "OSA";
     }
 
-    // Same hex values as the Agent Tiers Legend swatches and the *-bg CSS
-    // classes, so a special case's remark cell can be forced to match the
-    // row's own tier color explicitly (in JS) instead of the CSS cascade,
-    // which a more specific rule (.special-case-remarks-cell) was winning
-    // over and turning pink regardless of the row's actual tier.
-    const TIER_BG_COLORS = {
-        "senior-bg": "#E0F2FE", "executive-bg": "#F0F9FF",
-        "ogm-bg": "rgba(30, 58, 138, 0.28)",
-        "oum-bg": "rgba(30, 58, 138, 0.16)",
-        "osa-bg": "rgba(30, 58, 138, 0.07)",
-        "total-bg": "#F8FAFB",
-        "all-internal-bg": "#E0F2FE",
-        "all-outsource-bg": "rgba(30, 58, 138, 0.16)"
-    };
-
-    function getRowClass(agentName, isOutsource) {
+    /** Shading for one table row. Total / summary rows keep theirs; every other
+     *  row is flat.
+     *
+     *  Rows used to be tinted by the agent's role band, decoded by an "Agent
+     *  Tiers Legend" bar above each table. Both are gone: a colour can only
+     *  carry the band, and it carried the band as at the *report* month, which
+     *  is the wrong role for any invoice raised before a promotion. The exact
+     *  role now lives on the agent-name hover, resolved per row against that
+     *  row's own invoice date -- see agentRoleTooltip(). */
+    function getRowClass(agentName) {
         if (!agentName) return "";
         const nameLower = agentName.toLowerCase();
         if (nameLower.includes("total") || nameLower.includes("summary") || nameLower.includes("grand")) return "total-bg";
-        if (state.activeAgentType === "all") {
-            const t = state.rawData?.agentTypeMap?.[nameLower];
-            if (t === "internal") {
-                const tier = getInternalAgentTier(agentName);
-                if (tier === "Senior") return "senior-bg";
-                if (tier === "Executive") return "executive-bg";
-                return "all-internal-bg";
-            }
-            if (t === "outsource") {
-                const tier = getOutsourceAgentTier(agentName);
-                if (tier === "OGM") return "ogm-bg";
-                if (tier === "OUM") return "oum-bg";
-                if (tier === "OSA") return "osa-bg";
-                return "all-outsource-bg";
-            }
-            return "";
+        return "";
+    }
+
+    // -------------------------------------------------------------
+    // Agent role hover (Agent Roles & Hierarchy, by invoice date)
+    // -------------------------------------------------------------
+    const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+    /** "2026-08" -> "Aug 2026". Anything else is passed through untouched, so a
+     *  malformed effective_from shows as stored rather than as "NaN". */
+    function fmtRoleMonth(ym) {
+        const m = /^(\d{4})-(\d{2})$/.exec(String(ym || "").trim());
+        if (!m) return String(ym || "");
+        const idx = parseInt(m[2], 10) - 1;
+        return idx >= 0 && idx < 12 ? `${MONTH_ABBR[idx]} ${m[1]}` : String(ym);
+    }
+
+    /** How long a role ran, for the tooltip. "9999-12" is the open-ended end
+     *  split_effective_range() uses, and reads as "current" rather than as a
+     *  date no one will ever see. */
+    function fmtRolePeriod(start, end) {
+        const from = fmtRoleMonth(start);
+        if (!end || String(end).startsWith("9999")) return `${from} — current`;
+        return start === end ? from : `${from} — ${fmtRoleMonth(end)}`;
+    }
+
+    /** The Agent Roles & Hierarchy row(s) governing this agent in "YYYY-MM".
+     *
+     *  Same rule the server prices on -- of the rows whose effective range
+     *  covers the month, the latest start wins -- but applied per agent type,
+     *  because an agent can hold an Internal and an Outsource role at the same
+     *  time (Chan Jia Wei is a Branch Sales Manager and an OUM concurrently).
+     *  The report is read one agent type at a time, so the role belonging to
+     *  the active view is the one that answers the question; the combined
+     *  "All Agents" view keeps both. */
+    function roleEntriesAt(agentName, ym) {
+        const history = state.rawData?.agent_role_history;
+        if (!history || !ym) return [];
+        // The server keys this map on each agent's canonical full name, but a
+        // source row carries whatever the invoice system holds -- often a
+        // nickname ("Carol Siow" for Siow Sio Chui, "ZUL" for Ahmad
+        // Zulkarnain). Resolve before keying, then fall back to the raw name
+        // for anything the name map does not cover. Keying on the raw name
+        // alone missed 13 of the 47 agents actually present in the 2026 data.
+        const entries = history[normalizeAgentKey(resolveAgentName(agentName) || agentName)]
+                     || history[normalizeAgentKey(agentName)];
+        if (!entries || !entries.length) return [];
+
+        const covering = entries.filter(e => e.start <= ym && ym <= (e.end || "9999-12"));
+        if (!covering.length) return [];
+
+        const active = String(state.activeAgentType || "").toLowerCase();
+        const scoped = (active === "internal" || active === "outsource")
+            ? covering.filter(e => String(e.agent_type || "").toLowerCase() === active)
+            : covering;
+        // Falling back to every covering row rather than showing nothing: a
+        // role recorded under the other type still beats a blank tooltip.
+        const pool = scoped.length ? scoped : covering;
+
+        const winners = new Map();
+        pool.forEach(e => {
+            const t = String(e.agent_type || "").toLowerCase();
+            const cur = winners.get(t);
+            if (!cur || e.start > cur.start) winners.set(t, e);
+        });
+        return [...winners.values()];
+    }
+
+    /** Every "YYYY-MM" in a rendered date cell. One cell can stack several
+     *  invoice dates joined by <br/> (get_dates_for_invoices does exactly that
+     *  for a customer with more than one invoice), and they can straddle a role
+     *  change, so each has to be resolved on its own. */
+    function invoiceMonthsIn(cellText) {
+        const found = String(cellText || "").match(/\d{4}-\d{2}(?=-\d{2}|\b)/g);
+        return found ? [...new Set(found)] : [];
+    }
+
+    /** This row's Invoice Date cell, or "" when the table has no such column.
+     *  Passing "" is what makes agentRoleTooltip() fall back to the report
+     *  month, so the caller never has to test for the column itself. */
+    function invoiceDateCellOf(row, headers) {
+        if (!row || !headers) return "";
+        const idx = headers.findIndex(h => String(h || "").toLowerCase().includes("invoice date"));
+        return idx === -1 ? "" : String(row[idx] || "");
+    }
+
+    /** Tooltip payload for an agent-name cell, or null when there is nothing
+     *  useful to say.
+     *
+     *  `invoiceCellText` is the row's own Invoice Date cell where the table has
+     *  one — the role is then whatever the agent held when the invoice was
+     *  raised, not when it happened to pay out. Tables that carry no invoice
+     *  date (Summary Agent Commission, Production Bonus, EGA/ESA, Monthly
+     *  Contest) aggregate a whole month, so they fall back to the report month
+     *  and list every role that month's invoices span. */
+    function agentRoleTooltip(agentName, invoiceCellText) {
+        // Monthly Contest marks captains with a trailing "*" that is stripped
+        // before display -- it is not part of the name the roles table keys on.
+        const name = String(agentName || "").replace(/\*/g, "").trim();
+        if (!name) return null;
+        const low = name.toLowerCase();
+        if (low.includes("total") || low.includes("summary") || low.includes("grand")) return null;
+
+        const months = invoiceMonthsIn(invoiceCellText);
+        const reportMonth = `${state.activeYear}-${String(state.activeMonth).padStart(2, "0")}`;
+        const basis = months.length ? months : [reportMonth];
+
+        // Dedupe on the role row itself: two invoice dates inside one effective
+        // range are one role, and repeating it would imply a change that never
+        // happened.
+        const seen = new Map();
+        basis.forEach(ym => {
+            roleEntriesAt(name, ym).forEach(entry => {
+                seen.set(`${entry.agent_type}|${entry.start}|${entry.end}|${entry.role}`, entry);
+            });
+        });
+
+        // Same key rule as roleEntriesAt(): resolved name first, raw as fallback.
+        const roleMap = state.rawData?.agent_roles;
+        const resolved = roleMap?.[normalizeAgentKey(resolveAgentName(name) || name)]
+                      || roleMap?.[normalizeAgentKey(name)];
+        const displayName = resolved?.agent || resolveAgentName(name) || name;
+
+        if (!seen.size) {
+            // No row covers it. Say so plainly — the agent is priced by a
+            // built-in fallback, and a silent tooltip would hide that.
+            return {
+                title: displayName,
+                formula: "",
+                subtext: `<div style="color:#fcd34d;">No role on the Data page for `
+                       + `${escapeHtml(fmtRoleMonth(basis[0]))}.</div>`
+                       + `<div style="margin-top:6px;color:#cbd5e1;">Set one under `
+                       + `Data → Agent Roles &amp; Hierarchy.</div>`,
+            };
         }
-        if (isOutsource) {
-            const tier = getOutsourceAgentTier(agentName);
-            if (tier === "OGM") return "ogm-bg";
-            if (tier === "OUM") return "oum-bg";
-            if (tier === "OSA") return "osa-bg";
-            return "all-outsource-bg";
+
+        const entries = [...seen.values()].sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+        const basisNote = months.length
+            ? "Role as at the invoice date"
+            : `Role as at ${fmtRoleMonth(reportMonth)}`;
+
+        // Two roles can appear for two different reasons, and they mean
+        // opposite things: sequentially (the agent was promoted part-way
+        // through the invoices this row covers) or concurrently (they hold an
+        // Internal and an Outsource role at once). Only the first is a change.
+        const types = new Set(entries.map(e => String(e.agent_type || "").toLowerCase()));
+        const showType = types.size > 1;
+
+        const lines = entries.map(e => `
+            <div style="display:flex; justify-content:space-between; gap:20px; margin-bottom:4px;">
+                <strong>${escapeHtml(e.role || "(no role)")}${showType && e.agent_type
+                    ? ` <span style="font-weight:400;color:#94a3b8;">(${escapeHtml(e.agent_type)})</span>`
+                    : ""}</strong>
+                <span style="color:#cbd5e1; white-space:nowrap;">${escapeHtml(fmtRolePeriod(e.start, e.end))}</span>
+            </div>`).join("");
+
+        let multiNote = "";
+        if (entries.length > 1) {
+            const starts = new Set(entries.map(e => e.start));
+            multiNote = showType && starts.size === 1
+                ? `<div style="margin-top:6px; color:#fcd34d;">Holds both roles concurrently.</div>`
+                : `<div style="margin-top:6px; color:#fcd34d;">This row spans a role change.</div>`;
         }
-        const tier = getInternalAgentTier(agentName);
-        if (tier === "Senior") return "senior-bg";
-        if (tier === "Executive") return "executive-bg";
-        return "all-internal-bg";
+
+        return {
+            title: displayName,
+            formula: "",
+            subtext: `<div style="margin-bottom:6px; color:#cbd5e1;">${escapeHtml(basisNote)}</div>`
+                   + lines + multiNote,
+        };
+    }
+
+    /** Wires the role hover onto an agent-name cell. No-op when the agent has
+     *  nothing to show, so ordinary cells keep their plain cursor. */
+    function attachAgentRoleHover(td, agentName, invoiceCellText) {
+        const info = agentRoleTooltip(agentName, invoiceCellText);
+        if (!info) return;
+        td.classList.add("agent-role-hover");
+        td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, info));
+        td.addEventListener("mousemove", moveCommCalcTooltip);
+        td.addEventListener("mouseleave", hideCommCalcTooltip);
     }
 
     function escapeHtml(str) {
@@ -2161,6 +2487,79 @@ modalPackageType.value = defaults.pkg || "-";
         };
     }
 
+    // Hover breakdown for the Override ("Other Commission") column. The cell
+    // packs every credit into one <br/>-joined string; this lays them out one
+    // per line, names each party, and totals them when there is more than one.
+    //
+    // The percentage is DERIVED from the figures rather than assumed. The
+    // override behind this column is 0.5% of sales for an outsource OUM,
+    // 0.25% for an internal senior, and 20% of the whole commission on a
+    // Factory profit-sharing split -- quoting any one of those as "the" rate
+    // would be wrong on the other two.
+    function getOverrideBreakdownTooltip(row, headers, custName, cellValue) {
+        const raw = String(cellValue == null ? "" : cellValue).trim();
+        if (!raw || raw === "-") return null;
+
+        const salesIdx = headers.findIndex(h => {
+            const n = String(h).toLowerCase().trim();
+            return n === "sales price" || n === "total amount";
+        });
+        const sales = salesIdx !== -1 ? parseMoneyValue(row[salesIdx]) : 0;
+
+        const entries = raw.split(/<br\s*\/?>/i)
+            .map(s => s.replace(/<[^>]*>/g, "").trim())
+            .filter(s => s && s !== "-");
+        if (!entries.length) return null;
+
+        const num = (s) => {
+            const v = parseFloat(String(s).replace(/,/g, ""));
+            return isNaN(v) ? 0 : v;
+        };
+
+        let total = 0, parsedCount = 0;
+        const lines = entries.map(text => {
+            // "RM 85.00 (Recipient)" on a detail row -- money leaving this
+            // row. "RM 85.00 override from Source" on a summary row -- money
+            // arriving from someone else's row.
+            const toRecipient = text.match(/^RM\s*([-\d,.]+)\s*\((.+)\)\s*$/i);
+            const fromSource = text.match(/^RM\s*([-\d,.]+)\s*override from\s+(.+?)\s*$/i);
+            const m = toRecipient || fromSource;
+            if (!m) return `<div style="margin-bottom:4px;">${escapeHtml(text)}</div>`;
+
+            const amount = num(m[1]);
+            const who = m[2].trim();
+            total += amount;
+            parsedCount += 1;
+
+            // Only the "(recipient)" form is generated from THIS row's sales,
+            // so only that form can honestly be shown as a share of them.
+            const share = (toRecipient && sales)
+                ? `<div style="opacity:0.7; font-size:11px;">${(amount / sales * 100).toFixed(2)}% of ${formatRM(sales)} sales price</div>`
+                : "";
+            const direction = toRecipient ? "credited to" : "from";
+
+            return `<div style="margin-bottom:6px;">
+                <div style="display:flex; justify-content:space-between; gap:20px;">
+                    <span><span style="opacity:0.7;">${direction}</span> <strong>${escapeHtml(who)}</strong></span>
+                    <strong>${formatRM(amount)}</strong>
+                </div>
+                ${share}
+            </div>`;
+        });
+
+        if (parsedCount > 1) {
+            lines.push(`<div style="display:flex; justify-content:space-between; gap:20px;
+                border-top:1px dashed rgba(255,255,255,0.25); margin-top:6px; padding-top:6px;">
+                <span>Total</span><strong>${formatRM(total)}</strong>
+            </div>`);
+        }
+
+        return {
+            title: `Other Commission${custName && custName !== "-" ? ` — ${custName}` : ""}`,
+            subtext: lines.join(""),
+        };
+    }
+
     function showCommCalcTooltip(e, info) {
         const el = getOrCreateCommCalcTooltip();
         if (!el || !info) return;
@@ -2172,7 +2571,7 @@ modalPackageType.value = defaults.pkg || "-";
         el.innerHTML = `
             <div class="tooltip-header">${safeTitle}</div>
             ${info.preformula ? `<div class="tooltip-subtext">${info.preformula}</div>` : ""}
-            <div class="tooltip-formula">${safeFormula}</div>
+            ${info.formula ? `<div class="tooltip-formula">${safeFormula}</div>` : ""}
             ${info.subtext ? `<div class="tooltip-subtext">${info.subtext}</div>` : ""}
         `;
         el.classList.add("visible");
@@ -2230,15 +2629,15 @@ modalPackageType.value = defaults.pkg || "-";
         if (!entries || !entries.length) return null;
         const lines = entries.map(e => {
             const panel = e.panel_qty && e.panel_rating
-                ? `${e.panel_qty}X ${e.panel_rating}W${e.brand ? ` ${e.brand}` : ""}`
+                ? `${e.panel_qty}x ${e.panel_rating}W${e.brand ? ` ${e.brand}` : ""}`
                 : "-";
-            return `<div style="display:flex; justify-content:space-between; gap:20px; margin-bottom:4px;">
-                    <span>${escapeHtml(panel)}</span> <strong>${escapeHtml(e.phase || "-")}</strong>
+            return `<div style="margin-bottom:8px;">
+                    <div><strong>Panels</strong> ${escapeHtml(panel)}</div>
+                    <div><strong>Phase</strong> ${escapeHtml(e.phase || "-")}</div>
                 </div>`;
         }).join("");
         return {
             title: `System Details — ${name}`,
-            formula: entries.length > 1 ? `${entries.length} invoices` : "Panels · Phase",
             subtext: lines
         };
     }
@@ -2631,8 +3030,7 @@ modalPackageType.value = defaults.pkg || "-";
                     return { value: String(agentStats.customers.size), rowspan: 1, visible: true };
                 }
                 if (agentStats && ci === otherCommColIdx) {
-                    const other = agentStats.other === 0 ? "-" : formatRM(agentStats.other);
-                    return { value: other, rowspan: 1, visible: true };
+                    return { value: formatOtherCommissionBreakdown(agentStats), rowspan: 1, visible: true };
                 }
                 return {
                     value: val === null || val === undefined || String(val).trim() === "" ? "-" : String(val),
@@ -2693,7 +3091,13 @@ modalPackageType.value = defaults.pkg || "-";
                 if (colsToMerge.includes(ci) && !cellGrid[ri][ci].visible) continue;
                 const td = document.createElement("td");
                 td.innerHTML = cellGrid[ri][ci].value;
-                if (ci === agentColIdx && cellGrid[ri][ci].value !== "-") td.textContent = resolveAgentName(cellGrid[ri][ci].value);
+                if (ci === agentColIdx && cellGrid[ri][ci].value !== "-") {
+                    td.textContent = resolveAgentName(cellGrid[ri][ci].value);
+                    // No Invoice Date column on this rollup, so the hover falls
+                    // back to the report month and names every role the month's
+                    // invoices span.
+                    attachAgentRoleHover(td, fullAgentNames[ri], "");
+                }
                 if (ci === agentColIdx && agentSpans[ri] > 1) td.rowSpan = agentSpans[ri];
                 if (ci === totalInvColIdx && totalInvVisible[ri] && totalInvSpans[ri] > 1) td.rowSpan = totalInvSpans[ri];
                 if (ci === referralFeeColIdx && referralFeeVisible[ri] && referralFeeSpans[ri] > 1) td.rowSpan = referralFeeSpans[ri];
@@ -2716,6 +3120,18 @@ modalPackageType.value = defaults.pkg || "-";
                         : getCommissionCalcBreakdown(row, headers, fullAgentNames[ri], "", ri, rows);
                     if (calcInfo) {
                         td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, calcInfo));
+                        td.addEventListener("mousemove", (e) => moveCommCalcTooltip(e));
+                        td.addEventListener("mouseleave", hideCommCalcTooltip);
+                    }
+                }
+
+                // Same breakdown on the summary's Override cell, which holds
+                // the "override from <source agent>" spelling.
+                if (ci === overrideColIdx && cellGrid[ri][ci].value !== "-") {
+                    const ovrInfo = getOverrideBreakdownTooltip(
+                        row, headers, resolveAgentName(fullAgentNames[ri]), cellGrid[ri][ci].value);
+                    if (ovrInfo) {
+                        td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, ovrInfo));
                         td.addEventListener("mousemove", (e) => moveCommCalcTooltip(e));
                         td.addEventListener("mouseleave", hideCommCalcTooltip);
                     }
@@ -2781,7 +3197,6 @@ modalPackageType.value = defaults.pkg || "-";
     function renderActiveSection() {
         showLoader(false);
         updateHeaders();
-        renderLegend();
         updateNoteBox();
 
 
@@ -2893,6 +3308,10 @@ modalPackageType.value = defaults.pkg || "-";
         const ganColIdx = headers.findIndex(h => {
             const n = h.toLowerCase().trim();
             return n === "gan lai soon" || n === "gan lai soon (rm)";
+        });
+        const safwanColIdx = headers.findIndex(h => {
+            const n = h.toLowerCase().trim();
+            return n === "safwan" || n === "safwan (rm)";
         });
         const overrideColIdx = headers.findIndex(h => h.toLowerCase().includes("override"));
         const totalInvColIdx = getCountColumnIdx(headers);
@@ -3134,14 +3553,12 @@ modalPackageType.value = defaults.pkg || "-";
             } else {
                 if (hasAgentSummary) renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents, filteredAgentStats, agentRemarks);
 
-                const legendCard = document.getElementById("legendCard");
-                const legendVisible = legendCard && !legendCard.classList.contains("hidden");
-                let actionsTarget = legendCard;
-                if (!legendVisible) {
-                    actionsTarget = document.createElement("div");
-                    actionsTarget.className = "agent-summary-inline-actions";
-                    tableContainer.insertBefore(actionsTarget, dataTable);
-                }
+                // These used to be tucked into the legend bar when it was on
+                // screen; with the legend gone they always get their own
+                // toolbar row, the same as the "All Agents" branch above.
+                const actionsTarget = document.createElement("div");
+                actionsTarget.className = "agent-summary-inline-actions";
+                tableContainer.insertBefore(actionsTarget, dataTable);
                 actionsTarget.appendChild(actionsGroup);
             }
 
@@ -3417,7 +3834,22 @@ modalPackageType.value = defaults.pkg || "-";
                         if (remainder !== parseMoneyValue(displayVal)) displayVal = formatRM(remainder);
                     }
                     td.innerHTML = displayVal;
-                    if (ci === agentIdx && displayVal !== "-") td.textContent = resolveAgentName(displayVal);
+                    if (ci === agentIdx && displayVal !== "-") {
+                        td.textContent = resolveAgentName(displayVal);
+                        // The agent cell is merged down every row it owns, so
+                        // the hover reads the invoice dates of all of them --
+                        // one row's date would describe a single customer while
+                        // the cell itself covers several, and they can straddle
+                        // a role change.
+                        let spannedDates = "";
+                        if (invoiceDateIdx !== -1) {
+                            const span = agentSpans[ri] > 1 ? agentSpans[ri] : 1;
+                            for (let k = ri; k < Math.min(ri + span, N); k++) {
+                                spannedDates += " " + String(rowsToRender[k][invoiceDateIdx] || "");
+                            }
+                        }
+                        attachAgentRoleHover(td, agentName, spannedDates);
+                    }
                     if (ci === agentIdx && agentSpans[ri] > 1) td.rowSpan = agentSpans[ri];
                     if (ci === totalInvColIdx && totalInvVisible[ri] && totalInvSpans[ri] > 1) td.rowSpan = totalInvSpans[ri];
                     if (colsToMerge.includes(ci) && cellGrid[ri][ci] && cellGrid[ri][ci].rowspan > 1) td.rowSpan = cellGrid[ri][ci].rowspan;
@@ -3431,6 +3863,15 @@ modalPackageType.value = defaults.pkg || "-";
                         const sysInfo = getCustomerSystemTooltip(custName);
                         if (sysInfo) {
                             td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, sysInfo));
+                            td.addEventListener("mousemove", (e) => moveCommCalcTooltip(e));
+                            td.addEventListener("mouseleave", hideCommCalcTooltip);
+                        }
+                    }
+
+                    if (ci === overrideColIdx && !isTotalRow && displayVal !== "-") {
+                        const ovrInfo = getOverrideBreakdownTooltip(row, headers, custName, displayVal);
+                        if (ovrInfo) {
+                            td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, ovrInfo));
                             td.addEventListener("mousemove", (e) => moveCommCalcTooltip(e));
                             td.addEventListener("mouseleave", hideCommCalcTooltip);
                         }
@@ -3453,19 +3894,17 @@ modalPackageType.value = defaults.pkg || "-";
 
 
 
-                    // Item 4: Red remark TEXT for special case rows, but the cell's
-                    // BACKGROUND matches the row's own tier color (same as the
-                    // Agent Tiers Legend) instead of standing out — including when
-                    // there's no real remark and the cell just shows "-".
+                    // Item 4: Red remark TEXT for special case rows. The cell's
+                    // background is left to the row — it used to be forced to
+                    // the row's tier colour in JS, but with the tier tint gone
+                    // there is nothing left to match, and inheriting keeps it
+                    // level with its neighbours whether or not there's a remark.
                     if (isSpecialRow && remarksIdx !== -1 && ci === remarksIdx) {
                         td.textContent = (row.specialCaseData && row.specialCaseData.remarks) ? String(row.specialCaseData.remarks) : displayVal;
                         td.classList.add("new-commission-value");
                         td.classList.add("special-case-remarks");
                         td.classList.add("special-case-remarks-cell");
                         td.style.whiteSpace = "normal";
-                        const tierColor = TIER_BG_COLORS[rowClass];
-                        if (tierColor) td.style.setProperty("background-color", tierColor, "important");
-                        else td.style.removeProperty("background-color");
                     }
 
                     if (isSpecialRow && referralFeeIdx !== -1 && ci === referralFeeIdx) {
@@ -3494,13 +3933,24 @@ modalPackageType.value = defaults.pkg || "-";
                         }
                     }
 
-                    // Factory: green Insert Profit Sharing / clickable commission price
+                    // Factory: brick-orange Insert Profit Sharing / clickable commission price
                     if (!isTotalRow && !isSpecialRow && ci === commissionPriceIdx && isFactoryBasicCommission(row, headers, agentName, custName)) {
                         const factoryDisplay = getFactoryCellDisplay(row, headers, agentName, custName, "agent");
                         if (factoryDisplay) td.innerHTML = factoryDisplay;
                         if (userObj && !userObj.readOnly) {
                             td.style.cursor = "pointer"; td.title = "Click to set Factory profit sharing rate";
                             td.addEventListener("click", () => openFactoryRateModal(row, headers, agentName, custName, "agent"));
+                        }
+                    }
+
+                    // Factory: Safwan's own separate profit-sharing rate --
+                    // independent of the agent's own rate above.
+                    if (!isTotalRow && !isSpecialRow && safwanColIdx !== -1 && ci === safwanColIdx && isFactoryBasicCommission(row, headers, agentName, custName)) {
+                        const safwanDisplay = getFactoryCellDisplay(row, headers, agentName, custName, "safwan");
+                        if (safwanDisplay) td.innerHTML = safwanDisplay;
+                        if (userObj && !userObj.readOnly) {
+                            td.style.cursor = "pointer"; td.title = "Click to set Safwan's Factory profit sharing rate";
+                            td.addEventListener("click", () => openFactoryRateModal(row, headers, agentName, custName, "safwan"));
                         }
                     }
 
@@ -3608,7 +4058,10 @@ modalPackageType.value = defaults.pkg || "-";
                     const colHeader = headers[ci];
                     if (isNumericHeader(colHeader)) td.classList.add("numeric");
                     else if (isDateHeader(colHeader)) td.classList.add("date");
-                    if (isAgentHeader(colHeader) && cellVal != null && String(cellVal).trim()) td.textContent = resolveAgentName(cellVal);
+                    if (isAgentHeader(colHeader) && cellVal != null && String(cellVal).trim()) {
+                        td.textContent = resolveAgentName(cellVal);
+                        attachAgentRoleHover(td, agentName, invoiceDateCellOf(row, headers));
+                    }
 
                     // Add hover breakdown & click handlers for Basic/NFP commission cells
                     if (state.activeSection === "basic_nfp" && !isTotalRow) {
@@ -3639,6 +4092,225 @@ modalPackageType.value = defaults.pkg || "-";
             });
             rowCount.textContent = displayedRows + " rows";
         }
+    }
+
+    // -------------------------------------------------------------
+    // Production Bonus refunds
+    // -------------------------------------------------------------
+    // An invoice that collected more than it was worth owes the customer the
+    // difference. Small overpayments are rounding, not refunds, so only amounts
+    // above this get a remark -- without it the column fills with 20-sen
+    // "refunds" nobody will ever make, and the real ones stop standing out.
+    // Set so the live data splits where it was agreed to: the RM 5.00 case is a
+    // refund, the RM 2.00 / RM 0.20 ones are noise.
+    // The bank account and the done tick are per invoice, not per month: the
+    // same overpayment shown in two reports is still one refund.
+    const PB_REFUND_MIN = 2;
+    let pbRefunds = null;          // invoice number -> saved refund; null = not fetched
+    let pbRefundsLoading = false;
+
+    function loadPbRefunds(onLoaded) {
+        if (pbRefundsLoading) return;
+        pbRefundsLoading = true;
+        fetch("/api/pb-refunds")
+            .then(r => r.json())
+            .then(d => { pbRefunds = (d && d.refunds) || {}; })
+            .catch(() => { pbRefunds = {}; })
+            .finally(() => { pbRefundsLoading = false; if (onLoaded) onLoaded(); });
+    }
+
+    function pbOverpayment(headers, row) {
+        const ci = headers.findIndex(h => String(h).toLowerCase().trim() === "collected payment");
+        const si = headers.findIndex(h => String(h).toLowerCase().trim() === "sales price");
+        if (ci === -1 || si === -1) return 0;
+        return parseMoneyValue(row[ci]) - parseMoneyValue(row[si]);
+    }
+
+    function pbRefundCellHtml(headers, row) {
+        const over = pbOverpayment(headers, row);
+        if (!(over > PB_REFUND_MIN)) return "-";
+        const invIdx = headers.findIndex(h => String(h).toLowerCase().includes("invoice number"));
+        const inv = invIdx === -1 ? "" : String(row[invIdx] || "").trim();
+        const saved = (pbRefunds && pbRefunds[inv]) || {};
+        const bank = String(saved.bank_account || "");
+        const done = !!saved.refund_done;
+        const stamp = done && saved.done_at
+            ? `— ${String(saved.done_at).slice(0, 10)}, ${saved.done_by || ""}`
+            : "";
+        // The amount is written by the report, never typed: it has to keep
+        // agreeing with the two columns it is the difference of.
+        return `<div class="pb-refund" data-invoice="${escapeHtml(inv)}" style="display:flex; flex-direction:column; gap:4px; white-space:normal;">
+            <div>To refund <b>${formatRM(over)}</b><span class="pb-refund-bank-hint" style="color:#64748b;"></span> to <span class="pb-refund-bank" contenteditable="true"
+                  title="Click to enter the account this is refunded to"
+                  style="border-bottom:1px dashed #94a3b8; padding:0 2px; cursor:text; ${bank ? "" : "color:#94a3b8; font-style:italic;"}"
+                  >${escapeHtml(bank || "[insert Bank Account Number]")}</span></div>
+            <label style="display:inline-flex; align-items:center; gap:6px; font-size:12px; color:#475569; cursor:pointer;">
+              <input type="checkbox" class="pb-refund-done"${done ? " checked" : ""}> Refund done
+              <span class="pb-refund-stamp" style="color:#64748b;">${escapeHtml(stamp)}</span>
+            </label>
+        </div>`;
+    }
+
+    // The Collected Payment cell is a sum. Clicking it opens what it is a sum
+    // of, slips included -- which is also the only place a refund's bank and
+    // account holder are recorded, since no column in the database holds them.
+    function pbPaymentsLinkHtml(headers, row) {
+        const ci = headers.findIndex(h => String(h).toLowerCase().trim() === "collected payment");
+        const invIdx = headers.findIndex(h => String(h).toLowerCase().includes("invoice number"));
+        const custIdx = headers.findIndex(h => String(h).toLowerCase().includes("customer"));
+        const val = ci === -1 ? "-" : String(row[ci] ?? "-");
+        const inv = invIdx === -1 ? "" : String(row[invIdx] || "").trim();
+        if (!inv) return escapeHtml(val);
+        const cust = custIdx === -1 ? "" : String(row[custIdx] || "").trim();
+        // Reads as an ordinary amount -- no link colour, no underline. The
+        // pointer cursor and the tooltip are the whole affordance.
+        return `<span class="pb-pay-link" data-invoice="${escapeHtml(inv)}" data-customer="${escapeHtml(cust)}"
+            title="Click to see the payments and slips behind this figure"
+            style="cursor:pointer; color:inherit;">${escapeHtml(val)}</span>`;
+    }
+
+    function paymentSlipsHtml(d) {
+        const rows = (d && d.payments) || [];
+        if (!rows.length) return `<p style="color:#64748b;">No payments recorded against this invoice.</p>`;
+        const items = rows.map(p => {
+            const ref = String(p.remark || "").replace(/^\[Ref:\s*/i, "").replace(/\]$/, "").trim();
+            const slips = (p.slips || []).map(u =>
+                `<a href="${escapeHtml(u)}" target="_blank" rel="noopener noreferrer" title="Open the full slip">
+                   <img src="${escapeHtml(u)}" loading="lazy" alt="Payment slip"
+                        style="max-width:200px; max-height:160px; border:1px solid var(--border-color); border-radius:6px; display:block;">
+                 </a>`).join("")
+                || `<span style="color:#94a3b8; font-size:12px;">no slip attached</span>`;
+            return `<div style="display:flex; gap:16px; padding:12px 0; border-bottom:1px solid var(--border-color); align-items:flex-start;">
+                <div style="flex:1; min-width:0;">
+                  <div style="font-weight:700; font-size:15px;">${formatRM(p.amount)}</div>
+                  <div style="color:#475569; font-size:13px;">${escapeHtml(p.payment_date || "-")}</div>
+                  <div style="color:#475569; font-size:13px;">${escapeHtml(p.payment_method || "-")}${p.issuer_bank ? " · " + escapeHtml(p.issuer_bank) : ""}</div>
+                  ${ref && ref.toUpperCase() !== "N/A" ? `<div style="color:#64748b; font-size:12px;">Ref ${escapeHtml(ref)}</div>` : ""}
+                </div>
+                <div>${slips}</div>
+            </div>`;
+        }).join("");
+        return `<div style="margin-bottom:10px; color:#475569;">
+                  <b>${rows.length}</b> payment${rows.length === 1 ? "" : "s"} · total <b>${formatRM(d.total || 0)}</b>
+                  <div style="font-size:12px; color:#64748b; margin-top:4px;">
+                    A cash bank-in slip shows the account paid <em>into</em>; a cheque or transfer slip
+                    shows who paid. Confirm any account with the payer before refunding.
+                  </div>
+                </div>${items}`;
+    }
+
+    function openPaymentSlipsModal(invoiceNumber, customerName) {
+        const modal = document.getElementById("paymentSlipsModal");
+        const body = document.getElementById("paymentSlipsBody");
+        const titleEl = document.getElementById("paymentSlipsTitle");
+        if (!modal || !body) return;
+        if (titleEl) {
+            titleEl.textContent = customerName
+                ? `Payments — ${customerName} (Invoice ${invoiceNumber})`
+                : `Payments — Invoice ${invoiceNumber}`;
+        }
+        body.innerHTML = `<p style="color:#64748b;">Loading payments…</p>`;
+        modal.classList.remove("hidden");
+        fetch(`/api/invoice-payments?invoice_number=${encodeURIComponent(invoiceNumber)}`)
+            .then(r => r.json())
+            .then(d => { body.innerHTML = paymentSlipsHtml(d); })
+            .catch(() => {
+                body.innerHTML = `<p style="color:#b91c1c;">Could not load the payments for this invoice.</p>`;
+            });
+    }
+
+    function wirePbPaymentLinks(root) {
+        root.querySelectorAll(".pb-pay-link").forEach(el => {
+            el.addEventListener("click", (e) => {
+                e.stopPropagation();
+                openPaymentSlipsModal(el.getAttribute("data-invoice"),
+                                      el.getAttribute("data-customer"));
+            });
+        });
+    }
+
+    // Which bank the money came from, for the refund remark. Free text typed by
+    // whoever keyed the payment ("MAYBANK", "MAYBAK", "Ocbc "), so it is offered
+    // as a hint and never as the account itself -- and an invoice paid from two
+    // banks says so rather than picking one.
+    function fillPbRefundBankHints(root) {
+        root.querySelectorAll(".pb-refund").forEach(box => {
+            const inv = box.getAttribute("data-invoice");
+            const hintEl = box.querySelector(".pb-refund-bank-hint");
+            if (!inv || !hintEl) return;
+            fetch(`/api/invoice-payments?invoice_number=${encodeURIComponent(inv)}`)
+                .then(r => r.json())
+                .then(d => {
+                    const banks = [...new Set((d.payments || [])
+                        .map(p => String(p.issuer_bank || "").trim())
+                        .filter(Boolean)
+                        .map(b => b.toUpperCase()))];
+                    hintEl.textContent = banks.length ? ` (paid from ${banks.join(" / ")})` : "";
+                })
+                .catch(() => {});
+        });
+    }
+
+    function wirePbRefundCells(root) {
+        root.querySelectorAll(".pb-refund").forEach(box => {
+            const inv = box.getAttribute("data-invoice");
+            const bankEl = box.querySelector(".pb-refund-bank");
+            const doneEl = box.querySelector(".pb-refund-done");
+            const stampEl = box.querySelector(".pb-refund-stamp");
+            const placeholder = "[insert Bank Account Number]";
+            const bankValue = () => {
+                const t = bankEl ? bankEl.textContent.trim() : "";
+                return t === placeholder ? "" : t;
+            };
+            const save = () => {
+                const body = {
+                    invoice_number: inv,
+                    bank_account: bankValue(),
+                    refund_done: doneEl ? doneEl.checked : false
+                };
+                fetch("/api/pb-refunds", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body)
+                })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (!d || !d.refund) return;
+                        pbRefunds = pbRefunds || {};
+                        pbRefunds[inv] = d.refund;
+                        // Updated in place rather than by redrawing the table:
+                        // a redraw here would throw away the row the user is
+                        // still working in.
+                        if (stampEl) {
+                            stampEl.textContent = d.refund.refund_done && d.refund.done_at
+                                ? `— ${String(d.refund.done_at).slice(0, 10)}, ${d.refund.done_by || ""}`
+                                : "";
+                        }
+                    })
+                    .catch(() => {});
+            };
+            if (bankEl) {
+                bankEl.addEventListener("focus", () => {
+                    if (bankEl.textContent.trim() === placeholder) {
+                        bankEl.textContent = "";
+                        bankEl.style.color = "";
+                        bankEl.style.fontStyle = "";
+                    }
+                });
+                bankEl.addEventListener("keydown", (e) => {
+                    if (e.key === "Enter") { e.preventDefault(); bankEl.blur(); }
+                });
+                bankEl.addEventListener("blur", () => {
+                    if (!bankEl.textContent.trim()) {
+                        bankEl.textContent = placeholder;
+                        bankEl.style.color = "#94a3b8";
+                        bankEl.style.fontStyle = "italic";
+                    }
+                    save();
+                });
+            }
+            if (doneEl) doneEl.addEventListener("change", save);
+        });
     }
 
     // -------------------------------------------------------------
@@ -3767,9 +4439,24 @@ modalPackageType.value = defaults.pkg || "-";
             wrapper.appendChild(createBonusSubTable("OGM Production Bonus Summary", bonusData.headers_ogm, ogmRows));
         }
 
-        // Table 3: Team Sales Details
+        // Table 3: Team Sales Details, with a Remarks column for the invoices
+        // that collected more than they were worth.
         if (matchingDetailRows.length > 0) {
-            wrapper.appendChild(createBonusSubTable("Production Bonus Summary by customer", detailHeaders, matchingDetailRows));
+            if (pbRefunds === null) loadPbRefunds(() => renderActiveSection());
+            const detailHeadersWithRemarks = detailHeaders.concat(["Remarks"]);
+            const collectedIdx = detailHeaders.findIndex(
+                h => String(h).toLowerCase().trim() === "collected payment");
+            const detailRowsWithRemarks = matchingDetailRows.map(r => {
+                const out = r.slice();
+                if (collectedIdx !== -1) out[collectedIdx] = pbPaymentsLinkHtml(detailHeaders, r);
+                return out.concat([pbRefundCellHtml(detailHeaders, r)]);
+            });
+            const detailTable = createBonusSubTable(
+                "Production Bonus Summary by customer", detailHeadersWithRemarks, detailRowsWithRemarks);
+            wirePbRefundCells(detailTable);
+            wirePbPaymentLinks(detailTable);
+            fillPbRefundBankHints(detailTable);
+            wrapper.appendChild(detailTable);
         }
 
         tableContainer.appendChild(wrapper);
@@ -4029,7 +4716,10 @@ modalPackageType.value = defaults.pkg || "-";
                 }
                 
                 td.innerHTML = displayVal;
-                if (isAgentHeader(colHeader) && displayVal !== "-") td.textContent = resolveAgentName(displayVal);
+                if (isAgentHeader(colHeader) && displayVal !== "-") {
+                    td.textContent = resolveAgentName(displayVal);
+                    attachAgentRoleHover(td, agentName, invoiceDateCellOf(row, headers));
+                }
 
                 if (isNumericHeader(colHeader)) td.classList.add("numeric");
                 else if (isDateHeader(colHeader)) td.classList.add("date");
@@ -4199,7 +4889,10 @@ modalPackageType.value = defaults.pkg || "-";
                 
                 let displayVal = cellVal === null || cellVal === undefined ? "-" : String(cellVal);
                 td.innerHTML = displayVal;
-                if (isAgentHeader(colHeader) && displayVal !== "-") td.textContent = resolveAgentName(displayVal);
+                if (isAgentHeader(colHeader) && displayVal !== "-") {
+                    td.textContent = resolveAgentName(displayVal);
+                    attachAgentRoleHover(td, agentName, invoiceDateCellOf(row, headers));
+                }
 
                 if (isNumericHeader(colHeader)) td.classList.add("numeric");
                 else if (isDateHeader(colHeader)) td.classList.add("date");
@@ -4268,8 +4961,11 @@ modalPackageType.value = defaults.pkg || "-";
     }
 
     function getFactoryBaseRate(target) {
+        // Matches build_commission_pack.py / outsource_basic_commission.py /
+        // full_internal_basic_commission.py: the Factory base rate is a flat
+        // 2.0% for both agent types, and 0.5% for Safwan's own separate cut.
         if (target === "safwan") return 0.5;
-        return state.activeAgentType === "outsource" ? 2.5 : 2.0;
+        return 2.0;
     }
 
     function getFactoryRateKey(agent, customer) {
@@ -4306,13 +5002,16 @@ modalPackageType.value = defaults.pkg || "-";
             && customerName !== "-";
     }
 
+    // Only ever returns the "Insert Profit Sharing" placeholder, or null.
+    // Once a rate is saved, the cell already holds the server-computed
+    // figure (build_commission_pack.py applies the OSA/OUM/OGM split there),
+    // so this must NOT overwrite it with a client-side recomputation --
+    // that would only ever show the agent's un-split 100% share again.
     function getFactoryCellDisplay(row, headers, fullAgentName, customerName, target) {
-        const salesIdx = headers.findIndex(h => h.toLowerCase().trim() === "sales price" || h.toLowerCase().trim() === "total amount");
-        const sales = salesIdx !== -1 ? parseMoneyValue(row[salesIdx]) : 0;
         const rateData = findFactoryRate(fullAgentName, customerName);
         const profitSharing = getFactoryProfitSharingValue(rateData, target);
         if (profitSharing === null) return '<span class="profit-sharing-value">Insert Profit Sharing</span>';
-        return formatRM(getFactoryCommissionValue(sales, profitSharing, target));
+        return null;
     }
 
     function isSpecialCaseCommissionType(commissionType) {
@@ -4420,64 +5119,14 @@ modalPackageType.value = defaults.pkg || "-";
     }
 
     // -------------------------------------------------------------
-    // Dynamic Legend & Notes Box
+    // Notes Box
     // -------------------------------------------------------------
-    function renderLegend() {
-        const legendCard = document.getElementById("legendCard");
-        if (!legendCard) return;
-        
-        if (state.activeSection === "monthly_contest") {
-            legendCard.innerHTML = "";
-            legendCard.classList.add("hidden");
-            return;
-        }
-
-        legendCard.classList.remove("hidden");
-
-        if (state.activeAgentType === "all") {
-            legendCard.innerHTML = `
-                <div class="legend-details">
-                    <span class="legend-label">Agent Tiers Legend</span>
-                    <div class="legend-items" style="align-items: center;">
-                        <span class="legend-item-group-title" style="font-weight: 600; color: #475569; margin-right: 2px;">Internal:</span>
-                        <span class="legend-item"><span class="legend-dot" style="background-color: #E0F2FE; border: 1px solid #7DD3FC;"></span>Senior</span>
-                        <span class="legend-item"><span class="legend-dot" style="background-color: #F0F9FF; border: 1px solid #bae6fd;"></span>Executive</span>
-                        <span class="legend-divider" style="border-left: 1px solid #cbd5e1; margin: 0 8px; height: 16px; display: inline-block;"></span>
-                        <span class="legend-item-group-title" style="font-weight: 600; color: #475569; margin-right: 2px;">Outsource:</span>
-                        <span class="legend-item"><span class="legend-dot" style="background-color: rgba(30, 58, 138, 0.28); border: 1px solid rgba(30, 58, 138, 0.55);"></span>OGM</span>
-                        <span class="legend-item"><span class="legend-dot" style="background-color: rgba(30, 58, 138, 0.16); border: 1px solid rgba(30, 58, 138, 0.4);"></span>OUM</span>
-                        <span class="legend-item"><span class="legend-dot" style="background-color: rgba(30, 58, 138, 0.07); border: 1px solid rgba(30, 58, 138, 0.28);"></span>OSA</span>
-                    </div>
-                </div>
-            `;
-            return;
-        }
-
-        let showInternalTiers = state.activeAgentType === "internal";
-        
-        if (showInternalTiers) {
-            legendCard.innerHTML = `
-                <div class="legend-details">
-                    <span class="legend-label">Agent Tiers Legend</span>
-                    <div class="legend-items">
-                        <span class="legend-item"><span class="legend-dot" style="background-color: #E0F2FE; border: 1px solid #7DD3FC;"></span>Senior</span>
-                        <span class="legend-item"><span class="legend-dot" style="background-color: #F0F9FF; border: 1px solid #bae6fd;"></span>Executive</span>
-                    </div>
-                </div>
-            `;
-        } else {
-            legendCard.innerHTML = `
-                <div class="legend-details">
-                    <span class="legend-label">Agent Tiers Legend</span>
-                    <div class="legend-items">
-                        <span class="legend-item"><span class="legend-dot" style="background-color: rgba(30, 58, 138, 0.28); border: 1px solid rgba(30, 58, 138, 0.55);"></span>OGM</span>
-                        <span class="legend-item"><span class="legend-dot" style="background-color: rgba(30, 58, 138, 0.16); border: 1px solid rgba(30, 58, 138, 0.4);"></span>OUM</span>
-                        <span class="legend-item"><span class="legend-dot" style="background-color: rgba(30, 58, 138, 0.07); border: 1px solid rgba(30, 58, 138, 0.28);"></span>OSA</span>
-                    </div>
-                </div>
-            `;
-        }
-    }
+    // The Agent Tiers Legend used to sit here, decoding the row tint. Both are
+    // retired: the tint could only ever say which *band* an agent sat in, and
+    // it said it for the report month, so an invoice raised before a promotion
+    // was coloured by a role its agent did not hold at the time. Hovering an
+    // agent name now names the exact role, resolved against that row's own
+    // invoice date -- see agentRoleTooltip().
 
     function updateNoteBox() {
         const noteBox = document.getElementById("noteBox");
@@ -5126,6 +5775,22 @@ modalPackageType.value = defaults.pkg || "-";
 
     if (closeModalBtn) closeModalBtn.addEventListener("click", closeModal);
 
+    // Payment slips modal close handlers
+    const paymentSlipsModalEl = document.getElementById("paymentSlipsModal");
+    const closePaymentSlipsBtn = document.getElementById("closePaymentSlipsBtn");
+    const closePaymentSlips = () => {
+        if (paymentSlipsModalEl) paymentSlipsModalEl.classList.add("hidden");
+    };
+    if (closePaymentSlipsBtn) closePaymentSlipsBtn.addEventListener("click", closePaymentSlips);
+    if (paymentSlipsModalEl) {
+        paymentSlipsModalEl.addEventListener("click", (e) => {
+            if (e.target === paymentSlipsModalEl) closePaymentSlips();
+        });
+    }
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") closePaymentSlips();
+    });
+
     // Section Note modal close handlers
     const closeNoteModalBtn = document.getElementById("closeNoteModalBtn");
     const noteModalEl = document.getElementById("noteModal");
@@ -5464,6 +6129,28 @@ modalPackageType.value = defaults.pkg || "-";
     const closeFactoryModalBtn = document.getElementById("closeFactoryModalBtn");
     const saveFactoryModalBtn = document.getElementById("saveFactoryModalBtn");
 
+    // Cache of agent -> {tier, oum_name, ogm_name} from the Agent Roles &
+    // Hierarchy Data page, via /api/factory-split-hierarchy. Kept client-side
+    // only for the preview breakdown below; the actual split that gets paid
+    // is always computed server-side in build_commission_pack.py.
+    const factorySplitHierarchyCache = new Map();
+
+    async function fetchFactorySplitHierarchy(agent) {
+        const key = String(agent || "").trim().toLowerCase();
+        if (!key) return { tier: "", oum_name: null, ogm_name: null };
+        if (factorySplitHierarchyCache.has(key)) return factorySplitHierarchyCache.get(key);
+        try {
+            const res = await fetch(`/api/factory-split-hierarchy?agent=${encodeURIComponent(agent)}`);
+            const data = await res.json().catch(() => ({}));
+            const result = res.ok ? data : { tier: "", oum_name: null, ogm_name: null };
+            factorySplitHierarchyCache.set(key, result);
+            return result;
+        } catch (err) {
+            console.error("Error fetching factory split hierarchy:", err);
+            return { tier: "", oum_name: null, ogm_name: null };
+        }
+    }
+
     function openFactoryRateModal(rowRef, headers, agentName, customerName, target) {
         if (!factoryRateModal) return;
         if (state.activeAgentType === "all") {
@@ -5491,7 +6178,8 @@ modalPackageType.value = defaults.pkg || "-";
             system,
             nfp,
             sales,
-            target
+            target,
+            hierarchy: null
         };
 
         factoryAgentName.value = agentName;
@@ -5506,11 +6194,60 @@ modalPackageType.value = defaults.pkg || "-";
 
         updateFactoryModalCalculations();
         factoryRateModal.classList.remove("hidden");
+
+        // The split only applies to the agent's own rate, never Safwan's.
+        if (target === "agent") {
+            fetchFactorySplitHierarchy(agentName).then((hierarchy) => {
+                if (!state.editingFactoryRate || state.editingFactoryRate.agent !== agentName) return;
+                state.editingFactoryRate.hierarchy = hierarchy;
+                updateFactoryModalCalculations();
+            });
+        }
     }
 
     function closeFactoryModal() {
         state.editingFactoryRate = null;
         if (factoryRateModal) factoryRateModal.classList.add("hidden");
+    }
+
+    // Mirrors the confirmed split in build_commission_pack.py's
+    // fetch_outsource_basic(): applied to the WHOLE Agent Commission (base +
+    // sharing), only once profit sharing is actually set.
+    //   OSA -> OUM found:    OSA 70% / OUM 20% / OGM 10%
+    //   OSA -> OGM directly: OSA 70% / OGM 10%, 20% unpaid
+    //   OSA -> no report:    OSA 70%, 30% unpaid
+    //   agent is the OUM:    OUM 20%, 80% unpaid
+    function renderFactorySplitBreakdown(fullCommission, sharing, hierarchy) {
+        const box = document.getElementById("factorySplitBreakdown");
+        if (!box) return;
+        if (!hierarchy || sharing <= 0) { box.innerHTML = ""; return; }
+
+        const tier = String(hierarchy.tier || "").toUpperCase();
+        const rows = [];
+        const row = (label, amount) => rows.push(`
+            <div class="preview-row">
+                <span>${label}:</span>
+                <strong>${formatRM(amount)}</strong>
+            </div>`);
+
+        if (tier === "OSA" || tier === "OSA 1" || tier === "OSA1") {
+            row("OSA Share (70%)", fullCommission * 0.70);
+            if (hierarchy.oum_name) row(`OUM Share (20%) — ${hierarchy.oum_name}`, fullCommission * 0.20);
+            if (hierarchy.ogm_name) row(`OGM Share (10%) — ${hierarchy.ogm_name}`, fullCommission * 0.10);
+            if (!hierarchy.oum_name && !hierarchy.ogm_name) {
+                row("Unallocated (30% — no Reports To on file)", fullCommission * 0.30);
+            } else if (!hierarchy.oum_name || !hierarchy.ogm_name) {
+                row("Unallocated (20%)", fullCommission * 0.20);
+            }
+        } else if (tier === "OUM") {
+            row("OUM Share (20%)", fullCommission * 0.20);
+            row("Unallocated (80%)", fullCommission * 0.80);
+        } else {
+            box.innerHTML = "";
+            return;
+        }
+
+        box.innerHTML = rows.join("");
     }
 
     function updateFactoryModalCalculations() {
@@ -5525,6 +6262,13 @@ modalPackageType.value = defaults.pkg || "-";
         factoryBasicCommissionRate.value = baseRate;
         factoryFormula.textContent = `${baseRate.toFixed(1)}% base + ${profitSharing}% sharing`;
         previewFactoryComm.textContent = formatRM(commission);
+
+        if (target === "agent") {
+            renderFactorySplitBreakdown(commission, profitSharing, state.editingFactoryRate.hierarchy);
+        } else {
+            const box = document.getElementById("factorySplitBreakdown");
+            if (box) box.innerHTML = "";
+        }
     }
 
     if (factoryProfitSharingRate) {
@@ -5615,12 +6359,11 @@ modalPackageType.value = defaults.pkg || "-";
     // -------------------------------------------------------------
     // Net Floor Price List navigation
     // -------------------------------------------------------------
-    // Sends the user to the Data page, on the Basic & Net Floor Price
-    // Commission section, with the list already open on the same month
-    // the report page was showing.
+    // Sends the user to the Data page, on the Net Floor Price section, with
+    // the list already open on the same month the report page was showing.
     function goToNfpListPage() {
         const month = String(state.activeMonth || "").padStart(2, "0");
-        window.location.href = `/data?section=basic_nfp&showNfpList=1&month=${encodeURIComponent(month)}`;
+        window.location.href = `/data?section=nfp&showNfpList=1&month=${encodeURIComponent(month)}`;
     }
 
     // -------------------------------------------------------------
@@ -5754,6 +6497,7 @@ modalPackageType.value = defaults.pkg || "-";
         const refRateIdx = headers.findIndex(h => h.toLowerCase().includes("referral rate"));
         const refFeeIdx = headers.findIndex(h => h.toLowerCase().includes("referral fee"));
         const otherCommIdx = headers.findIndex(h => h.toLowerCase().includes("other comm") || h.toLowerCase().trim() === "override");
+        const advanceIdx = headers.findIndex(h => h.toLowerCase().includes("rm300") || h.toLowerCase().includes("basic commission (rm"));
 
         const parseVal = (v) => {
             if (!v || v === "-") return 0;
@@ -5843,6 +6587,16 @@ modalPackageType.value = defaults.pkg || "-";
             let basicRate = salesPrice > 0 ? ((basicCommVal / salesPrice) * 100) : getDefaultBasicRateForPackage(pkg, agentName);
             if (isNaN(basicRate)) basicRate = 3.0;
 
+            // The RM 300 advance is a flat tranche, not a percentage of the
+            // sale, so dividing it by the sales price invents a rate that
+            // nobody agreed to (RM 300 on a RM 30k invoice reads as 1.00%,
+            // not the 5% the agent is actually on). When the line is paying
+            // the advance -- its commission amount matches the Basic
+            // Commission (RM300) cell -- the rate column stays blank.
+            const advanceVal = advanceIdx !== -1 ? parseVal(basicRow[advanceIdx]) : 0;
+            const isAdvanceLine = advanceVal > 0 && basicCommVal > 0
+                && Math.abs(advanceVal - basicCommVal) < 0.005;
+
             const remarks = remarksIdx !== -1 && basicRow[remarksIdx] ? String(basicRow[remarksIdx]).trim() : "";
             if (remarks && remarks !== "-") {
                 notesList.push(`Item No. ${itemNo} - ${remarks}`);
@@ -5865,7 +6619,7 @@ modalPackageType.value = defaults.pkg || "-";
                 <td><b>${escapeHtml(customerName)}</b></td>
                 <td class="numeric">${sysPrice > 0 ? formatRM(sysPrice) : "-"}</td>
                 <td class="numeric">${salesPrice > 0 ? formatRM(salesPrice) : "-"}</td>
-                <td style="text-align: center;">${basicRate.toFixed(2)}%</td>
+                <td style="text-align: center;">${isAdvanceLine ? "-" : basicRate.toFixed(2) + "%"}</td>
                 <td class="numeric" style="font-weight: 700;">${formatRM(basicCommVal)}</td>
                 <td style="text-align: center;">${escapeHtml(refPerson)}</td>
                 <td style="text-align: center;">${refRate > 0 ? refRate.toFixed(1) + "%" : "-"}</td>

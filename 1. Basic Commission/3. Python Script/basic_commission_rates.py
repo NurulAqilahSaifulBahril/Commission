@@ -1,4 +1,5 @@
 import csv
+import re
 import sqlite3
 from pathlib import Path
 from decimal import Decimal
@@ -374,6 +375,175 @@ def _best_unified_row(agent_type: str, hierarchy: str, month: int, year: int = 2
         if best is None or (cand[0], cand[1]) > (best[0], best[1]):
             best = cand
     return (best[2], best[3], best[4]) if best else None
+
+
+# ── Net Floor Price tier rates (dashboard "commission_rates") ────────────────
+# The NFP engine hardcoded 25% / 100% / 20%. Those three numbers are now entered
+# on the Data page's Net Floor Price section, one row per tier, with the tier
+# itself written in the row's `condition` cell (its payout stages go in `label`,
+# because `condition` is spoken for). Nothing is entered by default, so while the
+# table holds no NFP rows every lookup returns the engine's original constants
+# and not a single payout moves.
+
+NFP_TIER_SALES_ABOVE = "sales_above"
+NFP_TIER_SYSTEM_ABOVE = "system_above"
+NFP_TIER_SALES_BELOW = "sales_below"
+
+NFP_DEFAULT_TIER_RATES = {
+    NFP_TIER_SALES_ABOVE: Decimal("0.25"),
+    NFP_TIER_SYSTEM_ABOVE: Decimal("1.00"),
+    NFP_TIER_SALES_BELOW: Decimal("0.20"),
+}
+
+
+def nfp_tier_key(condition: str):
+    """Which tier a stored condition names, or None.
+
+    Read off the comparison itself rather than the wording around it. These
+    labels have already carried "i." / "ii." / "iii." numerals and a trailing
+    explanation ("— pays (Sales − NFP) × rate"), and rows saved under either
+    spelling have to keep resolving to the same tier.
+    """
+    text = re.sub(r"^\s*(iii|ii|i)\.\s*", "", str(condition or "").lower())
+    head = re.split(r"[—(]", text)[0]
+    # "system price > net floor price" also contains ">", so the system tier has
+    # to be recognised before the sales-above one.
+    if "system" in head:
+        return NFP_TIER_SYSTEM_ABOVE
+    if "<" in head or "below" in head:
+        return NFP_TIER_SALES_BELOW
+    if ">" in head or "above" in head:
+        return NFP_TIER_SALES_ABOVE
+    return None
+
+
+def get_nfp_tier_rates(agent_type: str, month: int, year: int = 2026,
+                       agent: str = None, hierarchy: str = None) -> dict:
+    """The three NFP tier rates for this case, as fractions of 1.
+
+    Same precedence as every other Data page rate: a row naming the agent beats
+    a role-level row, and among equals the latest effective month wins. Each
+    tier resolves on its own, so entering one does not disturb the other two —
+    a tier nobody has entered keeps the engine's built-in rate.
+    """
+    target = f"{year:04d}-{month:02d}"
+    atype = str(agent_type or "").strip().lower()
+    role = _normalize_hierarchy(hierarchy) if hierarchy else ""
+    agent_key = _canon_agent_key(agent)
+
+    best = {}   # tier -> (specificity, effective_start, rate)
+    for r in _unified_rows():
+        if _cell(r, "rate_type") != "Net Floor Price Rate":
+            continue
+        if _cell(r, "remarks").lower() == "deleted":
+            continue
+        tier = nfp_tier_key(_cell(r, "condition"))
+        if tier is None:
+            continue
+        row_atype = _cell(r, "agent_type").lower()
+        if row_atype and row_atype != atype:
+            continue
+        row_role = _cell(r, "hierarchy")
+        if row_role and _normalize_hierarchy(row_role) != role:
+            continue
+        eff = _cell(r, "effective_from")
+        if not effective_covers(eff, target):
+            continue
+        row_agents = _row_agent_list(r)
+        if row_agents and agent_key not in {_canon_agent_key(a) for a in row_agents}:
+            continue
+        try:
+            rate = Decimal(_cell(r, "rate_pct").replace("%", "")) / Decimal("100")
+        except Exception:
+            continue
+        cand = (2 if row_agents else 0, effective_start(eff), rate)
+        prev = best.get(tier)
+        if prev is None or (cand[0], cand[1]) > (prev[0], prev[1]):
+            best[tier] = cand
+
+    rates = dict(NFP_DEFAULT_TIER_RATES)
+    for tier, cand in best.items():
+        rates[tier] = cand[2]
+    return rates
+
+
+def _best_nfp_rows(agent_type: str, month: int, year: int = 2026,
+                   agent: str = None, hierarchy: str = None) -> list:
+    """The NFP rows governing this case, one per tier."""
+    target = f"{year:04d}-{month:02d}"
+    atype = str(agent_type or "").strip().lower()
+    role = _normalize_hierarchy(hierarchy) if hierarchy else ""
+    agent_key = _canon_agent_key(agent)
+
+    best = {}
+    for r in _unified_rows():
+        if _cell(r, "rate_type") != "Net Floor Price Rate":
+            continue
+        if _cell(r, "remarks").lower() == "deleted":
+            continue
+        tier = nfp_tier_key(_cell(r, "condition"))
+        if tier is None:
+            continue
+        row_atype = _cell(r, "agent_type").lower()
+        if row_atype and row_atype != atype:
+            continue
+        row_role = _cell(r, "hierarchy")
+        if row_role and _normalize_hierarchy(row_role) != role:
+            continue
+        eff = _cell(r, "effective_from")
+        if not effective_covers(eff, target):
+            continue
+        row_agents = _row_agent_list(r)
+        if row_agents and agent_key not in {_canon_agent_key(a) for a in row_agents}:
+            continue
+        cand = (2 if row_agents else 0, effective_start(eff), r)
+        prev = best.get(tier)
+        if prev is None or (cand[0], cand[1]) > (prev[0], prev[1]):
+            best[tier] = cand
+    return [c[2] for c in best.values()]
+
+
+NFP_DEFAULT_PAYOUT_TRIGGER = Decimal("100")
+
+
+def get_nfp_payout_trigger(agent_type: str, month: int, year: int = 2026,
+                           agent: str = None, hierarchy: str = None) -> Decimal:
+    """The payment percentage at which NFP commission is recognised.
+
+    NFP pays as ONE figure per invoice (tier a minus tier c), so it recognises
+    at one moment, not once per tier. When the governing tiers disagree the
+    latest of their triggers wins — money is recognised when every condition
+    attached to it has been met, never before.
+
+    Advance stages are ignored: an advance is a part-payment of a commission,
+    and the NFP report carries no such split to pay one against.
+
+    Falls back to 100% -- what this report has always done -- when no governing
+    row states a trigger.
+    """
+    triggers = []
+    for r in _best_nfp_rows(agent_type, month, year=year, agent=agent,
+                            hierarchy=hierarchy):
+        pol = policy_from_row(r)
+        if pol and pol.balance_trigger is not None:
+            triggers.append(pol.balance_trigger)
+    return max(triggers) if triggers else NFP_DEFAULT_PAYOUT_TRIGGER
+
+
+def nfp_payout_thresholds_in_use() -> list:
+    """Every payment percentage an NFP row asks for, so the NFP query knows
+    which milestone dates it has to compute. 100 is always in the set: it is
+    what an unconfigured tier falls back to."""
+    out = {NFP_DEFAULT_PAYOUT_TRIGGER}
+    for r in _unified_rows():
+        if _cell(r, "rate_type") != "Net Floor Price Rate":
+            continue
+        if _cell(r, "remarks").lower() == "deleted":
+            continue
+        pol = policy_from_row(r)
+        if pol and pol.balance_trigger is not None:
+            out.add(pol.balance_trigger)
+    return sorted(out)
 
 
 # ── Payout policy (when a commission is recognised) ──────────────────────────

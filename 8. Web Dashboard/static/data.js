@@ -43,7 +43,7 @@
           formula: "(a − b) × z" },
         { key: "Production Bonus Rate", wired: false, unit: "%",
           rule: "Monthly production target", formula: "per scheme" },
-        { key: "Net Floor Price Rate", wired: false, unit: "%",
+        { key: "Net Floor Price Rate", wired: true, unit: "%",
           rule: "Tiered vs NFP (i / ii / iii)",
           ruleLines: [
               "i. Sales Price > Net Floor Price → positive rate",
@@ -116,6 +116,19 @@
      *  "2026-07" purely because it is the longer string. */
     function effStart(eff) { return splitEffRange(eff)[0]; }
     function effEnd(eff) { return splitEffRange(eff)[1]; }
+
+    /** Does this row's Invoice Date govern `ym` ("YYYY-MM")? Mirrors
+     *  effective_covers() in basic_commission_rates.py, so filtering by a month
+     *  shows exactly the rows the commission engines would price that month
+     *  with — an open-ended "2026-01" still counts for every later month.
+     *  A row with no date covers nothing, so it drops out of a month filter;
+     *  the needs-review banner still counts it, since that reads the unfiltered
+     *  list. */
+    function effectiveCoversMonth(eff, ym) {
+        const [start, end] = splitEffRange(eff);
+        if (!start || !ym) return false;
+        return start <= ym && ym <= end;
+    }
 
     /** "2026-12" -> "2027-01" */
     function nextYm(ym) {
@@ -338,9 +351,9 @@
         document.getElementById("accountWhoami").textContent = `${me.username} (${me.role})`;
         isAdmin = me.role === "admin";
         if (isAdmin) {
-            ["editModeBtn", "nfpUploadBtn", "seedRolesBtn", "addRoleBtn", "showExcludedRolesBtn", "saveRolesBtn",
+            ["editModeBtn", "nfpAddBtn", "nfpUploadBtn", "seedRolesBtn", "addRoleBtn", "showExcludedRolesBtn", "saveRolesBtn",
              "contestSaveBtn", "contestNewBtn", "contestAddRosterBtn",
-             "anpSaveBtn", "anpAddTierBtn", "egaSaveBtn", "egaAddMonthBtn", "pbSaveBtn"].forEach((id) => {
+             "anpSaveBtn", "anpAddTierBtn", "egaSaveBtn", "egaAddMonthBtn", "egaNewBtn", "pbSaveBtn"].forEach((id) => {
                 const el = document.getElementById(id);
                 if (el) el.style.display = "";
             });
@@ -570,8 +583,12 @@
     }
 
     async function loadPreview() {
-        const yVal = (document.getElementById("previewYear")?.value || "").trim();
-        const mVal = (document.getElementById("previewMonth")?.value || "").trim();
+        // Basic and Net Floor Price are separate sections with separate cards,
+        // so each carries its own Year/Month pair -- the one belonging to the
+        // visible card is the one that decides which revision is resolved.
+        const onNfp = activeDataSection === "nfp";
+        const yVal = (document.getElementById(onNfp ? "nfpPreviewYear" : "previewYear")?.value || "").trim();
+        const mVal = (document.getElementById(onNfp ? "nfpPreviewMonth" : "previewMonth")?.value || "").trim();
         const agentTypeFilter = (document.getElementById("previewAgentType")?.value || "").toLowerCase();
         const roleFilter = (document.getElementById("previewRole")?.value || "").trim();
         const agentNameFilter = (document.getElementById("previewAgentName")?.value || "").trim();
@@ -602,7 +619,8 @@
 
             // Apply agent type, property type, year, month, and section filter
             const sectionRateTypeMap = {
-                basic_nfp: "Basic Commission",
+                basic: "Basic Commission",
+                nfp: "Net Floor Price Rate",
                 anp: "ANP Commission",
                 ega_esa: "EGA/ESA Award",
                 production_bonus: "Production Bonus Rate",
@@ -611,7 +629,7 @@
             const targetRateType = sectionRateTypeMap[activeDataSection] || "Basic Commission";
 
             let filteredRates = (data.rates || []).filter((r) => {
-                if (targetRateType && r.rate_type && r.rate_type !== targetRateType && activeDataSection !== "basic_nfp") {
+                if (targetRateType && r.rate_type && r.rate_type !== targetRateType && activeDataSection !== "basic") {
                     return false;
                 }
                 if (agentTypeFilter && (r.agent_type || "").toLowerCase() !== agentTypeFilter) {
@@ -778,34 +796,51 @@
         paginationEl.querySelector("#editNextBtn")?.addEventListener("click", () => { editPage++; renderEditPage(); });
     }
 
+    /** An NFP row's payout stages. `label` holds them as written text (the tier
+     *  owns `condition` on these rows); the scalar columns are the fallback for
+     *  a row saved before the stages had anywhere to live. */
+    function nfpPayoutText(r) {
+        const label = String(r.label || "").trim();
+        if (label) return label;
+        return formatPaymentRulesCondition(
+            (r.trigger_pct || r.amount_rm)
+                ? [{ trigger_pct: r.trigger_pct || "", rule_type: r.rule_type || "Payout", amount_rm: r.amount_rm || "" }]
+                : []);
+    }
+
     function renderNfpPreview(nfpRates) {
-        // The Net Floor Price Commission card was removed from this page, so
-        // there is nothing to draw into. Kept as a no-op guard rather than
-        // deleted, since loadPreview() still receives nfp_rates from the API.
         const tbody = document.getElementById("nfpPreviewBody");
         if (!tbody) return;
         tbody.innerHTML = "";
+        const countEl = document.getElementById("nfpPreviewCount");
+        if (countEl) countEl.textContent = `${nfpRates.length} tier${nfpRates.length === 1 ? "" : "s"}`;
         if (!nfpRates.length) {
-            tbody.innerHTML = `<tr><td colspan="8" style="color:var(--text-muted);">No NFP tier entries cover this month.</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="10" style="color:var(--text-muted);">No NFP tier entries cover this month.</td></tr>`;
             return;
         }
         const info = typeInfo("Net Floor Price Rate");
         nfpRates.forEach((r) => {
             const roleLabel = r.agent ? `${r.hierarchy || "All"} — ${r.agent}` : (r.hierarchy || "All");
             const condTitle = r.condition ? ` title="${escapeHtml(r.condition)}"` : "";
+            // A built-in default describes the engine's own tier and belongs to
+            // no agent type, so there is nothing to revise -- taking control of
+            // one means adding a real entry, which "Add entry" does.
+            const isDefault = String(r.source || "") === "default";
             const tr = document.createElement("tr");
             tr.innerHTML = `
                 <td class="sm-cell">Net Floor Price</td>
+                <td class="sm-cell">${escapeHtml(fmtMonth(r.effective_from) || "—")}</td>
                 <td class="sm-cell">${escapeHtml(r.agent_type)}</td>
                 <td class="sm-cell">${escapeHtml(roleLabel)}</td>
                 <td class="sm-cell">${Number(r.rate_pct).toFixed(2)}%</td>
                 <td><span class="rule-cell"${condTitle}>${escapeHtml(r.condition || info.rule || "n/a")}</span></td>
+                <td>${formatConditionHtml(nfpPayoutText(r))}</td>
                 <td>${formulaCellHtml(info)}</td>
                 <td>${sourceBadge(r.source)}</td>
-                <td>${isAdmin ? `<button class="btn btn-secondary row-edit-btn" title="Revise this tier">✏️</button>` : ""}</td>
+                <td>${isAdmin && !isDefault ? `<button class="btn btn-secondary row-edit-btn" title="Revise this tier">✏️</button>` : ""}</td>
             `;
             const btn = tr.querySelector(".row-edit-btn");
-            if (btn) btn.addEventListener("click", () => openDataEditModal(r, "Net Floor Price Rate"));
+            if (btn) btn.addEventListener("click", () => openDataEditModal(r, NFP_TYPE));
             tbody.appendChild(tr);
         });
     }
@@ -1677,11 +1712,18 @@
         const searchQuery = searchEl ? searchEl.value.toLowerCase().trim() : "";
         const reviewOnlyEl = document.getElementById("rolesNeedsReviewFilter");
         const reviewOnly  = !!(reviewOnlyEl && reviewOnlyEl.checked);
+        const monthEl    = document.getElementById("rolesMonthFilter");
+        const monthQuery = monthEl ? String(monthEl.value || "").trim() : "";
+        const monthClearBtn = document.getElementById("rolesMonthClearBtn");
+        if (monthClearBtn) monthClearBtn.style.display = monthQuery ? "inline-flex" : "none";
 
         updateRolesReviewBanner();
         renderExcludedRoles();
 
         let filtered = rolesList;
+        if (monthQuery) {
+            filtered = filtered.filter(r => effectiveCoversMonth(r.effective_from, monthQuery));
+        }
         if (filterType) {
             filtered = filtered.filter(r => String(r.agent_type || "").toLowerCase().includes(filterType));
         }
@@ -1720,9 +1762,20 @@
                 : (r.role_expiring
                     ? `<div style="margin-top:3px; font-size:10px; color:#b45309;" title="This is this agent's newest row and its range ends soon. Add a follow-up row before then, or the agent drops back to the old hardcoded name matching.">ends ${escapeHtml(fmtMonth(effEnd(r.effective_from)))} — needs a follow-up row</div>`
                     : "");
+            // "To Present" is stored as a bare start month, so the cell would
+            // otherwise read "Jun 2026" -- indistinguishable from a row that
+            // applies to that one month only. Spelling out "→ Present" makes
+            // the open end visible, matching the Present tick in the popup;
+            // closed ranges already print both ends and need nothing added.
+            // (Open-ended rows can never be expiring, so this never collides
+            // with expiryHtml -- see flagExpiringRoles().)
+            const isOpenEnded = effEnd(r.effective_from) === OPEN_ENDED;
+            const presentHtml = isOpenEnded
+                ? ` <span style="color:#047857; font-weight:600;" title="Present — this role applies from ${escapeHtml(fmtMonth(effStart(r.effective_from)))} onwards, including every future month. Untick Present in the popup to set an end month.">→ Present</span>`
+                : "";
             const monthCell = needsDate
                 ? `<span title="This role came from eeAdmin's tags, which carry no dates. It is not saved and no commission calculation uses it until you set the month here." style="color:#b45309; font-weight:600;">⚠ Set effective date</span>`
-                : escapeHtml(fmtMonth(r.effective_from)) + expiryHtml;
+                : escapeHtml(fmtMonth(r.effective_from)) + presentHtml + expiryHtml;
             const displayAgent = r.agent || "—";
             const displayFullName = r.full_name || "—";
             const displayNick = r.nick_name || "—";
@@ -2296,7 +2349,9 @@
                 sel.appendChild(opt);
             });
             // Default to the requested month, else the month selected above.
-            const monthEl = document.getElementById("previewMonth");
+            const monthEl = document.getElementById("nfpPreviewMonth")?.value
+                ? document.getElementById("nfpPreviewMonth")
+                : document.getElementById("previewMonth");
             const pick = String(wantMonth || (monthEl ? monthEl.value : "")).padStart(2, "0");
             const viewYm = `2026-${pick}`;
             if (months.includes(viewYm)) sel.value = viewYm;
@@ -2446,6 +2501,7 @@
     // ── Wiring ───────────────────────────────────────────────────────────────
 
     document.getElementById("editModeBtn")?.addEventListener("click", () => openAddModal("Basic Commission"));
+    document.getElementById("nfpAddBtn")?.addEventListener("click", () => openAddModal("Net Floor Price Rate"));
     document.getElementById("nfpListBtn")?.addEventListener("click", () => showNfpList());
     document.getElementById("nfpListCloseBtn")?.addEventListener("click", () => {
         const card = document.getElementById("nfpListCard");
@@ -2644,6 +2700,45 @@
         return [...modalAgentSelected.values()];
     }
 
+    // A Net Floor Price row is a tier, not a rate on a sale: it has no property
+    // type, no override and no profit sharing, so those blocks are taken off the
+    // form rather than left there to be filled in and ignored. Payment stages DO
+    // apply -- but `condition` is spoken for by the tier on these rows, so their
+    // written form goes to `label` instead.
+    const NFP_TYPE = "Net Floor Price Rate";
+
+    function applyModalTypeVisibility(type) {
+        const isNfp = type === NFP_TYPE;
+        [["modalNfpTierRow", isNfp],
+         ["modalPropertyRow", !isNfp],
+         ["modalProfitSharingRow", !isNfp],
+         ["modalOverrideRulesRow", !isNfp]].forEach(([id, show]) => {
+            const el = document.getElementById(id);
+            if (el) el.style.display = show ? "" : "none";
+        });
+        const rateEl = document.getElementById("modalRatePct");
+        if (rateEl) rateEl.placeholder = isNfp ? "e.g. 25" : "e.g. 3.25";
+    }
+
+    /** Match a stored tier back to one of the three options. Compares on the
+     *  comparison itself ("sales price > net floor price") so the descriptive
+     *  tail can be reworded without orphaning rows already saved -- including
+     *  the "i." / "ii." / "iii." numerals these options used to carry. */
+    function setNfpTierValue(condition) {
+        const sel = document.getElementById("modalNfpTier");
+        if (!sel) return;
+        const core = (s) => String(s || "").toLowerCase()
+            .replace(/^\s*(iii|ii|i)\.\s*/, "")
+            .split(/[—(]/)[0]
+            .replace(/\s+/g, " ")
+            .trim();
+        const want = core(condition);
+        const match = want
+            ? Array.from(sel.options).find((o) => core(o.value) === want)
+            : null;
+        sel.value = match ? match.value : sel.options[0].value;
+    }
+
     function openAddModal(type) {
         // Open the Edit Entry modal with blank defaults for a new entry
         const blankEntry = {
@@ -2673,6 +2768,8 @@
 
         const typeEl = document.getElementById("modalType");
         if (typeEl) typeEl.value = type;
+        applyModalTypeVisibility(type);
+        setNfpTierValue("");
 
         // Reset Invoice Month to single / current month
         const modeSelEl = document.getElementById("modalMonthMode");
@@ -2733,6 +2830,8 @@
 
         const typeEl = document.getElementById("modalType");
         if (typeEl) typeEl.value = type;
+        applyModalTypeVisibility(type);
+        setNfpTierValue(r.condition);
 
         const modeSelEl = document.getElementById("modalMonthMode");
         const singleBox = document.getElementById("singleMonthBox");
@@ -2782,7 +2881,10 @@
             modeSel.value = r.profit_sharing_mode || "";
         }
 
-        setPaymentRulesInList(parsePaymentRulesFromEntry(r));
+        // On an NFP row the payout stages live in `label`, so the parser is
+        // pointed at that instead of the tier sitting in `condition`.
+        setPaymentRulesInList(parsePaymentRulesFromEntry(
+            type === NFP_TYPE ? Object.assign({}, r, { condition: r.label || "" }) : r));
 
         const invDateEl = document.getElementById("modalInvoiceDate");
         if (invDateEl) invDateEl.value = r.invoice_date_from || "";
@@ -3149,17 +3251,26 @@
         const ag = norm(e.agent) === norm(target.agent);
         const eff = norm(e.effective_from) === norm(target.effective_from);
         const prop = normProp(e.property_type) === normProp(target.property_type);
-        return rType && aType && hier && ag && eff && prop;
+        // NFP tiers differ only by condition (see fullEntryKey), so without this
+        // deleting one tier would take the other two with it.
+        const cond = norm(e.rate_type) !== norm(NFP_TYPE)
+            || norm(e.condition) === norm(target.condition);
+        return rType && aType && hier && ag && eff && prop && cond;
     }
     function fullEntryKey(e) {
         const norm = (v) => String(v || "").trim().toLowerCase();
+        const type = norm(e.rate_type || "Basic Commission");
         return [
-            norm(e.rate_type || "Basic Commission"),
+            type,
             norm(e.agent_type),
             norm(e.hierarchy),
             norm(e.agent),
             normProp(e.property_type),
-            norm(e.effective_from)
+            norm(e.effective_from),
+            // The three NFP tiers are one role, one month and one property type
+            // apart from their condition, so without it they collapse into a
+            // single row: saving tier ii would silently overwrite tier i.
+            type === norm(NFP_TYPE) ? norm(e.condition) : ""
         ].join("|");
     }
 
@@ -3253,6 +3364,9 @@
             agent: editingRawEntry.agent || "",
             property_type: editingRawEntry.property_type || "",
             effective_from: editingRawEntry.effective_from || CURRENT_YM,
+            // Keeps an NFP tombstone on its own tier instead of standing in for
+            // all three.
+            condition: editingRawEntry.condition || "",
             rate_pct: "",
             remarks: "deleted"
         });
@@ -3385,6 +3499,33 @@
                 || getVal("modalType")
                 || "Basic Commission";
 
+            // NFP rows carry their tier in `condition` and their payout stages
+            // in `label`. The Basic-only inputs are hidden for them, so whatever
+            // those held is left out rather than saved as stale values on a row
+            // that has no use for them.
+            if (rateType === NFP_TYPE) {
+                await saveSingleEntry({
+                    rate_type: rateType,
+                    effective_from: effFrom,
+                    agent_type: getVal("modalAgentType") || "Internal",
+                    hierarchy: getVal("modalRole") || "",
+                    agent: getSelectedModalAgents().join(", "),
+                    property_type: "",
+                    rate_pct: ratePct,
+                    override_rate_pct: "", override_from: "", oRules: [],
+                    profit_sharing_rate_pct: "", profit_sharing_mode: "",
+                    rule_type: primaryRuleType,
+                    trigger_pct: primaryTrigger,
+                    amount_rm: primaryAdvance,
+                    condition: getVal("modalNfpTier"),
+                    label: formattedCond,
+                    pRules: pRules,
+                    invoice_date_from: getVal("modalInvoiceDate"),
+                    remarks: getVal("modalRemarks").trim()
+                });
+                return;
+            }
+
             const updated = {
                 rate_type: rateType,
                 effective_from: effFrom,
@@ -3502,7 +3643,8 @@
         });
     }
     function initPreviewFilters() {
-        ["previewYear", "previewMonth", "previewPropertyType", "previewAgentName"].forEach((id) => {
+        ["previewYear", "previewMonth", "previewPropertyType", "previewAgentName",
+         "nfpPreviewYear", "nfpPreviewMonth"].forEach((id) => {
             const el = document.getElementById(id);
             if (el) el.addEventListener("change", loadPreview);
         });
@@ -3542,6 +3684,19 @@
             renderRoles();
         });
     }
+
+    const rolesMonthFilter = document.getElementById("rolesMonthFilter");
+    if (rolesMonthFilter) rolesMonthFilter.addEventListener("change", () => {
+        rolesPage = 1;
+        renderRoles();
+    });
+
+    const rolesMonthClearBtn = document.getElementById("rolesMonthClearBtn");
+    if (rolesMonthClearBtn) rolesMonthClearBtn.addEventListener("click", () => {
+        if (rolesMonthFilter) rolesMonthFilter.value = "";
+        rolesPage = 1;
+        renderRoles();
+    });
 
     const rolesNeedsReviewFilter = document.getElementById("rolesNeedsReviewFilter");
     if (rolesNeedsReviewFilter) rolesNeedsReviewFilter.addEventListener("change", () => {
@@ -4119,7 +4274,8 @@
     const RULE_SECTIONS = {
         anp: {
             card: "anpCard", endpoint: "/api/anp-rules", keyName: "effective_from",
-            keyInput: "anpPeriod", keyKind: "month",
+            keyKind: "month_range",
+            keyInputFrom: "anpPeriodFrom", keyInputTo: "anpPeriodTo", keyInputPresent: "anpPeriodPresent",
             badge: "anpSavedBadge", status: "anpStatus", saveBtn: "anpSaveBtn",
             prefix: "anp_", fields: ["min_paid", "excluded_payment_ids", "invoice_overrides"],
             childKey: "tiers", childBody: "anpTiersBody", addBtn: "anpAddTierBtn",
@@ -4131,7 +4287,8 @@
         },
         ega: {
             card: "egaCard", endpoint: "/api/ega-rules", keyName: "year",
-            keyInput: "egaYear", keyKind: "year",
+            keyKind: "year_range",
+            keyInputFrom: "egaYearFrom", keyInputTo: "egaYearTo", keyInputPresent: "egaYearPresent",
             badge: "egaSavedBadge", status: "egaStatus", saveBtn: "egaSaveBtn",
             extraKey: "agent_type", extraInput: "egaAgentType",
             prefix: "ega_", fields: ["ega_threshold", "esa_threshold", "factory_from",
@@ -4141,11 +4298,15 @@
                 { name: "month", type: "number" },
                 { name: "ep_threshold", type: "number" },
                 { name: "label", type: "text" }
-            ]
+            ],
+            // This one lives in a modal over a landing list, so a save has to
+            // refresh what is behind it and step out of the way.
+            afterSave: async () => { await loadEgaList(); closeEgaModal(); }
         },
         pb: {
             card: "pbCard", endpoint: "/api/production-bonus-rules", keyName: "effective_from",
-            keyInput: "pbPeriod", keyKind: "month",
+            keyKind: "month_range",
+            keyInputFrom: "pbPeriodFrom", keyInputTo: "pbPeriodTo", keyInputPresent: "pbPeriodPresent",
             badge: "pbSavedBadge", status: "pbStatus", saveBtn: "pbSaveBtn",
             prefix: "pb_", fields: ["min_paid", "property_types",
                                     "oum_team_target", "oum_personal_target", "oum_rate_pct",
@@ -4154,7 +4315,43 @@
         }
     };
 
+    /** Keep the To field matched to the Present checkbox, same behaviour as
+     *  the Agent Roles & Hierarchy modal's syncRoleMonthPresent(). Works for
+     *  both a month range (ANP) and a year range (EGA/ESA). */
+    function syncMonthRangePresent(toId, presentId) {
+        const present = document.getElementById(presentId);
+        const to = document.getElementById(toId);
+        if (!present || !to) return;
+        if (present.checked) to.value = "";
+        to.style.opacity = present.checked ? "0.5" : "";
+        to.title = present.checked
+            ? "No end — this applies from here onward. Pick an end point here if it stopped."
+            : "The last period this applies to.";
+    }
+
+    function defaultRangeFromValue(keyKind) {
+        const now = new Date();
+        return keyKind === "year_range"
+            ? String(now.getFullYear())
+            : `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    }
+
     function ruleKeyValue(cfg) {
+        if (cfg.keyKind === "month_range" || cfg.keyKind === "year_range") {
+            const fromEl = document.getElementById(cfg.keyInputFrom);
+            const toEl = document.getElementById(cfg.keyInputTo);
+            const presentEl = document.getElementById(cfg.keyInputPresent);
+            if (!fromEl) return "";
+            if (!fromEl.value) {
+                fromEl.value = defaultRangeFromValue(cfg.keyKind);
+                if (presentEl) presentEl.checked = true;
+                syncMonthRangePresent(cfg.keyInputTo, cfg.keyInputPresent);
+            }
+            const present = !!presentEl?.checked;
+            const to = (toEl?.value || "").trim();
+            if (present || !to) return fromEl.value;
+            return `${fromEl.value} to ${to}`;
+        }
         const el = document.getElementById(cfg.keyInput);
         if (!el) return "";
         if (!el.value) {
@@ -4266,6 +4463,7 @@
             status.className = "save-status ok";
             status.textContent = `Saved ${period}.`;
             await loadRuleSection(key);
+            if (cfg.afterSave) await cfg.afterSave();
             setTimeout(() => { status.textContent = ""; }, 2500);
         } catch (err) {
             status.className = "save-status err";
@@ -4273,10 +4471,166 @@
         }
     }
 
+    // ── EGA / ESA AWARD LANDING LIST ─────────────────────────────────────────
+    // The rule form shows one agent type at a time, so Internal and Outsource
+    // can be saved over each other with nothing on screen to show it. This list
+    // puts them side by side, with who touched each one last.
+    const EGA_MONTH_ABBR = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const EGA_AGENT_TYPES = ["internal", "outsource"];
+    let egaRuleSets = [];
+
+    /** 350000 -> "350k", 1200000 -> "1.2M". The ladder is six entries wide, so
+     *  full figures would push Last Updated off the row. */
+    function egaShortEp(value) {
+        const n = Number(String(value ?? "").replace(/,/g, ""));
+        if (!Number.isFinite(n) || n === 0) return "—";
+        if (Math.abs(n) >= 1e6) return `${(n / 1e6).toFixed(2).replace(/\.?0+$/, "")}M`;
+        if (Math.abs(n) >= 1e3) return `${(n / 1e3).toFixed(1).replace(/\.?0+$/, "")}k`;
+        return String(n);
+    }
+
+    function egaFullEp(value) {
+        const n = Number(String(value ?? "").replace(/,/g, ""));
+        return Number.isFinite(n) && n !== 0 ? n.toLocaleString("en-MY") : "—";
+    }
+
+    /** "Feb 350k · Mar 400k · …" for one half of the ladder. `wantEsa` picks the
+     *  side, matching how the award scripts split these rows: a label naming ESA
+     *  is an ESA row, everything else is EGA. */
+    function egaLadderSummary(months, wantEsa) {
+        const parts = (months || [])
+            .filter((m) => (String(m.label || "").toUpperCase().includes("ESA")) === wantEsa)
+            .sort((a, b) => Number(a.month) - Number(b.month))
+            .map((m) => `${EGA_MONTH_ABBR[Number(m.month)] || m.month} ${egaShortEp(m.ep_threshold)}`);
+        return parts.length ? parts.join(" · ") : "—";
+    }
+
+    function egaSchemeLabel(entry) {
+        const type = String(entry.agent_type || "");
+        return `${type.charAt(0).toUpperCase()}${type.slice(1)} ${entry.year}`;
+    }
+
+    /** Saved sets, plus a placeholder for any agent type missing in the current
+     *  year. A scheme that was never set up is exactly the thing worth seeing —
+     *  it is running on built-in defaults nobody chose. */
+    function egaListRows() {
+        const rows = egaRuleSets.slice();
+        const year = String(new Date().getFullYear());
+        EGA_AGENT_TYPES.forEach((type) => {
+            const exists = rows.some((r) => r.year === year && r.agent_type === type);
+            if (!exists) rows.push({ year, agent_type: type, saved: false, rules: {}, months: [] });
+        });
+        return rows.sort((a, b) => (b.year.localeCompare(a.year))
+            || a.agent_type.localeCompare(b.agent_type));
+    }
+
+    function renderEgaList() {
+        const body = document.getElementById("egaListBody");
+        if (!body) return;
+        const rows = egaListRows();
+
+        body.innerHTML = rows.map((entry, i) => {
+            const r = entry.rules || {};
+            const stamp = entry.saved
+                ? escapeHtml(contestUpdatedLabel(entry))
+                : `<span style="color:var(--text-muted);">Not set up — using defaults</span>`;
+            return `
+                <tr class="ega-row" data-index="${i}" style="cursor:pointer;">
+                    <td style="font-weight:600;">${escapeHtml(egaSchemeLabel(entry))}</td>
+                    <td>${escapeHtml(egaFullEp(r.ega_threshold))}</td>
+                    <td>${escapeHtml(egaFullEp(r.esa_threshold))}</td>
+                    <td>${escapeHtml(egaLadderSummary(entry.months, false))}</td>
+                    <td>${escapeHtml(egaLadderSummary(entry.months, true))}</td>
+                    <td style="color:var(--text-muted); font-size:12px;">${stamp}</td>
+                </tr>`;
+        }).join("");
+
+        body.querySelectorAll(".ega-row").forEach((tr) => {
+            tr.addEventListener("click", () => {
+                const entry = rows[Number(tr.dataset.index)];
+                if (entry) openEgaModal(entry);
+            });
+        });
+    }
+
+    async function loadEgaList() {
+        const status = document.getElementById("egaListStatus");
+        if (status) { status.className = "save-status"; status.textContent = "Loading..."; }
+        try {
+            const res = await api("/api/ega-rule-sets");
+            const data = await res.json().catch(() => ([]));
+            if (!res.ok) throw new Error(contestApiError(res, data, "Could not load the rule sets"));
+            egaRuleSets = Array.isArray(data) ? data : [];
+            renderEgaList();
+            if (status) status.textContent = "";
+        } catch (err) {
+            if (status) { status.className = "save-status err"; status.textContent = err.message; }
+        }
+    }
+
+    /** Point the form's key inputs at `entry`, then let the shared loader fetch
+     *  and populate it exactly as it did when these fields lived on the card. */
+    function openEgaModal(entry) {
+        const status = document.getElementById("egaStatus");
+        if (status) { status.className = "save-status"; status.textContent = ""; }
+
+        const [from, to] = String(entry.year || "").split(" to ");
+        const fromEl = document.getElementById("egaYearFrom");
+        const toEl = document.getElementById("egaYearTo");
+        const presentEl = document.getElementById("egaYearPresent");
+        if (fromEl) fromEl.value = (from || "").trim();
+        if (toEl) toEl.value = (to || "").trim();
+        if (presentEl) presentEl.checked = !to;
+        syncMonthRangePresent("egaYearTo", "egaYearPresent");
+
+        const typeEl = document.getElementById("egaAgentType");
+        if (typeEl) typeEl.value = entry.agent_type || "internal";
+
+        const title = document.getElementById("egaModalTitle");
+        if (title) {
+            title.textContent = entry.saved
+                ? `EGA / ESA — ${egaSchemeLabel(entry)}`
+                : `EGA / ESA — ${egaSchemeLabel(entry)} (new)`;
+        }
+
+        document.getElementById("egaModal")?.classList.remove("hidden");
+        loadRuleSection("ega");
+    }
+
+    function closeEgaModal() {
+        document.getElementById("egaModal")?.classList.add("hidden");
+    }
+
+    function initEgaRuleSets() {
+        document.getElementById("egaModalCloseBtn")?.addEventListener("click", closeEgaModal);
+        document.getElementById("egaCancelBtn")?.addEventListener("click", closeEgaModal);
+        document.getElementById("egaNewBtn")?.addEventListener("click", () => {
+            // Whichever agent type has no set for this year is almost always the
+            // one being added; fall back to Internal when both exist.
+            const year = String(new Date().getFullYear());
+            const missing = EGA_AGENT_TYPES.find(
+                (t) => !egaRuleSets.some((r) => r.year === year && r.agent_type === t));
+            openEgaModal({ year, agent_type: missing || "internal", saved: false, rules: {}, months: [] });
+        });
+    }
+
     function initRuleSections() {
         Object.keys(RULE_SECTIONS).forEach(key => {
             const cfg = RULE_SECTIONS[key];
-            document.getElementById(cfg.keyInput)?.addEventListener("change", () => loadRuleSection(key));
+            if (cfg.keyKind === "month_range" || cfg.keyKind === "year_range") {
+                const presentEl = document.getElementById(cfg.keyInputPresent);
+                presentEl?.addEventListener("change", () => {
+                    syncMonthRangePresent(cfg.keyInputTo, cfg.keyInputPresent);
+                    loadRuleSection(key);
+                });
+                syncMonthRangePresent(cfg.keyInputTo, cfg.keyInputPresent);
+                [cfg.keyInputFrom, cfg.keyInputTo].forEach(id => {
+                    document.getElementById(id)?.addEventListener("change", () => loadRuleSection(key));
+                });
+            } else {
+                document.getElementById(cfg.keyInput)?.addEventListener("change", () => loadRuleSection(key));
+            }
             if (cfg.extraInput) {
                 document.getElementById(cfg.extraInput)?.addEventListener("change", () => loadRuleSection(key));
             }
@@ -4320,12 +4674,14 @@
         const rolesCard = document.getElementById("rolesCard");
         const rolesMetricsRow = document.getElementById("rolesMetricsRow");
         const viewCard = document.getElementById("viewCard");
+        const nfpCard = document.getElementById("nfpCard");
         const nfpListCard = document.getElementById("nfpListCard");
         const viewCardTitle = document.querySelector("#viewCard .card-header h3");
 
         const titles = {
             roles: "Agent Roles & Hierarchy",
-            basic_nfp: "Basic & Net Floor Price Commission",
+            basic: "Basic Commission",
+            nfp: "Net Floor Price",
             anp: "ANP Commission",
             ega_esa: "EGA/ESA Award",
             production_bonus: "Production Bonus",
@@ -4338,6 +4694,7 @@
 
         const isRoles = activeDataSection === "roles";
         const isContest = activeDataSection === "monthly_contest";
+        const isNfp = activeDataSection === "nfp";
         // Sections with their own rules form, keyed by section id.
         const RULE_CARD_BY_SECTION = { anp: "anp", ega_esa: "ega", production_bonus: "pb" };
         const ruleKey = RULE_CARD_BY_SECTION[activeDataSection] || null;
@@ -4345,6 +4702,9 @@
             const el = document.getElementById(RULE_SECTIONS[k].card);
             if (el) el.style.display = (ruleKey === k) ? "block" : "none";
         });
+        // The EGA/ESA form is a modal, so it sits outside the card the loop
+        // above just hid — leaving the section would strand it over the page.
+        if (ruleKey !== "ega") closeEgaModal();
 
         if (rolesCard) {
             rolesCard.style.display = isRoles ? "block" : "none";
@@ -4361,8 +4721,14 @@
             contestCard.style.display = isContest ? "block" : "none";
         }
 
+        // The shared rates grid carries the Basic section (and any future
+        // section without a card of its own); NFP has its own tier table.
         if (viewCard) {
-            viewCard.style.display = (isRoles || isContest || ruleKey) ? "none" : "block";
+            viewCard.style.display = (isRoles || isContest || isNfp || ruleKey) ? "none" : "block";
+        }
+
+        if (nfpCard) {
+            nfpCard.style.display = isNfp ? "block" : "none";
         }
 
         // The price list is opened on demand, so switching section closes it.
@@ -4370,19 +4736,15 @@
             nfpListCard.style.display = "none";
         }
 
-        // "View Net Floor Price List" only makes sense on Basic & NFP.
-        const nfpListBtn = document.getElementById("nfpListBtn");
-        if (nfpListBtn) {
-            nfpListBtn.style.display = activeDataSection === "basic_nfp" ? "" : "none";
-        }
-
         if (viewCardTitle) {
-            if (activeDataSection === "basic_nfp") viewCardTitle.textContent = "Basic Commission";
-            else viewCardTitle.textContent = titles[activeDataSection] || "Commission Rates";
+            viewCardTitle.textContent = titles[activeDataSection] || "Commission Rates";
         }
 
         if (isContest) {
             loadContestList();
+        } else if (ruleKey === "ega") {
+            // EGA/ESA lands on its list; the rule form loads when a row opens.
+            loadEgaList();
         } else if (ruleKey) {
             loadRuleSection(ruleKey);
         } else if (!isRoles) {
@@ -4394,11 +4756,18 @@
     // List" button) lands directly on that Data section instead of the
     // default Agent Roles view.
     const urlParams = new URLSearchParams(window.location.search);
-    const wantSection = urlParams.get("section");
+    let wantSection = urlParams.get("section");
+    // "basic_nfp" was one section before Basic and Net Floor Price were split
+    // apart. Links minted before the split (and any bookmark) still arrive with
+    // the old id, so send them to whichever half they were actually after.
+    if (wantSection === "basic_nfp") {
+        wantSection = urlParams.get("showNfpList") ? "nfp" : "basic";
+    }
 
     initPreviewFilters();
     initDataSectionList();
     initContestRules();
+    initEgaRuleSets();
     initRuleSections();
     if (wantSection) {
         const list = document.getElementById("dataSectionList");
@@ -4423,7 +4792,10 @@
         // rows without the admin controls. Re-render now that the role is in.
         if (activeDataSection === "monthly_contest") loadContestList();
         const reloadKey = { anp: "anp", ega_esa: "ega", production_bonus: "pb" }[activeDataSection];
-        if (reloadKey) loadRuleSection(reloadKey);
+        // Same reason as the contest list: the first render ran before isAdmin
+        // was known, so the "New rule set" button was hidden on a deep link.
+        if (reloadKey === "ega") loadEgaList();
+        else if (reloadKey) loadRuleSection(reloadKey);
         if (urlParams.get("showNfpList")) {
             showNfpList(urlParams.get("month") || "");
         }

@@ -213,6 +213,54 @@ def get_factory_rates(raw_rows: list[dict[str, Any]], cli_factory_rates: dict[st
             factory_rates[inv_num] = {"sharing": rate_val}
     return factory_rates
 
+
+_DASHBOARD_FACTORY_RATE_CACHE: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+
+
+def get_dashboard_factory_rate(agent_name: str, customer_name: str, year: int | str, month: int | str,
+                               agent_type: str = "outsource") -> dict[str, Decimal] | None:
+    """The profit-sharing rates saved on the dashboard's Factory "Profit
+    Sharing" popup for this (agent, customer) pair, under the given
+    year/month/agent_type bucket -- the same bucket key the dashboard's
+    /api/factory-rates endpoint uses. Returns {"agent_rate", "safwan_rate"}
+    as Decimal fractions (5.0 saved as "5" becomes Decimal("0.05")), or None
+    if nothing has been saved for this pair yet, so the caller can fall back
+    to its own default (CLI arg / interactive prompt / plain 0)."""
+    key = (str(year), str(month), agent_type)
+    rows = _DASHBOARD_FACTORY_RATE_CACHE.get(key)
+    if rows is None:
+        dashboard_dir = _REPO_ROOT / "8. Web Dashboard"
+        try:
+            if str(dashboard_dir) not in sys.path:
+                sys.path.insert(0, str(dashboard_dir))
+            import db as _dashboard_db
+            rows = _dashboard_db.get_factory_rates_rows(str(year), str(month), agent_type)
+        except Exception as exc:
+            print(f"[Factory Rates] Warning: could not read dashboard factory_rates for "
+                  f"{year}-{month} ({exc}); Factory profit sharing defaults to 0% for this period.",
+                  file=sys.stderr)
+            rows = []
+        _DASHBOARD_FACTORY_RATE_CACHE[key] = rows
+
+    agent_key = str(agent_name or "").strip().lower()
+    cust_key = str(customer_name or "").strip().lower()
+    for r in rows:
+        if str(r.get("agent") or "").strip().lower() == agent_key \
+           and str(r.get("customer") or "").strip().lower() == cust_key:
+            def _pct(field):
+                val = r.get(field)
+                try:
+                    return Decimal(str(val)) / Decimal("100")
+                except Exception:
+                    return None
+            agent_rate = _pct("agent_rate")
+            safwan_rate = _pct("safwan_rate")
+            if agent_rate is None and safwan_rate is None:
+                return None
+            return {"agent_rate": agent_rate or Decimal("0"), "safwan_rate": safwan_rate or Decimal("0")}
+    return None
+
+
 def _norm_name(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip()).lower()
 
@@ -328,6 +376,110 @@ def get_agent_hierarchy_info(agent_name: str) -> dict[str, Any] | None:
         return {"canonical_name": "Elaine Ng Yie Kie", "tier": "OSA", "osa_parent": None, "oum_parent": None}
 
     return None
+
+
+def _factory_hierarchy_map() -> dict[str, dict[str, Any]]:
+    """normalized agent name -> {canonical_name, hierarchy, reports_to}, from
+    the Agent Roles & Hierarchy Data page (agent_roles table) -- deliberately
+    NOT get_agent_hierarchy_info()'s hardcoded map above. Used only by
+    resolve_factory_split_hierarchy() for the Factory profit-sharing split, per
+    an explicit decision to keep that one feature driven by what's editable on
+    the page, even though every other calculation in this file still uses the
+    hardcoded map. One row per agent wins: the latest effective_from among
+    non-hidden rows, the same rule agent_names.py uses for canonical names."""
+    root = str(_REPO_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    rates_dir = str(_SCRIPT_DIR)
+    if rates_dir not in sys.path:
+        sys.path.insert(0, rates_dir)
+    import agent_names as _names
+    from basic_commission_rates import _load_db_table, effective_start
+
+    try:
+        rows = _load_db_table("agent_roles")
+    except Exception:
+        return {}
+
+    latest: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        if r.get("hidden"):
+            continue
+        agent = str(r.get("agent") or "").strip()
+        if not agent:
+            continue
+        key = _names.normalize_key(agent)
+        eff = effective_start(r.get("effective_from"))
+        prev = latest.get(key)
+        if prev is None or eff > effective_start(prev.get("effective_from")):
+            latest[key] = r
+
+    out: dict[str, dict[str, Any]] = {}
+    for r in latest.values():
+        canon = _names.resolve(r.get("agent"))
+        reports_to = str(r.get("reports_to") or "").strip()
+        out[_names.normalize_key(canon)] = {
+            "canonical_name": canon,
+            "hierarchy": str(r.get("hierarchy") or "").strip().upper(),
+            "reports_to": _names.resolve(reports_to) if reports_to else None,
+        }
+    return out
+
+
+_FACTORY_HIERARCHY_CACHE: dict[str, dict[str, Any]] | None = None
+
+
+def resolve_factory_split_hierarchy(agent_name: str) -> dict[str, Any]:
+    """OSA/OUM/OGM tier, and who to credit for the Factory profit-sharing
+    70/20/10 split, read from the Agent Roles & Hierarchy Data page.
+
+    Walks reports_to up to two hops: agent -> (OUM or OGM directly) -> OGM.
+    Returns {"tier", "oum_name", "ogm_name"}. Either name is None when the
+    chain doesn't reach that tier -- the caller pays nothing for a missing
+    hop rather than guessing who should get it (confirmed: a missing OUM
+    hop does not enlarge OGM's cut, and a missing reports_to entirely burns
+    that share).
+    """
+    global _FACTORY_HIERARCHY_CACHE
+    if _FACTORY_HIERARCHY_CACHE is None:
+        _FACTORY_HIERARCHY_CACHE = _factory_hierarchy_map()
+
+    root = str(_REPO_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import agent_names as _names
+
+    key = _names.normalize_key(_names.resolve(agent_name))
+    row = _FACTORY_HIERARCHY_CACHE.get(key)
+    if not row:
+        return {"tier": "", "oum_name": None, "ogm_name": None}
+
+    def _lookup(name):
+        if not name:
+            return None
+        return _FACTORY_HIERARCHY_CACHE.get(_names.normalize_key(name))
+
+    tier = row["hierarchy"]
+    oum_name = None
+    ogm_name = None
+
+    if tier in ("OSA", "OSA 1", "OSA1"):
+        parent = _lookup(row["reports_to"])
+        if parent:
+            if parent["hierarchy"] == "OUM":
+                oum_name = parent["canonical_name"]
+                grandparent = _lookup(parent["reports_to"])
+                if grandparent and grandparent["hierarchy"] == "OGM":
+                    ogm_name = grandparent["canonical_name"]
+            elif parent["hierarchy"] == "OGM":
+                ogm_name = parent["canonical_name"]
+    elif tier == "OUM":
+        parent = _lookup(row["reports_to"])
+        if parent and parent["hierarchy"] == "OGM":
+            ogm_name = parent["canonical_name"]
+
+    return {"tier": tier, "oum_name": oum_name, "ogm_name": ogm_name}
+
 
 def get_agent_type_override(agent_name: str, invoice_date: Any = None) -> str | None:
     """'internal' / 'outsource' from the Agent Roles & Hierarchy page for the
@@ -689,6 +841,8 @@ class OutsourceFactoryInvoiceLine:
     basic_commission: Decimal
     referral_name: str | None = None
     gan_lai_soon: Decimal = Decimal("0")
+    senior_override: Decimal = Decimal("0")
+    senior_override_name: str | None = None
     first_payment_date: str = ""
     pct100_date: str = ""
     pct75_date: str = ""
@@ -863,8 +1017,12 @@ def main(argv: list[str]) -> int:
                     print(f"Error parsing rate for invoice {k}: {e}", file=sys.stderr)
                     return 1
 
-    # Resolve rates for each Factory invoice
+    # Resolve rates for each Factory invoice. The dashboard's saved rate (set
+    # via the "Profit Sharing" popup) always wins when present; --factory-rates
+    # / --profit-sharing / the interactive prompt are the fallback for periods
+    # nothing has been saved for yet, same as before.
     factory_rates: dict[str, Decimal] = {}
+    factory_safwan_rates: dict[str, Decimal] = {}
     if outsource_factory_rows:
         default_profit_sharing = None
         if args.profit_sharing is not None:
@@ -872,11 +1030,21 @@ def main(argv: list[str]) -> int:
 
         for i, r in enumerate(outsource_factory_rows, 1):
             inv_num = str(r.get("invoice_number") or "").strip()
+            agent_nm = str(r.get("agent_name") or "(unknown)").strip()
             cust_name = str(r.get("customer_name") or "(unknown)").strip()
             total = _to_decimal(r.get("total_amount"))
             epp = _to_decimal(r.get("epp_interest"))
             sales_price = total - epp
 
+            inv_month_dt = _parse_invoice_date(r.get("invoice_date"))
+            dash_rate = get_dashboard_factory_rate(agent_nm, cust_name, args.year, inv_month_dt.month) \
+                if inv_month_dt else None
+            if dash_rate is not None:
+                factory_rates[inv_num] = dash_rate["agent_rate"]
+                factory_safwan_rates[inv_num] = dash_rate["safwan_rate"]
+                continue
+
+            factory_safwan_rates[inv_num] = Decimal("0")
             if inv_num in cli_factory_rates:
                 factory_rates[inv_num] = cli_factory_rates[inv_num]
             elif default_profit_sharing is not None:
@@ -967,17 +1135,46 @@ def main(argv: list[str]) -> int:
 
         if prop_type == "Factory":
             rate = Decimal("0.02")
-            sharing = factory_rates.get(invoice_num, Decimal("0"))
-            
-            osa_sharing = sharing
-            if info["tier"] in ("OSA", "OSA 1") and sharing > 0:
-                osa_sharing = sharing * Decimal("0.70")
-                oum_p = info.get("oum_parent")
-                if oum_p:
-                    override_commissions[oum_p] += sales_price * sharing * Decimal("0.20")
-                override_commissions["OGM Pool"] += sales_price * sharing * Decimal("0.10")
-                
-            # Gan Lai Soon OGM Override Commission
+            agent_sharing = factory_rates.get(invoice_num, Decimal("0"))
+            safwan_sharing = factory_safwan_rates.get(invoice_num, Decimal("0"))
+
+            full_comm = sales_price * (rate + agent_sharing)
+
+            # Confirmed split, applied to the WHOLE Agent Commission (base +
+            # sharing), read from the Agent Roles & Hierarchy Data page --
+            # deliberately NOT the hardcoded `info` map used elsewhere in this
+            # loop (see resolve_factory_split_hierarchy()'s docstring):
+            #   OSA -> OUM found:    OSA 70% / OUM 20% / OGM 10%
+            #   OSA -> OGM directly: OSA 70% / OGM 10%, 20% unpaid
+            #   OSA -> no report:    OSA 70%, 30% unpaid
+            #   agent is the OUM:    OUM 20%, 80% unpaid
+            hier = resolve_factory_split_hierarchy(canonical_name)
+            factory_tier = hier["tier"]
+
+            comm = full_comm
+            factory_oum_name = None
+            factory_oum_cut = Decimal("0")
+            factory_ogm_cut = Decimal("0")
+
+            if agent_sharing > 0:
+                if factory_tier in ("OSA", "OSA 1", "OSA1"):
+                    comm = full_comm * Decimal("0.70")
+                    if hier["oum_name"]:
+                        factory_oum_name = hier["oum_name"]
+                        factory_oum_cut = full_comm * Decimal("0.20")
+                    if hier["ogm_name"]:
+                        factory_ogm_cut = full_comm * Decimal("0.10")
+                elif factory_tier == "OUM":
+                    comm = full_comm * Decimal("0.20")
+
+            if factory_oum_name:
+                override_commissions[factory_oum_name] += factory_oum_cut
+            if factory_ogm_cut > 0:
+                override_commissions["Gan Lai Soon"] += factory_ogm_cut
+
+            # Gan Lai Soon's regular 0.75% override, same on every OSA/OSA1/OUM
+            # invoice regardless of type -- on top of (not instead of) his
+            # Factory-specific cut above.
             tier = info["tier"]
             if tier in ("OSA", "OSA 1", "OUM"):
                 ogm_rate = Decimal("0.0075")
@@ -986,8 +1183,6 @@ def main(argv: list[str]) -> int:
             ogm_comm = sales_price * ogm_rate
             override_commissions["Gan Lai Soon"] += ogm_comm
 
-            comm = sales_price * (rate + osa_sharing)
-            
             processed_outsource_factory.append(
                 OutsourceFactoryInvoiceLine(
                     agent_name=canonical_name,
@@ -1001,19 +1196,21 @@ def main(argv: list[str]) -> int:
                     epp=epp,
                     sales_price=sales_price,
                     rate=rate,
-                    profit_sharing=osa_sharing,
+                    profit_sharing=agent_sharing,
                     basic_commission=comm,
                     referral_name=ref_name,
-                    gan_lai_soon=ogm_comm,
+                    gan_lai_soon=ogm_comm + factory_ogm_cut,
+                    senior_override=factory_oum_cut,
+                    senior_override_name=factory_oum_name,
                     first_payment_date=first_pay_dt,
                     pct100_date=pct100_str,
                     pct75_date=pct75_str,
                     pct5_date=pct5_str,
                 )
             )
-            
+
             safwan_rate = Decimal("0.005")
-            safwan_comm = sales_price * (safwan_rate + sharing)
+            safwan_comm = sales_price * (safwan_rate + safwan_sharing)
             processed_outsource_factory.append(
                 OutsourceFactoryInvoiceLine(
                     agent_name="Safwan",
@@ -1027,7 +1224,7 @@ def main(argv: list[str]) -> int:
                     epp=epp,
                     sales_price=sales_price,
                     rate=safwan_rate,
-                    profit_sharing=sharing,
+                    profit_sharing=safwan_sharing,
                     basic_commission=safwan_comm,
                     referral_name=ref_name,
                     gan_lai_soon=Decimal("0"),
@@ -1099,19 +1296,24 @@ def main(argv: list[str]) -> int:
         agent_sales[canonical_name] += total
         agent_own_commissions[canonical_name] += comm
         
-        # Calculate overrides on sales_price
-        tier = info["tier"]
-        if tier == "OSA 1":
-            oum_p = info["oum_parent"]
-            if oum_p:
-                override_commissions[oum_p] += sales_price * Decimal("0.005")
-        elif tier == "OSA":
-            oum_p = info["oum_parent"]
-            internal_senior = info.get("internal_senior_parent")
-            if oum_p:
-                override_commissions[oum_p] += sales_price * Decimal("0.005")
-            if internal_senior:
-                override_commissions[internal_senior] += sales_price * Decimal("0.005")
+        # Calculate overrides on sales_price -- Factory invoices are excluded:
+        # they already got their own complete override treatment (the
+        # confirmed 70/20/10 split, above) inside the `if prop_type ==
+        # "Factory":` branch, and applying this flat 0.5% on top would
+        # double-credit the same OUM.
+        if prop_type != "Factory":
+            tier = info["tier"]
+            if tier == "OSA 1":
+                oum_p = info["oum_parent"]
+                if oum_p:
+                    override_commissions[oum_p] += sales_price * Decimal("0.005")
+            elif tier == "OSA":
+                oum_p = info["oum_parent"]
+                internal_senior = info.get("internal_senior_parent")
+                if oum_p:
+                    override_commissions[oum_p] += sales_price * Decimal("0.005")
+                if internal_senior:
+                    override_commissions[internal_senior] += sales_price * Decimal("0.005")
 
     # ------------------ TABLE 1 ------------------
     # Final Commission Payout Summary by Agent
