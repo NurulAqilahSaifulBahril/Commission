@@ -77,7 +77,11 @@ document.addEventListener("DOMContentLoaded", () => {
             search: "",
             // "all" | "advance" (RM300 tranche payable this month) | "balance"
             // (75%-milestone balance payable this month). July 2026+ only.
-            payoutStage: "all"
+            payoutStage: "all",
+            // "all" | "ega" | "esa". EGA/ESA Award section only. Each agent
+            // carries ONE eligibility label and ESA outranks EGA, so the two
+            // lists never overlap: an ESA winner appears under ESA only.
+            egaAward: "all"
         },
         specialCaseRowRefs: new Set(), // Set of row-array references that were added via modal
         specialCasePairs: [],         // Array of [basicRow, nfpRow] pairs for bulk deletion
@@ -351,6 +355,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const clearFiltersBtn = document.getElementById("clearFiltersBtn");
     const rm300FilterGroup = document.getElementById("rm300FilterGroup");
     const payoutStageFilter = document.getElementById("payoutStageFilter");
+    const egaAwardFilterGroup = document.getElementById("egaAwardFilterGroup");
+    const egaAwardFilter = document.getElementById("egaAwardFilter");
     const rateCardsContainer = document.getElementById("rateCardsContainer");
     
     const syncDataBtn = document.getElementById("syncDataBtn");
@@ -518,12 +524,23 @@ document.addEventListener("DOMContentLoaded", () => {
             });
         }
 
+        // EGA/ESA Award section only: keep agents whose eligibility is an EGA
+        // award or an ESA award. Early-bird labels count under their own award.
+        if (egaAwardFilter) {
+            egaAwardFilter.addEventListener("change", (e) => {
+                state.filters.egaAward = e.target.value;
+                renderActiveSection();
+            });
+        }
+
         // Clear filters button
         clearFiltersBtn.addEventListener("click", () => {
             if (searchFilter) searchFilter.value = "";
             state.filters.search = "";
             if (payoutStageFilter) payoutStageFilter.value = "all";
             state.filters.payoutStage = "all";
+            if (egaAwardFilter) egaAwardFilter.value = "all";
+            state.filters.egaAward = "all";
             renderActiveSection();
         });
 
@@ -3213,6 +3230,18 @@ modalPackageType.value = defaults.pkg || "-";
             }
         }
 
+        if (egaAwardFilterGroup) {
+            // Only the award tables carry an Eligibility column to filter on.
+            const showAwardFilter = state.activeSection === "ega_esa";
+            egaAwardFilterGroup.style.display = showAwardFilter ? "" : "none";
+            // Leaving the section drops the filter, so returning to it later
+            // never shows a partial report with the control out of sight.
+            if (!showAwardFilter && state.filters.egaAward !== "all") {
+                state.filters.egaAward = "all";
+                if (egaAwardFilter) egaAwardFilter.value = "all";
+            }
+        }
+
         // ANP Commission is internal agents only — lock the Agent Type
         // dropdown to Internal while this tab is active so it can't be
         // switched away from underneath the (already-forced) data fetch.
@@ -4462,6 +4491,16 @@ modalPackageType.value = defaults.pkg || "-";
         tableContainer.appendChild(wrapper);
     }
 
+    // Which team's agent breakdown is open on the Monthly Contest tab, or null
+    // when none is. Table 3 is hidden until a team name in table 1 is clicked.
+    let contestSelectedTeam = null;
+
+    // Table 1 names a team "Brazil Team" while table 3 says just "Brazil", so
+    // the two are only comparable once the suffix is dropped.
+    function contestTeamKey(val) {
+        return String(val || "").trim().toLowerCase().replace(/\s+team$/, "");
+    }
+
     function renderMonthlyContest(contestData) {
         if (!contestData) {
             noDataView.classList.remove("hidden");
@@ -4509,12 +4548,12 @@ modalPackageType.value = defaults.pkg || "-";
         // first column; table 3 supplies each agent's team.
         const teamIdx = t3Headers.findIndex(h => h.toLowerCase().includes("team"));
         const visibleTeams = new Set(
-            teamIdx === -1 ? [] : matchingT3Rows.map(row => String(row[teamIdx] || "").trim().toLowerCase())
+            teamIdx === -1 ? [] : matchingT3Rows.map(row => contestTeamKey(row[teamIdx]))
         );
         const t1Restricted = !!(userObj && userObj.filterAgentName !== null) || !!state.filters.search;
         const t1Rows = (contestData.rows_t1 || []).filter(row => {
             if (!t1Restricted) return true;
-            return visibleTeams.has(String(row[0] || "").trim().toLowerCase());
+            return visibleTeams.has(contestTeamKey(row[0]));
         });
 
         const visibleAgents = new Set();
@@ -4548,12 +4587,92 @@ modalPackageType.value = defaults.pkg || "-";
         wrapper.style.gap = "28px";
         wrapper.style.padding = "24px";
 
+        // The agent breakdown is a drill-down of table 1: it stays hidden until
+        // a team name is clicked, then shows only that team's rows. Without a
+        // team column to filter on there is nothing to drill into, so table 3
+        // is shown whole as before.
+        const t1Headers = contestData.headers_t1 || [];
+        const drillDown = teamIdx !== -1 && t1Rows.length > 0;
+        const t1TeamIdx = Math.max(0, t1Headers.findIndex(h => /team\s*name/i.test(h)));
+
+        // A team picked before a month/filter change may no longer be listed.
+        if (contestSelectedTeam && !t1Rows.some(r => contestTeamKey(r[t1TeamIdx]) === contestTeamKey(contestSelectedTeam))) {
+            contestSelectedTeam = null;
+        }
+
+        const summaryHost = document.createElement("div");
+        const teamCells = [];
+
+        const renderContestSummary = () => {
+            summaryHost.innerHTML = "";
+            teamCells.forEach(({ cell, name }) => {
+                const on = contestSelectedTeam !== null && contestTeamKey(name) === contestTeamKey(contestSelectedTeam);
+                cell.style.textDecoration = on ? "underline" : "";
+                cell.style.color = on ? "#2563eb" : "";
+                cell.style.fontWeight = on ? "700" : "";
+            });
+
+            const rows = !drillDown
+                ? matchingT3Rows
+                : (contestSelectedTeam === null
+                    ? []
+                    : matchingT3Rows.filter(r => contestTeamKey(r[teamIdx]) === contestTeamKey(contestSelectedTeam)));
+
+            rowCount.textContent = `${t1Rows.length + rows.length} total rows`;
+
+            if (drillDown && contestSelectedTeam === null) return;
+
+            if (rows.length === 0) {
+                const empty = document.createElement("div");
+                empty.style.fontSize = "16px";
+                empty.style.color = "#64748b";
+                empty.textContent = `No cases recorded for ${contestSelectedTeam} this month.`;
+                summaryHost.appendChild(empty);
+                return;
+            }
+
+            const title = drillDown
+                ? `Summary of Cases and Awards by Agent — ${contestSelectedTeam}`
+                : "Summary of Cases and Awards by Agent";
+            const t3Table = createBonusSubTable(title, t3Headers, rows, captains);
+
+            if (drillDown) {
+                const clear = document.createElement("button");
+                clear.type = "button";
+                clear.className = "btn-secondary";
+                clear.textContent = "✕ Hide breakdown";
+                clear.style.alignSelf = "flex-start";
+                clear.addEventListener("click", () => {
+                    contestSelectedTeam = null;
+                    renderContestSummary();
+                });
+                t3Table.appendChild(clear);
+            }
+            summaryHost.appendChild(t3Table);
+        };
+
         if (t1Rows.length > 0) {
-            wrapper.appendChild(createBonusSubTable("Team Championship and Team Achievement Bonus", contestData.headers_t1, t1Rows, captains));
+            const t1Table = createBonusSubTable("Team Championship and Team Achievement Bonus", t1Headers, t1Rows, captains);
+            if (drillDown) {
+                t1Table.querySelectorAll("tbody tr").forEach((tr, idx) => {
+                    const name = String((t1Rows[idx] || [])[t1TeamIdx] || "").trim();
+                    const cell = tr.children[t1TeamIdx];
+                    if (!cell || !name || /total|grand|summary/i.test(name)) return;
+                    cell.style.cursor = "pointer";
+                    cell.title = `Show ${name}'s agent breakdown`;
+                    cell.addEventListener("click", () => {
+                        // Clicking the open team again closes the breakdown.
+                        contestSelectedTeam = contestTeamKey(contestSelectedTeam) === contestTeamKey(name) ? null : name;
+                        renderContestSummary();
+                    });
+                    teamCells.push({ cell, name });
+                });
+            }
+            wrapper.appendChild(t1Table);
         }
-        if (matchingT3Rows.length > 0) {
-            wrapper.appendChild(createBonusSubTable("Summary of Cases and Awards by Agent", t3Headers, matchingT3Rows, captains));
-        }
+
+        wrapper.appendChild(summaryHost);
+        renderContestSummary();
 
         tableContainer.appendChild(wrapper);
     }
@@ -4581,7 +4700,7 @@ modalPackageType.value = defaults.pkg || "-";
             legend.style.fontSize = "16px";
             legend.style.color = "#64748b";
             legend.style.marginBottom = "8px";
-            legend.innerHTML = `<em>Gold, Silver, Bronze badges indicate Rank 1, 2, and 3 respectively.</em>`;
+            legend.innerHTML = `<em>Gold, Silver, Bronze badges indicate Rank 1, 2, and 3 respectively. Click a team name to see that team's agent breakdown.</em>`;
             subWrapper.appendChild(legend);
         }
 
@@ -4757,6 +4876,23 @@ modalPackageType.value = defaults.pkg || "-";
         const agentIdx = t2Headers.findIndex(h => h.toLowerCase().includes("agent"));
         const customerIdx = t2Headers.findIndex(h => h.toLowerCase().includes("customer"));
 
+        // Award filter. determine_eligibility() hands back ONE label per agent
+        // and ESA outranks EGA, so "EGA" and "ESA" are disjoint lists — an ESA
+        // winner is not listed under EGA even though they cleared that bar.
+        // Early-bird labels ("EGA (Feb)", "ESA (Nov)") count under their award.
+        const t1EligIdx = (egaData.headers_t1 || [])
+            .findIndex(h => String(h).toLowerCase().includes("eligib"));
+        const t2EligIdx = t2Headers.findIndex(h => String(h).toLowerCase().includes("eligib"));
+        const awardOf = (value) => {
+            const v = String(value ?? "").trim().toUpperCase();
+            if (v.startsWith("ESA")) return "esa";
+            if (v.startsWith("EGA")) return "ega";
+            return "";           // "-" — qualified for nothing yet
+        };
+        const wantedAward = state.filters.egaAward || "all";
+        const matchesAward = (row, idx) =>
+            wantedAward === "all" || (idx !== -1 && awardOf(row[idx]) === wantedAward);
+
         const userObj = USER_ROLES[state.currentUser];
 
         const matchingT2Rows = t2Rows.filter(row => {
@@ -4767,6 +4903,7 @@ modalPackageType.value = defaults.pkg || "-";
                     return false;
                 }
             }
+            if (!matchesAward(row, t2EligIdx)) return false;
             return matchesSearch(agentVal, customerVal);
         });
 
@@ -4786,6 +4923,7 @@ modalPackageType.value = defaults.pkg || "-";
                 const cleanAgent = agentVal.trim().toLowerCase();
                 if (cleanAgent !== userObj.filterAgentName.toLowerCase().trim()) return false;
             }
+            if (!matchesAward(row, t1EligIdx)) return false;
             return matchesAgentSearch(agentVal);
         });
 

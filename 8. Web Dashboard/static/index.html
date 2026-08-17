@@ -154,6 +154,14 @@
                     <label for="searchFilter">Search Agent or Customer</label>
                     <input type="text" id="searchFilter" placeholder="Type agent or customer name...">
                 </div>
+                <div class="filter-group filter-group-narrow" id="egaAwardFilterGroup" style="display:none;">
+                    <label for="egaAwardFilter">Award</label>
+                    <select id="egaAwardFilter">
+                        <option value="all" selected>All Awards</option>
+                        <option value="ega">EGA</option>
+                        <option value="esa">ESA</option>
+                    </select>
+                </div>
                 <div class="filter-group filter-group-narrow" id="rm300FilterGroup" style="display:none;">
                     <label for="payoutStageFilter">Payout Stage</label>
                     <select id="payoutStageFilter">
@@ -552,7 +560,7 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=20260813-role-hover-v3"></script>
+    <script src="/static/app.js?v=20260817-contest-team-drilldown"></script>
     <script src="/static/updater.js?v=20260731-ota-v1"></script>
 </body>
 </html>
