@@ -642,6 +642,15 @@ def _build_macos(version: str, arch: str = "arm64", with_runtime: bool = True,
     shutil.copytree(app_bundle, payload / MAC_APP_NAME, symlinks=True)
     print(f"payload: Electron app {app_bundle} -> {payload / MAC_APP_NAME}")
 
+    # Verify the payload has the critical Flask files before creating the DMG
+    flask_app = payload / "8. Web Dashboard" / "app.py"
+    if not flask_app.exists():
+        raise RuntimeError(
+            f"FATAL: Flask app not found at {flask_app}\n"
+            f"       The payload is incomplete. Payload contents:\n"
+            f"       {sorted(p.name for p in payload.iterdir())}"
+        )
+
     # Create a disk image with architecture suffix
     arch_suffix = "arm64" if arch == "arm64" else "intel"
     dmg_path = DIST / f"CommissionDashboard-Setup-{version}-macos-{arch_suffix}.dmg"
