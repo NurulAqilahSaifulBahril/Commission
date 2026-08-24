@@ -3,8 +3,8 @@ name: Release
 # Push a version tag to cut a release:
 #   git tag v1.2.0 && git push origin v1.2.0
 #
-# Publishes a Windows installer, a macOS disk image, and the code-only OTA
-# update package.
+# Publishes a Windows installer, macOS disk images (both ARM64 and x86_64),
+# and the code-only OTA update package.
 #
 # EACH PLATFORM JOB BUILDS ITS OWN PAYLOAD. That is not redundancy, it is the
 # fix for the way this broke: the payload used to be staged in one job and the
@@ -219,25 +219,26 @@ jobs:
       - name: Show what electron-builder produced
         run: ls -la "10. Electron App/app/dist"
 
-      - name: Build macOS disk image
-        run: python3 tools/build_package.py --version ${{ needs.version.outputs.version }} --platform macos
+      - name: Build macOS disk images (both ARM64 and x86_64)
+        run: python3 tools/build_package.py --version ${{ needs.version.outputs.version }} --platform macos-all
 
-      - name: Verify the disk image carries a payload
+      - name: Verify the disk images carry payloads
         run: |
-          dmg="dist/CommissionDashboard-Setup-${{ needs.version.outputs.version }}-macos.dmg"
-          if [ ! -f "$dmg" ]; then echo "No disk image at $dmg"; exit 1; fi
-          mb=$(( $(stat -f%z "$dmg") / 1048576 ))
-          echo "Disk image: $dmg (${mb} MB)"
-          if [ "$mb" -lt 100 ]; then
-            echo "Disk image is ${mb} MB - too small to contain the bundled runtime."
-            exit 1
-          fi
+          for dmg in dist/CommissionDashboard-Setup-*-macos*.dmg; do
+            if [ ! -f "$dmg" ]; then echo "No disk image at $dmg"; exit 1; fi
+            mb=$(( $(stat -f%z "$dmg") / 1048576 ))
+            echo "Disk image: $(basename $dmg) (${mb} MB)"
+            if [ "$mb" -lt 100 ]; then
+              echo "Disk image is ${mb} MB - too small to contain the bundled runtime."
+              exit 1
+            fi
+          done
 
       - name: Upload macOS assets
         uses: actions/upload-artifact@v4
         with:
           name: macos-assets
-          path: dist/CommissionDashboard-Setup-*-macos.dmg
+          path: dist/CommissionDashboard-Setup-*-macos*.dmg
           retention-days: 1
 
   publish:
@@ -290,7 +291,10 @@ jobs:
 
             **Download for your platform:**
             - **Windows**: CommissionDashboard-Setup-${{ needs.version.outputs.version }}.exe
-            - **macOS** (Apple Silicon): CommissionDashboard-Setup-${{ needs.version.outputs.version }}-macos.dmg
+            - **macOS** (Apple Silicon, M1 or newer): CommissionDashboard-Setup-${{ needs.version.outputs.version }}-macos-arm64.dmg
+            - **macOS** (Intel): CommissionDashboard-Setup-${{ needs.version.outputs.version }}-macos-intel.dmg
+
+            Not sure which Mac you have? Apple menu → About This Mac. "Chip: Apple M…" means arm64; "Processor: Intel…" means intel.
 
             **New here?** Read `Commission-Portal-User-Guide.pdf` below — it
             walks through installing and updating, step by step.
@@ -302,7 +306,7 @@ jobs:
             Existing users: auto-update is enabled in the dashboard.
           files: |
             dist/CommissionDashboard-Setup-*.exe
-            dist/CommissionDashboard-Setup-*-macos.dmg
+            dist/CommissionDashboard-Setup-*-macos-*.dmg
             dist/CommissionDashboard-update-*.zip
             dist/Commission-Portal-User-Guide.pdf
             dist/SHA256SUMS.txt

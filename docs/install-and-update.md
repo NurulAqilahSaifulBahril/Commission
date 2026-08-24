@@ -23,7 +23,10 @@ brings everything it needs with it.
 1. Go to the [Commission Portal download page](https://github.com/NurulAqilahSaifulBahril/Commission/releases/latest).
 2. Scroll down to the **Assets** list.
 3. **Windows:** click `CommissionDashboard-Setup-….exe` to download it.
-4. **Mac:** click `CommissionDashboard-Setup-…-macos.dmg` to download it.
+4. **Mac:** first check which chip your Mac has: Apple menu → **About This
+   Mac**. If it says **Apple M1/M2/M3…**, download
+   `CommissionDashboard-Setup-…-macos-arm64.dmg`. If it says **Intel**,
+   download `CommissionDashboard-Setup-…-macos-intel.dmg`.
 
 ### Step 2 — Install
 

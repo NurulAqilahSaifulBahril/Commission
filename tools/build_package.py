@@ -49,8 +49,6 @@ SHELL_SRC_FILES = ["main.js", "loading.html", "package.json"]
 # launch it, so this layout is what lets OTA updates keep working on Mac
 # exactly as they do on Windows.
 MAC_APP_NAME = "CommissionDashboard.app"
-SHELL_BUILD_MAC = (REPO_ROOT / "10. Electron App" / "app" / "dist"
-                   / "mac-arm64" / MAC_APP_NAME)
 
 # ── Bundled Python runtime ───────────────────────────────────────────────────
 # The dashboard runs from source, so the target machine needs an interpreter.
@@ -77,18 +75,26 @@ RUNTIME_CACHE = REPO_ROOT / ".cache" / "python-embed"
 # relocatable tree -- so the Mac runtime comes from python-build-standalone,
 # which exists for exactly this. "install_only" is the plain bin/ + lib/
 # layout, putting the interpreter at runtime/bin/python3 where main.js looks.
-#
-# Apple Silicon only. Every Mac sold since 2020 is arm64; an Intel build would
-# need a second runtime and a second set of wheels for no one currently asking.
 PYTHON_MAC_VERSION = "3.12.13"
 PYTHON_MAC_RELEASE = "20260805"
-PYTHON_MAC_ARCHIVE = (f"cpython-{PYTHON_MAC_VERSION}+{PYTHON_MAC_RELEASE}"
-                      f"-aarch64-apple-darwin-install_only.tar.gz")
-PYTHON_MAC_URL = (
+
+# ARM64 (Apple Silicon, M1+)
+PYTHON_MAC_ARM64_ARCHIVE = (f"cpython-{PYTHON_MAC_VERSION}+{PYTHON_MAC_RELEASE}"
+                            f"-aarch64-apple-darwin-install_only.tar.gz")
+PYTHON_MAC_ARM64_URL = (
     f"https://github.com/astral-sh/python-build-standalone/releases/download/"
-    f"{PYTHON_MAC_RELEASE}/{PYTHON_MAC_ARCHIVE}"
+    f"{PYTHON_MAC_RELEASE}/{PYTHON_MAC_ARM64_ARCHIVE}"
 )
-PYTHON_MAC_WHEEL_PLATFORM = "macosx_11_0_arm64"
+PYTHON_MAC_ARM64_WHEEL_PLATFORM = "macosx_11_0_arm64"
+
+# x86_64 (Intel)
+PYTHON_MAC_X86_64_ARCHIVE = (f"cpython-{PYTHON_MAC_VERSION}+{PYTHON_MAC_RELEASE}"
+                             f"-x86_64-apple-darwin-install_only.tar.gz")
+PYTHON_MAC_X86_64_URL = (
+    f"https://github.com/astral-sh/python-build-standalone/releases/download/"
+    f"{PYTHON_MAC_RELEASE}/{PYTHON_MAC_X86_64_ARCHIVE}"
+)
+PYTHON_MAC_X86_64_WHEEL_PLATFORM = "macosx_11_0_x86_64"
 
 # Files/folders copied into the package, as glob patterns relative to the root.
 INCLUDE = [
@@ -301,7 +307,37 @@ def stage_runtime(payload: Path) -> bool:
     return True
 
 
-def stage_runtime_mac(payload: Path) -> bool:
+def _download_python_mac_arch(arch: str) -> tuple[Path, str, str]:
+    """Download python-build-standalone for a macOS architecture, cache it locally.
+
+    Returns (archive_path, wheel_platform, arch_name).
+    """
+    if arch == "arm64":
+        archive = PYTHON_MAC_ARM64_ARCHIVE
+        url = PYTHON_MAC_ARM64_URL
+        platform = PYTHON_MAC_ARM64_WHEEL_PLATFORM
+    elif arch == "x86_64":
+        archive = PYTHON_MAC_X86_64_ARCHIVE
+        url = PYTHON_MAC_X86_64_URL
+        platform = PYTHON_MAC_X86_64_WHEEL_PLATFORM
+    else:
+        raise ValueError(f"Unknown macOS architecture: {arch}")
+
+    cache = REPO_ROOT / ".cache" / "python-mac"
+    cache.mkdir(parents=True, exist_ok=True)
+    archive_path = cache / archive
+
+    if archive_path.exists():
+        print(f"runtime: using cached {archive} ({arch})")
+        return archive_path, platform, arch
+
+    print(f"runtime: downloading {archive} ({arch}) ...")
+    urllib.request.urlretrieve(url, archive_path)
+    print(f"runtime: cached to {archive_path}")
+    return archive_path, platform, arch
+
+
+def stage_runtime_mac(payload: Path, arch: str = "arm64") -> bool:
     """Put a ready-to-run Python for macOS at payload/runtime.
 
     The python-build-standalone distribution is a relocatable tarball that
@@ -311,14 +347,14 @@ def stage_runtime_mac(payload: Path) -> bool:
     """
     runtime = payload / "runtime"
     try:
-        archive_path = _download_python_mac()
+        archive_path, wheel_platform, arch_name = _download_python_mac_arch(arch)
     except Exception as e:
-        print(f"WARNING: could not fetch the macOS Python runtime ({e}). "
+        print(f"WARNING: could not fetch the macOS {arch} Python runtime ({e}). "
               f"Installer will require Python on the machine.")
         return False
 
     runtime.mkdir(parents=True, exist_ok=True)
-    print(f"runtime: extracting macOS Python to {runtime}")
+    print(f"runtime: extracting macOS Python ({arch_name}) to {runtime}")
     with tarfile.open(archive_path, "r:gz") as tf:
         # The tarball unpacks to cpython-<version>-<platform>/; extract into runtime/
         tf.extractall(runtime)
@@ -334,47 +370,26 @@ def stage_runtime_mac(payload: Path) -> bool:
     site_packages.mkdir(parents=True, exist_ok=True)
     req = REPO_ROOT / "requirements-dashboard.txt"
     cmd = [
-        # The build host's interpreter, not the one just unpacked. Same choice
-        # as the Windows path, and it does not assume the freshly extracted
-        # tree has a working pip. --platform/--python-version below are what
-        # make the wheels correct for the target, regardless of who resolves
-        # them.
         sys.executable, "-m", "pip", "install",
         "--target", str(site_packages),
         "--python-version", PYTHON_MAC_VERSION.rsplit(".", 1)[0],
-        "--platform", PYTHON_MAC_WHEEL_PLATFORM,
+        "--platform", wheel_platform,
         "--only-binary=:all:",
         "--no-compile",
         "--upgrade",
         "-r", str(req),
     ]
-    print(f"runtime: installing dependencies for macOS arm64...")
+    print(f"runtime: installing dependencies for macOS {arch_name}...")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(result.stdout[-3000:])
         print(result.stderr[-3000:])
-        raise RuntimeError("dependency install into the bundled macOS runtime failed")
+        raise RuntimeError(f"dependency install into the bundled macOS {arch} runtime failed")
 
     total = sum(f.stat().st_size for f in runtime.rglob("*") if f.is_file())
-    print(f"payload: Python {PYTHON_MAC_VERSION} runtime -> {runtime} "
+    print(f"payload: Python {PYTHON_MAC_VERSION} runtime ({arch_name}) -> {runtime} "
           f"({total // (1024 * 1024)} MB)")
     return True
-
-
-def _download_python_mac() -> Path:
-    """Download python-build-standalone for macOS arm64, cache it locally."""
-    cache = REPO_ROOT / ".cache" / "python-mac"
-    cache.mkdir(parents=True, exist_ok=True)
-    archive_path = cache / PYTHON_MAC_ARCHIVE
-
-    if archive_path.exists():
-        print(f"runtime: using cached {PYTHON_MAC_ARCHIVE}")
-        return archive_path
-
-    print(f"runtime: downloading {PYTHON_MAC_ARCHIVE} ...")
-    urllib.request.urlretrieve(PYTHON_MAC_URL, archive_path)
-    print(f"runtime: cached to {archive_path}")
-    return archive_path
 
 
 def stage_seed_env(payload: Path, seed_env: Path) -> None:
@@ -518,10 +533,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--platform",
-        choices=["windows", "macos"],
+        choices=["windows", "macos", "macos-arm64", "macos-x86_64", "macos-all"],
         default="windows",
-        help="Target platform (default: windows). For macOS, skips the Windows-specific "
-             "installer compilation and instead creates a disk image.",
+        help="Target platform (default: windows). "
+             "macos = macos-arm64 (Apple Silicon), "
+             "macos-arm64 = M1+ Macs only, "
+             "macos-x86_64 = Intel Macs only, "
+             "macos-all = both architectures in one build.",
     )
     args = parser.parse_args()
 
@@ -540,8 +558,14 @@ def main() -> int:
         parser.error(f"--seed-env file not found: {seed}")
 
     # Build the platform-specific package
-    if args.platform == "macos":
-        _build_macos(version, with_runtime=not args.no_runtime, seed_env=seed)
+    if args.platform in ("macos", "macos-arm64"):
+        _build_macos(version, arch="arm64", with_runtime=not args.no_runtime, seed_env=seed)
+    elif args.platform == "macos-x86_64":
+        _build_macos(version, arch="x86_64", with_runtime=not args.no_runtime, seed_env=seed)
+    elif args.platform == "macos-all":
+        _build_macos(version, arch="arm64", with_runtime=not args.no_runtime, seed_env=seed)
+        _build_macos(version, arch="x86_64", with_runtime=not args.no_runtime,
+                     seed_env=seed, clean=False)
     else:
         build(version, with_runtime=not args.no_runtime, seed_env=seed)
 
@@ -549,38 +573,52 @@ def main() -> int:
     return 0
 
 
-def _find_mac_app_bundle() -> Path:
-    """Locate the .app electron-builder just produced.
+def _find_mac_app_bundle(arch: str = "arm64") -> Path:
+    """Locate the .app electron-builder produced for the given architecture.
 
-    SHELL_BUILD_MAC is only the expected location. The actual directory name
-    depends on the target architecture and on electron-builder's config --
-    mac-arm64/ on an arm64 runner, plain mac/ on x64, and something else again
-    for a universal build. Hard-coding one of those is how the first attempt
-    failed, with an error that named a path rather than the real problem, so
-    search and report what was actually there when nothing matches.
+    electron-builder's output directory is arch-dependent: on an arm64 runner
+    the arm64 bundle lands in mac-arm64/ and the x64 one in plain mac/ (and
+    the names can flip on an x64 host). Rather than hard-code that mapping,
+    prefer the directory whose name matches the arch, fall back to the other
+    known names, and report what was actually there when nothing matches --
+    an earlier attempt hard-coded one path and failed with an error that named
+    a path rather than the real problem.
     """
-    if SHELL_BUILD_MAC.is_dir():
-        return SHELL_BUILD_MAC
-
     dist_dir = REPO_ROOT / "10. Electron App" / "app" / "dist"
-    candidates = sorted(dist_dir.glob("mac*/*.app")) if dist_dir.is_dir() else []
-    if candidates:
-        return candidates[0]
+
+    # electron-builder appends the arch to the output directory for every arch
+    # EXCEPT x64, which gets the bare platform name — on any host. So the
+    # arm64 bundle is always in mac-arm64/ and the x64 bundle always in mac/.
+    names = ["mac-arm64"] if arch == "arm64" else ["mac", "mac-x64"]
+
+    for name in names:
+        candidates = sorted((dist_dir / name).glob("*.app")) if (dist_dir / name).is_dir() else []
+        if candidates:
+            return candidates[0]
 
     listing = "\n".join(f"         {p.name}" for p in sorted(dist_dir.iterdir())) \
         if dist_dir.is_dir() else "         (dist/ does not exist)"
     raise SystemExit(
-        f"ERROR: no .app bundle found under {dist_dir}\n"
-        f"       Expected {SHELL_BUILD_MAC}\n"
+        f"ERROR: no {arch} .app bundle found under {dist_dir}\n"
         f"       dist/ contains:\n{listing}\n"
-        "       Run `npm run dist` in \"10. Electron App/app\" on macOS first."
+        "       Run `npm run dist` in \"10. Electron App/app\" on macOS first "
+        "(package.json targets both arm64 and x64)."
     )
 
 
-def _build_macos(version: str, with_runtime: bool = True, seed_env: Path | None = None) -> None:
-    """Build a macOS package: payload + app bundle + runtime -> disk image."""
-    _clean_dist()
+def _build_macos(version: str, arch: str = "arm64", with_runtime: bool = True,
+                 seed_env: Path | None = None, clean: bool = True) -> None:
+    """Build a macOS package for a given architecture: payload + app bundle + runtime -> disk image.
+
+    With clean=False only the payload directory is rebuilt and finished disk
+    images in dist/ survive — that is what lets macos-all produce two DMGs
+    without the second build deleting the first.
+    """
     payload = DIST / "payload"
+    if clean:
+        _clean_dist()
+    elif payload.exists():
+        shutil.rmtree(payload)
     payload.mkdir(parents=True)
 
     # Stage the code
@@ -592,20 +630,21 @@ def _build_macos(version: str, with_runtime: bool = True, seed_env: Path | None 
         shutil.copy2(src, dst)
     print(f"payload: {len(files)} files -> {payload}")
 
-    # Add macOS runtime
+    # Add macOS runtime for the specified architecture
     if with_runtime:
-        stage_runtime_mac(payload)
+        stage_runtime_mac(payload, arch=arch)
 
     # Add credentials if seeded
     if seed_env is not None:
         stage_seed_env(payload, seed_env)
 
-    app_bundle = _find_mac_app_bundle()
+    app_bundle = _find_mac_app_bundle(arch)
     shutil.copytree(app_bundle, payload / MAC_APP_NAME, symlinks=True)
     print(f"payload: Electron app {app_bundle} -> {payload / MAC_APP_NAME}")
 
-    # Create a disk image
-    dmg_path = DIST / f"CommissionDashboard-Setup-{version}-macos.dmg"
+    # Create a disk image with architecture suffix
+    arch_suffix = "arm64" if arch == "arm64" else "intel"
+    dmg_path = DIST / f"CommissionDashboard-Setup-{version}-macos-{arch_suffix}.dmg"
     print(f"Creating disk image: {dmg_path}")
     result = subprocess.run(
         [
@@ -623,7 +662,7 @@ def _build_macos(version: str, with_runtime: bool = True, seed_env: Path | None 
         raise RuntimeError(f"Failed to create disk image: {result.stderr}")
 
     size = dmg_path.stat().st_size
-    print(f"macOS: disk image -> {dmg_path} ({size // (1024 * 1024)} MB)")
+    print(f"macOS ({arch}): disk image -> {dmg_path} ({size // (1024 * 1024)} MB)")
 
 
 if __name__ == "__main__":

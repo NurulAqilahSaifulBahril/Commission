@@ -534,8 +534,11 @@ g.numbered(1, f"Go to the [Commission Portal download page]({RELEASES_URL}).")
 g.numbered(2, "Scroll down to the **Assets** list.")
 g.numbered(3, "**Windows:** click `CommissionDashboard-Setup-….exe` to "
               "download it.")
-g.numbered(4, "**Mac:** click `CommissionDashboard-Setup-…-macos.dmg` to "
-              "download it.")
+g.numbered(4, "**Mac:** first check which chip your Mac has: Apple menu → "
+              "**About This Mac**. If it says **Apple M1/M2/M3…**, download "
+              "`CommissionDashboard-Setup-…-macos-arm64.dmg`. If it says "
+              "**Intel**, download "
+              "`CommissionDashboard-Setup-…-macos-intel.dmg`.")
 
 g.step_heading("play", "Step 2 — Install")
 g.platform_block("WINDOWS", ACCENT, [
