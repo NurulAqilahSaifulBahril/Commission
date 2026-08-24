@@ -651,6 +651,18 @@ def _build_macos(version: str, arch: str = "arm64", with_runtime: bool = True,
             f"       {sorted(p.name for p in payload.iterdir())}"
         )
 
+    # Wrap the payload in a single folder for the DMG so users just drag one
+    # folder to Applications instead of managing three separate items.
+    dmg_root = DIST / "dmg-contents"
+    if dmg_root.exists():
+        shutil.rmtree(dmg_root)
+    dmg_root.mkdir(parents=True)
+
+    # Create the folder that users will drag to Applications
+    app_folder = dmg_root / "Commission Dashboard"
+    shutil.copytree(payload, app_folder)
+    print(f"dmg: wrapped payload in single folder -> {app_folder}")
+
     # Create a disk image with architecture suffix
     arch_suffix = "arm64" if arch == "arm64" else "intel"
     dmg_path = DIST / f"CommissionDashboard-Setup-{version}-macos-{arch_suffix}.dmg"
@@ -659,7 +671,7 @@ def _build_macos(version: str, arch: str = "arm64", with_runtime: bool = True,
         [
             "hdiutil", "create",
             "-volname", "Commission Dashboard",
-            "-srcfolder", str(payload),
+            "-srcfolder", str(dmg_root),
             "-ov", "-format", "UDZO",
             str(dmg_path),
         ],
