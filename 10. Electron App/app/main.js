@@ -20,11 +20,23 @@ const DASHBOARD_URL = `http://127.0.0.1:${PORT}`;
 // resources at <root>/shell/resources/app*, so walk up until app.py appears.
 function findCommissionRoot() {
   let dir = __dirname;
-  // 8 levels: deployed is <root>/shell/resources/app.asar (4 hops), but the
-  // dev build sits at <root>/10. Electron App/app/dist/win-unpacked/resources/
-  // app.asar (7 hops) and should be launchable for testing too.
-  for (let i = 0; i < 8; i++) {
-    if (fs.existsSync(path.join(dir, "8. Web Dashboard", "app.py"))) return dir;
+  // Walk up the directory tree looking for 8. Web Dashboard/app.py.
+  // Deployed: exe is at <root>/shell/resources/app*, so 4-5 hops up to root.
+  // Dev: app.asar is at <root>/10. Electron App/app/dist/*/resources/app.asar, so ~7 hops.
+  // macOS packaged: app is at <root>/CommissionDashboard.app/Contents/Resources/ or similar.
+  // Windows from DMG-like scenario: similar depth but different path structure.
+  // Search up to 15 levels to handle macOS .app bundles and various deployments.
+  for (let i = 0; i < 15; i++) {
+    const dashboardPath = path.join(dir, "8. Web Dashboard", "app.py");
+    if (fs.existsSync(dashboardPath)) {
+      return dir;
+    }
+    // Also check if dir itself contains the 8. Web Dashboard folder (for when the
+    // app is in a sibling folder scenario on macOS).
+    const dashboardDir = path.join(dir, "8. Web Dashboard");
+    if (fs.existsSync(dashboardDir) && fs.existsSync(path.join(dashboardDir, "app.py"))) {
+      return dir;
+    }
     dir = path.dirname(dir);
   }
   return null;
