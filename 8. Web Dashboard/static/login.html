@@ -60,6 +60,43 @@
             font-size: 0.95rem;
             box-sizing: border-box;
         }
+        .login-password-wrap {
+            position: relative;
+        }
+        .login-password-wrap input {
+            padding-right: 42px;
+        }
+        /* Hide Edge's built-in reveal button so it doesn't duplicate ours */
+        .login-password-wrap input::-ms-reveal,
+        .login-password-wrap input::-ms-clear {
+            display: none;
+        }
+        .login-password-toggle {
+            position: absolute;
+            top: 50%;
+            right: 6px;
+            transform: translateY(-50%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 30px;
+            height: 30px;
+            padding: 0;
+            border: none;
+            border-radius: 6px;
+            background: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            transition: var(--transition);
+        }
+        .login-password-toggle:hover {
+            color: var(--text-main);
+            background-color: var(--bg-primary);
+        }
+        .login-password-toggle svg {
+            width: 18px;
+            height: 18px;
+        }
         .login-error {
             color: #dc2626;
             font-size: 0.85rem;
@@ -100,7 +137,19 @@
                 </div>
                 <div class="login-field">
                     <label for="password">Password</label>
-                    <input type="password" id="password" name="password" autocomplete="current-password" required>
+                    <div class="login-password-wrap">
+                        <input type="password" id="password" name="password" autocomplete="current-password" required>
+                        <button type="button" class="login-password-toggle" id="togglePassword" aria-label="Show password" title="Show password" aria-pressed="false">
+                            <svg id="eyeOpen" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                <circle cx="12" cy="12" r="3"></circle>
+                            </svg>
+                            <svg id="eyeClosed" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display: none;">
+                                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
+                                <line x1="1" y1="1" x2="23" y2="23"></line>
+                            </svg>
+                        </button>
+                    </div>
                 </div>
                 <div class="login-error" id="loginError"></div>
                 <button type="submit" class="login-submit" id="loginSubmit">Sign in</button>
@@ -112,6 +161,23 @@
         const form = document.getElementById("loginForm");
         const errorBox = document.getElementById("loginError");
         const submitBtn = document.getElementById("loginSubmit");
+
+        const passwordInput = document.getElementById("password");
+        const toggleBtn = document.getElementById("togglePassword");
+        const eyeOpen = document.getElementById("eyeOpen");
+        const eyeClosed = document.getElementById("eyeClosed");
+
+        toggleBtn.addEventListener("click", () => {
+            const showing = passwordInput.type === "text";
+            passwordInput.type = showing ? "password" : "text";
+            eyeOpen.style.display = showing ? "" : "none";
+            eyeClosed.style.display = showing ? "none" : "";
+            const label = showing ? "Show password" : "Hide password";
+            toggleBtn.setAttribute("aria-label", label);
+            toggleBtn.setAttribute("title", label);
+            toggleBtn.setAttribute("aria-pressed", showing ? "false" : "true");
+            passwordInput.focus();
+        });
 
         function nextUrl() {
             const params = new URLSearchParams(window.location.search);
