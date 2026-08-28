@@ -85,6 +85,9 @@ function waitForPort(timeoutMs) {
 }
 
 let flaskProc = null;
+// What actually went wrong launching the interpreter. Read only by the
+// failure dialog.
+let launchFailure = null;
 
 function startFlask(root) {
   freePort();
@@ -119,12 +122,43 @@ function startFlask(root) {
   try {
     out = fs.openSync(path.join(root, "8. Web Dashboard", "shell-startup.log"), "w");
   } catch {}
+  launchFailure = null;
   flaskProc = spawn(python, [path.join(root, "8. Web Dashboard", "app.py")], {
     cwd: root,
     stdio: ["ignore", out, out],
     windowsHide: true,
   });
-  flaskProc.on("error", () => { flaskProc = null; });
+  // Both of these used to be discarded — the "error" handler threw the error
+  // object away and nothing watched for "exit" at all. When the interpreter
+  // failed to start it wrote nothing to the log, so the dialog had an empty
+  // log and no error, and could do nothing but guess at a cause. It guessed
+  // "macOS blocked it", which is only one of several things an empty log
+  // means. Keep what actually happened and say that instead.
+  flaskProc.on("error", (err) => {
+    flaskProc = null;
+    launchFailure = `could not run ${python}\n${err.code || ""} ${err.message}`.trim();
+  });
+  flaskProc.on("exit", (code, signal) => {
+    if (signal) {
+      launchFailure = `${python}\nwas killed by ${signal} before it could start.`;
+    } else if (code) {
+      launchFailure = `${python}\nexited immediately with code ${code}.`;
+    }
+  });
+}
+
+// True only when macOS has actually flagged the path — checked rather than
+// assumed, so the app can tell "still quarantined, run the installer" apart
+// from "not quarantined, so this is something else entirely".
+function isQuarantined(target) {
+  if (os.platform() !== "darwin") return false;
+  try {
+    execSync(`xattr -p com.apple.quarantine ${JSON.stringify(target)}`,
+      { stdio: ["ignore", "pipe", "ignore"] });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function startupLogTail(root, maxLines = 12) {
@@ -258,15 +292,19 @@ async function launch() {
         : "the setup script";
       hint = `No Python environment was found — run ${setupCmd} ` +
         "in the install folder, then open this app again.";
-    } else if (os.platform() === "darwin" && !tail) {
-      // The interpreter is present but produced no output at all. On a Mac
-      // that is the signature of Gatekeeper killing it: a quarantined
-      // runtime/bin/python3 is refused before it can write a line.
-      hint = "The bundled Python was blocked by macOS security.\n\n" +
+    } else if (os.platform() === "darwin" && isQuarantined(root)) {
+      // Checked, not inferred. macOS refuses to run quarantined programs, and
+      // that is the one cause the app can both confirm and give an exact fix
+      // for.
+      hint = "macOS has this install quarantined, so it will not let the " +
+        "bundled Python run.\n\n" +
         "Open the downloaded .dmg again and run " +
-        "\"Install Commission Dashboard.command\" — it clears the download " +
-        "quarantine that causes this. Dragging the folder across by hand " +
-        "does not.";
+        "\"Install Commission Dashboard.command\". It clears the quarantine; " +
+        "opening the app straight from the disk image, or dragging the folder " +
+        "across by hand, leaves it in place.";
+    } else if (launchFailure) {
+      hint = "The bundled Python would not start.\n\n" + launchFailure +
+        "\n\nSend this message to IT.";
     } else {
       hint = "Check \"8. Web Dashboard\\shell-startup.log\" and " +
         "\"8. Web Dashboard\\dashboard.log\" in the install folder, or send " +
