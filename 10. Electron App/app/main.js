@@ -147,6 +147,43 @@ function startFlask(root) {
   });
 }
 
+// Nothing can be repaired in a place we cannot write to, and the dashboard
+// could not keep its database or logs there either. A mounted disk image and a
+// translocated copy are both read-only, which is what makes this the right
+// test: an install on an external drive is writable and passes.
+// Returns "image" when we are running from a mounted disk image or a
+// translocated copy, "readonly" for an install folder we simply cannot write
+// to, and null when all is well. The two need different advice, and telling
+// someone their disk image is read-only when they are actually installed into
+// a folder they lack permission on just sends them round the loop again.
+function readOnlyReason(root) {
+  if (os.platform() !== "darwin") return null;
+  if (root.startsWith("/Volumes/") || root.includes("/AppTranslocation/")) {
+    return "image";
+  }
+  try {
+    fs.accessSync(root, fs.constants.W_OK);
+    return null;
+  } catch {
+    return "readonly";
+  }
+}
+
+// Clear the download flag from our own install folder. This is the same thing
+// the installer script does; doing it here too means an install that was
+// dragged across by hand — which is what people reach for, and which leaves a
+// bundled Python that macOS kills on sight — repairs itself on first launch
+// instead of dead-ending on a message about an installer they did not run.
+function clearQuarantine(root) {
+  try {
+    execSync(`xattr -dr com.apple.quarantine ${JSON.stringify(root)}`,
+      { stdio: "ignore", timeout: 120_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // True only when macOS has actually flagged the path — checked rather than
 // assumed, so the app can tell "still quarantined, run the installer" apart
 // from "not quarantined, so this is something else entirely".
@@ -247,6 +284,50 @@ async function launch() {
     dialog.showErrorBox("Commission Portal", message);
     app.quit();
     return;
+  }
+
+  // macOS pre-flight. Gatekeeper is by far the biggest source of failed
+  // installs here, and every one of those failures is recoverable without the
+  // user needing to understand any of it. So recover, rather than explain.
+  if (os.platform() === "darwin") {
+    const readOnly = readOnlyReason(root);
+    if (readOnly === "image") {
+      dialog.showErrorBox(
+        "Commission Portal",
+        "This copy is running from the disk image, which macOS keeps " +
+          "read-only — so the dashboard cannot start and nothing could be " +
+          "saved anyway.\n\n" +
+          "In the disk image window, drag the \"Commission Dashboard\" " +
+          "folder onto the Applications shortcut beside it. Then open it " +
+          "from Applications, not from the disk image."
+      );
+      app.quit();
+      return;
+    }
+    if (readOnly === "readonly") {
+      dialog.showErrorBox(
+        "Commission Portal",
+        `The Portal cannot write to its own folder:\n\n${root}\n\n` +
+          "It keeps its settings, database and logs there, so it cannot run " +
+          "from a place it has no permission on.\n\n" +
+          "Open the downloaded .dmg again and double-click \"Install " +
+          "Commission Dashboard\" — that installs it into your own " +
+          "Applications folder, which never has this problem."
+      );
+      app.quit();
+      return;
+    }
+    if (isQuarantined(root) && (!clearQuarantine(root) || isQuarantined(root))) {
+      dialog.showErrorBox(
+        "Commission Portal",
+        "macOS has quarantined this install and it could not be cleared " +
+          "automatically, so it will not let the bundled Python run.\n\n" +
+          "Open the downloaded .dmg again and double-click \"Install " +
+          "Commission Dashboard\"."
+      );
+      app.quit();
+      return;
+    }
   }
 
   startFlask(root);

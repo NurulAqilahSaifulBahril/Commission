@@ -32,7 +32,7 @@ COVER_DPI = 150
 LOGO = os.path.join(HERE, "assets", "logo-header.png")
 SCREENSHOT = os.path.join(DOCS, "img", "update-panel.png")
 
-VERSION = "1.2.22"
+VERSION = "1.2.23"
 DATE_LINE = "August 2026"
 RELEASES_URL = "https://github.com/NurulAqilahSaifulBahril/Commission/releases/latest"
 
@@ -552,26 +552,27 @@ g.platform_block("WINDOWS", ACCENT, [
 ])
 g.platform_block("MAC", DARK, [
     "Open the `.dmg` file you just downloaded.",
-    "Double-click **Install Commission Dashboard**. Do **not** drag the "
-    "folder across by hand — macOS locks down anything dragged out of a "
-    "download, and the Portal will not start.",
-    "**macOS will refuse to open it the first time**, saying it is from an "
-    "unidentified developer. This is normal for apps outside the App Store. "
-    "Right-click **Install Commission Dashboard**, choose **Open**, then "
-    "click **Open** again.",
+    "Drag the **Commission Dashboard** folder onto the **Applications** "
+    "shortcut next to it. Wait for the copy to finish — it is about 700 MB.",
+    "Open **Applications** → **Commission Dashboard** and double-click "
+    "**CommissionDashboard**. Do not open it from the disk image.",
+    "**macOS will refuse the first time**, saying it is from an unidentified "
+    "developer. This is normal for apps outside the App Store. Right-click "
+    "**CommissionDashboard**, choose **Open**, then click **Open** again.",
     "**On macOS Sequoia or newer** there is no Open button in that message. "
     "Go to Apple menu → **System Settings** → **Privacy & Security**, scroll "
     "down, and click **Open Anyway**.",
-    "A black window opens and copies the files. It takes a minute or two, "
-    "then the Portal opens by itself. Close the black window when it says "
-    "it is done.",
+    "The first start takes a minute or two. If macOS refuses the drag in "
+    "step 2 (*you don't have permission*), double-click **Install Commission "
+    "Dashboard** on the disk image instead — it installs into your own "
+    "Applications folder.",
 ])
 
 g.step_heading("check", "Step 3 — Open the Portal")
 g.para("**Windows:** Start Menu → **Finance Commission Dashboard** (or the "
        "desktop shortcut).")
-g.para("**Mac:** Finder → **Go** → **Home** → **Applications** → "
-       "**Commission Dashboard** → **CommissionDashboard**.")
+g.para("**Mac:** **Applications** → **Commission Dashboard** → "
+       "**CommissionDashboard**.")
 g.para("Log in with the **username and password IT gave you**. There is no "
        "account to create — yours already exists. The first load takes a "
        "moment while it fetches the year's data. **You are done.**")
@@ -616,17 +617,17 @@ g.trouble_table([
      "Tell IT — ask them to check `dashboard.log` in the Portal's folder"),
     ("**Mac:** \"cannot be opened because it is from an unidentified "
      "developer\"",
-     "Expected on the installer, once. Right-click **Install Commission "
-     "Dashboard** and choose **Open**, then **Open** again. On macOS "
-     "Sequoia: System Settings → Privacy & Security → **Open Anyway**."),
-    ("**Mac:** \"damaged and can't be opened\", or \"Could not find the "
-     "dashboard files\"",
-     "The app was dragged out of the disk image instead of installed. "
-     "Delete it, open the `.dmg` again, and run **Install Commission "
-     "Dashboard** this time."),
-    ("**Mac:** you installed it but cannot find it afterwards",
-     "It is in your own Applications folder, not the main one: Finder → "
-     "**Go** → **Home** → **Applications** → **Commission Dashboard**."),
+     "Expected once, the first time you open it. Right-click "
+     "**CommissionDashboard** and choose **Open**, then **Open** again. On "
+     "macOS Sequoia: System Settings → Privacy & Security → **Open Anyway**."),
+    ("**Mac:** \"running from the disk image\", or the Portal will not start "
+     "after opening it from the `.dmg` window",
+     "It has to be copied out first. Drag the **Commission Dashboard** "
+     "folder onto the **Applications** shortcut, then open it from there."),
+    ("**Mac:** \"you don't have permission\" when dragging to Applications",
+     "Double-click **Install Commission Dashboard** on the disk image "
+     "instead. It installs into your own Applications folder: Finder → "
+     "**Go** → **Home** → **Applications**."),
     ("An update failed", "Tell IT — ask them to check `dashboard.log`"),
     ("Numbers look out of date",
      "Wait a few minutes, or click **Sync Data** at the top right"),

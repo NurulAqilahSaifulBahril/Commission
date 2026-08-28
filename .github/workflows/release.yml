@@ -264,6 +264,8 @@ jobs:
             [ -x "$mnt/Install Commission Dashboard.command" ] \
               || fail "no executable installer script on the image"
             [ -f "$mnt/READ ME FIRST.txt" ] || fail "no READ ME FIRST.txt"
+            [ -L "$mnt/Applications" ] \
+              || fail "no Applications shortcut - drag-to-install has nowhere to drop"
             [ -f "$root/8. Web Dashboard/app.py" ] || fail "no Flask app in the folder"
             [ -x "$root/runtime/bin/python3" ] || fail "no bundled python3"
             [ -L "$app/Contents/Frameworks/Electron Framework.framework/Versions/Current" ] \
@@ -340,18 +342,20 @@ jobs:
             ### Installing on a Mac
 
             1. Open the downloaded `.dmg`.
-            2. Double-click **Install Commission Dashboard.command**.
-            3. macOS blocks it the first time — it is not an App Store app.
-               Right-click the installer → **Open** → **Open**. On macOS
-               Sequoia or newer, go to **System Settings → Privacy &
+            2. Drag the **Commission Dashboard** folder onto the
+               **Applications** shortcut beside it.
+            3. Open it from Applications. macOS blocks it the first time — it
+               is not an App Store app. Right-click → **Open** → **Open**. On
+               macOS Sequoia or newer, go to **System Settings → Privacy &
                Security** and click **Open Anyway** instead.
-            4. It copies everything to your Applications folder and opens the
-               dashboard. Takes a minute or two.
+            4. First start takes a minute or two.
 
-            **Do not drag the folder across by hand.** macOS quarantines
-            anything dragged out of a downloaded disk image, and a quarantined
-            copy cannot start its own server — the installer exists to clear
-            that. Full steps, with screenshots, are in the user guide below.
+            That is the whole install, and step 3 happens only once. Don't run
+            it from the disk image — it has to be copied out first. If macOS
+            refuses the drag ("you don't have permission"), double-click
+            **Install Commission Dashboard** on the image instead; it installs
+            into your own Applications folder. Full steps are in the user
+            guide below.
 
             **New here?** Read `Commission-Portal-User-Guide.pdf` below — it
             walks through installing and updating, step by step.

@@ -893,28 +893,33 @@ echo "You can close this window."
     (dmg_root / "READ ME FIRST.txt").write_text(f"""Commission Dashboard — installing on a Mac
 ==========================================
 
-1. Double-click "{MAC_INSTALLER_NAME}".
+1. Drag the "{MAC_FOLDER_NAME}" folder onto the
+   Applications shortcut next to it.
 
-2. macOS will say it is from an unidentified developer and refuse.
-   That is expected — this app is not distributed through the App Store.
-   Right-click (or Control-click) "{MAC_INSTALLER_NAME}",
-   choose Open, then choose Open again in the dialog.
+2. Open Applications, then "{MAC_FOLDER_NAME}", and
+   double-click CommissionDashboard.
 
-   On macOS Sequoia or newer there is no Open button in that first
-   dialog. Instead go to  Apple menu > System Settings > Privacy &
-   Security, scroll down, and click "Open Anyway".
+3. macOS will block it the first time and say it is from an
+   unidentified developer. That is expected — this app is not
+   distributed through the App Store. Right-click (or Control-click)
+   CommissionDashboard, choose Open, then choose Open again.
 
-3. The installer copies everything to your Applications folder and
-   opens the dashboard. It takes a minute or two.
+   On macOS Sequoia or newer there is no Open button in that dialog.
+   Go to  Apple menu > System Settings > Privacy & Security, scroll
+   down, and click "Open Anyway".
 
-4. Sign in with the username and password IT gave you.
+4. It takes a minute or two to start the first time. Sign in with the
+   username and password IT gave you.
 
-To open it again later:
-   Finder > Go > Home > Applications > {MAC_FOLDER_NAME}
-   ...and double-click CommissionDashboard.
+Steps 1 to 3 are one time only. After that just open it from
+Applications like any other app.
 
-You only have to do step 2 once, for the installer. The installed app
-opens normally after that.
+Do not run it from this disk image — it has to be copied out first.
+
+If macOS will not let you drag into Applications ("you don't have
+permission to..."), double-click "{MAC_INSTALLER_NAME}"
+instead. That installs into your own Applications folder — Finder >
+Go > Home > Applications — which never has that problem.
 
 Anything unexpected: send IT a photo of the message on screen.
 """, encoding="utf-8", newline="\n")
@@ -988,6 +993,14 @@ def _build_macos(version: str, arch: str = "arm64", with_runtime: bool = True,
     # Last write into the bundle has happened; anything after this invalidates
     # the signature.
     _codesign_mac(app_folder / MAC_APP_NAME)
+
+    # The shortcut that makes drag-to-install possible at all: without it there
+    # is nowhere on the image to drag to, and people drag the folder to the
+    # desktop or open the app in place. Dragging is now a supported route --
+    # the app clears its own quarantine on first launch -- so it gets the
+    # standard Mac affordance rather than being warned against.
+    (dmg_root / "Applications").symlink_to("/Applications")
+    print("dmg: added Applications shortcut for drag-to-install")
 
     _write_mac_installer(dmg_root)
 
