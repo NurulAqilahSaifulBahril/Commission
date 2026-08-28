@@ -185,10 +185,32 @@ async function launch() {
 
   const root = findCommissionRoot();
   if (!root) {
-    dialog.showErrorBox(
-      "Commission Portal",
-      "Could not find the dashboard files (8. Web Dashboard\\app.py) near this app. Reinstall the Finance Commission Dashboard."
-    );
+    // On macOS the overwhelmingly likely cause is not a broken install but
+    // App Translocation: a still-quarantined app (dragged out of the disk
+    // image by hand instead of run through the installer) is executed from a
+    // randomised read-only copy under /private/var/folders, so the sibling
+    // "8. Web Dashboard" folder is nowhere near __dirname. The generic
+    // "reinstall it" text sent people round the same loop, because dragging
+    // it again reproduces the same state. Name the actual fix instead.
+    const translocated =
+      os.platform() === "darwin" &&
+      (__dirname.includes("/AppTranslocation/") || __dirname.startsWith("/private/var/folders/"));
+    const message = translocated
+      ? "macOS is running this app from a temporary read-only copy, so it " +
+        "cannot see the dashboard files next to it.\n\n" +
+        "Open the downloaded .dmg again and run " +
+        "\"Install Commission Dashboard.command\" instead of dragging the " +
+        "app out. That puts it in your Applications folder and clears the " +
+        "download quarantine that causes this."
+      : os.platform() === "darwin"
+      ? "Could not find the dashboard files (\"8. Web Dashboard/app.py\") " +
+        "next to this app.\n\n" +
+        "CommissionDashboard must stay inside the \"Commission Dashboard\" " +
+        "folder — moving the app out on its own leaves it with nothing to " +
+        "run. Open the downloaded .dmg again and run " +
+        "\"Install Commission Dashboard.command\"."
+      : "Could not find the dashboard files (8. Web Dashboard\\app.py) near this app. Reinstall the Finance Commission Dashboard.";
+    dialog.showErrorBox("Commission Portal", message);
     app.quit();
     return;
   }
@@ -217,9 +239,15 @@ async function launch() {
     // (no access keys in .env) crashed the server silently and got
     // misdiagnosed. The server's own last words are in shell-startup.log.
     const tail = startupLogTail(root);
-    const hasInterpreter =
-      fs.existsSync(path.join(root, "runtime", "python.exe")) ||
-      fs.existsSync(path.join(root, ".venv", "Scripts", "python.exe"));
+    // Was looking for python.exe on every platform, so on a Mac — where the
+    // bundled interpreter is runtime/bin/python3 — this was always false and
+    // the dialog always blamed a missing Python environment, whatever had
+    // actually gone wrong. Check the paths startFlask() actually uses.
+    const hasInterpreter = os.platform() === "win32"
+      ? fs.existsSync(path.join(root, "runtime", "python.exe")) ||
+        fs.existsSync(path.join(root, ".venv", "Scripts", "python.exe"))
+      : fs.existsSync(path.join(root, "runtime", "bin", "python3")) ||
+        fs.existsSync(path.join(root, ".venv", "bin", "python3"));
     let hint;
     if (tail.includes("PG_MIRROR_TOKEN") || tail.includes("PG_PROXY_TOKEN")) {
       hint = "The access keys are missing or wrong. Ask IT for your keys and " +
@@ -230,6 +258,15 @@ async function launch() {
         : "the setup script";
       hint = `No Python environment was found — run ${setupCmd} ` +
         "in the install folder, then open this app again.";
+    } else if (os.platform() === "darwin" && !tail) {
+      // The interpreter is present but produced no output at all. On a Mac
+      // that is the signature of Gatekeeper killing it: a quarantined
+      // runtime/bin/python3 is refused before it can write a line.
+      hint = "The bundled Python was blocked by macOS security.\n\n" +
+        "Open the downloaded .dmg again and run " +
+        "\"Install Commission Dashboard.command\" — it clears the download " +
+        "quarantine that causes this. Dragging the folder across by hand " +
+        "does not.";
     } else {
       hint = "Check \"8. Web Dashboard\\shell-startup.log\" and " +
         "\"8. Web Dashboard\\dashboard.log\" in the install folder, or send " +

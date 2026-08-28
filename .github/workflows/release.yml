@@ -219,7 +219,14 @@ jobs:
       - name: Show what electron-builder produced
         run: ls -la "10. Electron App/app/dist"
 
+      # MAC_SIGN_IDENTITY is optional and normally unset: with no Apple
+      # Developer ID the build signs ad-hoc, which is what makes the app
+      # launchable on Apple Silicon at all. Set the secret to a "Developer ID
+      # Application: ..." name (with the certificate imported into the runner
+      # keychain) to sign for distribution instead.
       - name: Build macOS disk images (both ARM64 and x86_64)
+        env:
+          MAC_SIGN_IDENTITY: ${{ secrets.MAC_SIGN_IDENTITY }}
         run: python3 tools/build_package.py --version ${{ needs.version.outputs.version }} --platform macos-all
 
       - name: Verify the disk images carry payloads
@@ -232,6 +239,40 @@ jobs:
               echo "Disk image is ${mb} MB - too small to contain the bundled runtime."
               exit 1
             fi
+          done
+
+      # Mount each image and check the three things that decide whether a Mac
+      # user gets a working install or a dead end. All three have shipped
+      # broken before, and none of them show up in a file size:
+      #   - the installer script, which clears the download quarantine that
+      #     blocks a dragged-across copy;
+      #   - a valid code signature, without which Apple Silicon reports the
+      #     app as "damaged" and offers no way past it;
+      #   - the Electron framework's symlinks, whose flattening was what
+      #     invalidated that signature in the first place.
+      - name: Verify the disk images are actually installable
+        run: |
+          set -e
+          for dmg in dist/CommissionDashboard-Setup-*-macos*.dmg; do
+            echo "== $(basename "$dmg")"
+            mnt=$(mktemp -d)
+            hdiutil attach "$dmg" -mountpoint "$mnt" -nobrowse -quiet
+            root="$mnt/Commission Dashboard"
+            app="$root/CommissionDashboard.app"
+            fail() { echo "   FAIL: $1"; hdiutil detach "$mnt" -quiet; exit 1; }
+
+            [ -x "$mnt/Install Commission Dashboard.command" ] \
+              || fail "no executable installer script on the image"
+            [ -f "$mnt/READ ME FIRST.txt" ] || fail "no READ ME FIRST.txt"
+            [ -f "$root/8. Web Dashboard/app.py" ] || fail "no Flask app in the folder"
+            [ -x "$root/runtime/bin/python3" ] || fail "no bundled python3"
+            [ -L "$app/Contents/Frameworks/Electron Framework.framework/Versions/Current" ] \
+              || fail "Electron framework symlinks were flattened - the bundle is broken"
+            codesign --verify --deep --strict "$app" \
+              || fail "the app bundle does not pass codesign - macOS will call it damaged"
+
+            echo "   ok: installer, payload, runtime, symlinks, signature"
+            hdiutil detach "$mnt" -quiet
           done
 
       - name: Upload macOS assets
@@ -295,6 +336,22 @@ jobs:
             - **macOS** (Intel): CommissionDashboard-Setup-${{ needs.version.outputs.version }}-macos-intel.dmg
 
             Not sure which Mac you have? Apple menu → About This Mac. "Chip: Apple M…" means arm64; "Processor: Intel…" means intel.
+
+            ### Installing on a Mac
+
+            1. Open the downloaded `.dmg`.
+            2. Double-click **Install Commission Dashboard.command**.
+            3. macOS blocks it the first time — it is not an App Store app.
+               Right-click the installer → **Open** → **Open**. On macOS
+               Sequoia or newer, go to **System Settings → Privacy &
+               Security** and click **Open Anyway** instead.
+            4. It copies everything to your Applications folder and opens the
+               dashboard. Takes a minute or two.
+
+            **Do not drag the folder across by hand.** macOS quarantines
+            anything dragged out of a downloaded disk image, and a quarantined
+            copy cannot start its own server — the installer exists to clear
+            that. Full steps, with screenshots, are in the user guide below.
 
             **New here?** Read `Commission-Portal-User-Guide.pdf` below — it
             walks through installing and updating, step by step.

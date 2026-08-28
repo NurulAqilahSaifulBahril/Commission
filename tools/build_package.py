@@ -50,6 +50,16 @@ SHELL_SRC_FILES = ["main.js", "loading.html", "package.json"]
 # exactly as they do on Windows.
 MAC_APP_NAME = "CommissionDashboard.app"
 
+# The folder that ships inside the disk image and ends up in the user's
+# Applications folder. Space-separated and human-readable: it is what staff see
+# in Finder, unlike the bundle name, which has to match electron-builder's
+# productName.
+MAC_FOLDER_NAME = "Commission Dashboard"
+
+# Double-clicked from the disk image; see _write_mac_installer for why the Mac
+# gets an installer script where Windows gets an .exe.
+MAC_INSTALLER_NAME = "Install Commission Dashboard.command"
+
 # ── Bundled Python runtime ───────────────────────────────────────────────────
 # The dashboard runs from source, so the target machine needs an interpreter.
 # It used to need its own: the installer demanded Python 3.10+ on PATH and then
@@ -606,6 +616,260 @@ def _find_mac_app_bundle(arch: str = "arm64") -> Path:
     )
 
 
+def _write_mac_entitlements(where: Path) -> Path:
+    """The hardened-runtime exceptions Electron and the bundled Python need.
+
+    Only used when signing with a real Developer ID -- an ad-hoc signature
+    never runs under the hardened runtime, so it needs none of this. Written to
+    a subdirectory rather than dist/ itself: it is a build input, and
+    write_checksums() lists every loose file in dist/ as a release asset.
+    """
+    where = where / "build-temp"
+    where.mkdir(parents=True, exist_ok=True)
+    plist = where / "mac-entitlements.plist"
+    plist.write_text("""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- V8 compiles JavaScript at runtime; without these Electron dies at boot. -->
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+  <!-- The shell spawns runtime/bin/python3, which is signed by someone else
+       entirely (python-build-standalone) and loads its own .dylibs and
+       compiled wheels. Library validation would refuse every one of them. -->
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict>
+</plist>
+""", encoding="utf-8", newline="\n")
+    return plist
+
+
+def _codesign_mac(app: Path) -> None:
+    """Sign the .app so macOS will consent to launch it.
+
+    electron-builder skips signing on CI -- "cannot find valid Developer ID
+    Application identity", plainly in the build log -- and an *unsigned* bundle
+    is not merely warned about on Apple Silicon: the kernel will not exec an
+    arm64 binary that carries no signature at all. Finder reports that as
+    "CommissionDashboard is damaged and can't be opened. You should move it to
+    the Trash", with no way past it. That is a dead end, not a prompt, and it is
+    what an M-series Mac saw on every build before this one.
+
+    An ad-hoc signature ("-") needs no Apple account and no money, and it turns
+    the dead end into the ordinary unidentified-developer prompt -- which the
+    installer script clears outright by stripping quarantine. Set
+    MAC_SIGN_IDENTITY to a real "Developer ID Application: ..." to sign for
+    distribution instead. Signing with a Developer ID and then notarising is
+    the only way to remove the prompt itself rather than work around it;
+    notarisation is not wired up here, because it needs a paid Apple Developer
+    account that this project does not have yet.
+
+    Signing must come AFTER the bundle is in its final place and nothing further
+    will be written into it. Any modification of a signed bundle invalidates the
+    signature, and an invalid signature reads to macOS as "damaged" -- exactly
+    the failure we are here to fix.
+    """
+    identity = os.environ.get("MAC_SIGN_IDENTITY", "-").strip() or "-"
+    adhoc = identity == "-"
+    label = "ad-hoc" if adhoc else identity
+
+    # Stray extended attributes make codesign fail with "resource fork, Finder
+    # information, or similar detritus not allowed". Cheap to prevent, and the
+    # error names a cause that means nothing to whoever reads the build log.
+    subprocess.run(["xattr", "-cr", str(app)], capture_output=True, text=True)
+
+    # --deep is deprecated for distribution signing but is the right tool for an
+    # ad-hoc pass over a bundle we did not build the signing plan for: it walks
+    # every nested helper, framework and dylib. Without it only the outer
+    # executable is signed and the Electron helpers stay unsigned -- which fails
+    # on arm64 in the same way as signing nothing.
+    cmd = ["codesign", "--force", "--deep", "--sign", identity]
+    if adhoc:
+        # An ad-hoc signature cannot carry a trusted timestamp; asking for one
+        # is a hard error rather than a downgrade.
+        cmd.append("--timestamp=none")
+    else:
+        # Notarisation refuses anything without the hardened runtime and a
+        # secure timestamp. The entitlements are what keep Electron working
+        # under it -- V8 needs writable-executable memory, and the dashboard
+        # spawns the bundled python3, which library validation would block.
+        entitlements = _write_mac_entitlements(DIST)
+        cmd += ["--options", "runtime", "--timestamp",
+                "--entitlements", str(entitlements)]
+    cmd.append(str(app))
+    sign = subprocess.run(cmd, capture_output=True, text=True)
+    if sign.returncode != 0:
+        print(sign.stdout[-2000:])
+        print(sign.stderr[-2000:])
+        raise RuntimeError(
+            f"codesign failed for {app}. An unsigned bundle will not launch on "
+            "Apple Silicon, so this is fatal rather than a warning."
+        )
+
+    verify = subprocess.run(
+        ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)],
+        capture_output=True, text=True,
+    )
+    if verify.returncode != 0:
+        print(verify.stderr[-2000:])
+        raise RuntimeError(
+            f"{app} does not verify after signing — macOS would call it damaged."
+        )
+    print(f"macOS: signed {app.name} ({label}) and verified the signature")
+
+
+def _write_mac_installer(dmg_root: Path) -> None:
+    """Put a double-clickable installer beside the app folder in the disk image.
+
+    Windows has an .exe that does this; the Mac had "drag this folder to
+    Applications", which fails for two reasons that are invisible to the person
+    doing the dragging:
+
+    * Quarantine. Everything out of a downloaded disk image carries
+      com.apple.quarantine. On an unsigned build that is the
+      unidentified-developer wall, and it applies not only to the .app but to
+      runtime/bin/python3 and every .dylib under it, so even an app that opens
+      cannot start its own server.
+    * App Translocation. A quarantined app launched from anywhere other than a
+      folder the user explicitly moved it to is run from a randomised read-only
+      mount. __dirname then points into /private/var/folders/..., where
+      findCommissionRoot() cannot see "8. Web Dashboard" — the app opens and
+      immediately reports "Could not find the dashboard files."
+
+    Both die the moment the quarantine attribute is gone, which a script can do
+    and a drag cannot. The script also installs to ~/Applications rather than
+    /Applications: no admin password, and the folder stays writable, which the
+    dashboard requires — it writes .env, dashboard.db and its logs in place.
+
+    The script itself is quarantined too, so the first run still needs one
+    right-click → Open. One deliberate override, once, in exchange for an
+    install that then behaves like any other app.
+    """
+    script = dmg_root / MAC_INSTALLER_NAME
+    script.write_text(f"""#!/bin/bash
+# Installs the Commission Dashboard into ~/Applications.
+#
+# Copies the app folder off this disk image, removes the quarantine flag macOS
+# puts on downloaded files, and opens the dashboard. Existing settings, the
+# local database and saved rules are carried over, not overwritten.
+
+set -u
+
+SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+SRC="$SRC_DIR/{MAC_FOLDER_NAME}"
+DEST_PARENT="$HOME/Applications"
+DEST="$DEST_PARENT/{MAC_FOLDER_NAME}"
+APP="$DEST/{MAC_APP_NAME}"
+
+# Files holding live state. Kept across a reinstall for the same reason
+# updater.py preserves them across an update: they are the user's, not ours.
+KEEP=(
+  ".env"
+  "8. Web Dashboard/dashboard.db"
+  "8. Web Dashboard/data"
+  "8. Web Dashboard/special_cases.json"
+  "8. Web Dashboard/factory_rates.json"
+)
+
+fail() {{
+  echo ""
+  echo "Install failed: $1"
+  echo ""
+  echo "Send this whole window to IT and they can take it from here."
+  echo "Press Return to close."
+  read -r _
+  exit 1
+}}
+
+echo "Installing the Commission Dashboard..."
+echo ""
+
+[ -d "$SRC" ] || fail "could not find \\"{MAC_FOLDER_NAME}\\" next to this installer.
+         Open the downloaded .dmg and run the installer from inside it."
+
+mkdir -p "$DEST_PARENT" || fail "could not create $DEST_PARENT"
+
+STASH=""
+if [ -d "$DEST" ]; then
+  echo "Found an existing install — keeping your settings and data."
+  STASH="$(mktemp -d)"
+  for rel in "${{KEEP[@]}}"; do
+    if [ -e "$DEST/$rel" ]; then
+      mkdir -p "$STASH/$(dirname "$rel")"
+      cp -R "$DEST/$rel" "$STASH/$rel" || fail "could not back up $rel"
+    fi
+  done
+  rm -rf "$DEST" || fail "could not replace the old install at $DEST"
+fi
+
+# ditto, not cp: it is the only copy on macOS that reliably preserves the
+# symlinks inside the Electron framework and the code signature that depends
+# on them. A plain recursive cp flattens them and the app becomes "damaged".
+echo "Copying files (this takes a minute — about 700 MB)..."
+ditto "$SRC" "$DEST" || fail "could not copy the app to $DEST"
+
+if [ -n "$STASH" ]; then
+  for rel in "${{KEEP[@]}}"; do
+    if [ -e "$STASH/$rel" ]; then
+      rm -rf "$DEST/$rel"
+      mkdir -p "$DEST/$(dirname "$rel")"
+      cp -R "$STASH/$rel" "$DEST/$rel" || fail "could not restore $rel"
+    fi
+  done
+  rm -rf "$STASH"
+  echo "Restored your settings and data."
+fi
+
+# The step a drag-and-drop install cannot do, and the reason it was failing.
+echo "Clearing the macOS download quarantine..."
+xattr -dr com.apple.quarantine "$DEST" 2>/dev/null
+
+[ -d "$APP" ] || fail "the copy finished but $APP is not there."
+
+echo ""
+echo "Installed to: $DEST"
+echo "Opening the Commission Dashboard..."
+open "$APP" || fail "the app is installed but would not open. Open it from Finder: Go → Home → Applications."
+
+echo ""
+echo "Done. From now on, open it from Finder: Go → Home → Applications → {MAC_FOLDER_NAME}."
+echo "You can close this window."
+""", encoding="utf-8", newline="\n")
+    script.chmod(0o755)
+
+    (dmg_root / "READ ME FIRST.txt").write_text(f"""Commission Dashboard — installing on a Mac
+==========================================
+
+1. Double-click "{MAC_INSTALLER_NAME}".
+
+2. macOS will say it is from an unidentified developer and refuse.
+   That is expected — this app is not distributed through the App Store.
+   Right-click (or Control-click) "{MAC_INSTALLER_NAME}",
+   choose Open, then choose Open again in the dialog.
+
+   On macOS Sequoia or newer there is no Open button in that first
+   dialog. Instead go to  Apple menu > System Settings > Privacy &
+   Security, scroll down, and click "Open Anyway".
+
+3. The installer copies everything to your Applications folder and
+   opens the dashboard. It takes a minute or two.
+
+4. Sign in with the username and password IT gave you.
+
+To open it again later:
+   Finder > Go > Home > Applications > {MAC_FOLDER_NAME}
+   ...and double-click CommissionDashboard.
+
+You only have to do step 2 once, for the installer. The installed app
+opens normally after that.
+
+Anything unexpected: send IT a photo of the message on screen.
+""", encoding="utf-8", newline="\n")
+    print(f"dmg: wrote {MAC_INSTALLER_NAME} and READ ME FIRST.txt")
+
+
 def _build_macos(version: str, arch: str = "arm64", with_runtime: bool = True,
                  seed_env: Path | None = None, clean: bool = True) -> None:
     """Build a macOS package for a given architecture: payload + app bundle + runtime -> disk image.
@@ -651,17 +915,30 @@ def _build_macos(version: str, arch: str = "arm64", with_runtime: bool = True,
             f"       {sorted(p.name for p in payload.iterdir())}"
         )
 
-    # Wrap the payload in a single folder for the DMG so users just drag one
-    # folder to Applications instead of managing three separate items.
+    # Wrap the payload in a single folder for the DMG, so the disk image holds
+    # one obvious thing to install rather than three loose items.
     dmg_root = DIST / "dmg-contents"
     if dmg_root.exists():
         shutil.rmtree(dmg_root)
     dmg_root.mkdir(parents=True)
 
-    # Create the folder that users will drag to Applications
-    app_folder = dmg_root / "Commission Dashboard"
-    shutil.copytree(payload, app_folder)
-    print(f"dmg: wrapped payload in single folder -> {app_folder}")
+    # MOVE, never copy. shutil.copytree() defaults to symlinks=False, which
+    # resolves every symlink it walks into a full copy of its target. Inside
+    # CommissionDashboard.app that means Contents/Frameworks/Electron
+    # Framework.framework/Versions/Current and the four aliases beside it stop
+    # being links, which both inflates the image by a couple of hundred MB and
+    # destroys the bundle layout the code signature is computed over. macOS
+    # calls the result damaged and refuses to open it. A rename has no such
+    # failure mode, and is instant.
+    app_folder = dmg_root / MAC_FOLDER_NAME
+    shutil.move(str(payload), str(app_folder))
+    print(f"dmg: staged payload -> {app_folder}")
+
+    # Last write into the bundle has happened; anything after this invalidates
+    # the signature.
+    _codesign_mac(app_folder / MAC_APP_NAME)
+
+    _write_mac_installer(dmg_root)
 
     # Create a disk image with architecture suffix
     arch_suffix = "arm64" if arch == "arm64" else "intel"
