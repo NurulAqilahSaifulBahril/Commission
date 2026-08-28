@@ -1017,6 +1017,11 @@ tell application "Finder"
     open
     update without registering applications
     delay 2
+    -- Leave nothing holding the volume. Ending with the window open kept
+    -- Finder attached to it, and the compression step that follows then
+    -- failed with "Resource temporarily unavailable" -- an error that names
+    -- the symptom and not one word of the cause.
+    close
   end tell
 end tell
 """
@@ -1091,20 +1096,49 @@ def _create_styled_dmg(dmg_root: Path, dmg_path: Path, background: str) -> None:
             )
         subprocess.run(["sync"], capture_output=True)
     finally:
-        for attempt in range(3):
+        for attempt in range(5):
             if not mount.exists():
                 break
-            cmd = ["hdiutil", "detach", str(mount)]
+            cmd = ["hdiutil", "detach", str(mount), "-quiet"]
             if attempt:
                 cmd.append("-force")
-            if subprocess.run(cmd, capture_output=True).returncode == 0:
-                break
+            subprocess.run(cmd, capture_output=True)
             _time.sleep(2)
 
+    # `hdiutil detach` returning 0 is not the same as the device being gone,
+    # and convert on a still-attached image fails with EAGAIN. Wait for the
+    # image to actually disappear from the attached list before compressing.
+    deadline = _time.time() + 90
+    while _time.time() < deadline:
+        info = subprocess.run(["hdiutil", "info"], capture_output=True, text=True)
+        if str(temp_dmg) not in info.stdout:
+            break
+        _time.sleep(2)
+    else:
+        raise RuntimeError(
+            f"{temp_dmg} is still attached after 90s — something is holding "
+            "the volume and it cannot be compressed."
+        )
+
     dmg_path.unlink(missing_ok=True)
-    run(["hdiutil", "convert", str(temp_dmg), "-format", "UDZO",
-         "-imagekey", "zlib-level=9", "-o", str(dmg_path)],
-        "compressing the disk image")
+    # Belt as well as braces: whatever else might briefly hold the file
+    # (Spotlight indexing a freshly detached volume, for one), a retry costs
+    # seconds and a failure costs a whole release cycle.
+    for attempt in range(1, 4):
+        converted = subprocess.run(
+            ["hdiutil", "convert", str(temp_dmg), "-format", "UDZO",
+             "-imagekey", "zlib-level=9", "-o", str(dmg_path)],
+            capture_output=True, text=True,
+        )
+        if converted.returncode == 0:
+            break
+        print(f"dmg: compression attempt {attempt} failed: "
+              f"{converted.stderr.strip()[:200]}")
+        dmg_path.unlink(missing_ok=True)
+        _time.sleep(5)
+    else:
+        raise RuntimeError(
+            f"compressing the disk image failed: {converted.stderr.strip()[:300]}")
     temp_dmg.unlink(missing_ok=True)
 
 
