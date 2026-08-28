@@ -347,13 +347,31 @@ def _download_python_mac_arch(arch: str) -> tuple[Path, str, str]:
     return archive_path, platform, arch
 
 
+def _mac_runtime_root(runtime: Path) -> Path:
+    """The directory holding bin/python3, wherever the tarball put it.
+
+    Upstream currently unpacks to a "python/" folder, but the name is not part
+    of any contract we control, so identify the root by what has to be inside
+    it. Returns `runtime` itself when the archive was already flat.
+    """
+    if (runtime / "bin" / "python3").exists():
+        return runtime
+    for child in sorted(runtime.iterdir()):
+        if child.is_dir() and (child / "bin" / "python3").exists():
+            return child
+    raise RuntimeError(
+        f"no bin/python3 anywhere under {runtime} — the python-build-standalone "
+        f"layout has changed. Found: {sorted(p.name for p in runtime.iterdir())}"
+    )
+
+
 def stage_runtime_mac(payload: Path, arch: str = "arm64") -> bool:
     """Put a ready-to-run Python for macOS at payload/runtime.
 
-    The python-build-standalone distribution is a relocatable tarball that
-    unpacks to runtime/bin/python3 (where main.js expects it on Mac).
-    Dependencies are installed the same way as Windows: pip --target into
-    site-packages, but with the macOS wheel platform tag.
+    The python-build-standalone distribution is a relocatable tarball. It is
+    flattened so the interpreter ends up at runtime/bin/python3, which is the
+    path main.js tries first on a Mac, and the dependencies go into the
+    distribution's own site-packages so they are on sys.path without help.
     """
     runtime = payload / "runtime"
     try:
@@ -366,17 +384,36 @@ def stage_runtime_mac(payload: Path, arch: str = "arm64") -> bool:
     runtime.mkdir(parents=True, exist_ok=True)
     print(f"runtime: extracting macOS Python ({arch_name}) to {runtime}")
     with tarfile.open(archive_path, "r:gz") as tf:
-        # The tarball unpacks to cpython-<version>-<platform>/; extract into runtime/
         tf.extractall(runtime)
-        # Move the contents up one level so bin/ sits directly under runtime/
-        extracted = list(runtime.glob("cpython-*"))
-        if extracted:
-            for item in extracted[0].iterdir():
-                dst = runtime / item.name
-                item.replace(dst)
-            extracted[0].rmdir()
 
-    site_packages = runtime / "lib" / "python3.12" / "site-packages"
+    # python-build-standalone's install_only archives unpack to a single
+    # top-level "python/" directory. This used to glob for "cpython-*" -- the
+    # name of the downloaded *archive*, not of anything inside it -- so the
+    # match never happened, the flatten was skipped, and the interpreter stayed
+    # at runtime/python/bin/python3, one level below where main.js looks for
+    # it. The shell then fell through to bare "python3" on PATH: on a clean Mac
+    # that is Apple's stub, which pops a "install the developer tools" prompt,
+    # and which could not see the bundled dependencies even if it ran. Every
+    # Mac build so far has shipped that way. Locate the extracted root by
+    # finding the interpreter, so a change to the upstream folder name shows up
+    # as a build failure rather than as a silently misplaced runtime.
+    inner = _mac_runtime_root(runtime)
+    if inner != runtime:
+        for item in inner.iterdir():
+            item.replace(runtime / item.name)
+        inner.rmdir()
+        print(f"runtime: flattened {inner.name}/ into {runtime.name}/")
+
+    # Derive site-packages rather than hard-coding python3.12, and use the
+    # distribution's own directory: it is already on sys.path, so nothing has
+    # to teach the interpreter where the dependencies went.
+    lib_dirs = sorted(runtime.glob("lib/python3.*"))
+    if not lib_dirs:
+        raise RuntimeError(
+            f"no lib/python3.* directory under {runtime} — the runtime did not "
+            "unpack in the layout this build expects."
+        )
+    site_packages = lib_dirs[0] / "site-packages"
     site_packages.mkdir(parents=True, exist_ok=True)
     req = REPO_ROOT / "requirements-dashboard.txt"
     cmd = [
@@ -396,9 +433,23 @@ def stage_runtime_mac(payload: Path, arch: str = "arm64") -> bool:
         print(result.stderr[-3000:])
         raise RuntimeError(f"dependency install into the bundled macOS {arch} runtime failed")
 
+    # The one thing that has to be true for the Mac app to work at all, checked
+    # where it is cheap to fix rather than on a user's machine. main.js runs
+    # exactly this path; a size in MB says nothing about whether it is there.
+    interpreter = runtime / "bin" / "python3"
+    if not interpreter.exists():
+        raise RuntimeError(
+            f"{interpreter} is missing after staging — the shell would fall "
+            f"back to whatever python3 is on the user's PATH. Contents of "
+            f"{runtime}: {sorted(p.name for p in runtime.iterdir())}"
+        )
+    if not os.access(interpreter, os.X_OK):
+        raise RuntimeError(f"{interpreter} is not executable.")
+
     total = sum(f.stat().st_size for f in runtime.rglob("*") if f.is_file())
     print(f"payload: Python {PYTHON_MAC_VERSION} runtime ({arch_name}) -> {runtime} "
-          f"({total // (1024 * 1024)} MB)")
+          f"({total // (1024 * 1024)} MB), interpreter at bin/python3, "
+          f"dependencies in {site_packages.relative_to(runtime)}")
     return True
 
 
