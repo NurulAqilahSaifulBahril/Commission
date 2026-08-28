@@ -926,6 +926,188 @@ Anything unexpected: send IT a photo of the message on screen.
     print(f"dmg: wrote {MAC_INSTALLER_NAME} and READ ME FIRST.txt")
 
 
+# The disk image window: content size in points, and the centre of each icon
+# within it. Shared by the background art and the AppleScript that places the
+# icons, so the arrow drawn in the image lands between the two things it points
+# from and to. Change one and you must change the other.
+DMG_WINDOW = (660, 440)
+DMG_ICON_SIZE = 96
+DMG_POSITIONS = {
+    MAC_FOLDER_NAME: (175, 170),
+    "Applications": (485, 170),
+    "READ ME FIRST.txt": (175, 345),
+    MAC_INSTALLER_NAME: (485, 345),
+}
+
+
+def _stage_dmg_background(dmg_root: Path) -> str:
+    """Put the window background inside the image, hidden, and name the file.
+
+    Committed as PNG rather than generated here so the build needs no imaging
+    library. tiffutil combines the 1x and 2x art into the multi-resolution
+    file Finder wants on a retina display; if it is not there or fails, the 1x
+    PNG alone still works and merely looks softer.
+    """
+    src = REPO_ROOT / "10. Electron App" / "assets"
+    one, two = src / "dmg-background.png", src / "dmg-background@2x.png"
+    if not one.is_file():
+        raise SystemExit(f"ERROR: {one} is missing — the disk image has no background art.")
+
+    hidden = dmg_root / ".background"
+    hidden.mkdir(parents=True, exist_ok=True)
+
+    if two.is_file():
+        tiff = hidden / "background.tiff"
+        combined = subprocess.run(
+            ["tiffutil", "-cathidpicheck", str(one), str(two), "-out", str(tiff)],
+            capture_output=True, text=True,
+        )
+        if combined.returncode == 0 and tiff.is_file():
+            print("dmg: background art -> background.tiff (1x + 2x)")
+            return "background.tiff"
+        print(f"dmg: tiffutil unavailable or failed, using the 1x PNG "
+              f"({combined.stderr.strip()[:120]})")
+
+    shutil.copy2(one, hidden / "background.png")
+    print("dmg: background art -> background.png (1x only)")
+    return "background.png"
+
+
+def _folder_size_mb(root: Path) -> int:
+    """Bytes on disk, not following symlinks — the Electron framework's links
+    would otherwise be counted as full copies of what they point at."""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        for name in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                pass
+    return total // (1024 * 1024)
+
+
+def _dmg_applescript(background: str) -> str:
+    """Finder instructions that turn a plain file list into the drag window.
+
+    Positions are icon centres measured from the top-left of the window's
+    content area, which is the same origin the background image uses.
+    """
+    left, top = 200, 120
+    width, height = DMG_WINDOW
+    places = "\n".join(
+        f'      set position of item "{name}" of container window to '
+        f"{{{x}, {y}}}"
+        for name, (x, y) in DMG_POSITIONS.items()
+    )
+    return f"""
+tell application "Finder"
+  tell disk "{MAC_FOLDER_NAME}"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set the bounds of container window to {{{left}, {top}, {left + width}, {top + height}}}
+    set opts to the icon view options of container window
+    set arrangement of opts to not arranged
+    set icon size of opts to {DMG_ICON_SIZE}
+    set text size of opts to 12
+    set background picture of opts to file ".background:{background}"
+{places}
+    close
+    open
+    update without registering applications
+    delay 2
+  end tell
+end tell
+"""
+
+
+def _create_styled_dmg(dmg_root: Path, dmg_path: Path, background: str) -> None:
+    """Build the disk image, then lay its window out the way Mac users expect.
+
+    A plain `hdiutil create` produces a window that is just a file list, which
+    is why the folder had to be explained in a README nobody opens. The layout
+    people already know -- app on the left, Applications on the right, arrow
+    between -- can only be set by having Finder do it on a *writable* image, so
+    the image is built read-write, mounted, arranged, then converted to the
+    compressed read-only form that ships.
+    """
+    import time as _time
+
+    def run(cmd, what, check=True):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if check and r.returncode != 0:
+            print(r.stdout[-1500:])
+            print(r.stderr[-1500:])
+            raise RuntimeError(f"{what} failed: {r.stderr.strip()[:300]}")
+        return r
+
+    mount = Path("/Volumes") / MAC_FOLDER_NAME
+    # A leftover mount from the previous architecture's build would make the
+    # volume name ambiguous, and Finder would arrange the wrong one.
+    if mount.exists():
+        run(["hdiutil", "detach", str(mount), "-force"], "detaching a stale mount",
+            check=False)
+
+    temp_dmg = DIST / "build-temp" / f"{dmg_path.stem}-rw.dmg"
+    temp_dmg.parent.mkdir(parents=True, exist_ok=True)
+    temp_dmg.unlink(missing_ok=True)
+
+    # Finder writes .DS_Store into the image while arranging it, so the
+    # read-write image needs room the payload does not account for.
+    size_mb = _folder_size_mb(dmg_root) + 150
+    run(["hdiutil", "create", "-volname", MAC_FOLDER_NAME,
+         "-srcfolder", str(dmg_root), "-fs", "HFS+", "-format", "UDRW",
+         "-size", f"{size_mb}m", "-ov", str(temp_dmg)],
+        "creating the writable disk image")
+
+    run(["hdiutil", "attach", str(temp_dmg), "-readwrite", "-noverify"],
+        "mounting the writable disk image")
+
+    try:
+        script = _dmg_applescript(background)
+        # Finder scripting on a build machine occasionally returns an
+        # AppleEvent timeout on the first try. Retry before giving up, rather
+        # than failing a whole release over a transient one.
+        for attempt in range(1, 4):
+            styled = subprocess.run(["osascript", "-"], input=script,
+                                    capture_output=True, text=True)
+            if styled.returncode == 0:
+                print(f"dmg: window arranged by Finder (attempt {attempt})")
+                break
+            print(f"dmg: Finder styling attempt {attempt} failed: "
+                  f"{styled.stderr.strip()[:200]}")
+            _time.sleep(3)
+        else:
+            raise RuntimeError(
+                "Finder would not arrange the disk image window. The image "
+                "would open as a plain file list, which is the thing this "
+                "step exists to prevent."
+            )
+        if not (mount / ".DS_Store").exists():
+            raise RuntimeError(
+                "Finder reported success but wrote no .DS_Store, so the "
+                "layout would not persist."
+            )
+        subprocess.run(["sync"], capture_output=True)
+    finally:
+        for attempt in range(3):
+            if not mount.exists():
+                break
+            cmd = ["hdiutil", "detach", str(mount)]
+            if attempt:
+                cmd.append("-force")
+            if subprocess.run(cmd, capture_output=True).returncode == 0:
+                break
+            _time.sleep(2)
+
+    dmg_path.unlink(missing_ok=True)
+    run(["hdiutil", "convert", str(temp_dmg), "-format", "UDZO",
+         "-imagekey", "zlib-level=9", "-o", str(dmg_path)],
+        "compressing the disk image")
+    temp_dmg.unlink(missing_ok=True)
+
+
 def _build_macos(version: str, arch: str = "arm64", with_runtime: bool = True,
                  seed_env: Path | None = None, clean: bool = True) -> None:
     """Build a macOS package for a given architecture: payload + app bundle + runtime -> disk image.
@@ -1004,24 +1186,11 @@ def _build_macos(version: str, arch: str = "arm64", with_runtime: bool = True,
 
     _write_mac_installer(dmg_root)
 
-    # Create a disk image with architecture suffix
+    background = _stage_dmg_background(dmg_root)
+
     arch_suffix = "arm64" if arch == "arm64" else "intel"
     dmg_path = DIST / f"CommissionDashboard-Setup-{version}-macos-{arch_suffix}.dmg"
-    print(f"Creating disk image: {dmg_path}")
-    result = subprocess.run(
-        [
-            "hdiutil", "create",
-            "-volname", "Commission Dashboard",
-            "-srcfolder", str(dmg_root),
-            "-ov", "-format", "UDZO",
-            str(dmg_path),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(result.stderr)
-        raise RuntimeError(f"Failed to create disk image: {result.stderr}")
+    _create_styled_dmg(dmg_root, dmg_path, background)
 
     size = dmg_path.stat().st_size
     print(f"macOS ({arch}): disk image -> {dmg_path} ({size // (1024 * 1024)} MB)")

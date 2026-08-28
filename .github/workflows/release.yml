@@ -266,6 +266,13 @@ jobs:
             [ -f "$mnt/READ ME FIRST.txt" ] || fail "no READ ME FIRST.txt"
             [ -L "$mnt/Applications" ] \
               || fail "no Applications shortcut - drag-to-install has nowhere to drop"
+            # Without these the image opens as a plain file list and the
+            # drag-here layout everyone recognises is simply absent - which
+            # looks identical to a successful build from the outside.
+            [ -f "$mnt/.DS_Store" ] \
+              || fail "no .DS_Store - Finder never arranged the window"
+            ls "$mnt/.background/"background.* >/dev/null 2>&1 \
+              || fail "no background art on the image"
             [ -f "$root/8. Web Dashboard/app.py" ] || fail "no Flask app in the folder"
             [ -x "$root/runtime/bin/python3" ] || fail "no bundled python3"
             [ -L "$app/Contents/Frameworks/Electron Framework.framework/Versions/Current" ] \

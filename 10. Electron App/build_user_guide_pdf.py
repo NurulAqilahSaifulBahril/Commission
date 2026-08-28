@@ -32,7 +32,7 @@ COVER_DPI = 150
 LOGO = os.path.join(HERE, "assets", "logo-header.png")
 SCREENSHOT = os.path.join(DOCS, "img", "update-panel.png")
 
-VERSION = "1.2.23"
+VERSION = "1.2.24"
 DATE_LINE = "August 2026"
 RELEASES_URL = "https://github.com/NurulAqilahSaifulBahril/Commission/releases/latest"
 
