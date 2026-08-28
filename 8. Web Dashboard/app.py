@@ -896,15 +896,51 @@ _SETUP_PAGE = """<!doctype html>
 <p>The app itself installed fine. It just cannot reach the company database yet,
 because the access keys are not in place on this computer.</p>
 <ol>
-  <li><b>Ask IT for your access keys</b> — a few lines that look like
-      <code>PG_PROXY_TOKEN=…</code> and <code>PG_MIRROR_TOKEN=…</code></li>
-  <li>Open this file in Notepad (create it if it does not exist):
-      <div class="path">{env_path}</div></li>
-  <li>Paste the lines in, each on its own line, and save.</li>
-  <li><b>Close the Portal window and open it again.</b></li>
+{steps}
 </ol>
 <p class="muted">Details for IT: {error}</p>
 </div></body></html>"""
+
+
+def _setup_steps() -> str:
+    """The "how to add your keys" list, in terms that fit the machine.
+
+    This page used to say "open this file in Notepad" on every platform and
+    print the path on its own. On a Mac that is two dead ends at once: there is
+    no Notepad, and the file begins with a dot, so Finder hides it and there is
+    no obvious way to create it. Give each platform a route that actually
+    works there.
+    """
+    env_path = REPO_ROOT / ".env"
+    ask = ("<li><b>Ask IT for your access keys</b> — a few lines that look "
+           "like <code>PG_PROXY_TOKEN=…</code> and "
+           "<code>PG_MIRROR_TOKEN=…</code></li>")
+    reopen = "<li><b>Close the Portal and open it again.</b></li>"
+
+    if sys.platform == "darwin":
+        # `touch` first because `open -e` cannot open a file that is not there
+        # yet, and on a fresh install it never is.
+        cmd = f'touch "{env_path}" && open -e "{env_path}"'
+        return (
+            ask +
+            "<li>Open <b>Terminal</b> — press <code>⌘ Space</code>, type "
+            "<i>Terminal</i>, press Return — then paste this line and press "
+            "Return:"
+            f'<div class="path">{html.escape(cmd)}</div>'
+            "An empty TextEdit window opens. (The file name starts with a dot, "
+            "so Finder hides it; this is the dependable way to reach it.)</li>"
+            "<li>Paste the lines in, each on its own line, then press "
+            "<code>⌘ S</code> to save and close the window.</li>" +
+            reopen
+        )
+
+    return (
+        ask +
+        "<li>Open this file in Notepad (create it if it does not exist):"
+        f'<div class="path">{html.escape(str(env_path))}</div></li>'
+        "<li>Paste the lines in, each on its own line, and save.</li>" +
+        reopen
+    )
 
 
 @app.before_request
@@ -917,7 +953,7 @@ def _setup_gate():
     if SETUP_ERROR is None:
         return None
     from markupsafe import escape
-    return _SETUP_PAGE.format(env_path=escape(str(REPO_ROOT / ".env")),
+    return _SETUP_PAGE.format(steps=_setup_steps(),
                               error=escape(SETUP_ERROR)), 503
 
 # Load disk cache and start pre-fetch if empty or missing main data keys
@@ -1789,9 +1825,22 @@ def get_overview():
 # either side of the campaign cut-off, then EP point and the balance left to
 # qualify. Company-wide first, then one block per branch, as the print does.
 
-SALES_REPORT_LAST_MONTH = 6      # the EGA half year closes 30 June
+SALES_REPORT_SPLIT_MONTH = 6     # the EGA campaign window closes 10 June
 SALES_REPORT_SPLIT_DAY = 10      # June is shown as 1-10 / 11-30, per the campaign
 SALES_REPORT_TARGETS = {"Internal": 600000.0, "Outsource": 720000.0}
+
+
+def _sales_report_last_month(year: int) -> int:
+    """How many months of `year` the ledger covers: always at least the June
+    campaign close, extended to the current month as the calendar moves past
+    it so the report keeps accumulating instead of staying frozen at June."""
+    from datetime import date
+    today = date.today()
+    if year < today.year:
+        return 12
+    if year > today.year:
+        return SALES_REPORT_SPLIT_MONTH
+    return min(12, max(SALES_REPORT_SPLIT_MONTH, today.month))
 
 
 def _sales_report_targets(year: int) -> dict[str, float]:
@@ -1888,11 +1937,12 @@ def _sales_report_display_name(raw: str, role: dict) -> str:
 
 
 def _sales_report_payload(year: int) -> dict | None:
-    """Per-agent sales ledger for Jan..June of `year`, or None when the cache is
-    cold. Like the overview, this is a page people land on -- it reads whatever
-    the prefetch already built rather than starting a multi-minute job."""
+    """Per-agent sales ledger for Jan..last_month of `year`, or None when the
+    cache is cold. Like the overview, this is a page people land on -- it reads
+    whatever the prefetch already built rather than starting a multi-minute job."""
     from decimal import Decimal
 
+    last_month = _sales_report_last_month(year)
     bundle = get_cached_data(year, "outsource")
     if not bundle or "ega_raw" not in bundle:
         load_disk_cache()
@@ -1928,7 +1978,7 @@ def _sales_report_payload(year: int) -> dict | None:
         seen_bubble.add(bubble)
 
         when = int_mod._parse_invoice_date(r.get("invoice_date"))
-        if when is None or when.month > SALES_REPORT_LAST_MONTH:
+        if when is None or when.month > last_month:
             continue
 
         raw = str(r.get("agent_name") or "").strip()
@@ -1957,11 +2007,12 @@ def _sales_report_payload(year: int) -> dict | None:
         cell = months.setdefault(when.month, [0, zero])
         cell[0] += 1
         cell[1] += sales
-        if when.month == SALES_REPORT_LAST_MONTH:
+        if when.month == SALES_REPORT_SPLIT_MONTH:
             split = entry["jun"].setdefault(kind, [zero, zero])
             split[0 if when.day <= SALES_REPORT_SPLIT_DAY else 1] += sales
-        # Campaign window: 1 May through 10 June.
-        if when.month == 5 or (when.month == SALES_REPORT_LAST_MONTH
+        # Campaign window: 1 May through 10 June. Fixed to the actual EGA
+        # campaign dates regardless of how far the ledger now extends.
+        if when.month == 5 or (when.month == SALES_REPORT_SPLIT_MONTH
                                and when.day <= SALES_REPORT_SPLIT_DAY):
             entry["campaign_cases"] += 1
             entry["campaign_ans"] += sales
@@ -1996,7 +2047,7 @@ def _sales_report_payload(year: int) -> dict | None:
                 "months": [
                     {"noc": entry["lines"][kind].get(m, [0, zero])[0],
                      "ans": float(entry["lines"][kind].get(m, [0, zero])[1])}
-                    for m in range(1, SALES_REPORT_LAST_MONTH + 1)
+                    for m in range(1, last_month + 1)
                 ],
                 "jun_early": float(entry["jun"].get(kind, [zero, zero])[0]),
                 "jun_late": float(entry["jun"].get(kind, [zero, zero])[1]),
@@ -2018,7 +2069,8 @@ def _sales_report_payload(year: int) -> dict | None:
     return {
         "ready": True,
         "year": year,
-        "last_month": SALES_REPORT_LAST_MONTH,
+        "last_month": last_month,
+        "split_month": SALES_REPORT_SPLIT_MONTH,
         "split_day": SALES_REPORT_SPLIT_DAY,
         "scoped_to_agent": scope_agent,
         "targets": targets,
