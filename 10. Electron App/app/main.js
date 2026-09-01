@@ -15,31 +15,200 @@ const os = require("os");
 const PORT = 5001;
 const DASHBOARD_URL = `http://127.0.0.1:${PORT}`;
 
-// Dev: this file lives at <root>/10. Electron App/app/main.js.
-// Packaged: the built shell is copied to <root>/shell/, putting the exe's
-// resources at <root>/shell/resources/app*, so walk up until app.py appears.
+// ── macOS: the install lives here, not next to the app ───────────────────────
+//
+// On Windows the shell sits inside the install folder and the dashboard files
+// are its siblings. That shape cannot work on a Mac, and every macOS failure
+// this app has had traces back to trying:
+//
+//   * Everything dragged out of a downloaded .dmg carries com.apple.quarantine.
+//     Approving the .app ("Open anyway") approves the .app alone — the sibling
+//     runtime/bin/python3 and its dylibs stay quarantined, so the window opens
+//     and the server it spawns is killed on sight.
+//   * App Translocation. macOS runs a quarantined app from a randomised
+//     read-only copy under /private/var/folders, so siblings are nowhere near
+//     __dirname. Finder only exempts an app from this when the user drags the
+//     .app ITSELF; dragging a folder that contains it does not count — which is
+//     exactly what the old disk image asked people to do.
+//
+// So the payload ships INSIDE the bundle (Contents/Resources/payload.tar.gz)
+// and is unpacked here on first launch. The bundle travels with the app, so
+// translocation is harmless; this directory is ours, so it is writable and
+// nothing in it is quarantined. Python path resolution needs no change at all:
+// every module derives its root from __file__, so it simply follows.
+const MAC_ROOT = path.join(
+  os.homedir(), "Library", "Application Support", "Commission Dashboard");
+
+// Written by seedMacInstall() to record which bundle produced this tree. A
+// re-seed happens only when the .app on disk is a different build, so an OTA
+// update — which bumps version.json but not this — is never rolled back by it.
+const MAC_SEED_STAMP = ".seeded-from";
+
+// Live state a re-seed must carry across. Same paths updater.py pins in
+// PRESERVE_PATHS, for the same reason: they are the user's, not the build's.
+const MAC_PRESERVE = [
+  ".env",
+  "8. Web Dashboard/dashboard.db",
+  "8. Web Dashboard/data",
+  "8. Web Dashboard/special_cases.json",
+  "8. Web Dashboard/factory_rates.json",
+];
+
+function run(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { stdio: "ignore", ...opts });
+    child.on("error", (err) => resolve({ ok: false, detail: err.message }));
+    child.on("exit", (code, signal) => resolve({
+      ok: code === 0,
+      detail: signal ? `killed by ${signal}` : `exit code ${code}`,
+    }));
+  });
+}
+
+// rename() when it can, copy when it cannot. Same volume is the norm here (the
+// stash is deliberately a sibling of the install), but a redirected Application
+// Support folder on a managed Mac could land it elsewhere, and EXDEV must not
+// be what loses someone their edited rules.
+function move(from, to) {
+  try {
+    fs.renameSync(from, to);
+  } catch (err) {
+    if (err.code !== "EXDEV") throw err;
+    fs.cpSync(from, to, { recursive: true });
+    fs.rmSync(from, { recursive: true, force: true });
+  }
+}
+
+// The payload shipped inside this bundle, or null when there is none — which
+// means we are running from a source checkout (npm start), where the dashboard
+// files are already on disk and findCommissionRoot() is the right answer.
+function bundledPayload() {
+  const res = process.resourcesPath;
+  if (!res) return null;
+  const archive = path.join(res, "payload.tar.gz");
+  if (!fs.existsSync(archive)) return null;
+  let build = "";
+  try {
+    build = fs.readFileSync(path.join(res, "payload-version.txt"), "utf8").trim();
+  } catch {}
+  return { archive, build };
+}
+
+// Where live state waits while tar writes over the tree. A sibling of the
+// install so it is on the same volume: see the note in seedMacInstall().
+const MAC_STASH = MAC_ROOT + ".seed-stash";
+
+// Put stashed live state back and remove the stash. Safe to call at any point:
+// it only ever moves files towards the install, never away from it.
+function restoreStash() {
+  if (!fs.existsSync(MAC_STASH)) return false;
+  for (const rel of MAC_PRESERVE) {
+    const from = path.join(MAC_STASH, rel);
+    if (!fs.existsSync(from)) continue;
+    const to = path.join(MAC_ROOT, rel);
+    // Whatever is at the destination is the release's copy of a file that
+    // belongs to this install; the stashed one wins.
+    fs.rmSync(to, { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    move(from, to);
+  }
+  fs.rmSync(MAC_STASH, { recursive: true, force: true });
+  return true;
+}
+
+// Unpack the bundled payload into MAC_ROOT, first run and after an upgrade.
+// Returns the install root, or throws with something worth showing a user.
+async function seedMacInstall(payload, status) {
+  // FIRST, before deciding anything else. A stash still on disk means a
+  // previous seed died between moving live state out and putting it back, so
+  // it holds the only copy of that install's database and edited rules.
+  // Recovering it has to happen before the checks below, because an unpack
+  // that died even earlier leaves no app.py — which would read as "fresh
+  // install", skip the stash handling entirely, and the recovery step at the
+  // end would then delete the lot.
+  if (restoreStash()) {
+    console.log("recovered live state from an interrupted setup");
+  }
+
+  let seededFrom = "";
+  try {
+    seededFrom = fs.readFileSync(path.join(MAC_ROOT, MAC_SEED_STAMP), "utf8").trim();
+  } catch {}
+  const haveApp = fs.existsSync(path.join(MAC_ROOT, "8. Web Dashboard", "app.py"));
+  if (haveApp && seededFrom && seededFrom === payload.build) return MAC_ROOT;
+
+  const upgrading = haveApp;
+  status(upgrading
+    ? "Updating the dashboard files. This takes a minute..."
+    : "Setting up the dashboard for the first time. This takes a minute...");
+
+  // Move live state aside. tar overwrites what the archive holds and leaves
+  // everything else alone, and special_cases.json / factory_rates.json ARE in
+  // the archive — so without this an upgrade would silently discard rules the
+  // admin edited in the app.
+  //
+  // The stash is a sibling of MAC_ROOT rather than somewhere under /var/folders
+  // so that it is on the same volume, which makes every move below a rename:
+  // instant, and no second copy of "8. Web Dashboard/data" on disk. That folder
+  // holds cached reports and can run to hundreds of MB, so copying it out and
+  // back on every version upgrade is a cost worth not paying.
+  if (upgrading) {
+    fs.mkdirSync(MAC_STASH, { recursive: true });
+    for (const rel of MAC_PRESERVE) {
+      const from = path.join(MAC_ROOT, rel);
+      if (!fs.existsSync(from)) continue;
+      const to = path.join(MAC_STASH, rel);
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      move(from, to);
+    }
+  }
+
+  fs.mkdirSync(MAC_ROOT, { recursive: true });
+  const untar = await run("/usr/bin/tar", ["-xzf", payload.archive, "-C", MAC_ROOT]);
+  if (!untar.ok) {
+    throw new Error(
+      `Could not unpack the dashboard files into\n${MAC_ROOT}\n\n${untar.detail}`);
+  }
+
+  restoreStash();
+
+  // Belt and braces. Nothing we write here should carry the download flag, but
+  // if anything ever does, macOS kills the bundled interpreter and the failure
+  // looks like a broken Python rather than a quarantined one.
+  await run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", MAC_ROOT]);
+
+  fs.writeFileSync(path.join(MAC_ROOT, MAC_SEED_STAMP), payload.build, "utf8");
+  return MAC_ROOT;
+}
+
+// Where the install root is on Windows, and in a source checkout on any
+// platform: walk up from this file until "8. Web Dashboard/app.py" appears.
+//
+//   Windows install: <root>/shell/resources/app.asar        -> 4 hops
+//   Source checkout: <root>/10. Electron App/app/main.js    -> 3 hops
+//   npm run dist:    .../app/dist/*/resources/app.asar      -> 7 hops
+//
+// A packaged macOS build never gets here — resolveRoot() answers with MAC_ROOT
+// before this is called. 15 is simply well clear of the deepest case above.
 function findCommissionRoot() {
   let dir = __dirname;
-  // Walk up the directory tree looking for 8. Web Dashboard/app.py.
-  // Deployed: exe is at <root>/shell/resources/app*, so 4-5 hops up to root.
-  // Dev: app.asar is at <root>/10. Electron App/app/dist/*/resources/app.asar, so ~7 hops.
-  // macOS packaged: app is at <root>/CommissionDashboard.app/Contents/Resources/ or similar.
-  // Windows from DMG-like scenario: similar depth but different path structure.
-  // Search up to 15 levels to handle macOS .app bundles and various deployments.
   for (let i = 0; i < 15; i++) {
-    const dashboardPath = path.join(dir, "8. Web Dashboard", "app.py");
-    if (fs.existsSync(dashboardPath)) {
-      return dir;
-    }
-    // Also check if dir itself contains the 8. Web Dashboard folder (for when the
-    // app is in a sibling folder scenario on macOS).
-    const dashboardDir = path.join(dir, "8. Web Dashboard");
-    if (fs.existsSync(dashboardDir) && fs.existsSync(path.join(dashboardDir, "app.py"))) {
-      return dir;
-    }
-    dir = path.dirname(dir);
+    if (fs.existsSync(path.join(dir, "8. Web Dashboard", "app.py"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;  // hit the filesystem root
+    dir = parent;
   }
   return null;
+}
+
+// Packaged on macOS the answer is always MAC_ROOT; everywhere else — Windows,
+// and a Mac source checkout — it is still found by walking up from __dirname.
+async function resolveRoot(status) {
+  if (os.platform() === "darwin") {
+    const payload = bundledPayload();
+    if (payload) return await seedMacInstall(payload, status);
+  }
+  return findCommissionRoot();
 }
 
 function freePort() {
@@ -147,46 +316,10 @@ function startFlask(root) {
   });
 }
 
-// Nothing can be repaired in a place we cannot write to, and the dashboard
-// could not keep its database or logs there either. A mounted disk image and a
-// translocated copy are both read-only, which is what makes this the right
-// test: an install on an external drive is writable and passes.
-// Returns "image" when we are running from a mounted disk image or a
-// translocated copy, "readonly" for an install folder we simply cannot write
-// to, and null when all is well. The two need different advice, and telling
-// someone their disk image is read-only when they are actually installed into
-// a folder they lack permission on just sends them round the loop again.
-function readOnlyReason(root) {
-  if (os.platform() !== "darwin") return null;
-  if (root.startsWith("/Volumes/") || root.includes("/AppTranslocation/")) {
-    return "image";
-  }
-  try {
-    fs.accessSync(root, fs.constants.W_OK);
-    return null;
-  } catch {
-    return "readonly";
-  }
-}
-
-// Clear the download flag from our own install folder. This is the same thing
-// the installer script does; doing it here too means an install that was
-// dragged across by hand — which is what people reach for, and which leaves a
-// bundled Python that macOS kills on sight — repairs itself on first launch
-// instead of dead-ending on a message about an installer they did not run.
-function clearQuarantine(root) {
-  try {
-    execSync(`xattr -dr com.apple.quarantine ${JSON.stringify(root)}`,
-      { stdio: "ignore", timeout: 120_000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 // True only when macOS has actually flagged the path — checked rather than
-// assumed, so the app can tell "still quarantined, run the installer" apart
-// from "not quarantined, so this is something else entirely".
+// assumed. seedMacInstall() strips this from the install root every time it
+// runs, so a positive here means something re-applied it and the bundled
+// interpreter is being killed for that reason rather than any other.
 function isQuarantined(target) {
   if (os.platform() !== "darwin") return false;
   try {
@@ -254,82 +387,65 @@ async function launch() {
     }
   });
 
-  const root = findCommissionRoot();
+  // Progress on the loading screen. The first launch on a Mac unpacks a few
+  // hundred MB before the server is even started, and a window that says
+  // "Starting the dashboard..." for two minutes reads as a hang.
+  const status = (msg) => {
+    try {
+      win.webContents.executeJavaScript(
+        `(() => { const el = document.getElementById("status");` +
+        ` if (el) el.textContent = ${JSON.stringify(msg)}; })()`
+      );
+    } catch {}
+  };
+
+  let root;
+  try {
+    root = await resolveRoot(status);
+  } catch (err) {
+    dialog.showErrorBox(
+      "Commission Portal",
+      "The Commission Portal could not set itself up.\n\n" + err.message +
+        "\n\nSend this message to IT."
+    );
+    app.quit();
+    return;
+  }
   if (!root) {
-    // On macOS the overwhelmingly likely cause is not a broken install but
-    // App Translocation: a still-quarantined app (dragged out of the disk
-    // image by hand instead of run through the installer) is executed from a
-    // randomised read-only copy under /private/var/folders, so the sibling
-    // "8. Web Dashboard" folder is nowhere near __dirname. The generic
-    // "reinstall it" text sent people round the same loop, because dragging
-    // it again reproduces the same state. Name the actual fix instead.
-    const translocated =
-      os.platform() === "darwin" &&
-      (__dirname.includes("/AppTranslocation/") || __dirname.startsWith("/private/var/folders/"));
-    const message = translocated
-      ? "macOS is running this app from a temporary read-only copy, so it " +
-        "cannot see the dashboard files next to it.\n\n" +
-        "Open the downloaded .dmg again and run " +
-        "\"Install Commission Dashboard.command\" instead of dragging the " +
-        "app out. That puts it in your Applications folder and clears the " +
-        "download quarantine that causes this."
-      : os.platform() === "darwin"
-      ? "Could not find the dashboard files (\"8. Web Dashboard/app.py\") " +
-        "next to this app.\n\n" +
-        "CommissionDashboard must stay inside the \"Commission Dashboard\" " +
-        "folder — moving the app out on its own leaves it with nothing to " +
-        "run. Open the downloaded .dmg again and run " +
-        "\"Install Commission Dashboard.command\"."
-      : "Could not find the dashboard files (8. Web Dashboard\\app.py) near this app. Reinstall the Finance Commission Dashboard.";
-    dialog.showErrorBox("Commission Portal", message);
+    dialog.showErrorBox(
+      "Commission Portal",
+      os.platform() === "darwin"
+        ? "This copy of the Commission Portal is missing its dashboard files.\n\n" +
+          "It looks like it was built or copied incompletely. Download the " +
+          ".dmg again from the Releases page and drag CommissionDashboard to " +
+          "Applications."
+        : "Could not find the dashboard files (8. Web Dashboard\\app.py) near " +
+          "this app. Reinstall the Finance Commission Dashboard."
+    );
     app.quit();
     return;
   }
 
-  // macOS pre-flight. Gatekeeper is by far the biggest source of failed
-  // installs here, and every one of those failures is recoverable without the
-  // user needing to understand any of it. So recover, rather than explain.
+  // The install root is ours and inside the user's home, so it is writable in
+  // every normal case. A managed Mac with a redirected or locked Application
+  // Support folder is the exception, and it fails in a way worth naming: the
+  // dashboard keeps its database, .env and logs here.
   if (os.platform() === "darwin") {
-    const readOnly = readOnlyReason(root);
-    if (readOnly === "image") {
-      dialog.showErrorBox(
-        "Commission Portal",
-        "This copy is running from the disk image, which macOS keeps " +
-          "read-only — so the dashboard cannot start and nothing could be " +
-          "saved anyway.\n\n" +
-          "In the disk image window, drag the \"Commission Dashboard\" " +
-          "folder onto the Applications shortcut beside it. Then open it " +
-          "from Applications, not from the disk image."
-      );
-      app.quit();
-      return;
-    }
-    if (readOnly === "readonly") {
+    try {
+      fs.accessSync(root, fs.constants.W_OK);
+    } catch {
       dialog.showErrorBox(
         "Commission Portal",
         `The Portal cannot write to its own folder:\n\n${root}\n\n` +
-          "It keeps its settings, database and logs there, so it cannot run " +
-          "from a place it has no permission on.\n\n" +
-          "Open the downloaded .dmg again and double-click \"Install " +
-          "Commission Dashboard\" — that installs it into your own " +
-          "Applications folder, which never has this problem."
-      );
-      app.quit();
-      return;
-    }
-    if (isQuarantined(root) && (!clearQuarantine(root) || isQuarantined(root))) {
-      dialog.showErrorBox(
-        "Commission Portal",
-        "macOS has quarantined this install and it could not be cleared " +
-          "automatically, so it will not let the bundled Python run.\n\n" +
-          "Open the downloaded .dmg again and double-click \"Install " +
-          "Commission Dashboard\"."
+          "It keeps its settings, database and logs there. Ask IT to check " +
+          "the permissions on that folder."
       );
       app.quit();
       return;
     }
   }
 
+  status("Starting the dashboard...");
   startFlask(root);
   const deadline = Date.now() + 60_000;
   await waitForPort(60_000);
@@ -368,21 +484,21 @@ async function launch() {
       hint = "The access keys are missing or wrong. Ask IT for your keys and " +
         "add them to the .env file in the install folder, then open this app again.";
     } else if (!hasInterpreter) {
-      const setupCmd = os.platform() === "win32"
-        ? "\"Setup Environment.bat\""
-        : "the setup script";
-      hint = `No Python environment was found — run ${setupCmd} ` +
-        "in the install folder, then open this app again.";
+      hint = os.platform() === "win32"
+        ? "No Python environment was found — run \"Setup Environment.bat\" " +
+          "in the install folder, then open this app again."
+        : "The bundled Python is missing from\n" + root + "\n\n" +
+          "The setup step did not finish. Quit the Portal, delete that " +
+          "folder, and open the app again to rebuild it.";
     } else if (os.platform() === "darwin" && isQuarantined(root)) {
-      // Checked, not inferred. macOS refuses to run quarantined programs, and
-      // that is the one cause the app can both confirm and give an exact fix
-      // for.
-      hint = "macOS has this install quarantined, so it will not let the " +
-        "bundled Python run.\n\n" +
-        "Open the downloaded .dmg again and run " +
-        "\"Install Commission Dashboard.command\". It clears the quarantine; " +
-        "opening the app straight from the disk image, or dragging the folder " +
-        "across by hand, leaves it in place.";
+      // Checked, not inferred. macOS refuses to run quarantined programs.
+      // Re-opening the app is the fix because seedMacInstall() strips the flag
+      // on every launch — so if this is still true, it is being re-applied and
+      // IT needs to know rather than the user retrying forever.
+      hint = "macOS has quarantined the dashboard files, so it will not let " +
+        "the bundled Python run.\n\n" + root + "\n\n" +
+        "Quit the Portal and open it again. If this message comes back, " +
+        "send it to IT.";
     } else if (launchFailure) {
       hint = "The bundled Python would not start.\n\n" + launchFailure +
         "\n\nSend this message to IT.";

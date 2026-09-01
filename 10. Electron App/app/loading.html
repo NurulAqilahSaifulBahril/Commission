@@ -26,12 +26,13 @@
       animation: spin 0.9s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
-    p { color: #6b7079; font-size: 0.9rem; margin: 0; }
+    p { color: #6b7079; font-size: 0.9rem; margin: 0;
+        max-width: 32rem; text-align: center; line-height: 1.5; }
   </style>
 </head>
 <body>
   <img src="assets/logo-mark-black.png" alt="Eternalgy" />
   <div class="spinner"></div>
-  <p>Starting the dashboard...</p>
+  <p id="status">Starting the dashboard...</p>
 </body>
 </html>

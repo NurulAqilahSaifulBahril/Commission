@@ -43,26 +43,24 @@ brings everything it needs with it.
 **Mac**
 
 1. Open the `.dmg` file you just downloaded.
-2. Drag the **Commission Dashboard** folder onto the **Applications** shortcut
-   next to it. Wait for the copy to finish — it is about 700 MB.
-3. Open **Applications** → **Commission Dashboard** and double-click
-   **CommissionDashboard**. Do not open it from the disk image.
+2. Drag **CommissionDashboard** onto the **Applications** shortcut next to it.
+3. Open **Applications** and double-click **CommissionDashboard**.
 4. **macOS will refuse the first time**, saying it is from an unidentified
    developer. This is normal for apps outside the App Store. Right-click
    **CommissionDashboard**, choose **Open**, then click **Open** again.
 5. **On macOS Sequoia or newer** there is no Open button in that message. Go to
    Apple menu → **System Settings** → **Privacy & Security**, scroll down, and
    click **Open Anyway**.
-6. The first start takes a minute or two. If macOS refuses the drag in step 2
-   (*you don't have permission*), double-click **Install Commission Dashboard**
-   on the disk image instead — it installs into your own Applications folder.
+6. **The first start sets itself up before the dashboard appears.** It unpacks
+   about 700 MB and takes a minute or two; the window tells you what it is
+   doing. Later starts are quick.
 
 ### Step 3 — Open the Portal
 
 **Windows:** Start Menu → **Finance Commission Dashboard** (or the desktop
 shortcut).
 
-**Mac:** **Applications** → **Commission Dashboard** → **CommissionDashboard**.
+**Mac:** **Applications** → **CommissionDashboard**.
 
 Log in with the **username and password IT gave you**. There is no account to
 create — yours already exists. The first load takes a moment while it fetches
@@ -112,8 +110,8 @@ there is nothing for you to do. Let your admin know.
 |---|---|
 | The Portal will not open | Tell IT — ask them to check `dashboard.log` in the Portal's folder |
 | **Mac:** "cannot be opened because it is from an unidentified developer" | Expected once, the first time you open it. Right-click **CommissionDashboard** and choose **Open**, then **Open** again. On macOS Sequoia: System Settings → Privacy & Security → **Open Anyway**. |
-| **Mac:** "running from the disk image", or the Portal will not start after opening it from the `.dmg` window | It has to be copied out first. Drag the **Commission Dashboard** folder onto the **Applications** shortcut, then open it from there. |
-| **Mac:** "you don't have permission" when dragging to Applications | Double-click **Install Commission Dashboard** on the disk image instead. It installs into your own Applications folder: Finder → **Go** → **Home** → **Applications**. |
+| **Mac:** the window sits on "Setting up the dashboard for the first time" | That is the first launch unpacking about 700 MB. Give it a minute or two. |
+| **Mac:** "you don't have permission" when dragging to Applications | Drop it into your own Applications folder instead: Finder → **Go** → **Home** → **Applications**. The Portal runs the same from either. |
 | **Mac:** the Portal does not come back by itself after an update, and the page will not reload | Expected once, when updating from version 1.2.25 or earlier. Quit the Portal and open it again from **Applications** → **Commission Dashboard**. The update itself already installed correctly, and later updates restart on their own. |
 | An update failed | Tell IT — ask them to check `dashboard.log` |
 | Numbers look out of date | Wait a few minutes, or click **Sync Data** at the top right |

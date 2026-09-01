@@ -54,9 +54,12 @@ PRESERVE_PATHS = [
     "8. Web Dashboard/factory_rates.json",
     "shell",  # the packaged Electron shell — never part of an OTA package, but
               # pinned here too so a future INCLUDE mistake can't wipe it out.
-    "CommissionDashboard.app",  # the same thing on a Mac, where the bundle
-              # sits in the install root rather than under shell/. Replacing a
-              # file inside it would also break the code signature, and macOS
+    "CommissionDashboard.app",  # the Mac equivalent of shell/. It no longer
+              # lives in the install root -- the app bundle stays in
+              # /Applications and unpacks this tree into Application Support --
+              # so nothing should ever match this. Kept because the cost is one
+              # line and the failure it guards against is a bricked install:
+              # writing inside a bundle breaks its code signature, and macOS
               # calls an app that fails codesign damaged.
     "runtime",  # the bundled Python interpreter. Same reasoning as shell, and
                 # the stakes are higher: remove it mid-update and the dashboard

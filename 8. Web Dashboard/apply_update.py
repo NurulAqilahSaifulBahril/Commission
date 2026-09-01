@@ -37,6 +37,8 @@ PRESERVE_PATHS = {
     "8. Web Dashboard/factory_rates.json",
     "shell",
     "runtime",
+    # Not expected in the install root on a Mac any more (the bundle stays in
+    # /Applications); pinned for the same defensive reason as in updater.py.
     "CommissionDashboard.app",
 }
 

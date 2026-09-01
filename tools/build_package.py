@@ -40,26 +40,36 @@ SHELL_BUILD = REPO_ROOT / "10. Electron App" / "app" / "dist" / "win-unpacked"
 SHELL_SRC = REPO_ROOT / "10. Electron App" / "app"
 SHELL_SRC_FILES = ["main.js", "loading.html", "package.json"]
 
-# macOS keeps the Windows shape, with the .app standing in for shell/:
+# macOS does NOT keep the Windows shape. It used to try -- the .app standing in
+# for shell/, with "8. Web Dashboard" and runtime/ as its siblings in one
+# installed folder -- and that is the shape every macOS failure this project
+# had traces back to. Two macOS rules make it unworkable:
 #
-#   <root>/CommissionDashboard.app   <root>/8. Web Dashboard   <root>/runtime
+#   * Quarantine is per-file. Everything dragged out of a downloaded image
+#     carries com.apple.quarantine, and approving the .app approves the .app.
+#     The sibling runtime/bin/python3 stays flagged, so the window opens and
+#     the server it spawns is killed on sight.
+#   * App Translocation. Finder only exempts an app from it when the user drags
+#     the .app ITSELF. Dragging a folder that contains the app does not count,
+#     so the app ran from a randomised read-only copy under /private/var/folders
+#     and reported that it could not find the dashboard files -- which is what
+#     the disk image's own arrow was telling people to do.
 #
-# The bundle is deliberately NOT the install root. Everything the dashboard
-# writes -- .env, dashboard.db, logs, data/ -- therefore lands outside it.
-# Writing inside a bundle breaks its code signature and macOS then refuses to
-# launch it, so this layout is what lets OTA updates keep working on Mac
-# exactly as they do on Windows.
+# So the install tree is packed into the bundle (Contents/Resources/) and
+# main.js unpacks it to ~/Library/Application Support/Commission Dashboard on
+# first launch. The bundle travels with the app, so translocation is harmless;
+# that directory is the app's own, so it is writable and unquarantined; and
+# nothing is ever written inside the bundle, so the signature stays valid and
+# OTA updates keep working exactly as they do on Windows.
 MAC_APP_NAME = "CommissionDashboard.app"
 
-# The folder that ships inside the disk image and ends up in the user's
-# Applications folder. Space-separated and human-readable: it is what staff see
-# in Finder, unlike the bundle name, which has to match electron-builder's
-# productName.
+# The disk image's volume name -- what staff see in Finder when it mounts.
+# Space-separated and human-readable, unlike the bundle name, which has to
+# match electron-builder's productName.
 MAC_FOLDER_NAME = "Commission Dashboard"
 
-# Double-clicked from the disk image; see _write_mac_installer for why the Mac
-# gets an installer script where Windows gets an .exe.
-MAC_INSTALLER_NAME = "Install Commission Dashboard.command"
+MAC_PAYLOAD_ARCHIVE = "payload.tar.gz"
+MAC_PAYLOAD_STAMP = "payload-version.txt"
 
 # ── Bundled Python runtime ───────────────────────────────────────────────────
 # The dashboard runs from source, so the target machine needs an interpreter.
@@ -772,159 +782,103 @@ def _codesign_mac(app: Path) -> None:
     print(f"macOS: signed {app.name} ({label}) and verified the signature")
 
 
-def _write_mac_installer(dmg_root: Path) -> None:
-    """Put a double-clickable installer beside the app folder in the disk image.
+def _embed_mac_payload(payload: Path, app: Path, version: str) -> str:
+    """Pack the install tree into the .app and return the stamp identifying it.
 
-    Windows has an .exe that does this; the Mac had "drag this folder to
-    Applications", which fails for two reasons that are invisible to the person
-    doing the dragging:
+    A single compressed archive rather than the tree laid out under
+    Resources/. Both would ride along with the bundle, but a tree puts hundreds
+    of Mach-O files -- runtime/bin/python3, every compiled wheel, every .dylib
+    under it -- inside Resources, where `codesign --deep` has to walk and sign
+    each one and `--strict` verification then has opinions about nested code in
+    a resource directory. One opaque file has none of those problems: codesign
+    hashes it and moves on. It also compresses, so the .app is a third of the
+    size it would otherwise be.
 
-    * Quarantine. Everything out of a downloaded disk image carries
-      com.apple.quarantine. On an unsigned build that is the
-      unidentified-developer wall, and it applies not only to the .app but to
-      runtime/bin/python3 and every .dylib under it, so even an app that opens
-      cannot start its own server.
-    * App Translocation. A quarantined app launched from anywhere other than a
-      folder the user explicitly moved it to is run from a randomised read-only
-      mount. __dirname then points into /private/var/folders/..., where
-      findCommissionRoot() cannot see "8. Web Dashboard" — the app opens and
-      immediately reports "Could not find the dashboard files."
-
-    Both die the moment the quarantine attribute is gone, which a script can do
-    and a drag cannot. The script also installs to ~/Applications rather than
-    /Applications: no admin password, and the folder stays writable, which the
-    dashboard requires — it writes .env, dashboard.db and its logs in place.
-
-    The script itself is quarantined too, so the first run still needs one
-    right-click → Open. One deliberate override, once, in exchange for an
-    install that then behaves like any other app.
+    main.js unpacks it on first launch, and after any upgrade, into
+    ~/Library/Application Support/Commission Dashboard.
     """
-    script = dmg_root / MAC_INSTALLER_NAME
-    script.write_text(f"""#!/bin/bash
-# Installs the Commission Dashboard into ~/Applications.
-#
-# Copies the app folder off this disk image, removes the quarantine flag macOS
-# puts on downloaded files, and opens the dashboard. Existing settings, the
-# local database and saved rules are carried over, not overwritten.
+    resources = app / "Contents" / "Resources"
+    if not resources.is_dir():
+        raise RuntimeError(f"{app} has no Contents/Resources — not an app bundle?")
 
-set -u
+    archive = resources / MAC_PAYLOAD_ARCHIVE
+    print(f"macOS: packing the payload into {archive.relative_to(app.parent)} ...")
+    with tarfile.open(archive, "w:gz", compresslevel=6) as tf:
+        # arcname="." so `tar -xzf ... -C <root>` lands the tree at the root
+        # rather than one folder below it. Symlinks are stored as symlinks
+        # (tarfile does not dereference by default), which matters for the
+        # bundled Python: runtime/bin/python3 is a link to python3.12.
+        tf.add(payload, arcname=".")
 
-SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-SRC="$SRC_DIR/{MAC_FOLDER_NAME}"
-DEST_PARENT="$HOME/Applications"
-DEST="$DEST_PARENT/{MAC_FOLDER_NAME}"
-APP="$DEST/{MAC_APP_NAME}"
+    mb = archive.stat().st_size // (1024 * 1024)
 
-# Files holding live state. Kept across a reinstall for the same reason
-# updater.py preserves them across an update: they are the user's, not ours.
-KEEP=(
-  ".env"
-  "8. Web Dashboard/dashboard.db"
-  "8. Web Dashboard/data"
-  "8. Web Dashboard/special_cases.json"
-  "8. Web Dashboard/factory_rates.json"
-)
+    # The stamp is what main.js compares against the copy it unpacked last
+    # time, so it has to change whenever the archive does -- not merely when
+    # the version string does. Two builds of the same version are different
+    # builds, and during testing they are the ONLY thing that differs.
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()[:16]
+    stamp = f"{version}-{digest}"
+    (resources / MAC_PAYLOAD_STAMP).write_text(stamp + "\n",
+                                               encoding="utf-8", newline="\n")
+    print(f"macOS: payload -> {mb} MB archive, stamp {stamp}")
+    return stamp
 
-fail() {{
-  echo ""
-  echo "Install failed: $1"
-  echo ""
-  echo "Send this whole window to IT and they can take it from here."
-  echo "Press Return to close."
-  read -r _
-  exit 1
-}}
 
-echo "Installing the Commission Dashboard..."
-echo ""
+def _write_mac_readme(dmg_root: Path) -> None:
+    """The one note beside the app in the disk image.
 
-[ -d "$SRC" ] || fail "could not find \\"{MAC_FOLDER_NAME}\\" next to this installer.
-         Open the downloaded .dmg and run the installer from inside it."
+    There used to be an "Install Commission Dashboard.command" here as well,
+    because a plain drag could not produce a working install: the dashboard
+    files sat NEXT TO the .app, and everything dragged out of a downloaded
+    image is quarantined. Approving the app approved the app alone, so the
+    bundled interpreter beside it was still killed on sight -- and dragging the
+    enclosing FOLDER (which is what the window's arrow asked for) does not even
+    exempt the app from App Translocation, so it ran from a read-only copy
+    under /private/var/folders and could not find those files at all. The
+    script existed to strip the quarantine that a drag cannot.
 
-mkdir -p "$DEST_PARENT" || fail "could not create $DEST_PARENT"
-
-STASH=""
-if [ -d "$DEST" ]; then
-  echo "Found an existing install — keeping your settings and data."
-  STASH="$(mktemp -d)"
-  for rel in "${{KEEP[@]}}"; do
-    if [ -e "$DEST/$rel" ]; then
-      mkdir -p "$STASH/$(dirname "$rel")"
-      cp -R "$DEST/$rel" "$STASH/$rel" || fail "could not back up $rel"
-    fi
-  done
-  rm -rf "$DEST" || fail "could not replace the old install at $DEST"
-fi
-
-# ditto, not cp: it is the only copy on macOS that reliably preserves the
-# symlinks inside the Electron framework and the code signature that depends
-# on them. A plain recursive cp flattens them and the app becomes "damaged".
-echo "Copying files (this takes a minute — about 700 MB)..."
-ditto "$SRC" "$DEST" || fail "could not copy the app to $DEST"
-
-if [ -n "$STASH" ]; then
-  for rel in "${{KEEP[@]}}"; do
-    if [ -e "$STASH/$rel" ]; then
-      rm -rf "$DEST/$rel"
-      mkdir -p "$DEST/$(dirname "$rel")"
-      cp -R "$STASH/$rel" "$DEST/$rel" || fail "could not restore $rel"
-    fi
-  done
-  rm -rf "$STASH"
-  echo "Restored your settings and data."
-fi
-
-# The step a drag-and-drop install cannot do, and the reason it was failing.
-echo "Clearing the macOS download quarantine..."
-xattr -dr com.apple.quarantine "$DEST" 2>/dev/null
-
-[ -d "$APP" ] || fail "the copy finished but $APP is not there."
-
-echo ""
-echo "Installed to: $DEST"
-echo "Opening the Commission Dashboard..."
-open "$APP" || fail "the app is installed but would not open. Open it from Finder: Go → Home → Applications."
-
-echo ""
-echo "Done. From now on, open it from Finder: Go → Home → Applications → {MAC_FOLDER_NAME}."
-echo "You can close this window."
-""", encoding="utf-8", newline="\n")
-    script.chmod(0o755)
-
+    None of that applies now. The payload ships inside the bundle, so the only
+    thing to drag is the .app itself -- the gesture Finder does exempt from
+    translocation -- and the files it unpacks into Application Support are
+    written by us and carry no quarantine. What is left is the ordinary
+    unsigned-app prompt, which is one right-click, once.
+    """
     (dmg_root / "READ ME FIRST.txt").write_text(f"""Commission Dashboard — installing on a Mac
 ==========================================
 
-1. Drag the "{MAC_FOLDER_NAME}" folder onto the
-   Applications shortcut next to it.
+1. Drag CommissionDashboard onto the Applications shortcut
+   beside it.
 
-2. Open Applications, then "{MAC_FOLDER_NAME}", and
-   double-click CommissionDashboard.
+2. Open your Applications folder and double-click
+   CommissionDashboard.
 
-3. macOS will block it the first time and say it is from an
-   unidentified developer. That is expected — this app is not
-   distributed through the App Store. Right-click (or Control-click)
-   CommissionDashboard, choose Open, then choose Open again.
+3. The first time only, macOS will say it is from an
+   unidentified developer and refuse to open it. That is
+   expected — this app is not distributed through the App
+   Store. Right-click (or Control-click) CommissionDashboard,
+   choose Open, then choose Open again.
 
-   On macOS Sequoia or newer there is no Open button in that dialog.
-   Go to  Apple menu > System Settings > Privacy & Security, scroll
-   down, and click "Open Anyway".
+   On macOS Sequoia or newer there is no Open button in that
+   dialog. Go to Apple menu > System Settings > Privacy &
+   Security, scroll down, and click "Open Anyway".
 
-4. It takes a minute or two to start the first time. Sign in with the
-   username and password IT gave you.
+4. The first launch sets itself up before the dashboard
+   appears — it unpacks about 700 MB and takes a minute or
+   two. The window tells you what it is doing. Later launches
+   start straight away.
 
-Steps 1 to 3 are one time only. After that just open it from
-Applications like any other app.
+5. Sign in with the username and password IT gave you.
 
-Do not run it from this disk image — it has to be copied out first.
+Steps 1 to 3 are one time only.
 
-If macOS will not let you drag into Applications ("you don't have
-permission to..."), double-click "{MAC_INSTALLER_NAME}"
-instead. That installs into your own Applications folder — Finder >
-Go > Home > Applications — which never has that problem.
+The dashboard keeps its settings, database and logs in
+  Home > Library > Application Support > Commission Dashboard
+and updates itself from inside the app, so you do not need to
+download this image again for routine updates.
 
 Anything unexpected: send IT a photo of the message on screen.
 """, encoding="utf-8", newline="\n")
-    print(f"dmg: wrote {MAC_INSTALLER_NAME} and READ ME FIRST.txt")
+    print("dmg: wrote READ ME FIRST.txt")
 
 
 # The disk image window: content size in points, and the centre of each icon
@@ -934,10 +888,9 @@ Anything unexpected: send IT a photo of the message on screen.
 DMG_WINDOW = (660, 440)
 DMG_ICON_SIZE = 96
 DMG_POSITIONS = {
-    MAC_FOLDER_NAME: (175, 170),
+    MAC_APP_NAME: (175, 170),
     "Applications": (485, 170),
-    "READ ME FIRST.txt": (175, 345),
-    MAC_INSTALLER_NAME: (485, 345),
+    "READ ME FIRST.txt": (330, 345),
 }
 
 
@@ -1261,11 +1214,8 @@ def _build_macos(version: str, arch: str = "arm64", with_runtime: bool = True,
     if seed_env is not None:
         stage_seed_env(payload, seed_env)
 
-    app_bundle = _find_mac_app_bundle(arch)
-    shutil.copytree(app_bundle, payload / MAC_APP_NAME, symlinks=True)
-    print(f"payload: Electron app {app_bundle} -> {payload / MAC_APP_NAME}")
-
-    # Verify the payload has the critical Flask files before creating the DMG
+    # Check the payload before it is sealed into the bundle, where a mistake
+    # stops being visible in a directory listing.
     flask_app = payload / "8. Web Dashboard" / "app.py"
     if not flask_app.exists():
         raise RuntimeError(
@@ -1274,38 +1224,38 @@ def _build_macos(version: str, arch: str = "arm64", with_runtime: bool = True,
             f"       {sorted(p.name for p in payload.iterdir())}"
         )
 
-    # Wrap the payload in a single folder for the DMG, so the disk image holds
-    # one obvious thing to install rather than three loose items.
     dmg_root = DIST / "dmg-contents"
     if dmg_root.exists():
         shutil.rmtree(dmg_root)
     dmg_root.mkdir(parents=True)
 
-    # MOVE, never copy. shutil.copytree() defaults to symlinks=False, which
-    # resolves every symlink it walks into a full copy of its target. Inside
-    # CommissionDashboard.app that means Contents/Frameworks/Electron
+    # symlinks=True, always. copytree() resolves symlinks by default, which
+    # inside CommissionDashboard.app means Contents/Frameworks/Electron
     # Framework.framework/Versions/Current and the four aliases beside it stop
-    # being links, which both inflates the image by a couple of hundred MB and
-    # destroys the bundle layout the code signature is computed over. macOS
-    # calls the result damaged and refuses to open it. A rename has no such
-    # failure mode, and is instant.
-    app_folder = dmg_root / MAC_FOLDER_NAME
-    shutil.move(str(payload), str(app_folder))
-    print(f"dmg: staged payload -> {app_folder}")
+    # being links -- inflating the image by a couple of hundred MB and
+    # destroying the bundle layout the code signature is computed over. macOS
+    # calls the result damaged and refuses to open it.
+    app_bundle = _find_mac_app_bundle(arch)
+    app = dmg_root / MAC_APP_NAME
+    shutil.copytree(app_bundle, app, symlinks=True)
+    print(f"dmg: Electron app {app_bundle} -> {app}")
+
+    # The install tree goes INSIDE the bundle. Nothing may sit beside the .app
+    # on a Mac: see the block comment in main.js, and _write_mac_readme below.
+    _embed_mac_payload(payload, app, version)
+    shutil.rmtree(payload)
 
     # Last write into the bundle has happened; anything after this invalidates
     # the signature.
-    _codesign_mac(app_folder / MAC_APP_NAME)
+    _codesign_mac(app)
 
-    # The shortcut that makes drag-to-install possible at all: without it there
-    # is nowhere on the image to drag to, and people drag the folder to the
-    # desktop or open the app in place. Dragging is now a supported route --
-    # the app clears its own quarantine on first launch -- so it gets the
-    # standard Mac affordance rather than being warned against.
+    # Drag-to-Applications is the supported route again, and now the correct
+    # one: the thing being dragged is the .app itself, which is the only
+    # gesture Finder exempts from App Translocation.
     (dmg_root / "Applications").symlink_to("/Applications")
     print("dmg: added Applications shortcut for drag-to-install")
 
-    _write_mac_installer(dmg_root)
+    _write_mac_readme(dmg_root)
 
     background = _stage_dmg_background(dmg_root)
 

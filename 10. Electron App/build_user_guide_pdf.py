@@ -552,27 +552,24 @@ g.platform_block("WINDOWS", ACCENT, [
 ])
 g.platform_block("MAC", DARK, [
     "Open the `.dmg` file you just downloaded.",
-    "Drag the **Commission Dashboard** folder onto the **Applications** "
-    "shortcut next to it. Wait for the copy to finish — it is about 700 MB.",
-    "Open **Applications** → **Commission Dashboard** and double-click "
-    "**CommissionDashboard**. Do not open it from the disk image.",
+    "Drag **CommissionDashboard** onto the **Applications** shortcut next "
+    "to it.",
+    "Open **Applications** and double-click **CommissionDashboard**.",
     "**macOS will refuse the first time**, saying it is from an unidentified "
     "developer. This is normal for apps outside the App Store. Right-click "
     "**CommissionDashboard**, choose **Open**, then click **Open** again.",
     "**On macOS Sequoia or newer** there is no Open button in that message. "
     "Go to Apple menu → **System Settings** → **Privacy & Security**, scroll "
     "down, and click **Open Anyway**.",
-    "The first start takes a minute or two. If macOS refuses the drag in "
-    "step 2 (*you don't have permission*), double-click **Install Commission "
-    "Dashboard** on the disk image instead — it installs into your own "
-    "Applications folder.",
+    "**The first start sets itself up before the dashboard appears.** It "
+    "unpacks about 700 MB and takes a minute or two; the window tells you "
+    "what it is doing. Later starts are quick.",
 ])
 
 g.step_heading("check", "Step 3 — Open the Portal")
 g.para("**Windows:** Start Menu → **Finance Commission Dashboard** (or the "
        "desktop shortcut).")
-g.para("**Mac:** **Applications** → **Commission Dashboard** → "
-       "**CommissionDashboard**.")
+g.para("**Mac:** **Applications** → **CommissionDashboard**.")
 g.para("Log in with the **username and password IT gave you**. There is no "
        "account to create — yours already exists. The first load takes a "
        "moment while it fetches the year's data. **You are done.**")
@@ -620,20 +617,19 @@ g.trouble_table([
      "Expected once, the first time you open it. Right-click "
      "**CommissionDashboard** and choose **Open**, then **Open** again. On "
      "macOS Sequoia: System Settings → Privacy & Security → **Open Anyway**."),
-    ("**Mac:** \"running from the disk image\", or the Portal will not start "
-     "after opening it from the `.dmg` window",
-     "It has to be copied out first. Drag the **Commission Dashboard** "
-     "folder onto the **Applications** shortcut, then open it from there."),
+    ("**Mac:** the window sits on \"Setting up the dashboard for the first "
+     "time\"",
+     "That is the first launch unpacking about 700 MB. Give it a minute or "
+     "two — it only happens once per version."),
     ("**Mac:** \"you don't have permission\" when dragging to Applications",
-     "Double-click **Install Commission Dashboard** on the disk image "
-     "instead. It installs into your own Applications folder: Finder → "
-     "**Go** → **Home** → **Applications**."),
+     "Drop it into your own Applications folder instead: Finder → **Go** → "
+     "**Home** → **Applications**. The Portal runs the same from either."),
     ("**Mac:** the Portal does not come back by itself after an update, and "
      "the page will not reload",
      "Expected once, when updating from version 1.2.25 or earlier. Quit the "
-     "Portal and open it again from **Applications** → **Commission "
-     "Dashboard**. The update itself already installed correctly, and later "
-     "updates restart on their own."),
+     "Portal and open it again from **Applications** → "
+     "**CommissionDashboard**. The update itself already installed "
+     "correctly, and later updates restart on their own."),
     ("An update failed", "Tell IT — ask them to check `dashboard.log`"),
     ("Numbers look out of date",
      "Wait a few minutes, or click **Sync Data** at the top right"),

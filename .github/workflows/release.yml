@@ -241,13 +241,17 @@ jobs:
             fi
           done
 
-      # Mount each image and check the three things that decide whether a Mac
-      # user gets a working install or a dead end. All three have shipped
+      # Mount each image and check the things that decide whether a Mac user
+      # gets a working install or a dead end. Every one of them has shipped
       # broken before, and none of them show up in a file size:
-      #   - the installer script, which clears the download quarantine that
-      #     blocks a dragged-across copy;
-      #   - a valid code signature, without which Apple Silicon reports the
-      #     app as "damaged" and offers no way past it;
+      #   - ONE .app on the image and nothing beside it but the Applications
+      #     shortcut. Anything else to drag brings back App Translocation:
+      #     Finder exempts an app from it only when the .app itself is dragged,
+      #     so a folder on the image is a trap, not a convenience;
+      #   - the payload archive inside the bundle, which is the install -- an
+      #     app that ships without it starts and then has nothing to run;
+      #   - a valid code signature, without which Apple Silicon reports the app
+      #     as "damaged" and offers no way past it;
       #   - the Electron framework's symlinks, whose flattening was what
       #     invalidated that signature in the first place.
       - name: Verify the disk images are actually installable
@@ -257,15 +261,23 @@ jobs:
             echo "== $(basename "$dmg")"
             mnt=$(mktemp -d)
             hdiutil attach "$dmg" -mountpoint "$mnt" -nobrowse -quiet
-            root="$mnt/Commission Dashboard"
-            app="$root/CommissionDashboard.app"
+            app="$mnt/CommissionDashboard.app"
+            res="$app/Contents/Resources"
             fail() { echo "   FAIL: $1"; hdiutil detach "$mnt" -quiet; exit 1; }
 
-            [ -x "$mnt/Install Commission Dashboard.command" ] \
-              || fail "no executable installer script on the image"
+            [ -d "$app" ] || fail "no CommissionDashboard.app at the top of the image"
             [ -f "$mnt/READ ME FIRST.txt" ] || fail "no READ ME FIRST.txt"
             [ -L "$mnt/Applications" ] \
               || fail "no Applications shortcut - drag-to-install has nowhere to drop"
+            # A folder on the image is what people drag instead of the app, and
+            # dragging a folder does not clear translocation. Nothing but the
+            # app, the shortcut and the note belongs here.
+            for extra in "$mnt"/*; do
+              case "$(basename "$extra")" in
+                CommissionDashboard.app|Applications|"READ ME FIRST.txt") ;;
+                *) fail "unexpected item on the image: $(basename "$extra")" ;;
+              esac
+            done
             # Without these the image opens as a plain file list and the
             # drag-here layout everyone recognises is simply absent - which
             # looks identical to a successful build from the outside.
@@ -273,14 +285,31 @@ jobs:
               || fail "no .DS_Store - Finder never arranged the window"
             ls "$mnt/.background/"background.* >/dev/null 2>&1 \
               || fail "no background art on the image"
-            [ -f "$root/8. Web Dashboard/app.py" ] || fail "no Flask app in the folder"
-            [ -x "$root/runtime/bin/python3" ] || fail "no bundled python3"
+
+            [ -f "$res/payload-version.txt" ] || fail "no payload stamp in the bundle"
+            [ -f "$res/payload.tar.gz" ] || fail "no payload archive in the bundle"
+            list=$(mktemp)
+            tar -tzf "$res/payload.tar.gz" > "$list" \
+              || fail "the payload archive is not readable"
+            grep -qx "./8. Web Dashboard/app.py" "$list" \
+              || fail "no Flask app inside the payload archive"
+            grep -qx "./runtime/bin/python3" "$list" \
+              || fail "no bundled python3 inside the payload archive"
+            # Unpack just the interpreter: the archive carries python3 as a
+            # symlink to python3.12, and a mode lost in packing is invisible in
+            # a listing but fatal on the user's machine.
+            probe=$(mktemp -d)
+            tar -xzf "$res/payload.tar.gz" -C "$probe" "./runtime/bin" \
+              || fail "could not unpack runtime/bin from the payload archive"
+            [ -x "$probe/runtime/bin/python3" ] \
+              || fail "the bundled python3 is not executable after unpacking"
+
             [ -L "$app/Contents/Frameworks/Electron Framework.framework/Versions/Current" ] \
               || fail "Electron framework symlinks were flattened - the bundle is broken"
             codesign --verify --deep --strict "$app" \
               || fail "the app bundle does not pass codesign - macOS will call it damaged"
 
-            echo "   ok: installer, payload, runtime, symlinks, signature"
+            echo "   ok: layout, payload archive, runtime, symlinks, signature"
             hdiutil detach "$mnt" -quiet
           done
 
@@ -349,20 +378,17 @@ jobs:
             ### Installing on a Mac
 
             1. Open the downloaded `.dmg`.
-            2. Drag the **Commission Dashboard** folder onto the
-               **Applications** shortcut beside it.
+            2. Drag **CommissionDashboard** onto the **Applications** shortcut
+               beside it.
             3. Open it from Applications. macOS blocks it the first time — it
                is not an App Store app. Right-click → **Open** → **Open**. On
                macOS Sequoia or newer, go to **System Settings → Privacy &
                Security** and click **Open Anyway** instead.
-            4. First start takes a minute or two.
+            4. The first start sets itself up before the dashboard appears and
+               takes a minute or two. The window says what it is doing.
 
-            That is the whole install, and step 3 happens only once. Don't run
-            it from the disk image — it has to be copied out first. If macOS
-            refuses the drag ("you don't have permission"), double-click
-            **Install Commission Dashboard** on the image instead; it installs
-            into your own Applications folder. Full steps are in the user
-            guide below.
+            That is the whole install, and step 3 happens only once. Full steps
+            are in the user guide below.
 
             **New here?** Read `Commission-Portal-User-Guide.pdf` below — it
             walks through installing and updating, step by step.
