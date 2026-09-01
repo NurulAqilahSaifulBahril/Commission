@@ -474,13 +474,20 @@ def stage_seed_env(payload: Path, seed_env: Path) -> None:
     NEVER as an asset on the public GitHub Releases page. The CI release
     workflow does not pass --seed-env, so public builds stay key-free.
 
-    Only the PG_* proxy lines are taken from the seed file. FLASK_SECRET_KEY
+    Only the keys in `allowed` below are taken from the seed file. FLASK_SECRET_KEY
     must stay per-install (the server generates one on first boot), and
     anything else in a working .env (e.g. a retired DATABASE_URL) has no
     business being copied onto six machines.
     """
+    # UPDATE_GITHUB_TOKEN is here for the macOS path. Windows appends it to
+    # dist/payload/.env as a separate build step, which works because the
+    # payload directory survives until Inno compiles it; on a Mac the payload
+    # is packed into the bundle and deleted, so there is nothing left to append
+    # to and the token has to arrive with the rest of the keys. The Windows
+    # workflow does not put it in its seed file, so nothing is duplicated.
     allowed = ("PG_PROXY_URL", "PG_PROXY_TOKEN", "PG_PROXY_DB",
-               "PG_MIRROR_TOKEN", "PG_MIRROR_DB", "PG_MIRROR_SCHEMA")
+               "PG_MIRROR_TOKEN", "PG_MIRROR_DB", "PG_MIRROR_SCHEMA",
+               "UPDATE_GITHUB_TOKEN")
     lines = []
     for raw in seed_env.read_text(encoding="utf-8").splitlines():
         line = raw.strip()

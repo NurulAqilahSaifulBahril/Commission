@@ -219,6 +219,58 @@ jobs:
       - name: Show what electron-builder produced
         run: ls -la "10. Electron App/app/dist"
 
+      # Same rule as the Windows job, and for the same reason: a seeded image
+      # carries live database credentials, and release assets inherit
+      # repository visibility. Secrets present on a PUBLIC repo is a hard
+      # failure, not a warning. With no secrets set, the build produces
+      # key-free images and staff paste their own keys.
+      - name: Decide whether to seed access keys
+        id: seed
+        env:
+          HAS_KEYS: ${{ secrets.PG_MIRROR_TOKEN != '' }}
+          IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [ "$HAS_KEYS" != "true" ]; then
+            echo "No PG_* secrets configured - building key-free disk images."
+            echo "seed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$IS_PRIVATE" != "true" ]; then
+            echo "PG_* secrets are configured but this repository is PUBLIC." >&2
+            echo "A seeded disk image attached to a public release exposes live" >&2
+            echo "database credentials to anyone who finds the URL. Make the" >&2
+            echo "repository private before tagging, or remove the secrets." >&2
+            exit 1
+          fi
+          echo "seed=true" >> "$GITHUB_OUTPUT"
+
+      # Values are never echoed -- only the line count. Anything written to the
+      # log here would be readable by anyone who can see the run.
+      - name: Write seed .env from secrets
+        if: steps.seed.outputs.seed == 'true'
+        env:
+          PG_PROXY_URL: ${{ secrets.PG_PROXY_URL }}
+          PG_PROXY_TOKEN: ${{ secrets.PG_PROXY_TOKEN }}
+          PG_PROXY_DB: ${{ secrets.PG_PROXY_DB }}
+          PG_MIRROR_TOKEN: ${{ secrets.PG_MIRROR_TOKEN }}
+          PG_MIRROR_DB: ${{ secrets.PG_MIRROR_DB }}
+          PG_MIRROR_SCHEMA: ${{ secrets.PG_MIRROR_SCHEMA }}
+          # Unlike Windows, which appends this to the staged payload after the
+          # fact, the Mac build packs the payload into the bundle and deletes
+          # it -- so the token has to come through the seed file. stage_seed_env
+          # allows it for exactly this reason.
+          UPDATE_GITHUB_TOKEN: ${{ secrets.UPDATE_GITHUB_TOKEN }}
+        run: |
+          : > ci-seed.env
+          for name in PG_PROXY_URL PG_PROXY_TOKEN PG_PROXY_DB \
+                      PG_MIRROR_TOKEN PG_MIRROR_DB PG_MIRROR_SCHEMA \
+                      UPDATE_GITHUB_TOKEN; do
+            value="${!name}"
+            if [ -n "$value" ]; then printf '%s=%s\n' "$name" "$value" >> ci-seed.env; fi
+          done
+          chmod 600 ci-seed.env
+          echo "Wrote ci-seed.env with $(wc -l < ci-seed.env | tr -d ' ') key line(s)."
+
       # MAC_SIGN_IDENTITY is optional and normally unset: with no Apple
       # Developer ID the build signs ad-hoc, which is what makes the app
       # launchable on Apple Silicon at all. Set the secret to a "Developer ID
@@ -227,7 +279,19 @@ jobs:
       - name: Build macOS disk images (both ARM64 and x86_64)
         env:
           MAC_SIGN_IDENTITY: ${{ secrets.MAC_SIGN_IDENTITY }}
-        run: python3 tools/build_package.py --version ${{ needs.version.outputs.version }} --platform macos-all
+        run: |
+          seed_args=""
+          if [ "${{ steps.seed.outputs.seed }}" = "true" ]; then
+            seed_args="--seed-env ci-seed.env"
+          fi
+          python3 tools/build_package.py \
+            --version ${{ needs.version.outputs.version }} \
+            --platform macos-all $seed_args
+
+      # always(), so a failed build cannot leave credentials on the runner.
+      - name: Remove the seed file
+        if: always()
+        run: rm -f ci-seed.env
 
       - name: Verify the disk images carry payloads
         run: |
@@ -303,6 +367,25 @@ jobs:
               || fail "could not unpack runtime/bin from the payload archive"
             [ -x "$probe/runtime/bin/python3" ] \
               || fail "the bundled python3 is not executable after unpacking"
+
+            # Both directions matter, and the second one more than the first.
+            # A seeded build that quietly lost its .env just sends staff to the
+            # setup page; an UNSEEDED build that somehow carries one has put
+            # live database credentials inside a public release asset. Neither
+            # is visible from the outside, so assert both. Key NAMES only --
+            # never grep in a way that could echo a value into the log.
+            if [ "${{ steps.seed.outputs.seed }}" = "true" ]; then
+              grep -qxF "./.env" "$list" || fail "seeded build has no .env in the payload"
+              tar -xzf "$res/payload.tar.gz" -C "$probe" "./.env" \
+                || fail "could not unpack the seeded .env"
+              grep -q "^PG_MIRROR_TOKEN=." "$probe/.env" \
+                || fail "the seeded .env carries no PG_MIRROR_TOKEN"
+              echo "   ok: seeded .env present (internal distribution only)"
+            elif grep -qxF "./.env" "$list"; then
+              fail "UNSEEDED build contains a .env - credentials would ship publicly"
+            else
+              echo "   ok: no .env in the payload, as expected for a key-free build"
+            fi
 
             [ -L "$app/Contents/Frameworks/Electron Framework.framework/Versions/Current" ] \
               || fail "Electron framework symlinks were flattened - the bundle is broken"
