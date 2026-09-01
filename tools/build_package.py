@@ -20,6 +20,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -1027,6 +1028,99 @@ end tell
 """
 
 
+def _attached_devices(image: Path) -> list[str]:
+    """The /dev/diskN nodes currently backing this disk image.
+
+    Read from hdiutil's plist rather than its human output. The text form puts
+    device, filesystem and mount point on one line, and this volume's name has
+    a space in it, so recovering the device from that is guesswork.
+
+    Longest name first, so a slice (/dev/disk4s1) is asked before the whole
+    disk (/dev/disk4) that would take it with it.
+    """
+    r = subprocess.run(["hdiutil", "info", "-plist"], capture_output=True)
+    if r.returncode != 0:
+        # An empty list here reads as "detached" and lets the build march on
+        # into a convert that fails with EAGAIN. Say so rather than let that
+        # be the explanation someone has to reconstruct later.
+        print(f"dmg: hdiutil info failed ({r.returncode}); "
+              "assuming the image is detached")
+        return []
+    try:
+        data = plistlib.loads(r.stdout)
+    except Exception as e:
+        print(f"dmg: could not parse hdiutil info ({e}); "
+              "assuming the image is detached")
+        return []
+    target = os.path.realpath(str(image))
+    devs = []
+    for img in data.get("images", []):
+        if os.path.realpath(str(img.get("image-path") or "")) != target:
+            continue
+        for ent in img.get("system-entities", []):
+            dev = ent.get("dev-entry")
+            if dev:
+                devs.append(dev)
+    return sorted(set(devs), key=len, reverse=True)
+
+
+def _holders(mount: Path) -> str:
+    """Which processes are keeping a volume busy. Diagnostics only."""
+    try:
+        r = subprocess.run(["lsof", "+D", str(mount)], capture_output=True,
+                           text=True, timeout=60)
+        return (r.stdout or "").strip()[:1500] or "(lsof named nothing)"
+    except Exception as e:
+        return f"(lsof failed: {e})"
+
+
+def _detach_image(image: Path, mount: Path, timeout: int = 180) -> None:
+    """Unmount a writable image and wait for its device to actually go away.
+
+    `hdiutil detach` returning 0 does not mean the device is gone, and
+    `hdiutil convert` on a still-attached image fails with EAGAIN -- which is
+    what "Resource temporarily unavailable" was in v1.2.24.
+
+    The version after that fixed the wrong half. It asked for a detach five
+    times over ten seconds, then polled for ninety more without attempting
+    anything further, so a volume that Finder or Spotlight held for longer
+    than ten seconds was simply never asked again: the build watched it stay
+    mounted and failed. v1.2.26 died there. Keep asking for the whole window,
+    escalate to -force after the first try, and go by the device list rather
+    than the mount point -- the mount point disappears first and the device
+    outliving it is precisely the state that breaks the compression step.
+
+    Failing that, name the process holding it. "Something is holding the
+    volume" is a symptom, and it was all the previous message could say.
+    """
+    import time as _time
+
+    deadline = _time.time() + timeout
+    last = ""
+    attempt = 0
+    while _time.time() < deadline:
+        devs = _attached_devices(image)
+        if not devs:
+            return
+        attempt += 1
+        targets = devs + ([str(mount)] if mount.exists() else [])
+        for target in targets:
+            cmd = ["hdiutil", "detach", target]
+            if attempt > 1:
+                cmd.append("-force")
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0:
+                break
+            last = f"{' '.join(cmd)} -> {(r.stderr or r.stdout).strip()[:200]}"
+        _time.sleep(2)
+
+    raise RuntimeError(
+        f"{image} is still attached after {timeout}s and cannot be compressed.\n"
+        f"  last detach attempt: {last or '(none failed - it just never left)'}\n"
+        f"  holding {mount}:\n{_holders(mount)}"
+    )
+
+
 def _create_styled_dmg(dmg_root: Path, dmg_path: Path, background: str) -> None:
     """Build the disk image, then lay its window out the way Mac users expect.
 
@@ -1096,29 +1190,22 @@ def _create_styled_dmg(dmg_root: Path, dmg_path: Path, background: str) -> None:
             )
         subprocess.run(["sync"], capture_output=True)
     finally:
-        for attempt in range(5):
-            if not mount.exists():
-                break
-            cmd = ["hdiutil", "detach", str(mount), "-quiet"]
-            if attempt:
-                cmd.append("-force")
-            subprocess.run(cmd, capture_output=True)
-            _time.sleep(2)
-
-    # `hdiutil detach` returning 0 is not the same as the device being gone,
-    # and convert on a still-attached image fails with EAGAIN. Wait for the
-    # image to actually disappear from the attached list before compressing.
-    deadline = _time.time() + 90
-    while _time.time() < deadline:
-        info = subprocess.run(["hdiutil", "info"], capture_output=True, text=True)
-        if str(temp_dmg) not in info.stdout:
-            break
-        _time.sleep(2)
-    else:
-        raise RuntimeError(
-            f"{temp_dmg} is still attached after 90s — something is holding "
-            "the volume and it cannot be compressed."
-        )
+        # Detaching and waiting for the device to be gone are the same problem,
+        # so they are the same call now. Splitting them is what let the build
+        # stop asking after ten seconds and then wait ninety for an answer it
+        # was no longer requesting.
+        #
+        # This one raises where the old loop swallowed everything, so it must
+        # not fire while another exception is already on its way out: a
+        # detach failure reported instead of the Finder failure that caused it
+        # would send the next person looking in the wrong place.
+        if sys.exc_info()[0] is None:
+            _detach_image(temp_dmg, mount)
+        else:
+            try:
+                _detach_image(temp_dmg, mount, timeout=30)
+            except Exception as cleanup_error:
+                print(f"dmg: could not detach during cleanup: {cleanup_error}")
 
     dmg_path.unlink(missing_ok=True)
     # Belt as well as braces: whatever else might briefly hold the file
