@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 
 # Kept in sync with updater.PRESERVE_PATHS — this file cannot import it.
+# "runtime" and the Mac app bundle had drifted out of this copy while the
+# comment still claimed the two matched.
 PRESERVE_PATHS = {
     ".env",
     ".venv",
@@ -34,6 +36,8 @@ PRESERVE_PATHS = {
     "8. Web Dashboard/special_cases.json",
     "8. Web Dashboard/factory_rates.json",
     "shell",
+    "runtime",
+    "CommissionDashboard.app",
 }
 
 SKIP_NAMES = {"__pycache__", ".git", ".venv"}
@@ -165,7 +169,11 @@ def relaunch(command: list[str], cwd: Path) -> None:
 
     # A .bat needs a shell, and the install path contains spaces — pass it as a
     # quoted string so cmd.exe does not split "Launch Dashboard.bat" in two.
-    use_shell = command[0].lower().endswith(".bat")
+    # Gated on os.name as well as the extension: the batch file ships to Mac
+    # installs too, and handing one to /bin/sh is how the macOS relaunch used
+    # to fail. updater.py no longer sends it, and this makes sure a future
+    # caller cannot resurrect that failure.
+    use_shell = os.name == "nt" and command[0].lower().endswith(".bat")
     target = " ".join(f'"{part}"' for part in command) if use_shell else command
 
     subprocess.Popen(

@@ -54,6 +54,10 @@ PRESERVE_PATHS = [
     "8. Web Dashboard/factory_rates.json",
     "shell",  # the packaged Electron shell — never part of an OTA package, but
               # pinned here too so a future INCLUDE mistake can't wipe it out.
+    "CommissionDashboard.app",  # the same thing on a Mac, where the bundle
+              # sits in the install root rather than under shell/. Replacing a
+              # file inside it would also break the code signature, and macOS
+              # calls an app that fails codesign damaged.
     "runtime",  # the bundled Python interpreter. Same reasoning as shell, and
                 # the stakes are higher: remove it mid-update and the dashboard
                 # has nothing left to restart itself with.
@@ -292,12 +296,35 @@ def _flatten_single_root(folder: Path) -> Path:
 
 
 def _relaunch_command() -> list[str]:
-    """How to start the server again once files are swapped."""
-    launcher = REPO_ROOT / "Launch Dashboard.bat"
-    if launcher.exists():
-        return [str(launcher)]
-    venv_py = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
-    python = str(venv_py) if venv_py.exists() else sys.executable
+    """How to start the server again once files are swapped.
+
+    Windows-only until it was not: "Launch Dashboard.bat" is in the packager's
+    INCLUDE list, so it ships to a Mac install too and this returned it there.
+    apply_update.py then ran a batch file through /bin/sh, which fails on the
+    first line, and the update applied but nothing ever came back up -- the
+    window sat on a dead localhost:5001 until the user quit and reopened.
+    Decide on os.name, not on what happens to exist in the folder.
+    """
+    if os.name == "nt":
+        launcher = REPO_ROOT / "Launch Dashboard.bat"
+        if launcher.exists():
+            return [str(launcher)]
+        venv_py = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+        python = str(venv_py) if venv_py.exists() else sys.executable
+        return [python, str(CURRENT_DIR / "app.py")]
+
+    # macOS/Linux: no launcher script ships in the install folder, so start the
+    # server directly. sys.executable first -- it is the interpreter that is
+    # running us, which by definition is one that works here (the bundled
+    # runtime/bin/python3 when the Electron shell spawned us, whatever the
+    # user used from a source checkout otherwise). The rest is for the case
+    # where it comes back empty, as it can under an embedded interpreter.
+    candidates = [
+        sys.executable,
+        str(REPO_ROOT / "runtime" / "bin" / "python3"),
+        str(REPO_ROOT / ".venv" / "bin" / "python3"),
+    ]
+    python = next((c for c in candidates if c and Path(c).exists()), "python3")
     return [python, str(CURRENT_DIR / "app.py")]
 
 
@@ -363,10 +390,16 @@ def _run_update(release: dict) -> None:
         creation = 0
         if os.name == "nt":
             creation = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED_PROCESS
+        # start_new_session is the POSIX half of the same idea. Without it the
+        # applier stays in this server's process group, so anything that
+        # signals the group -- the Electron shell, a terminal -- reaches a
+        # process that is midway through overwriting the install. It survives
+        # today only because main.js kills our PID alone rather than the tree.
         subprocess.Popen(
             cmd,
             cwd=str(work_dir),
             creationflags=creation,
+            start_new_session=(os.name != "nt"),
             close_fds=True,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
