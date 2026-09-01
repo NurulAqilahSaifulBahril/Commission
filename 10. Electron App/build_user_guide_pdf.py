@@ -32,8 +32,8 @@ COVER_DPI = 150
 LOGO = os.path.join(HERE, "assets", "logo-header.png")
 SCREENSHOT = os.path.join(DOCS, "img", "update-panel.png")
 
-VERSION = "1.2.24"
-DATE_LINE = "August 2026"
+VERSION = "1.2.26"
+DATE_LINE = "September 2026"
 RELEASES_URL = "https://github.com/NurulAqilahSaifulBahril/Commission/releases/latest"
 
 # ── Fonts (Segoe UI family + Consolas, as in the original) ───────────────────
@@ -628,6 +628,12 @@ g.trouble_table([
      "Double-click **Install Commission Dashboard** on the disk image "
      "instead. It installs into your own Applications folder: Finder → "
      "**Go** → **Home** → **Applications**."),
+    ("**Mac:** the Portal does not come back by itself after an update, and "
+     "the page will not reload",
+     "Expected once, when updating from version 1.2.25 or earlier. Quit the "
+     "Portal and open it again from **Applications** → **Commission "
+     "Dashboard**. The update itself already installed correctly, and later "
+     "updates restart on their own."),
     ("An update failed", "Tell IT — ask them to check `dashboard.log`"),
     ("Numbers look out of date",
      "Wait a few minutes, or click **Sync Data** at the top right"),
