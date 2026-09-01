@@ -9,6 +9,7 @@ Run:  python "10. Electron App/build_user_guide_pdf.py"
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 
@@ -37,12 +38,60 @@ DATE_LINE = "September 2026"
 RELEASES_URL = "https://github.com/NurulAqilahSaifulBahril/Commission/releases/latest"
 
 # ── Fonts (Segoe UI family + Consolas, as in the original) ───────────────────
-FONTS = r"C:\Windows\Fonts"
-pdfmetrics.registerFont(TTFont("SegoeUI", os.path.join(FONTS, "segoeui.ttf")))
-pdfmetrics.registerFont(TTFont("SegoeUI-Bold", os.path.join(FONTS, "segoeuib.ttf")))
-pdfmetrics.registerFont(TTFont("SegoeUI-Italic", os.path.join(FONTS, "segoeuii.ttf")))
-pdfmetrics.registerFont(TTFont("SegoeUI-Semibold", os.path.join(FONTS, "seguisb.ttf")))
-pdfmetrics.registerFont(TTFont("Consolas", os.path.join(FONTS, "consola.ttf")))
+# On Windows this resolves to exactly the original faces, so a build there is
+# unchanged. It used to be able to resolve to nothing else: the path was
+# hardcoded to C:\Windows\Fonts, which meant the guide could not be rebuilt on
+# a Mac at all -- so a release cut from a Mac shipped install instructions that
+# no longer matched the installer, which is worse than any typeface.
+#
+# Office for Mac ships Consolas but NOT Segoe UI (only Segoe Print, Script and
+# Symbol), so Aptos stands in for the body face there -- Microsoft's own
+# humanist UI sans, carrying the same four weights this document needs,
+# semibold included. A Mac build is therefore legible and internally
+# consistent, but NOT identical to a Windows one. Rebuild on Windows before a
+# release if the exact house style matters; the substitution is announced on
+# stdout so it cannot happen quietly.
+FONT_DIRS = [
+    r"C:\Windows\Fonts",
+    "/Library/Fonts",
+    os.path.expanduser("~/Library/Fonts"),
+] + sorted(glob.glob("/Applications/Microsoft */Contents/Resources/DFonts"))
+
+# First entry is the house style; the rest are fallbacks, best first.
+FONT_CANDIDATES = {
+    "SegoeUI": ["segoeui.ttf", "Aptos.ttf"],
+    "SegoeUI-Bold": ["segoeuib.ttf", "Aptos-Bold.ttf"],
+    "SegoeUI-Italic": ["segoeuii.ttf", "Aptos-Italic.ttf"],
+    "SegoeUI-Semibold": ["seguisb.ttf", "Aptos-SemiBold.ttf"],
+    "Consolas": ["consola.ttf"],
+}
+
+
+def _register_fonts() -> None:
+    chosen: dict[str, str] = {}
+    for name, candidates in FONT_CANDIDATES.items():
+        for filename in candidates:
+            hit = next((os.path.join(d, filename) for d in FONT_DIRS
+                        if os.path.isfile(os.path.join(d, filename))), None)
+            if hit:
+                pdfmetrics.registerFont(TTFont(name, hit))
+                chosen[name] = filename
+                break
+        if name not in chosen:
+            raise SystemExit(
+                f"ERROR: no font file found for {name}.\n"
+                f"       Tried {candidates} in:\n"
+                + "\n".join(f"         {d}" for d in FONT_DIRS)
+            )
+    swapped = [n for n, f in chosen.items() if f != FONT_CANDIDATES[n][0]]
+    if swapped:
+        print("NOTE: Segoe UI is not installed here, so the guide was set in "
+              + ", ".join(sorted({chosen[n] for n in swapped}))
+              + ".\n      Content is correct; rebuild on Windows for the exact "
+                "house style.")
+
+
+_register_fonts()
 
 # ── Palette (sampled from the original PDF) ──────────────────────────────────
 DARK = HexColor("#0f1922")
