@@ -1221,7 +1221,23 @@ def admin_user_detail_api(user_id: int):
         updates["is_active"] = bool(req_data["is_active"])
 
     db.update_user(user_id, **updates)
-    db.insert_audit(actor["username"], "update", "user", f"Updated user '{target['username']}'", user_id=actor["id"])
+    # Every change to a user used to land in the audit log as the same
+    # "Updated user 'x'", so a password reset and a reactivation were
+    # indistinguishable after the fact -- which is most of what the log is
+    # for. Say which fields moved, never the values of the secret ones.
+    changed = []
+    if "username" in updates:
+        changed.append(f"renamed to '{updates['username']}'")
+    if "role" in updates:
+        changed.append(f"role -> {updates['role']}")
+    if "password_hash" in updates:
+        changed.append("password set")
+    if "is_active" in updates:
+        changed.append("reactivated" if updates["is_active"] else "deactivated")
+    summary = f"Updated user '{target['username']}'"
+    if changed:
+        summary += ": " + ", ".join(changed)
+    db.insert_audit(actor["username"], "update", "user", summary, user_id=actor["id"])
     return jsonify({"status": "success"})
 
 
