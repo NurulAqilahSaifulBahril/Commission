@@ -177,6 +177,16 @@ async function seedMacInstall(payload, status) {
   // looks like a broken Python rather than a quarantined one.
   await run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", MAC_ROOT]);
 
+  // A freshly unpacked runtime has no bytecode, and compiling it on first
+  // import is what made the first launch on an Intel Mac take over a minute
+  // — long enough that the shell gave up and killed the server as it came
+  // up. Compile it here instead, where the loading screen already says the
+  // setup is running. Best effort: a failure just means the slow first
+  // import happens later, under the longer start allowance in launch().
+  status("Preparing the dashboard for its first start...");
+  await run(path.join(MAC_ROOT, "runtime", "bin", "python3"),
+    ["-m", "compileall", "-q", "-j", "0", MAC_ROOT]);
+
   fs.writeFileSync(path.join(MAC_ROOT, MAC_SEED_STAMP), payload.build, "utf8");
   return MAC_ROOT;
 }
@@ -447,8 +457,21 @@ async function launch() {
 
   status("Starting the dashboard...");
   startFlask(root);
-  const deadline = Date.now() + 60_000;
-  await waitForPort(60_000);
+  // The server can take a while to listen: a cold runtime imports pandas and
+  // friends, then reaches the database before it binds the port. The first
+  // launch on an Intel Mac measured 63 s to the banner, and the old 60 s
+  // budget declared it dead one second after it came up. Give it three
+  // minutes, and tell the user it is still going rather than look hung.
+  const SERVER_START_MS = 180_000;
+  const stillGoing = setTimeout(() => status(
+    "Still starting. The first start after an install can take a couple of minutes..."),
+    20_000);
+  const listening = await waitForPort(SERVER_START_MS);
+  clearTimeout(stillGoing);
+  // The page-load retries get their own budget, counted from when the port
+  // opened. It used to share the port wait's deadline, so a slow start left
+  // zero attempts and the shell blamed a server that was in fact running.
+  const deadline = Date.now() + (listening ? 30_000 : 0);
 
   // A bare TCP connect can succeed against the previous, still-dying
   // listener that freePort() just killed — loading then gets
