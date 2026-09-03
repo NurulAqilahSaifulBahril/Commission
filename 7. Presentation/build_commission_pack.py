@@ -1545,6 +1545,34 @@ def _full_payment_display(dates: tuple) -> str:
     return full_pay
 
 
+def _balance_payment_display(cust_basic_lines: list, dates: tuple) -> str:
+    """The "75% Payment Date" cell for a Basic Commission customer row.
+
+    A multi-stage invoice settles its balance at the 75% milestone, so that is
+    the date this column has to show. It used to render the invoice's
+    full_payment_date -- the 100% date -- under a "75% Payment Date" heading,
+    which made every invoice sitting between the two milestones read "pending"
+    while its balance was in fact due and paid. 17 of 115 July/August rows were
+    doing that.
+
+    Single-stage (pre-July) invoices genuinely settle at 100% and keep the old
+    display, as do NFP rows, which are never advanced and so never reach this
+    function.
+    """
+    if not any(_is_new_policy_line(ln) for ln in cust_basic_lines):
+        return _full_payment_display(dates)
+    reached = sorted({
+        str(getattr(ln, "pct75_date", "") or "").strip()
+        for ln in cust_basic_lines
+        if _is_new_policy_line(ln) and str(getattr(ln, "pct75_date", "") or "").strip()
+    })
+    if reached:
+        return "<br/>".join(reached)
+    # Multi-stage but the 75% milestone has not been reached: genuinely pending.
+    inv_date = dates[0] if dates else ""
+    return "pending" if inv_date and inv_date != "-" else _full_payment_display(dates)
+
+
 def _is_cleaning_inspection_service(r_nfp) -> bool:
     """True when the NFP row's item is a standalone cleaning/inspection service
     call (e.g. "Cleaning And Inspection Service") rather than an actual solar
@@ -2197,7 +2225,7 @@ def build_internal_summary_tables(
                     if m >= 7:
                         basic_row.append(rm300_display)
                     basic_row.extend([
-                        _full_payment_display(basic_dates),
+                        _balance_payment_display(cust_basic_lines, basic_dates),
                         cust_basic_pkg_str,
                         ensure_rm_prefix(f"{basic_info['system_price']:,.2f}" if basic_info['system_price'] != 0 else "-"),
                         basic_nfp_cell,
@@ -2660,7 +2688,7 @@ def build_outsource_summary_tables(
                     if m >= 7:
                         basic_row.append(rm300_display)
                     basic_row.extend([
-                        _full_payment_display(basic_display_dates),
+                        _balance_payment_display(cust_basic_lines, basic_display_dates),
                         basic_display_pkg,
                         ensure_rm_prefix(f"{basic_display_system:,.2f}" if basic_display_system != 0 else "-"),
                         basic_nfp_cell,
