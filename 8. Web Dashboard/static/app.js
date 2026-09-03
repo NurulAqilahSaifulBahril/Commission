@@ -2698,8 +2698,16 @@ modalPackageType.value = defaults.pkg || "-";
                 <span>${label}:</span> <strong>${escapeHtml(shown(value))}</strong>
             </div>`;
 
+        // The advance is earned by reaching 5% payment, so it is dated by that
+        // milestone. It used to show the invoice's 1st Payment Date, which is a
+        // different thing: a first payment can fall short of the trigger, and
+        // the row then credited it with earning an advance it had not earned.
+        // Falls back to the old cell for payloads cached before this column.
+        const advDateIdx = findIdx(n => n === "advance payment date");
+        const advanceDate = advDateIdx === -1 ? cell(firstPayIdx) : cell(advDateIdx);
+
         const out = [];
-        if (!isPreJuly) out.push(line("Advance RM 300 (1st Payment)", cell(firstPayIdx)));
+        if (!isPreJuly) out.push(line("Advance RM 300 (5% Payment)", advanceDate));
         out.push(line(isPreJuly ? "Payout (100% Payment)" : "Balance Payout (75% Payment)", payoutDate));
         return out.join("");
     }
@@ -3342,7 +3350,8 @@ modalPackageType.value = defaults.pkg || "-";
         // Removing them from the array would shift all of that; skipping them
         // when the cells are emitted changes only what is drawn.
         const HIDDEN_DETAIL_HEADERS = ["1st payment date", "basic commission (rm300)", "75% payment date",
-                                       "basic rate %", "advance deducted"];
+                                       "basic rate %", "advance deducted",
+                                       "advance payment date"];
         const hiddenDetailCols = new Set(
             state.activeSection !== "basic_nfp" ? [] : headers.reduce((acc, h, i) => {
                 if (HIDDEN_DETAIL_HEADERS.includes(String(h).toLowerCase().trim())) acc.push(i);
