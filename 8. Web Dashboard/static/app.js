@@ -2814,6 +2814,26 @@ modalPackageType.value = defaults.pkg || "-";
                     subtext: `Basic Commission = Sales Price × Rate % = ${fmtNum(sales)} × Rate = ${commValStr}` + clickTip
                 };
             }
+            // The rate the agent was actually assigned, carried on the row.
+            // It is NOT commission / sales: on a Balance Payout row the
+            // commission is already net of the RM300 advance, so dividing it
+            // back out invented a rate nobody assigned (4.38% for an agent on
+            // 5%). Show the assigned rate and subtract the advance in the open.
+            const rateIdx = headers.findIndex(h => h.toLowerCase().trim() === "basic rate %");
+            const advIdx = headers.findIndex(h => h.toLowerCase().trim() === "advance deducted");
+            const assignedRate = rateIdx !== -1 ? String(row[rateIdx] || "").trim() : "";
+            const advance = advIdx !== -1 ? parseNum(row[advIdx]) : 0;
+            if (sales > 0 && assignedRate && assignedRate !== "-") {
+                const advanceStr = advance > 0 ? ` - ${fmtNum(advance)}` : "";
+                return {
+                    title: `Basic Commission — ${custName}`,
+                    preformula: milestones,
+                    formula: `Sales Price = Total Amount - EPP Effective`,
+                    subtext: `Basic Commission = Sales Price × Rate % = ${fmtNum(sales)} × ${assignedRate}${advanceStr} = ${commValStr}` + clickTip
+                };
+            }
+            // Cached payloads built before the rate column existed: fall back to
+            // the old derived figure rather than showing no rate at all.
             if (sales > 0 && commPrice > 0) {
                 const ratePct = ((commPrice / sales) * 100).toFixed(2);
                 return {
@@ -3321,7 +3341,8 @@ modalPackageType.value = defaults.pkg || "-";
         // 1st Payment Date, and every merge/rowspan pass below is index-based.
         // Removing them from the array would shift all of that; skipping them
         // when the cells are emitted changes only what is drawn.
-        const HIDDEN_DETAIL_HEADERS = ["1st payment date", "basic commission (rm300)", "75% payment date"];
+        const HIDDEN_DETAIL_HEADERS = ["1st payment date", "basic commission (rm300)", "75% payment date",
+                                       "basic rate %", "advance deducted"];
         const hiddenDetailCols = new Set(
             state.activeSection !== "basic_nfp" ? [] : headers.reduce((acc, h, i) => {
                 if (HIDDEN_DETAIL_HEADERS.includes(String(h).toLowerCase().trim())) acc.push(i);

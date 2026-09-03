@@ -340,6 +340,11 @@ def _expand_basic_lines_for_month(basic_lines: list, m: int) -> list:
             if pct75_m == m:
                 balance_ln = _replace_line(ln, basic_commission=full_amt - rm300_amt)
                 balance_ln._show_rm300 = False
+                # This row is the balance, so its commission is already net of
+                # the advance paid in an earlier month. Record how much came
+                # off: the Basic Commission hover shows it as an explicit
+                # "- 300" rather than bending the rate to fit the net figure.
+                balance_ln._advance_deducted = rm300_amt
                 result.append(balance_ln)
         else:
             # Only the 5% milestone has been reached so far.
@@ -2040,10 +2045,11 @@ def build_internal_summary_tables(
             agent_anp_by_month[m] = agent_anp_rows
 
         # Customer summary
-        basic_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False})
+        basic_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False, "advance": 0.0})
         for ln in month_basic_lines:
             key = (ln.agent_name.strip(), ln.customer_name.strip())
             basic_by_cust[key]["comm"] += float(ln.basic_commission)
+            basic_by_cust[key]["advance"] += float(getattr(ln, "_advance_deducted", 0) or 0)
             basic_by_cust[key]["sales"] += float(ln.sales_price)
             inv_num = ln.invoice_number.strip()
             r_nfp = nfp_by_inv.get(inv_num) or nfp_by_inv_all.get(inv_num)
@@ -2191,7 +2197,12 @@ def build_internal_summary_tables(
                         "Basic Commission", ensure_rm_prefix(basic_comm_val),
                         row_other_commission,
                         ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"),
-                        to_title_case(row_referral_label), ensure_rm_prefix(f"{cust_referral_rm:,.2f}" if cust_referral_rm != 0 else "-")
+                        to_title_case(row_referral_label), ensure_rm_prefix(f"{cust_referral_rm:,.2f}" if cust_referral_rm != 0 else "-"),
+                        # Trailing, and hidden in the UI (HIDDEN_DETAIL_HEADERS
+                        # in app.js): appended so no existing column index in
+                        # either the dashboard or the PDF pack shifts.
+                        rate_basic,
+                        f"{basic_info.get('advance', 0.0):,.2f}" if basic_info.get("advance") else "-",
                     ])
                     customer_rows.append(basic_row)
                     show_agent = ""
@@ -2206,7 +2217,7 @@ def build_internal_summary_tables(
                         nfp_nfp_cell,
                         ensure_rm_prefix(f"{nfp_info['sales']:,.2f}" if nfp_info['sales'] != 0 else "-"),
                         "Net Floor Price Commission", nfp_comm_val,
-                        "-", "-", "-", "-"
+                        "-", "-", "-", "-", "-", "-"
                     ])
                     customer_rows.append(nfp_row)
 
@@ -2481,10 +2492,11 @@ def build_outsource_summary_tables(
             agent_summary_by_month[m] = agent_rows
 
         # Customer summary
-        basic_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False})
+        basic_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False, "advance": 0.0})
         for ln in month_basic_lines:
             key = (ln.agent_name.strip(), ln.customer_name.strip())
             basic_by_cust[key]["comm"] += ln.basic_commission
+            basic_by_cust[key]["advance"] += float(getattr(ln, "_advance_deducted", 0) or 0)
             basic_by_cust[key]["sales"] += float(ln.sales_price)
             inv_num = ln.invoice_number.strip()
             r_nfp = nfp_by_inv.get(inv_num) or nfp_by_inv_all.get(inv_num)
@@ -2638,7 +2650,9 @@ def build_outsource_summary_tables(
                         ensure_rm_prefix(f"{basic_display_sales:,.2f}" if basic_display_sales != 0 else "-"),
                         "Basic Commission", ensure_rm_prefix(basic_comm_val),
                         row_other_commission,
-                        ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"), ensure_rm_prefix(f"{row_gan_lai_soon:,.2f}" if row_gan_lai_soon != 0 else "-"), "-", "-"
+                        ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"), ensure_rm_prefix(f"{row_gan_lai_soon:,.2f}" if row_gan_lai_soon != 0 else "-"), "-", "-",
+                        rate_basic,
+                        f"{basic_info.get('advance', 0.0):,.2f}" if basic_info.get("advance") else "-",
                     ])
                     customer_rows.append(basic_row)
                     show_agent = ""
@@ -2653,7 +2667,7 @@ def build_outsource_summary_tables(
                         nfp_nfp_cell,
                         ensure_rm_prefix(f"{nfp_info['sales']:,.2f}" if nfp_info['sales'] != 0 else "-"),
                         "Net Floor Price Commission", nfp_comm_val,
-                        "-", "-", "-", "-", "-"
+                        "-", "-", "-", "-", "-", "-", "-"
                     ])
                     customer_rows.append(nfp_row)
 
