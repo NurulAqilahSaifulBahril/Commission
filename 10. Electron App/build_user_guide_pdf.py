@@ -1,8 +1,13 @@
 """Generate 'docs/Commission-Portal-User-Guide.pdf' in the Eternalgy house style.
 
-Reproduces the original guide design (dark cover band, blue accent, pill
-badges, numbered chips, amber callout, green cards, red troubleshooting
-table) and adds macOS instructions alongside the Windows ones.
+Keeps the original guide design (dark cover band, blue accent, pill badges,
+numbered chips, green cards) and covers macOS alongside Windows.
+
+The guide is deliberately a SINGLE A4 page -- people print it and pin it up,
+so it has to fit. Everything here is sized against that budget: the cover band
+is short, Windows and Mac install steps sit side by side in two columns, and
+the build asserts the page count at the end. Adding a paragraph means taking
+one out.
 
 Run:  python "10. Electron App/build_user_guide_pdf.py"
 """
@@ -61,9 +66,6 @@ NOTE_BAR = HexColor("#b45309")
 GREEN_BG = HexColor("#edfbf2")
 GREEN_TOP = HexColor("#bcead0")
 GREEN = HexColor("#15803d")
-RED = HexColor("#dc2626")
-RED_ROW = HexColor("#fdf0ef")
-RED_LINE = HexColor("#f6c9c4")
 SHADOW = HexColor("#d7dee7")
 WHITE = HexColor("#ffffff")
 
@@ -72,8 +74,11 @@ PAGE_W, PAGE_H = 595.28, 841.89
 M = 56.69                       # left margin
 RIGHT = 538.58                  # right content edge
 CW = RIGHT - M                  # content width
-BOTTOM_LIMIT = 780              # last usable y (top-based)
-LEADING = 14.2
+BOTTOM_LIMIT = 792              # last usable y (top-based)
+BODY = 9.0                      # body text size
+LEADING = 11.9
+COL_GAP = 20.0                  # gutter between the WINDOWS and MAC columns
+COL_W = (CW - COL_GAP) / 2
 
 # ── Rich text: **bold**  *italic*  `code`  [text](url) ───────────────────────
 _TOKEN = re.compile(r"(\*\*.+?\*\*|\*.+?\*|`.+?`|\[.+?\]\(.+?\))")
@@ -117,7 +122,7 @@ def _spans(text: str, base_font: str, size: float, color) -> list[tuple]:
     return out
 
 
-def _wrap(text: str, width: float, base_font="SegoeUI", size=10.0, color=TEXT):
+def _wrap(text: str, width: float, base_font="SegoeUI", size=BODY, color=TEXT):
     words = _spans(text, base_font, size, color)
     lines, line, w = [], [], 0.0
     for tok in words:
@@ -162,24 +167,27 @@ class Guide:
     def _cover_header(self):
         c = self.c
         c.setFillColor(DARK)
-        c.rect(0, self.Y(153.1), PAGE_W, 153.1, stroke=0, fill=1)
+        c.rect(0, self.Y(104), PAGE_W, 104, stroke=0, fill=1)
         c.setFillColor(ACCENT)
-        c.rect(0, self.Y(156.1), PAGE_W, 3, stroke=0, fill=1)
+        c.rect(0, self.Y(107), PAGE_W, 3, stroke=0, fill=1)
         if os.path.exists(LOGO):
-            c.drawImage(LOGO, M, self.Y(59.1), width=42.5, height=21.7,
+            c.drawImage(LOGO, M, self.Y(45), width=38, height=19.4,
                         preserveAspectRatio=True, mask="auto")
         c.setFont("SegoeUI-Bold", 8.5); c.setFillColor(BADGE_BLUE)
-        c.drawString(M + 53, self.Y(52.5), "E T E R N A L G Y")
-        c.setFont("SegoeUI-Semibold", 25); c.setFillColor(WHITE)
-        c.drawString(M, self.Y(90), "Commission Portal")
-        c.setFillColor(LIGHT_BLUE)
-        c.drawString(M, self.Y(122), "Install & Update Guide")
-        c.setFont("SegoeUI", 10); c.setFillColor(SUBTITLE)
-        c.drawString(M, self.Y(140.5),
-                     f"Finance Commission Dashboard  \u00b7  Version {VERSION}"
-                     f"  \u00b7  {DATE_LINE}")
+        c.drawString(M + 48, self.Y(39.5), "E T E R N A L G Y")
+        # Title and subtitle share one line. Stacked they read better but cost
+        # 32pt, and the single-page budget does not have 32pt to give.
+        c.setFont("SegoeUI-Semibold", 22); c.setFillColor(WHITE)
+        c.drawString(M, self.Y(74), "Commission Portal")
+        w = pdfmetrics.stringWidth("Commission Portal", "SegoeUI-Semibold", 22)
+        c.setFillColor(LIGHT_BLUE); c.setFont("SegoeUI-Semibold", 15)
+        c.drawString(M + w + 12, self.Y(73), "Install & Update Guide")
+        c.setFont("SegoeUI", 9.2); c.setFillColor(SUBTITLE)
+        c.drawString(M, self.Y(93),
+                     "Finance Commission Dashboard  ·  Version %s"
+                     "  ·  %s" % (VERSION, DATE_LINE))
         self._footer()
-        self.y = 186
+        self.y = 126
 
     def _cont_header(self):
         c = self.c
@@ -228,7 +236,7 @@ class Guide:
                 c.linkURL(url, (x, by - 3, x + w, by + size), relative=0)
             x += w
 
-    def para(self, text, size=10.0, font="SegoeUI", color=TEXT,
+    def para(self, text, size=BODY, font="SegoeUI", color=TEXT,
              width=None, x=None, leading=None, gap=8.0):
         width = CW if width is None else width
         x = M if x is None else x
@@ -327,68 +335,89 @@ class Guide:
 
     # ── composed blocks ──────────────────────────────────────────────────────
     def part_heading(self, part_label, title, icon_kind=None, color=ACCENT):
-        self.ensure(110)
-        self.pill(part_label, color)
-        self.spacer(10)
-        x = M
+        """Pill, icon and title on ONE line -- stacked they cost 40pt each."""
+        self.ensure(46)
+        w = self.pill(part_label, color, advance=False)
+        x = M + w + 10
         if icon_kind:
-            self.icon(icon_kind, M, self.y + 2, color)
-            x = M + 36
-        self.c.setFont("SegoeUI-Semibold", 17); self.c.setFillColor(DARK)
-        self.c.drawString(x, self.Y(self.y + 19), title)
-        self.y += 26
-        self.c.setStrokeColor(color); self.c.setLineWidth(2.2)
-        self.c.line(M, self.Y(self.y), M + 73.7, self.Y(self.y))
-        self.y += 16
+            self.icon(icon_kind, x, self.y - 2.5, color)
+            x += 27
+        self.c.setFont("SegoeUI-Semibold", 14.5); self.c.setFillColor(DARK)
+        self.c.drawString(x, self.Y(self.y + 12.6), title)
+        self.y += 19
+        self.c.setStrokeColor(color); self.c.setLineWidth(2.0)
+        self.c.line(M, self.Y(self.y), M + 60, self.Y(self.y))
+        self.y += 9
 
     def step_heading(self, icon_kind, title):
-        self.ensure(76)
-        self.spacer(12)
-        self.icon(icon_kind, M, self.y)
-        self.c.setFont("SegoeUI-Semibold", 13); self.c.setFillColor(DARK)
-        self.c.drawString(M + 36, self.Y(self.y + 14.4), title)
-        self.y += 30
+        self.ensure(48)
+        self.spacer(4)
+        self.icon(icon_kind, M, self.y - 2)
+        self.c.setFont("SegoeUI-Semibold", 11.5); self.c.setFillColor(DARK)
+        self.c.drawString(M + 27, self.Y(self.y + 12), title)
+        self.y += 22
 
     def sub_heading(self, title, keep=0):
         """keep = height of the block that must stay with this heading."""
-        self.ensure(40 + keep)
-        self.spacer(10)
-        self.c.setFont("SegoeUI-Semibold", 12.5); self.c.setFillColor(DARK)
-        self.c.drawString(M, self.Y(self.y + 13), title)
-        self.y += 22
+        self.ensure(32 + keep)
+        self.spacer(6)
+        self.c.setFont("SegoeUI-Semibold", 11.5); self.c.setFillColor(DARK)
+        self.c.drawString(M, self.Y(self.y + 11.5), title)
+        self.y += 18
 
     @staticmethod
-    def _numbered_h(text):
-        lines = _wrap(text, CW - 24, "SegoeUI", 10, TEXT)
-        return max(15.0, len(lines) * LEADING) + 10
+    def _numbered_h(text, width=CW - 22):
+        lines = _wrap(text, width, "SegoeUI", BODY, TEXT)
+        return max(14.0, len(lines) * LEADING) + 6
 
-    def numbered(self, n, text):
-        lines = _wrap(text, CW - 24, "SegoeUI", 10, TEXT)
-        h = max(15.0, len(lines) * LEADING)
-        self.ensure(h + 10)
+    def _numbered_at(self, n, text, x, width, y):
+        """Draw one numbered step at an absolute spot; return the y below it."""
+        lines = _wrap(text, width, "SegoeUI", BODY, TEXT)
+        h = max(14.0, len(lines) * LEADING)
         c = self.c
         c.setFillColor(NUM_BG)
-        c.roundRect(M, self.Y(self.y + 15), 15, 15, 3, stroke=0, fill=1)
-        c.setFillColor(NUM_FG); c.setFont("SegoeUI-Bold", 8.4)
-        c.drawCentredString(M + 7.5, self.Y(self.y + 10.4), str(n))
-        yy = self.y
+        c.roundRect(x, self.Y(y + 14), 14, 14, 3, stroke=0, fill=1)
+        c.setFillColor(NUM_FG); c.setFont("SegoeUI-Bold", 8.0)
+        c.drawCentredString(x + 7, self.Y(y + 9.9), str(n))
+        yy = y
         for ln in lines:
             yy += LEADING
-            self._draw_line_tokens(ln, M + 24, yy - 3)
-        self.y += h + 10
+            self._draw_line_tokens(ln, x + 22, yy - 3)
+        return y + h + 6
 
-    def platform_block(self, label, bg, items):
-        # Widow control: the WINDOWS/MAC pill must not end a page on its own,
-        # so require room for the pill plus its first two steps. Splitting a
-        # long list across a page turn is fine; stranding the label is not.
-        head_h = 2 + 15 + 9 + sum(self._numbered_h(t) for t in items[:2])
-        self.ensure(head_h)
-        self.spacer(2)
-        self.pill(label, bg)
-        self.spacer(9)
-        for i, item in enumerate(items, 1):
-            self.numbered(i, item)
-        self.spacer(2)
+    def numbered(self, n, text):
+        self.ensure(self._numbered_h(text))
+        self.y = self._numbered_at(n, text, M, CW - 22, self.y)
+
+    def two_col(self, left, right, left_w=COL_W):
+        """Two platform columns side by side, each (label, colour, [steps]).
+
+        Stacked, the Windows and Mac lists ran most of a page on their own.
+        Side by side they cost the height of the taller list only, which is
+        what buys the room for Part 2 below them.
+
+        left_w exists because an even split wastes the page: the Mac list is
+        much longer, so equal columns leave a third of the Windows column
+        blank while pushing Mac onto extra lines. Narrowing Windows to 170pt
+        brings both columns out within a line of each other and gives back
+        45pt -- most of this page's breathing room. Re-tune it if either
+        list changes length.
+        """
+        widths = (left_w, CW - COL_GAP - left_w)
+        cols = (left, right)
+        heights = [22 + sum(self._numbered_h(t, w - 22) for t in items)
+                   for (_label, _bg, items), w in zip(cols, widths)]
+        self.ensure(max(heights) + 4)
+        top = self.y
+        x = M
+        for (label, bg, items), w in zip(cols, widths):
+            self.y = top
+            self.pill(label, bg, x=x)
+            self.spacer(7)
+            for n, item in enumerate(items, 1):
+                self.y = self._numbered_at(n, item, x, w - 22, self.y)
+            x += w + COL_GAP
+        self.y = top + max(heights) + 4
 
     def callout(self, paragraphs):
         wrapped = [_wrap(p, CW - 46 - 16, "SegoeUI", 10, TEXT) for p in paragraphs]
@@ -410,105 +439,79 @@ class Guide:
             yy += 6
         self.y = top + h + 12
 
+    def _screenshot(self, x, top, width):
+        """Draw the framed update-panel shot at an absolute spot; return its
+        height. Returns 0 if the image is missing, so a fresh checkout that
+        has not fetched it still builds."""
+        if not os.path.exists(SCREENSHOT):
+            return 0.0
+        pad = 6.0
+        img_w = width - 2 * pad
+        img_h = img_w * 903 / 888
+        h = img_h + 2 * pad
+        c = self.c
+        c.setFillColor(SHADOW)
+        c.roundRect(x + 1.5, self.Y(top + h + 2), width, h, 5, stroke=0, fill=1)
+        c.setFillColor(WHITE); c.setStrokeColor(ACCENT); c.setLineWidth(1.0)
+        c.roundRect(x, self.Y(top + h), width, h, 5, stroke=1, fill=1)
+        c.drawImage(SCREENSHOT, x + pad, self.Y(top + pad + img_h),
+                    width=img_w, height=img_h)
+        return h
+
+    def steps_beside_figure(self, intro, steps, fig_w=140.0, gap=16.0):
+        """Update steps on the left, the Software Update screenshot on the
+        right.
+
+        The screenshot is the one thing people actually recognise -- the box
+        in the sidebar -- so it earns its place even on a one-page handout.
+        Beside the steps it costs the height of the taller side; stacked
+        under them, as it used to be, it cost a quarter of the page.
+        """
+        text_w = CW - fig_w - gap
+        img_h = (fig_w - 12) * 903 / 888 + 12
+        h_text = (len(_wrap(intro, text_w)) * LEADING + 5
+                  + sum(self._numbered_h(t, text_w - 22) for t in steps))
+        self.ensure(max(h_text, img_h) + 4)
+        top = self.y
+        self._screenshot(RIGHT - fig_w, top, fig_w)
+        self.para(intro, width=text_w, gap=5)
+        for n, step in enumerate(steps, 1):
+            self.y = self._numbered_at(n, step, M, text_w - 22, self.y)
+        self.y = max(self.y, top + img_h) + 8
+
     def green_cards(self, cards):
         col_w = 229.0
         gap = CW - 2 * col_w
         for row in range(0, len(cards), 2):
             pair = cards[row:row + 2]
-            wrapped = [_wrap(t, col_w - 42 - 12, "SegoeUI", 9.7, TEXT) for t in pair]
-            hts = [22 + len(w) * 13.4 + 10 for w in wrapped]
+            wrapped = [_wrap(t, col_w - 38 - 10, "SegoeUI", 8.9, TEXT) for t in pair]
+            hts = [15 + len(w) * 11.6 + 7 for w in wrapped]
             row_h = max(hts)
-            self.ensure(row_h + 10)
-            for i, (w, h) in enumerate(zip(wrapped, hts)):
+            self.ensure(row_h + 6)
+            # Both cards get the taller card's height -- a short card next to
+            # a tall one reads as a rendering fault, not as a design.
+            for i, w in enumerate(wrapped):
                 x = M + i * (col_w + gap)
                 c = self.c
                 c.setFillColor(GREEN_BG)
-                c.rect(x, self.Y(self.y + h), col_w, h, stroke=0, fill=1)
+                c.rect(x, self.Y(self.y + row_h), col_w, row_h, stroke=0, fill=1)
                 c.setStrokeColor(GREEN_TOP); c.setLineWidth(0.8)
                 c.line(x, self.Y(self.y), x + col_w, self.Y(self.y))
                 # green check circle
                 c.setFillColor(GREEN)
-                c.circle(x + 18, self.Y(self.y + 19), 8, stroke=0, fill=1)
-                c.setStrokeColor(WHITE); c.setLineWidth(1.5)
+                c.circle(x + 16, self.Y(self.y + 14), 7, stroke=0, fill=1)
+                c.setStrokeColor(WHITE); c.setLineWidth(1.4)
                 c.setLineCap(1); c.setLineJoin(1)
                 p = c.beginPath()
-                p.moveTo(x + 14.6, self.Y(self.y + 19.2))
-                p.lineTo(x + 17, self.Y(self.y + 21.6))
-                p.lineTo(x + 21.6, self.Y(self.y + 16.4))
+                p.moveTo(x + 13, self.Y(self.y + 14.2))
+                p.lineTo(x + 15.1, self.Y(self.y + 16.3))
+                p.lineTo(x + 19.1, self.Y(self.y + 11.7))
                 c.drawPath(p, stroke=1, fill=0)
-                yy = self.y + 11
+                yy = self.y + 6
                 for ln in w:
-                    yy += 13.4
-                    self._draw_line_tokens(ln, x + 42, yy - 3)
-            self.y += row_h + 10
-
-    def trouble_table(self, rows):
-        col2_x = 260.0
-        header_h = 29.0
-        self.ensure(header_h + 40)
-        c = self.c
-        # header
-        c.setFillColor(RED)
-        c.rect(M, self.Y(self.y + header_h), CW, header_h, stroke=0, fill=1)
-        c.setFillColor(WHITE); c.setFont("SegoeUI-Bold", 8)
-        c.drawString(M + 18, self.Y(self.y + 18.6), "WHAT YOU SEE")
-        c.drawString(col2_x, self.Y(self.y + 18.6), "WHAT TO DO")
-        self.y += header_h
-        for i, (what, todo) in enumerate(rows):
-            w1 = _wrap(what, col2_x - (M + 18) - 12, "SegoeUI", 10, TEXT)
-            w2 = _wrap(todo, RIGHT - col2_x - 10, "SegoeUI", 10, TEXT)
-            h = max(len(w1), len(w2)) * LEADING + 16
-            self.ensure(h + 4)
-            if i % 2 == 0:
-                c.setFillColor(RED_ROW)
-                c.rect(M, self.Y(self.y + h), CW, h, stroke=0, fill=1)
-            yy = self.y + 8
-            for ln in w1:
-                yy += LEADING
-                self._draw_line_tokens(ln, M + 18, yy - 3)
-            yy = self.y + 8
-            for ln in w2:
-                yy += LEADING
-                self._draw_line_tokens(ln, col2_x, yy - 3)
-            self.y += h
-            c.setStrokeColor(RED_LINE); c.setLineWidth(0.5)
-            c.line(M, self.Y(self.y), RIGHT, self.Y(self.y))
-        c.setStrokeColor(RED); c.setLineWidth(1.3)
-        c.line(M, self.Y(self.y), RIGHT, self.Y(self.y))
-        self.y += 14
-
-    def screenshot_panel(self, caption):
-        panel_w, img_w = 196.0, 176.0
-        img_h = img_w * 903 / 888
-        panel_h = 10 + 15 + 8 + img_h + 10
-        self.ensure(panel_h + 30)
-        c = self.c
-        x = (PAGE_W - panel_w) / 2
-        top = self.y
-        c.setFillColor(SHADOW)
-        c.roundRect(x + 1.5, self.Y(top + panel_h + 2), panel_w, panel_h, 6,
-                    stroke=0, fill=1)
-        c.setFillColor(WHITE); c.setStrokeColor(ACCENT); c.setLineWidth(1.1)
-        c.roundRect(x, self.Y(top + panel_h), panel_w, panel_h, 6,
-                    stroke=1, fill=1)
-        # pill
-        label = "WHAT YOU'LL SEE"
-        pw = pdfmetrics.stringWidth(label, "SegoeUI-Bold", 8.2) + 18
-        c.setFillColor(ACCENT)
-        c.roundRect(x + 10, self.Y(top + 10 + 15), pw, 15, 7.5, stroke=0, fill=1)
-        c.setFillColor(WHITE); c.setFont("SegoeUI-Bold", 8.2)
-        c.drawCentredString(x + 10 + pw / 2, self.Y(top + 10 + 10.8), label)
-        if os.path.exists(SCREENSHOT):
-            c.drawImage(SCREENSHOT, x + 10, self.Y(top + 33 + img_h),
-                        width=img_w, height=img_h)
-        self.y = top + panel_h + 14
-        # caption
-        lines = _wrap(caption, CW, "SegoeUI-Italic", 9, MUTED)
-        for ln in lines:
-            total = sum(pdfmetrics.stringWidth(t[0], t[1], t[2]) for t in ln)
-            self.y += 12.5
-            self._draw_line_tokens(ln, (PAGE_W - total) / 2, self.y - 3)
-        self.y += 10
+                    yy += 11.6
+                    self._draw_line_tokens(ln, x + 38, yy - 3)
+            self.y += row_h + 6
 
     def save(self):
         self.c.save()
@@ -517,127 +520,80 @@ class Guide:
 # ══ Build the document ════════════════════════════════════════════════════════
 g = Guide()
 
-g.para("A short guide for everyone using the Commission Portal — on "
-       "**Windows or Mac**. You install it **once**. After that it keeps "
-       "itself up to date.")
-g.para("*(Once it is running, see* [Using the Commission Portal]"
-       "(https://github.com/NurulAqilahSaifulBahril/Commission)*.)*", gap=4)
-g.rule()
+g.para("A short guide for everyone using the Commission Portal, on **Windows "
+       "or Mac**. You install it **once** — about 5 minutes, with nothing to "
+       "install beforehand — and after that it keeps itself up to date. "
+       "*(See also* [Using the Portal]"
+       "(https://github.com/NurulAqilahSaifulBahril/Commission)*.)*")
+g.rule(gap_before=2, gap_after=8)
 
 # ── Part 1 ────────────────────────────────────────────────────────────────────
-g.part_heading("PART 1", "Part 1 — Installing")
-g.para("Set aside about 5 minutes. There is nothing to install beforehand — "
-       "the Portal brings everything it needs with it.")
+g.part_heading("PART 1", "Installing")
 
 g.step_heading("download", "Step 1 — Download the Portal")
-g.numbered(1, f"Go to the [Commission Portal download page]({RELEASES_URL}).")
-g.numbered(2, "Scroll down to the **Assets** list.")
-g.numbered(3, "**Windows:** click `CommissionDashboard-Setup-….exe` to "
-              "download it.")
-g.numbered(4, "**Mac:** first check which chip your Mac has: Apple menu → "
-              "**About This Mac**. If it says **Apple M1/M2/M3…**, download "
-              "`CommissionDashboard-Setup-…-macos-arm64.dmg`. If it says "
-              "**Intel**, download "
-              "`CommissionDashboard-Setup-…-macos-intel.dmg`.")
+g.numbered(1, f"Open the [Commission Portal download page]({RELEASES_URL}) "
+              "and scroll down to the **Assets** list.")
+g.numbered(2, "**Windows:** download `CommissionDashboard-Setup-….exe`.")
+g.numbered(3, "**Mac:** Apple menu → **About This Mac**. **Apple M1/M2/M3…** "
+              "→ `…-macos-arm64.dmg`; **Intel** → `…-macos-intel.dmg`.")
 
 g.step_heading("play", "Step 2 — Install")
-g.platform_block("WINDOWS", ACCENT, [
-    "Open the file you just downloaded.",
-    "**If Windows shows a blue \"Windows protected your PC\" box:** click "
-    "**More info**, then **Run anyway**. This is normal — Windows shows it "
-    "for any app it has not seen before.",
-    "Click **Next** through the screens. Tick **Create a desktop shortcut** "
-    "if you would like one.",
-    "Click **Install**.",
-])
-g.platform_block("MAC", DARK, [
-    "Open the `.dmg` file you just downloaded.",
-    "Drag the **Commission Dashboard** folder onto the **Applications** "
-    "shortcut next to it. Wait for the copy to finish — it is about 700 MB.",
-    "Open **Applications** → **Commission Dashboard** and double-click "
-    "**CommissionDashboard**. Do not open it from the disk image.",
-    "**macOS will refuse the first time**, saying it is from an unidentified "
-    "developer. This is normal for apps outside the App Store. Right-click "
-    "**CommissionDashboard**, choose **Open**, then click **Open** again.",
-    "**On macOS Sequoia or newer** there is no Open button in that message. "
-    "Go to Apple menu → **System Settings** → **Privacy & Security**, scroll "
-    "down, and click **Open Anyway**.",
-    "The first start takes a minute or two. If macOS refuses the drag in "
-    "step 2 (*you don't have permission*), double-click **Install Commission "
-    "Dashboard** on the disk image instead — it installs into your own "
-    "Applications folder.",
-])
+g.two_col(
+    ("WINDOWS", ACCENT, [
+        "Open the file you just downloaded.",
+        "If a blue **Windows protected your PC** box appears: **More info**, "
+        "then **Run anyway**. Normal for any new app.",
+        "Click **Next** through the screens — tick **Create a desktop "
+        "shortcut** if you want one — then **Install**.",
+    ]),
+    ("MAC", DARK, [
+        "Open the `.dmg`. Drag the **Commission Dashboard** folder onto "
+        "**Applications** and wait — it is about 700 MB.",
+        "Open it from **Applications**, never from the disk image.",
+        "macOS blocks it the first time. Right-click **CommissionDashboard** "
+        "→ **Open** → **Open**. On **Sequoia or newer**: **System Settings** "
+        "→ **Privacy & Security** → **Open Anyway**.",
+        "Drag refused (*you do not have permission*)? Double-click **Install "
+        "Commission Dashboard** on the disk image instead.",
+    ]),
+    left_w=170.0,
+)
 
-g.step_heading("check", "Step 3 — Open the Portal")
-g.para("**Windows:** Start Menu → **Finance Commission Dashboard** (or the "
-       "desktop shortcut).")
-g.para("**Mac:** **Applications** → **Commission Dashboard** → "
-       "**CommissionDashboard**.")
-g.para("Log in with the **username and password IT gave you**. There is no "
-       "account to create — yours already exists. The first load takes a "
-       "moment while it fetches the year's data. **You are done.**")
-g.rule()
+g.step_heading("key", "Step 3 — Open the Portal and log in")
+g.para("**Windows:** Start Menu → **Finance Commission Dashboard**. **Mac:** "
+       "**Applications** → **Commission Dashboard**. Log in with the "
+       "**username and password IT gave you** — your account already exists, "
+       "there is nothing to create. The first load takes a moment while it "
+       "fetches the year’s data. **You are done.**")
+g.rule(gap_before=2, gap_after=8)
 
 # ── Part 2 ────────────────────────────────────────────────────────────────────
-g.part_heading("PART 2", "Part 2 — Updating", icon_kind="refresh")
-g.para("**Short version: you don't have to do anything.** The Portal checks "
-       "for new versions by itself and tells you when one is ready. This "
-       "works the same on Windows and Mac.")
-g.sub_heading("When an update is ready")
-g.para("A **Software Update** box appears at the **bottom of the left-hand "
-       "menu**, showing the new version number.")
-g.screenshot_panel("The Software Update panel, showing a new version "
-                   "available with an Install Update button")
-g.para("**If you see an \"Install Update\" button:**", gap=6)
-g.numbered(1, "Click **Install Update**.")
-g.numbered(2, "Click **OK** on the confirmation message.")
-g.numbered(3, "Wait. A progress bar runs, the Portal restarts itself, and "
-              "the page reloads on its own. This takes a minute or two.")
-g.numbered(4, "**Do not close the window while it is working.**")
-g.para("**If you do not see a button**, the box says \"*Ask an admin to "
-       "install it.*\" — there is nothing for you to do. Let your admin know.")
-g.sub_heading("Things worth knowing", keep=130)
+g.part_heading("PART 2", "Updating", icon_kind="refresh")
+g.steps_beside_figure(
+    "**You do not have to do anything.** The Portal checks for new versions "
+    "itself, on Windows and Mac alike. When one is ready, the **Software "
+    "Update** box on the right appears at the **bottom of the left-hand "
+    "menu**.",
+    [
+        "Click **Install Update**, then **OK**.",
+        "Wait a minute or two — a progress bar runs, the Portal restarts and "
+        "the page reloads on its own. **Do not close the window.**",
+        "**No button?** The box says *Ask an admin to install it* — nothing "
+        "for you to do. Let your admin know.",
+    ],
+)
 g.green_cards([
-    "**Nothing of yours is lost.** Your login, your Excel files, saved "
-    "reports and any rates you edited all stay exactly as they are. An "
-    "update only replaces the program itself.",
-    "**You never download the installer again.** Steps 1–3 above are one "
-    "time only.",
-    "**To check your version:** look at the bottom-left corner of the menu.",
-    "**If an update fails**, the Portal puts the old version back by itself "
-    "and keeps working. Tell IT so they can look into it.",
+    "**Nothing of yours is lost.** Logins, files and saved reports all stay.",
+    "**You never download the installer again.** Your version sits "
+    "bottom-left.",
 ])
-g.rule()
 
-# ── Troubleshooting ───────────────────────────────────────────────────────────
-g.part_heading("TROUBLESHOOTING", "If something goes wrong",
-               icon_kind="warning", color=RED)
-g.trouble_table([
-    ("The Portal will not open",
-     "Tell IT — ask them to check `dashboard.log` in the Portal's folder"),
-    ("**Mac:** \"cannot be opened because it is from an unidentified "
-     "developer\"",
-     "Expected once, the first time you open it. Right-click "
-     "**CommissionDashboard** and choose **Open**, then **Open** again. On "
-     "macOS Sequoia: System Settings → Privacy & Security → **Open Anyway**."),
-    ("**Mac:** \"running from the disk image\", or the Portal will not start "
-     "after opening it from the `.dmg` window",
-     "It has to be copied out first. Drag the **Commission Dashboard** "
-     "folder onto the **Applications** shortcut, then open it from there."),
-    ("**Mac:** \"you don't have permission\" when dragging to Applications",
-     "Double-click **Install Commission Dashboard** on the disk image "
-     "instead. It installs into your own Applications folder: Finder → "
-     "**Go** → **Home** → **Applications**."),
-    ("**Mac:** the Portal does not come back by itself after an update, and "
-     "the page will not reload",
-     "Expected once, when updating from version 1.2.25 or earlier. Quit the "
-     "Portal and open it again from **Applications** → **Commission "
-     "Dashboard**. The update itself already installed correctly, and later "
-     "updates restart on their own."),
-    ("An update failed", "Tell IT — ask them to check `dashboard.log`"),
-    ("Numbers look out of date",
-     "Wait a few minutes, or click **Sync Data** at the top right"),
-])
+# The guide is a one-page handout by design - people print it and pin it up.
+# Fail the build rather than quietly shipping a second page nobody prints.
+if g.page != 1:
+    raise SystemExit(
+        f"The guide has grown to {g.page} pages. It has to stay one page: "
+        "trim copy or tighten spacing before rebuilding.")
 
 g.save()
 print("Wrote", OUT)
