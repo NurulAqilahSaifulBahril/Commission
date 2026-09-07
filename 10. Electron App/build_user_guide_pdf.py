@@ -116,6 +116,15 @@ RED_LINE = HexColor("#f6c9c4")
 SHADOW = HexColor("#d7dee7")
 WHITE = HexColor("#ffffff")
 
+# macOS system-dialog chrome, for the two Gatekeeper mocks below. Sampled
+# against light-mode System Settings / alert panels, not this document's own
+# palette, since the point is to look like what actually appears on screen.
+OS_BG = HexColor("#f0f0f2")
+OS_BORDER = HexColor("#d2d2d6")
+OS_TEXT = HexColor("#1c1c1e")
+OS_SUBTEXT = HexColor("#5c5c60")
+OS_BTN_BG = HexColor("#e2e2e5")
+
 # ── Page geometry (A4, matching the original) ────────────────────────────────
 PAGE_W, PAGE_H = 595.28, 841.89
 M = 56.69                       # left margin
@@ -550,8 +559,248 @@ class Guide:
         if os.path.exists(SCREENSHOT):
             c.drawImage(SCREENSHOT, x + 10, self.Y(top + 33 + img_h),
                         width=img_w, height=img_h)
-        self.y = top + panel_h + 14
-        # caption
+        self._panel_caption(top, panel_h, caption)
+
+    # ── Gatekeeper mocks ─────────────────────────────────────────────────────
+    # Drawn rather than screenshotted. The exact wording has already changed
+    # once across macOS versions -- the "unidentified developer" dialog with
+    # an Open button became "Apple could not verify..." with no in-dialog
+    # bypass at all -- so a real screenshot goes stale at the next OS
+    # redesign while a redrawn mock of the substance still reads correctly.
+    def gatekeeper_blocked_panel(self, caption):
+        w, pad, icon_sz = 300.0, 20.0, 42.0
+        text_x = pad + icon_sz + 14
+        text_w = w - text_x - pad
+        title = "“CommissionDashboard” Not Opened"
+        body = ("Apple could not verify “CommissionDashboard” is "
+                "free of malware that may harm your Mac or compromise your "
+                "privacy.")
+        body_lines = _wrap(body, text_w, "SegoeUI", 9.0, OS_SUBTEXT)
+        block_h = max(icon_sz, 14 + 6 + len(body_lines) * 12.2)
+        btn_h = 23.0
+        h = pad + block_h + 14 + 12 + btn_h + 18
+        self.ensure(h + 40)
+        c = self.c
+        x = (PAGE_W - w) / 2
+        top = self.y
+        c.setFillColor(SHADOW)
+        c.roundRect(x + 1.5, self.Y(top + h + 2), w, h, 9, stroke=0, fill=1)
+        c.setFillColor(OS_BG); c.setStrokeColor(OS_BORDER); c.setLineWidth(1)
+        c.roundRect(x, self.Y(top + h), w, h, 9, stroke=1, fill=1)
+        # app-icon stand-in
+        iy = top + pad
+        c.setFillColor(ACCENT)
+        c.roundRect(x + pad, self.Y(iy + icon_sz), icon_sz, icon_sz, 9,
+                    stroke=0, fill=1)
+        c.setFillColor(WHITE); c.setFont("SegoeUI-Bold", 17)
+        c.drawCentredString(x + pad + icon_sz / 2, self.Y(iy + icon_sz / 2 + 6), "C")
+        tx = x + text_x
+        c.setFillColor(OS_TEXT); c.setFont("SegoeUI-Semibold", 10.6)
+        c.drawString(tx, self.Y(iy + 13), title)
+        yy = iy + 13 + 6
+        for ln in body_lines:
+            yy += 12.2
+            self._draw_line_tokens(ln, tx, yy - 3)
+        by_top = top + pad + block_h + 14
+        c.setStrokeColor(RULE); c.setLineWidth(0.6)
+        c.line(x + pad, self.Y(by_top), x + w - pad, self.Y(by_top))
+        label = "Done"
+        bw = pdfmetrics.stringWidth(label, "SegoeUI-Semibold", 9.5) + 26
+        bx = x + w - pad - bw
+        by = by_top + 12
+        c.setFillColor(OS_BTN_BG); c.setStrokeColor(OS_BORDER); c.setLineWidth(0.8)
+        c.roundRect(bx, self.Y(by + btn_h), bw, btn_h, 6, stroke=1, fill=1)
+        c.setFillColor(OS_TEXT); c.setFont("SegoeUI-Semibold", 9.5)
+        c.drawCentredString(bx + bw / 2, self.Y(by + btn_h / 2 + 3.3), label)
+        self._panel_caption(top, h, caption)
+
+    def gatekeeper_settings_panel(self, caption):
+        w, pad = 300.0, 18.0
+        row_pad, btn_w, btn_h = 14.0, 96.0, 26.0
+        row_w = w - 2 * pad
+        text_w = row_w - 2 * row_pad - btn_w - 10
+        l1 = _wrap("“CommissionDashboard” was blocked to protect "
+                    "your Mac.", text_w, "SegoeUI-Semibold", 9.2, OS_TEXT)
+        l2 = _wrap("Click Open Anyway to trust this app and run it.",
+                    text_w, "SegoeUI", 8.5, OS_SUBTEXT)
+        row_h = max(btn_h + 2 * row_pad,
+                    row_pad * 2 + len(l1) * 12.4 + len(l2) * 11.2 + 4)
+        h = pad + 20 + row_h + pad
+        self.ensure(h + 40)
+        c = self.c
+        x = (PAGE_W - w) / 2
+        top = self.y
+        c.setFillColor(SHADOW)
+        c.roundRect(x + 1.5, self.Y(top + h + 2), w, h, 9, stroke=0, fill=1)
+        c.setFillColor(WHITE); c.setStrokeColor(OS_BORDER); c.setLineWidth(1)
+        c.roundRect(x, self.Y(top + h), w, h, 9, stroke=1, fill=1)
+        c.setFillColor(MUTED); c.setFont("SegoeUI-Bold", 8)
+        c.drawString(x + pad, self.Y(top + pad + 7), "S E C U R I T Y")
+        row_top = top + pad + 20
+        c.setFillColor(OS_BG)
+        c.roundRect(x + pad, self.Y(row_top + row_h), row_w, row_h, 7,
+                    stroke=0, fill=1)
+        ty = row_top + row_pad
+        for ln in l1:
+            ty += 12.4
+            self._draw_line_tokens(ln, x + pad + row_pad, ty - 3)
+        ty += 3
+        for ln in l2:
+            ty += 11.2
+            self._draw_line_tokens(ln, x + pad + row_pad, ty - 3)
+        # the button, ringed in the house accent so it reads as "click here"
+        # without claiming macOS itself highlights it -- it does not.
+        bx = x + w - pad - row_pad - btn_w
+        by = row_top + (row_h - btn_h) / 2
+        c.setStrokeColor(ACCENT); c.setLineWidth(1.4)
+        c.roundRect(bx - 2.5, self.Y(by + btn_h + 2.5), btn_w + 5, btn_h + 5,
+                    8, stroke=1, fill=0)
+        c.setFillColor(OS_BTN_BG); c.setStrokeColor(OS_BORDER); c.setLineWidth(0.8)
+        c.roundRect(bx, self.Y(by + btn_h), btn_w, btn_h, 6, stroke=1, fill=1)
+        c.setFillColor(OS_TEXT); c.setFont("SegoeUI-Semibold", 9.5)
+        c.drawCentredString(bx + btn_w / 2, self.Y(by + btn_h / 2 + 3.3), "Open Anyway")
+        self._panel_caption(top, h, caption)
+
+    # ── compact side-by-side variants, for the one-page layout ──────────────
+    # Same substance as the full-size panels above, at a size two can sit
+    # side by side. Draw at an explicit (x, top) rather than the flowing
+    # self.y, since two of these share one row.
+    def _mini_blocked_panel(self, x, top, w):
+        pad, icon_sz = 11.0, 24.0
+        text_x = pad + icon_sz + 7
+        text_w = w - text_x - pad
+        title_lines = _wrap("“CommissionDashboard” Not Opened",
+                            text_w, "SegoeUI-Semibold", 8.2, OS_TEXT)
+        body_lines = _wrap("Apple could not verify this app is "
+                           "malware-free.", text_w, "SegoeUI", 7.2, OS_SUBTEXT)
+        block_h = max(icon_sz, len(title_lines) * 10.2 + 4 + len(body_lines) * 9.4)
+        btn_h = 17.0
+        h = pad + block_h + 8 + 8 + btn_h + 10
+        c = self.c
+        c.setFillColor(SHADOW)
+        c.roundRect(x + 1, self.Y(top + h + 1.5), w, h, 7, stroke=0, fill=1)
+        c.setFillColor(OS_BG); c.setStrokeColor(OS_BORDER); c.setLineWidth(0.9)
+        c.roundRect(x, self.Y(top + h), w, h, 7, stroke=1, fill=1)
+        iy = top + pad
+        c.setFillColor(ACCENT)
+        c.roundRect(x + pad, self.Y(iy + icon_sz), icon_sz, icon_sz, 6,
+                    stroke=0, fill=1)
+        c.setFillColor(WHITE); c.setFont("SegoeUI-Bold", 11)
+        c.drawCentredString(x + pad + icon_sz / 2, self.Y(iy + icon_sz / 2 + 4), "C")
+        tx = x + text_x
+        yy = iy
+        for ln in title_lines:
+            yy += 10.2
+            self._draw_line_tokens(ln, tx, yy - 2.6)
+        yy += 4
+        for ln in body_lines:
+            yy += 9.4
+            self._draw_line_tokens(ln, tx, yy - 2.2)
+        by_top = top + pad + block_h + 8
+        c.setStrokeColor(RULE); c.setLineWidth(0.5)
+        c.line(x + pad, self.Y(by_top), x + w - pad, self.Y(by_top))
+        label = "Done"
+        bw = pdfmetrics.stringWidth(label, "SegoeUI-Semibold", 7.4) + 18
+        bx = x + w - pad - bw
+        by = by_top + 8
+        c.setFillColor(OS_BTN_BG); c.setStrokeColor(OS_BORDER); c.setLineWidth(0.7)
+        c.roundRect(bx, self.Y(by + btn_h), bw, btn_h, 5, stroke=1, fill=1)
+        c.setFillColor(OS_TEXT); c.setFont("SegoeUI-Semibold", 7.4)
+        c.drawCentredString(bx + bw / 2, self.Y(by + btn_h / 2 + 2.6), label)
+        return h
+
+    def _mini_settings_panel(self, x, top, w):
+        pad, row_pad, btn_w, btn_h = 10.0, 9.0, 66.0, 18.0
+        row_w = w - 2 * pad
+        text_w = row_w - 2 * row_pad - btn_w - 8
+        l1 = _wrap("“CommissionDashboard” blocked.", text_w,
+                   "SegoeUI-Semibold", 7.6, OS_TEXT)
+        l2 = _wrap("Click Open Anyway to trust it.", text_w,
+                   "SegoeUI", 7.0, OS_SUBTEXT)
+        row_h = max(btn_h + 2 * row_pad,
+                    row_pad * 2 + len(l1) * 9.6 + len(l2) * 8.6 + 2)
+        h = pad + 15 + row_h + pad
+        c = self.c
+        c.setFillColor(SHADOW)
+        c.roundRect(x + 1, self.Y(top + h + 1.5), w, h, 7, stroke=0, fill=1)
+        c.setFillColor(WHITE); c.setStrokeColor(OS_BORDER); c.setLineWidth(0.9)
+        c.roundRect(x, self.Y(top + h), w, h, 7, stroke=1, fill=1)
+        c.setFillColor(MUTED); c.setFont("SegoeUI-Bold", 6.6)
+        c.drawString(x + pad, self.Y(top + pad + 6), "S E C U R I T Y")
+        row_top = top + pad + 15
+        c.setFillColor(OS_BG)
+        c.roundRect(x + pad, self.Y(row_top + row_h), row_w, row_h, 6,
+                    stroke=0, fill=1)
+        ty = row_top + row_pad
+        for ln in l1:
+            ty += 9.6
+            self._draw_line_tokens(ln, x + pad + row_pad, ty - 2.6)
+        ty += 2
+        for ln in l2:
+            ty += 8.6
+            self._draw_line_tokens(ln, x + pad + row_pad, ty - 2.2)
+        bx = x + w - pad - row_pad - btn_w
+        by = row_top + (row_h - btn_h) / 2
+        c.setStrokeColor(ACCENT); c.setLineWidth(1.1)
+        c.roundRect(bx - 2, self.Y(by + btn_h + 2), btn_w + 4, btn_h + 4, 7,
+                    stroke=1, fill=0)
+        c.setFillColor(OS_BTN_BG); c.setStrokeColor(OS_BORDER); c.setLineWidth(0.7)
+        c.roundRect(bx, self.Y(by + btn_h), btn_w, btn_h, 5, stroke=1, fill=1)
+        c.setFillColor(OS_TEXT); c.setFont("SegoeUI-Semibold", 7.2)
+        c.drawCentredString(bx + btn_w / 2, self.Y(by + btn_h / 2 + 2.6),
+                            "Open Anyway")
+        return h
+
+    def gatekeeper_mini_row(self, caption):
+        w, gap = 218.0, 20.0
+        total = w * 2 + gap
+        x0 = M + (CW - total) / 2
+        self.ensure(130)
+        top = self.y
+        h1 = self._mini_blocked_panel(x0, top, w)
+        h2 = self._mini_settings_panel(x0 + w + gap, top, w)
+        self._panel_caption(top, max(h1, h2), caption)
+
+    # Smaller sibling of screenshot_panel, sized to fit the one-page layout's
+    # leftover space rather than a full page of its own.
+    def mini_screenshot_panel(self, caption):
+        pad, pill_h, gap = 8.0, 13.0, 6.0
+        img_w = 118.0
+        img_h = img_w * 903 / 888
+        panel_w = img_w + 2 * pad
+        panel_h = pad + pill_h + gap + img_h + pad
+        self.ensure(panel_h + 40)
+        c = self.c
+        x = (PAGE_W - panel_w) / 2
+        top = self.y
+        c.setFillColor(SHADOW)
+        c.roundRect(x + 1.5, self.Y(top + panel_h + 2), panel_w, panel_h, 6,
+                    stroke=0, fill=1)
+        c.setFillColor(WHITE); c.setStrokeColor(ACCENT); c.setLineWidth(1.0)
+        c.roundRect(x, self.Y(top + panel_h), panel_w, panel_h, 6,
+                    stroke=1, fill=1)
+        label = "WHAT YOU'LL SEE"
+        pw = pdfmetrics.stringWidth(label, "SegoeUI-Bold", 6.6) + 14
+        c.setFillColor(ACCENT)
+        c.roundRect(x + pad, self.Y(top + pad + pill_h), pw, pill_h, 6.5,
+                    stroke=0, fill=1)
+        c.setFillColor(WHITE); c.setFont("SegoeUI-Bold", 6.6)
+        c.drawCentredString(x + pad + pw / 2, self.Y(top + pad + 9.4), label)
+        if os.path.exists(SCREENSHOT):
+            c.drawImage(SCREENSHOT, x + pad,
+                        self.Y(top + pad + pill_h + gap + img_h),
+                        width=img_w, height=img_h)
+        self._panel_caption(top, panel_h, caption)
+
+    def mini_heading(self, text):
+        self.ensure(24)
+        self.spacer(3)
+        self.c.setFont("SegoeUI-Semibold", 11); self.c.setFillColor(DARK)
+        self.c.drawString(M, self.Y(self.y + 11), text)
+        self.y += 15
+
+    def _panel_caption(self, top, h, caption):
+        self.y = top + h + 14
         lines = _wrap(caption, CW, "SegoeUI-Italic", 9, MUTED)
         for ln in lines:
             total = sum(pdfmetrics.stringWidth(t[0], t[1], t[2]) for t in ln)
@@ -563,126 +812,55 @@ class Guide:
         self.c.save()
 
 
-# ══ Build the document ════════════════════════════════════════════════════════
+# ══ Build the document — one page, install + update only ════════════════════
+# Troubleshooting deliberately left out: this is the quick version, not the
+# full reference. The spacious multi-page components above (platform pill +
+# numbered steps, the update screenshot, the green reassurance cards) are
+# condensed to inline "Windows:"/"Mac:" sentences so the whole thing fits on
+# the cover page.
 g = Guide()
 
-g.para("A short guide for everyone using the Commission Portal — on "
-       "**Windows or Mac**. You install it **once**. After that it keeps "
-       "itself up to date.")
-g.para("*(Once it is running, see* [Using the Commission Portal]"
-       "(https://github.com/NurulAqilahSaifulBahril/Commission)*.)*", gap=4)
-g.rule()
+g.para("A quick guide for **Windows** and **Mac**. Install once — the "
+       "Portal keeps itself updated after that.", size=9.2, leading=11.6,
+       gap=6)
+g.rule(gap_before=2, gap_after=8)
 
-# ── Part 1 ────────────────────────────────────────────────────────────────────
-g.part_heading("PART 1", "Part 1 — Installing")
-g.para("Set aside about 5 minutes. There is nothing to install beforehand — "
-       "the Portal brings everything it needs with it.")
+g.mini_heading("1 · Download")
+g.para(f"Go to the [Commission Portal download page]({RELEASES_URL}) → "
+       "**Assets**. **Windows:** download the `.exe`. **Mac:** check your "
+       "chip first (Apple menu → **About This Mac**) — download the "
+       "**arm64** build for Apple Silicon (M1 and newer), or **intel** for "
+       "an Intel Mac.", size=9.2, leading=11.6, gap=6)
 
-g.step_heading("download", "Step 1 — Download the Portal")
-g.numbered(1, f"Go to the [Commission Portal download page]({RELEASES_URL}).")
-g.numbered(2, "Scroll down to the **Assets** list.")
-g.numbered(3, "**Windows:** click `CommissionDashboard-Setup-….exe` to "
-              "download it.")
-g.numbered(4, "**Mac:** first check which chip your Mac has: Apple menu → "
-              "**About This Mac**. If it says **Apple M1/M2/M3…**, download "
-              "`CommissionDashboard-Setup-…-macos-arm64.dmg`. If it says "
-              "**Intel**, download "
-              "`CommissionDashboard-Setup-…-macos-intel.dmg`.")
+g.mini_heading("2 · Install")
+g.para("**Windows:** open the file. If you see \"Windows protected your "
+       "PC\", click **More info** → **Run anyway**, then **Next** → "
+       "**Install**.", size=9.2, leading=11.6, gap=5)
+g.para("**Mac:** open the `.dmg`, drag **CommissionDashboard** onto "
+       "**Applications**, then open it from there.", size=9.2, leading=11.6,
+       gap=5)
+g.para("**macOS will refuse the first time** — expected, not an error. "
+       "**Sequoia/Tahoe** (no Open button in the message): **System "
+       "Settings → Privacy & Security → Open Anyway**, shown below. "
+       "**Older macOS:** right-click the app → **Open** → **Open**.",
+       size=9.2, leading=11.6, gap=6)
+g.gatekeeper_mini_row(
+    "Left: what macOS shows. Right: Privacy & Security → Open Anyway.")
 
-g.step_heading("play", "Step 2 — Install")
-g.platform_block("WINDOWS", ACCENT, [
-    "Open the file you just downloaded.",
-    "**If Windows shows a blue \"Windows protected your PC\" box:** click "
-    "**More info**, then **Run anyway**. This is normal — Windows shows it "
-    "for any app it has not seen before.",
-    "Click **Next** through the screens. Tick **Create a desktop shortcut** "
-    "if you would like one.",
-    "Click **Install**.",
-])
-g.platform_block("MAC", DARK, [
-    "Open the `.dmg` file you just downloaded.",
-    "Drag **CommissionDashboard** onto the **Applications** shortcut next "
-    "to it.",
-    "Open **Applications** and double-click **CommissionDashboard**.",
-    "**macOS will refuse the first time**, saying it is from an unidentified "
-    "developer. This is normal for apps outside the App Store. Right-click "
-    "**CommissionDashboard**, choose **Open**, then click **Open** again.",
-    "**On macOS Sequoia or newer** there is no Open button in that message. "
-    "Go to Apple menu → **System Settings** → **Privacy & Security**, scroll "
-    "down, and click **Open Anyway**.",
-    "**The first start sets itself up before the dashboard appears.** It "
-    "unpacks about 700 MB and takes a minute or two; the window tells you "
-    "what it is doing. Later starts are quick.",
-])
+g.mini_heading("3 · Open & sign in")
+g.para("**Windows:** Start Menu → **Finance Commission Dashboard**. "
+       "**Mac:** **Applications** → **CommissionDashboard**. Sign in with "
+       "the **username and password IT gave you** — there is no account "
+       "to create. **You're done** — steps 1–3 are one time only.",
+       size=9.2, leading=11.6, gap=6)
 
-g.step_heading("check", "Step 3 — Open the Portal")
-g.para("**Windows:** Start Menu → **Finance Commission Dashboard** (or the "
-       "desktop shortcut).")
-g.para("**Mac:** **Applications** → **CommissionDashboard**.")
-g.para("Log in with the **username and password IT gave you**. There is no "
-       "account to create — yours already exists. The first load takes a "
-       "moment while it fetches the year's data. **You are done.**")
-g.rule()
-
-# ── Part 2 ────────────────────────────────────────────────────────────────────
-g.part_heading("PART 2", "Part 2 — Updating", icon_kind="refresh")
-g.para("**Short version: you don't have to do anything.** The Portal checks "
-       "for new versions by itself and tells you when one is ready. This "
-       "works the same on Windows and Mac.")
-g.sub_heading("When an update is ready")
-g.para("A **Software Update** box appears at the **bottom of the left-hand "
-       "menu**, showing the new version number.")
-g.screenshot_panel("The Software Update panel, showing a new version "
-                   "available with an Install Update button")
-g.para("**If you see an \"Install Update\" button:**", gap=6)
-g.numbered(1, "Click **Install Update**.")
-g.numbered(2, "Click **OK** on the confirmation message.")
-g.numbered(3, "Wait. A progress bar runs, the Portal restarts itself, and "
-              "the page reloads on its own. This takes a minute or two.")
-g.numbered(4, "**Do not close the window while it is working.**")
-g.para("**If you do not see a button**, the box says \"*Ask an admin to "
-       "install it.*\" — there is nothing for you to do. Let your admin know.")
-g.sub_heading("Things worth knowing", keep=130)
-g.green_cards([
-    "**Nothing of yours is lost.** Your login, your Excel files, saved "
-    "reports and any rates you edited all stay exactly as they are. An "
-    "update only replaces the program itself.",
-    "**You never download the installer again.** Steps 1–3 above are one "
-    "time only.",
-    "**To check your version:** look at the bottom-left corner of the menu.",
-    "**If an update fails**, the Portal puts the old version back by itself "
-    "and keeps working. Tell IT so they can look into it.",
-])
-g.rule()
-
-# ── Troubleshooting ───────────────────────────────────────────────────────────
-g.part_heading("TROUBLESHOOTING", "If something goes wrong",
-               icon_kind="warning", color=RED)
-g.trouble_table([
-    ("The Portal will not open",
-     "Tell IT — ask them to check `dashboard.log` in the Portal's folder"),
-    ("**Mac:** \"cannot be opened because it is from an unidentified "
-     "developer\"",
-     "Expected once, the first time you open it. Right-click "
-     "**CommissionDashboard** and choose **Open**, then **Open** again. On "
-     "macOS Sequoia: System Settings → Privacy & Security → **Open Anyway**."),
-    ("**Mac:** the window sits on \"Setting up the dashboard for the first "
-     "time\"",
-     "That is the first launch unpacking about 700 MB. Give it a minute or "
-     "two — it only happens once per version."),
-    ("**Mac:** \"you don't have permission\" when dragging to Applications",
-     "Drop it into your own Applications folder instead: Finder → **Go** → "
-     "**Home** → **Applications**. The Portal runs the same from either."),
-    ("**Mac:** the Portal does not come back by itself after an update, and "
-     "the page will not reload",
-     "Expected once, when updating from version 1.2.25 or earlier. Quit the "
-     "Portal and open it again from **Applications** → "
-     "**CommissionDashboard**. The update itself already installed "
-     "correctly, and later updates restart on their own."),
-    ("An update failed", "Tell IT — ask them to check `dashboard.log`"),
-    ("Numbers look out of date",
-     "Wait a few minutes, or click **Sync Data** at the top right"),
-])
+g.mini_heading("Updating")
+g.para("The Portal checks for updates itself. When one is ready, a "
+       "**Software Update** box appears at the bottom of the left-hand "
+       "menu — click **Install Update** and wait; it restarts on its own. "
+       "Nothing of yours (login, files, edited rates) is touched. "
+       "Questions? Ask **IT**.", size=9.2, leading=11.6, gap=4)
+g.mini_screenshot_panel("The Software Update panel — click Install Update")
 
 g.save()
 print("Wrote", OUT)
