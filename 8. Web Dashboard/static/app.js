@@ -6623,19 +6623,12 @@ modalPackageType.value = defaults.pkg || "-";
         fetch("/api/agent-roles")
             .then(res => res.json())
             .then(roles => {
+                // IC No comes from the Data page's roles table only — Postgres
+                // never carried it as text, and since 2026-09 supplies nothing
+                // but agent names.
                 const matched = Array.isArray(roles) && roles.find(r => r.agent && r.agent.toLowerCase().trim() === resolvedName.toLowerCase().trim());
                 if (matched && matched.ic_no) {
                     setSlipIcValue(matched.ic_no);
-                } else {
-                    fetch("/api/agent-roles/pg-list")
-                        .then(res => res.json())
-                        .then(data => {
-                            const pgMatched = data.agents && data.agents.find(a => a.name && a.name.toLowerCase().trim() === resolvedName.toLowerCase().trim());
-                            if (pgMatched && pgMatched.ic_no) {
-                                setSlipIcValue(pgMatched.ic_no);
-                            }
-                        })
-                        .catch(() => {});
                 }
             })
             .catch(() => {});

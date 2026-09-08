@@ -571,23 +571,19 @@
                     </div>
                     <div class="section-hint">
                         Who holds which role and who they report to — this drives the override
-                        attribution. Agent Name, Agent Type, Branch and Role are pulled live from
-                        eeAdmin every time this page loads; <strong>Reports To is never in
-                        eeAdmin</strong> and must always be entered here.
-                        <strong>One row per role.</strong> An agent who carries several role tags
-                        at once — a promotion usually adds the new tag without removing the old
-                        one, and a transfer can leave an Internal and an Outsource tag side by
-                        side — gets a separate row for each, so all of them can be kept with the
-                        period each actually applied to.
-                        <strong>eeAdmin tags carry no dates</strong>, so every pulled role arrives
-                        marked "⚠ Set effective date". Until you enter that month the row is not
-                        saved and no commission calculation uses it. Once dated it behaves like the
-                        rates: recalculating an old month uses the hierarchy as it stood then.
-                        An undated row disappears by itself if its tag is removed in eeAdmin; a row
-                        you have dated is kept and marked "no longer tagged in eeAdmin" instead,
-                        because earlier months were priced with it — delete it here if it was
-                        entered in error. Until an agent is listed here the calculation falls back
-                        to the old hardcoded name matching.
+                        attribution. <strong>Only the Agent Name is pulled from eeAdmin</strong>,
+                        so a newly tagged agent appears here by itself; Agent Type, Role, Reports
+                        To, Branch, IC No and Nick Name are entered and kept on this page and are
+                        never changed by eeAdmin.
+                        <strong>One row per role.</strong> A promotion or transfer is a new
+                        effective-dated row, not an edit, so every role can be kept with the
+                        period it actually applied to.
+                        A new name arrives marked "⚠ Set effective date". Until you enter that
+                        month the row is not saved and no commission calculation uses it. Once
+                        dated it behaves like the rates: recalculating an old month uses the
+                        hierarchy as it stood then. An agent who leaves or is blocked in eeAdmin
+                        keeps their rows here until you delete them. Until an agent is listed
+                        here the calculation falls back to the old hardcoded name matching.
                     </div>
 
                     <!-- Needs-review summary: only shown when something is flagged -->
@@ -620,7 +616,7 @@
                             <input type="checkbox" id="rolesNeedsReviewFilter"> Needs review only
                         </label>
                         <button class="btn btn-secondary" id="refreshPgAgentsBtn" style="font-size:12.5px; padding:6px 14px;">🔄 Refresh from Postgres</button>
-                        <span id="rolesSyncedAt" style="font-size:11.5px; color:var(--text-muted);" title="This page re-pulls from eeAdmin when you come back to the tab and every 5 minutes while it is open. It never refreshes while the edit window is open."></span>
+                        <span id="rolesSyncedAt" style="font-size:11.5px; color:var(--text-muted);" title="This page re-pulls the agent name list from eeAdmin when you come back to the tab and every 5 minutes while it is open. It never refreshes while the edit window is open."></span>
                         <span class="save-status" id="pgAgentsStatus"></span>
                     </div>
 
@@ -650,9 +646,9 @@
                         </div>
                         <div class="section-hint" style="margin-bottom:8px;">
                             Deleted through this grid. They stay off the table above and are never
-                            re-added by Seed or a Postgres refresh, even if eeAdmin still tags them.
+                            re-added by Seed or a Postgres refresh, even if eeAdmin still lists them.
                             Restore puts an agent back exactly as if they had never been deleted —
-                            they reappear next load using whatever eeAdmin currently tags them.
+                            they reappear next load as a name-only row to fill in again.
                         </div>
                         <div class="table-container">
                             <table class="dashboard-table" style="table-layout:auto;">
