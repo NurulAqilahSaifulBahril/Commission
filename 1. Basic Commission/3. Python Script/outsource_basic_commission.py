@@ -1130,8 +1130,11 @@ def main(argv: list[str]) -> int:
         pay_dt = str(pay_dt or "")[:10]
         first_pay_dt = str(first_pay_dt or "")[:10]
         
-        # Determine referral name
-        ref_name = r.get("referral_name")
+        # Determine referral name, with the "Referral"/"Referrer" prefix some
+        # entries carry stripped off so one person spelled several ways is one
+        # referrer.
+        import agent_names as _names
+        ref_name = _names.clean_referral_name(r.get("referral_name"))
 
         if prop_type == "Factory":
             rate = Decimal("0.02")
@@ -1384,7 +1387,9 @@ def main(argv: list[str]) -> int:
     for ln in processed_outsource_invoices + processed_outsource_factory:
         if _is_valid_referral(ln.referral_name):
             sales_price = ln.sales_price
-            rate = _referral_rate(ln.invoice_date)
+            # A rate typed on the dashboard wins; otherwise the standard one.
+            rate = (getattr(ln, "referral_rate_override", None)
+                    or _referral_rate(ln.invoice_date))
             fee = sales_price * rate
             t4_rows.append([
                 ln.referral_name.strip(),

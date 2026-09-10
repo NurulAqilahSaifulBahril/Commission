@@ -2306,6 +2306,14 @@ body {
 }
 .sr-section-title:first-child { margin-top: 4px; }
 
+/* One line naming the two abbreviations the month columns repeat. */
+.sr-legend {
+    margin: 4px 0 0;
+    font-size: 12.5px;
+    color: var(--text-muted);
+}
+.sr-legend strong { color: var(--text-main); font-weight: 600; }
+
 .sr-block { margin-bottom: 18px; }
 
 .sr-table {
@@ -2354,6 +2362,10 @@ body {
 
 .sr-table td.sr-short { color: #B54A1D; }
 
+/* A dash standing in for data nobody has entered yet, as opposed to a
+   real zero. Muted so a row of them reads as "not recorded". */
+.sr-table .sr-muted { color: var(--text-muted); }
+
 .sr-table tr.sr-subtotal td {
     font-weight: 700;
     background-color: #f1f5f9;
@@ -2371,3 +2383,66 @@ body {
     color: #5C4813;
 }
 .sr-caveat strong { font-weight: 700; }
+
+/* ── Sales Report: case hover panel ─────────────────────────────────────────
+   A browser tooltip cannot draw a table, and the payment detail behind a NOC
+   cell only reads well as columns, so the page carries its own panel. Fixed
+   positioning keeps it above the table's own horizontal scrolling. */
+.sr-table td[data-cases] {
+    cursor: help;
+    text-decoration: underline dotted var(--text-muted, #64748b);
+}
+
+.sr-tip {
+    position: fixed;
+    z-index: 900;
+    max-width: 560px;
+    max-height: 60vh;
+    overflow-y: auto;
+    padding: 10px 12px;
+    background: var(--bg-card, #fff);
+    border: 1px solid var(--border-color, #dfe3ec);
+    border-radius: 10px;
+    box-shadow: 0 12px 32px rgba(15, 23, 42, 0.18);
+    pointer-events: none;
+}
+
+.sr-tip-head {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text-primary, #0f172a);
+    margin-bottom: 6px;
+}
+
+.sr-tip-table { border-collapse: collapse; font-size: 11px; width: 100%; }
+
+.sr-tip-table th {
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-muted, #64748b);
+    border-bottom: 1px solid var(--border-color, #dfe3ec);
+    padding: 3px 8px 3px 0;
+    white-space: nowrap;
+}
+
+.sr-tip-table td {
+    padding: 3px 8px 3px 0;
+    color: var(--text-primary, #0f172a);
+    white-space: nowrap;
+    vertical-align: top;
+}
+
+.sr-tip-table td.numeric { text-align: right; font-variant-numeric: tabular-nums; }
+.sr-tip-cust { font-weight: 600; border-top: 1px solid var(--border-color, #dfe3ec); }
+.sr-tip-none { color: var(--text-muted, #64748b); font-style: italic; }
+
+/* A referral cell is hand-entered, so it invites a click rather than looking
+   like the read-only figures around it. */
+.referral-editable {
+    cursor: pointer;
+    text-decoration: underline dotted var(--text-muted, #64748b);
+}
+
+.referral-editable:hover {
+    background: var(--bg-hover, #eef2ff);
+}

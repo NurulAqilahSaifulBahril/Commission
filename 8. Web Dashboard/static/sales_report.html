@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v=20260909-casetip">
 </head>
 <body class="report-page">
     <div class="app-container">
@@ -24,13 +24,21 @@
                         <option value="2026" selected>Year 2026</option>
                     </select>
                 </div>
+                <!-- The report always opens in January; this picks where it
+                     stops. Every figure follows it, EP point included. -->
+                <div class="select-wrapper" style="margin-top: 8px;">
+                    <select id="srPeriodSelect"
+                            title="Reporting period. The report runs from January to the month picked here, and the up-to-date EP point counts only that range.">
+                        <option value="">Reporting month</option>
+                    </select>
+                </div>
             </div>
 
             <!-- Same groups, labels and controls as the overview and report
                  sidebars, so all three read as one navigation. Only the
                  .active item differs: Sales Report here. -->
             <div class="sidebar-group">
-                <label class="group-label">Navigation</label>
+                <label class="group-label">Sales Section</label>
                 <ul class="nav-list">
                     <li class="nav-link-item"><a href="/"><span class="bullet"></span> Overview</a></li>
                     <li class="active"><span class="bullet"></span> Sales Report</li>
@@ -82,6 +90,10 @@
                     <button id="srExport" class="btn btn-secondary">
                         <span class="icon">⬇️</span> Export CSV
                     </button>
+                    <button id="srExportPdf" class="btn btn-secondary"
+                            title="Download the report on screen as a PDF. The agent search is applied.">
+                        <span class="icon">📄</span> Download PDF
+                    </button>
                     <a href="/" class="btn btn-primary" style="text-decoration:none;">
                         <span class="icon">📊</span> Overview
                     </a>
@@ -92,7 +104,24 @@
 
             <div class="sr-caveat" id="srCaveat" hidden></div>
 
+            <!-- Hidden until a report is actually on screen: there is nothing
+                 to search while the cache is still building. -->
+            <section class="card filter-panel" id="srFilterPanel" hidden>
+                <div class="filter-group">
+                    <label for="srAgentSearch">Search Agent</label>
+                    <input type="text" id="srAgentSearch" autocomplete="off"
+                           placeholder="Type an agent name..."
+                           title="Shows only the agents whose name matches. Subtotals, the summary cards and the CSV export all follow this filter.">
+                </div>
+                <button id="srClearSearch" class="btn-clear" title="Clear the agent search" hidden>Clear</button>
+                <span class="status-text" id="srMatchNote" style="align-self:center;"></span>
+            </section>
+
             <section id="srSections"></section>
+
+            <!-- Hover panel for the NOC cells. Lives outside the tables
+                 so it is never clipped by their own scrolling. -->
+            <div id="srCaseTip" class="sr-tip" hidden></div>
 
             <div id="srLoader" class="loader-overlay hidden" style="position:relative; min-height:160px;">
                 <div class="spinner"></div>
@@ -106,7 +135,7 @@
         </main>
     </div>
 
-    <script src="/static/sales_report.js?v=20260813-sales-v1"></script>
+    <script src="/static/sales_report.js?v=20260910-esachina"></script>
     <script src="/static/updater.js?v=20260731-ota-v1"></script>
 </body>
 </html>

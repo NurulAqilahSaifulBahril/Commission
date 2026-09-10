@@ -4,9 +4,14 @@
     {
       "name": "dashboard",
       "runtimeExecutable": "C:\\Users\\User\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe",
-      "runtimeArgs": ["8. Web Dashboard/app.py"],
-      "port": 5001,
-      "autoPort": true
+      "runtimeArgs": [
+        "8. Web Dashboard/app.py"
+      ],
+      "port": 5002,
+      "autoPort": false,
+      "env": {
+        "PORT": "5002"
+      }
     }
   ]
 }

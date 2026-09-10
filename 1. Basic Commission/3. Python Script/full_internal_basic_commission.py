@@ -867,8 +867,11 @@ def _process_invoices(
         pay_dt = str(pay_dt or "")[:10]
         first_pay_dt = str(first_pay_dt or "")[:10]
 
-        # Determine referral name: default to database values
-        ref_name = row.get("referral_name")
+        # Determine referral name: default to database values, with the
+        # "Referral"/"Referrer" prefix some entries carry stripped off so one
+        # person spelled several ways is one referrer.
+        import agent_names as _names
+        ref_name = _names.clean_referral_name(row.get("referral_name"))
 
         # Calculate senior override per invoice (based on sales_price)
         senior_ovr = sales_price * SENIOR_OVERRIDE_RATE
@@ -1030,7 +1033,9 @@ def _table4_rows(lines: list[InvoiceLine]) -> list[list[str]]:
     for ln in lines:
         if _is_valid_referral(ln.referral_name):
             sales_price = ln.sales_price
-            rate = _referral_rate(ln.invoice_date)
+            # A rate typed on the dashboard wins; otherwise the standard one.
+            rate = (getattr(ln, "referral_rate_override", None)
+                    or _referral_rate(ln.invoice_date))
             fee = sales_price * rate
             table_rows.append([
                 ln.referral_name.strip(),

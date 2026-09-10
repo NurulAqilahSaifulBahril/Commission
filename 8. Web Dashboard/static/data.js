@@ -353,7 +353,8 @@
         if (isAdmin) {
             ["editModeBtn", "nfpAddBtn", "nfpUploadBtn", "seedRolesBtn", "addRoleBtn", "showExcludedRolesBtn", "saveRolesBtn",
              "contestSaveBtn", "contestNewBtn", "contestAddRosterBtn",
-             "anpSaveBtn", "anpAddTierBtn", "egaSaveBtn", "egaAddMonthBtn", "egaNewBtn", "pbSaveBtn"].forEach((id) => {
+             "anpSaveBtn", "anpAddTierBtn", "egaSaveBtn", "egaAddMonthBtn", "egaNewBtn", "pbSaveBtn",
+             "egaCarryAddBtn", "egaCarrySaveBtn"].forEach((id) => {
                 const el = document.getElementById(id);
                 if (el) el.style.display = "";
             });
@@ -1772,6 +1773,143 @@
 
     let editingAgentObj = null;
 
+    // ── eeAdmin name search (Add Agent only) ─────────────────────────────────
+    // The hierarchy list itself comes from /api/agent-roles/pg-list, which
+    // keeps only people tagged internal/outsource/sales. Someone whose
+    // agent_type was never set in eeAdmin is therefore invisible there — and
+    // is exactly who you open this modal to add. So the search below calls
+    // /api/agent-roles/pg-search, which drops that tag filter, and remembers
+    // the eeAdmin id of whatever you pick so the saved row links to the real
+    // record instead of being matched by name forever after.
+
+    // { bubble_id, name } of the search hit currently chosen, or null.
+    let pickedPgAgent = null;
+    let agentSearchTimer = null;
+    let agentSearchSeq = 0;
+
+    /** Coloured one-liner under the Agent Name box; "" hides it. */
+    function setAgentSearchStatus(text, tone) {
+        const el = document.getElementById("roleModalAgentStatus");
+        if (!el) return;
+        el.textContent = text || "";
+        el.style.display = text ? "" : "none";
+        el.style.color = tone === "ok" ? "var(--success-color, #15803d)"
+            : tone === "warn" ? "#b45309"
+            : "var(--text-muted)";
+    }
+
+    function hideAgentSuggest() {
+        const box = document.getElementById("roleModalAgentSuggest");
+        if (box) { box.style.display = "none"; box.innerHTML = ""; }
+    }
+
+    /** Put the Agent Name box into edit-a-row mode (locked, greyed) or
+     *  add-a-row mode (typeable, searches eeAdmin). */
+    function setAgentNameMode(editable) {
+        const input = document.getElementById("roleModalAgent");
+        if (!input) return;
+        input.readOnly = !editable;
+        input.style.background = editable ? "" : "var(--bg-muted, #f1f3f5)";
+        input.style.color = editable ? "" : "var(--text-muted)";
+        input.style.cursor = editable ? "" : "not-allowed";
+        input.placeholder = editable ? "Type a name to search eeAdmin…" : "";
+        input.title = editable
+            ? "Type at least 2 letters to search every eeAdmin record, including people with no agent type set."
+            : "Fixed — sourced from eeAdmin (Postgres) and cannot be edited here. Use Full Name / Nick Name to customise what's displayed.";
+        hideAgentSuggest();
+        setAgentSearchStatus(editable
+            ? "Type at least 2 letters to search eeAdmin. Untagged people are included."
+            : "");
+    }
+
+    function renderAgentSuggest(list, term) {
+        const box = document.getElementById("roleModalAgentSuggest");
+        if (!box) return;
+        if (!list.length) {
+            hideAgentSuggest();
+            setAgentSearchStatus(`No eeAdmin record matches "${term}". You can still save this as a manual row.`, "warn");
+            return;
+        }
+        box.innerHTML = list.map((a, i) => {
+            const type = a.agent_type ? a.agent_type : "no agent type set";
+            return `<div class="pg-suggest-item" data-idx="${i}" style="padding:7px 12px; cursor:pointer; font-size:13px; line-height:1.35;">
+                        <div style="font-weight:600;">${escapeHtml(a.name)}</div>
+                        <div style="font-size:11px; color:var(--text-muted);">${escapeHtml(type)}</div>
+                    </div>`;
+        }).join("");
+        box.querySelectorAll(".pg-suggest-item").forEach((el) => {
+            el.addEventListener("mouseenter", () => { el.style.background = "var(--bg-hover, #f1f3f5)"; });
+            el.addEventListener("mouseleave", () => { el.style.background = ""; });
+            el.addEventListener("mousedown", (ev) => {
+                // mousedown, not click: the input's blur handler closes this
+                // list, and blur fires first on a click.
+                ev.preventDefault();
+                choosePgAgent(list[Number(el.dataset.idx)]);
+            });
+        });
+        box.style.display = "";
+        setAgentSearchStatus(`${list.length} match${list.length === 1 ? "" : "es"} in eeAdmin — pick one.`);
+    }
+
+    function choosePgAgent(a) {
+        pickedPgAgent = { bubble_id: a.bubble_id || "", name: a.name || "" };
+        const input = document.getElementById("roleModalAgent");
+        if (input) input.value = a.name || "";
+        hideAgentSuggest();
+        setAgentSearchStatus(
+            a.agent_type
+                ? `Linked to eeAdmin (${a.agent_type}).`
+                : "Linked to eeAdmin. This person has no agent type there, so pick one below.",
+            "ok");
+    }
+
+    /** One search. Returns [] and shows the reason when the lookup fails —
+     *  a dead proxy must not look like "this person does not exist". */
+    async function searchPgAgents(term) {
+        const mySeq = ++agentSearchSeq;
+        try {
+            const res = await api(`/api/agent-roles/pg-search?q=${encodeURIComponent(term)}`);
+            const data = await res.json();
+            if (mySeq !== agentSearchSeq) return null;  // a newer keystroke won
+            if (!res.ok) {
+                setAgentSearchStatus(data.error || "eeAdmin search failed.", "warn");
+                return null;
+            }
+            return data.agents || [];
+        } catch (e) {
+            if (mySeq !== agentSearchSeq) return null;
+            setAgentSearchStatus(`eeAdmin search failed: ${e.message}`, "warn");
+            return null;
+        }
+    }
+
+    document.getElementById("roleModalAgent")?.addEventListener("input", () => {
+        const input = document.getElementById("roleModalAgent");
+        if (!input || input.readOnly) return;
+        // Editing the text after picking someone means the link no longer
+        // describes what is in the box.
+        if (pickedPgAgent && input.value.trim().toLowerCase() !== pickedPgAgent.name.toLowerCase()) {
+            pickedPgAgent = null;
+        }
+        const term = input.value.trim();
+        clearTimeout(agentSearchTimer);
+        if (term.length < 2) {
+            hideAgentSuggest();
+            setAgentSearchStatus("Type at least 2 letters to search eeAdmin. Untagged people are included.");
+            return;
+        }
+        setAgentSearchStatus("Searching eeAdmin…");
+        agentSearchTimer = setTimeout(async () => {
+            const list = await searchPgAgents(term);
+            if (list) renderAgentSuggest(list, term);
+        }, 300);
+    });
+
+    document.getElementById("roleModalAgent")?.addEventListener("blur", () => {
+        setTimeout(hideAgentSuggest, 150);
+    });
+
+
     function openAgentRoleModal(r) {
         editingAgentObj = r;
         const modal = document.getElementById("agentRoleModal");
@@ -1804,6 +1942,11 @@
         if (r) {
             const needsDate = !!r.needs_date || !String(r.effective_from || "").trim();
             document.getElementById("agentRoleModalTitle").textContent = "Edit Agent Details";
+            // The name of an existing row is eeAdmin's to change, not this
+            // modal's — searching would only invite retargeting the row at a
+            // different person by accident.
+            pickedPgAgent = r.pg_bubble_id ? { bubble_id: r.pg_bubble_id, name: r.agent || "" } : null;
+            setAgentNameMode(false);
             // Left blank on purpose for a role read from eeAdmin's tags: the
             // date is the one thing eeAdmin cannot tell us, so pre-filling this
             // month would just be a guess the admin might not notice.
@@ -1841,6 +1984,9 @@
             document.getElementById("roleModalBranch").value = "";
             document.getElementById("roleModalDeleteBtn").style.display = "none";
             setRoleModalNote("");
+            pickedPgAgent = null;
+            setAgentNameMode(true);
+            setTimeout(() => document.getElementById("roleModalAgent")?.focus(), 50);
         }
 
         modal.classList.remove("hidden");
@@ -1920,6 +2066,33 @@
             return;
         }
 
+        // Adding a row: settle what this name points at in eeAdmin before
+        // anything is written. Typing a name in full and pressing Save without
+        // touching the dropdown is the normal case, so an exact match is
+        // adopted silently rather than being treated as unmatched.
+        if (!editingAgentObj && agentName) {
+            const dup = rolesList.find((x) =>
+                String(x.agent || "").trim().toLowerCase() === agentName.toLowerCase());
+            if (dup) {
+                alert(`${dup.agent} is already on this page.\n\nOpen that row and add a new effective month instead of adding a second row for the same person.`);
+                return;
+            }
+            if (!pickedPgAgent || pickedPgAgent.name.toLowerCase() !== agentName.toLowerCase()) {
+                const hits = await searchPgAgents(agentName);
+                const exact = (hits || []).find((a) =>
+                    String(a.name || "").trim().toLowerCase() === agentName.toLowerCase());
+                if (exact) {
+                    choosePgAgent(exact);
+                } else if (hits === null) {
+                    // The lookup itself failed, so we do not know either way.
+                    if (!confirm(`Could not reach eeAdmin to check "${agentName}".\n\nSave the row anyway? It will be a manual entry with no eeAdmin link.`)) return;
+                    pickedPgAgent = null;
+                } else if (!confirm(`"${agentName}" was not found in eeAdmin.\n\nSave it anyway as a manual row? Check the spelling first — a typo here creates a second copy of a person who is already there.`)) {
+                    return;
+                }
+            }
+        }
+
         // Required, never defaulted: an effective month decides which invoices
         // this role prices, so falling back to "this month" would quietly
         // backdate or postdate a role nobody chose a date for.
@@ -1956,6 +2129,12 @@
         } else {
             const newAgent = {
                 effective_from: effMonth,
+                // The eeAdmin id of the person picked in the search, when
+                // there was one. Rows keyed by id survive a rename in eeAdmin;
+                // a manual row saved past the "not found" warning has no id
+                // and stays matched by name.
+                pg_bubble_id: (pickedPgAgent && pickedPgAgent.name.toLowerCase() === agentName.toLowerCase())
+                    ? pickedPgAgent.bubble_id : "",
                 agent: agentName,
                 full_name: fullName,
                 nick_name: nickName,
@@ -2118,6 +2297,116 @@
             status.textContent = e.message;
         }
     }
+
+    // ── EGA carry-over cases ─────────────────────────────────────────────────
+    // Cases closed before the scheme cutoff. Only the COUNT matters: it picks
+    // the multiplier applied to the agent's 1 May – 10 Jun campaign sales on
+    // the Sales Report. Held here because nothing in eeAdmin reproduces the
+    // counts the printed report uses.
+
+    let egaCarryRows = [];
+
+    /** Every third case adds another half point per ringgit. Mirrors
+     *  _campaign_bonus_tier() in app.py — keep the two in step. */
+    function carryTier(cases) {
+        const n = parseInt(String(cases || "0").replace(/[^0-9]/g, ""), 10) || 0;
+        return Math.floor(n / 3) * 0.5;
+    }
+
+    function egaCarryYear() {
+        const el = document.getElementById("egaCarryYear");
+        return String((el && el.value) || "2026").trim();
+    }
+
+    async function loadEgaCarryover() {
+        try {
+            const res = await api("/api/ega-carryover");
+            egaCarryRows = await res.json();
+            if (!Array.isArray(egaCarryRows)) egaCarryRows = [];
+        } catch (e) {
+            egaCarryRows = [];
+        }
+        renderEgaCarry();
+    }
+
+    function renderEgaCarry() {
+        const body = document.getElementById("egaCarryBody");
+        if (!body) return;
+        const year = egaCarryYear();
+        const mine = egaCarryRows.filter(r => String(r.year || "").trim() === year);
+        body.innerHTML = "";
+        if (!mine.length) {
+            body.innerHTML = `<tr><td colspan="5" style="text-align:center; padding:18px; color:var(--text-muted);">`
+                + `No carry-over cases recorded for ${escapeHtml(year)}. `
+                + `Every agent scores EP from their sales alone until a row is added here.</td></tr>`;
+            return;
+        }
+        mine.forEach((r) => {
+            const tr = document.createElement("tr");
+            const tier = carryTier(r.cases);
+            tr.innerHTML = `
+                <td><input type="text" list="agentNameList" value="${escapeHtml(r.agent || "")}"
+                     data-f="agent" style="width:100%;" ${isAdmin ? "" : "disabled"}></td>
+                <td><input type="number" min="0" step="1" value="${escapeHtml(r.cases || "")}"
+                     data-f="cases" style="width:100%;" ${isAdmin ? "" : "disabled"}></td>
+                <td><input type="number" min="0" step="0.01" value="${escapeHtml(r.sales || "")}"
+                     data-f="sales" style="width:100%;" ${isAdmin ? "" : "disabled"}></td>
+                <td class="carry-tier" style="font-weight:600;"
+                    title="Multiplier applied to this agent's 1 May – 10 Jun campaign sales.">
+                    ${tier ? tier.toFixed(1) + "&times;" : "—"}</td>
+                <td>${isAdmin ? `<button class="btn btn-secondary carry-del" style="padding:4px 8px; font-size:12px;">✕</button>` : ""}</td>`;
+            tr.querySelectorAll("input").forEach((inp) => {
+                inp.addEventListener("input", () => {
+                    r[inp.dataset.f] = inp.value;
+                    if (inp.dataset.f === "cases") {
+                        const cell = tr.querySelector(".carry-tier");
+                        const t = carryTier(inp.value);
+                        cell.innerHTML = t ? t.toFixed(1) + "&times;" : "—";
+                    }
+                });
+            });
+            tr.querySelector(".carry-del")?.addEventListener("click", () => {
+                egaCarryRows = egaCarryRows.filter(x => x !== r);
+                renderEgaCarry();
+            });
+            body.appendChild(tr);
+        });
+    }
+
+    async function saveEgaCarryover() {
+        const status = document.getElementById("egaCarryStatus");
+        if (status) { status.className = "save-status"; status.textContent = "Saving..."; }
+        // Every year is sent, not just the one on screen: the save replaces the
+        // whole table, so omitting the others would delete them.
+        const entries = egaCarryRows
+            .map(r => ({ year: String(r.year || "").trim(), agent: String(r.agent || "").trim(),
+                         cases: String(r.cases || "").trim(), sales: String(r.sales || "").trim() }))
+            .filter(r => r.year && r.agent);
+        try {
+            const res = await api("/api/ega-carryover", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ entries })
+            });
+            const d = await res.json();
+            if (!res.ok) throw new Error(d.error || "Save failed");
+            if (status) {
+                status.className = "save-status ok";
+                status.textContent = "Saved. Sales Report EP recalculated.";
+                setTimeout(() => { status.textContent = ""; }, 3000);
+            }
+            await loadEgaCarryover();
+        } catch (e) {
+            if (status) { status.className = "save-status err"; status.textContent = e.message; }
+        }
+    }
+
+    document.getElementById("egaCarryAddBtn")?.addEventListener("click", () => {
+        egaCarryRows.push({ year: egaCarryYear(), agent: "", cases: "", sales: "" });
+        renderEgaCarry();
+    });
+    document.getElementById("egaCarrySaveBtn")?.addEventListener("click", saveEgaCarryover);
+    document.getElementById("egaCarryYear")?.addEventListener("input", renderEgaCarry);
 
     // ── NFP price list viewer ────────────────────────────────────────────────
 
@@ -4517,6 +4806,12 @@
         // above just hid — leaving the section would strand it over the page.
         if (ruleKey !== "ega") closeEgaModal();
 
+        // Carry-over cases belong to the EGA scheme but are per agent, not per
+        // agent type, so they sit on the section page rather than in the
+        // per-scheme modal.
+        const carryCard = document.getElementById("egaCarryCard");
+        if (carryCard) carryCard.style.display = (ruleKey === "ega") ? "block" : "none";
+
         if (rolesCard) {
             rolesCard.style.display = isRoles ? "block" : "none";
         }
@@ -4597,6 +4892,7 @@
         // show IC numbers without an extra round-trip per row.
         loadRoles();
         loadPgAgents();
+        loadEgaCarryover();
         startRolesAutoRefresh();
         // updateDataSectionView() already ran, before isAdmin was known, so a
         // deep link straight to the contest section would have rendered its

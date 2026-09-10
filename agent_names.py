@@ -40,6 +40,41 @@ def title_case(name):
     )
 
 
+# Some invoices carry the word "Referral" glued to, or sitting in front of, the
+# referrer's actual name. Every spelling seen in the data so far; all are long
+# enough that no real name can begin with one.
+_REFERRAL_WORDS = (
+    "refferral", "refferal", "referrer", "referrel", "referral",
+    "referer", "referal",
+)
+
+
+def clean_referral_name(name):
+    """The referrer's own name, with any "Referral"/"Referrer" prefix removed.
+
+    Data entry writes the same person three ways -- "Referrer Sim Wei Ling",
+    "Referrel Sim Wei Ling", "Referralyap Chin Choi" -- which makes one referrer
+    look like several. Stripping the word first lets them collapse.
+
+    Returns "" when the entry was the bare word with no name after it: that is
+    a placeholder, not a person.
+    """
+    text = re.sub(r"\s+", " ", str(name or "")).strip()
+    if not text:
+        return ""
+    low = text.casefold()
+    for word in _REFERRAL_WORDS:
+        if not low.startswith(word):
+            continue
+        rest = text[len(word):].lstrip(" .:;-_,/")
+        if not re.search(r"[A-Za-z]", rest):
+            return ""          # the word on its own
+        # Only re-case what was glued on ("...yap Chin Choi"); a name that was
+        # already separated keeps whatever capitalisation it was typed with.
+        return title_case(rest) if rest[:1].islower() else rest
+    return text
+
+
 def _role_rows():
     rates_dir = os.path.join(REPO_ROOT, "1. Basic Commission", "3. Python Script")
     if rates_dir not in sys.path:

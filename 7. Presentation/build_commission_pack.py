@@ -1807,6 +1807,84 @@ def build_customer_summary_rows(
 
 
 # ---------------------------------------------------------------------------
+# Referral overrides entered on the dashboard's Basic & NFP table
+# ---------------------------------------------------------------------------
+
+_REFERRAL_OVERRIDE_CACHE: dict[str, dict] = {}
+
+
+def referral_overrides(year) -> dict:
+    """Hand-entered referrals for `year`, keyed by (agent, customer) lowercased.
+
+    The ERP names a referrer on only a handful of invoices, so most referrals
+    are typed on the dashboard instead. Read once per year and cached: this is
+    called for every invoice line of every month.
+    """
+    key = str(year)
+    hit = _REFERRAL_OVERRIDE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out: dict = {}
+    try:
+        dashboard_dir = REPO_ROOT / "8. Web Dashboard"
+        if str(dashboard_dir) not in sys.path:
+            sys.path.insert(0, str(dashboard_dir))
+        import db as _dashboard_db
+        for r in _dashboard_db.list_referral_overrides(key):
+            agent = str(r.get("agent") or "").strip().lower()
+            customer = str(r.get("customer") or "").strip().lower()
+            if not agent or not customer:
+                continue
+            out[(agent, customer)] = {
+                "name": str(r.get("referral_name") or "").strip(),
+                "rate": _referral_rate_fraction(r.get("rate")),
+            }
+    except Exception as exc:
+        print(f"[Referral] Warning: could not read referral overrides for {key} "
+              f"({exc}); the standard rate applies to every row.", file=sys.stderr)
+        out = {}
+    _REFERRAL_OVERRIDE_CACHE[key] = out
+    return out
+
+
+def _referral_rate_fraction(raw):
+    """"2.5" (percent, as typed on the dashboard) -> Decimal("0.025").
+
+    A blank or unreadable rate returns None so the caller falls back to the
+    scripts' own standard rate rather than silently paying nothing.
+    """
+    from decimal import Decimal, InvalidOperation
+    text = str(raw or "").strip().replace("%", "").replace(",", "")
+    if not text:
+        return None
+    try:
+        return Decimal(text) / Decimal("100")
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def apply_referral_overrides(lines: list, year) -> None:
+    """Stamp each invoice line with its customer's hand-entered referral.
+
+    Done once, in place, before any of the summary loops run, so every reader
+    downstream -- the customer table, the agent totals, Table 4 -- sees the same
+    name and rate without each having to look the override up for itself.
+    """
+    overrides = referral_overrides(year)
+    if not overrides:
+        return
+    for ln in lines:
+        hit = overrides.get((str(getattr(ln, "agent_name", "")).strip().lower(),
+                             str(getattr(ln, "customer_name", "")).strip().lower()))
+        if not hit:
+            continue
+        if hit["name"]:
+            ln.referral_name = hit["name"]
+        if hit["rate"] is not None:
+            ln.referral_rate_override = hit["rate"]
+
+
+# ---------------------------------------------------------------------------
 # Build the two summary tables for internal
 # ---------------------------------------------------------------------------
 
@@ -1839,6 +1917,7 @@ def build_internal_summary_tables(
         ln.agent_name = to_title_case(ln.agent_name)
         ln.customer_name = to_title_case(ln.customer_name)
         ln.referral_name = to_title_case(ln.referral_name)
+    apply_referral_overrides(basic_lines, year)
     for r in nfp_rows:
         r.agent_name = to_title_case(r.agent_name)
         r.customer_name = to_title_case(r.customer_name)
@@ -1913,7 +1992,8 @@ def build_internal_summary_tables(
             # Referral fee
             if basic._is_valid_referral(ln.referral_name):
                 sales_price = float(ln.sales_price)
-                rate = float(basic._referral_rate(ln.invoice_date))
+                rate = float(getattr(ln, "referral_rate_override", None)
+                             or basic._referral_rate(ln.invoice_date))
                 fee = sales_price * rate
                 referral_by_agent[agent] = referral_by_agent.get(agent, 0.0) + fee
                 ref_name = ln.referral_name.strip()
@@ -2155,7 +2235,8 @@ def build_internal_summary_tables(
                         if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer:
                             if basic._is_valid_referral(ln.referral_name):
                                 sales_price = float(ln.sales_price)
-                                rate = float(basic._referral_rate(ln.invoice_date))
+                                rate = float(getattr(ln, "referral_rate_override", None)
+                                             or basic._referral_rate(ln.invoice_date))
                                 fee = sales_price * rate
                                 cust_referral_rm += fee
                                 ref_name = ln.referral_name.strip()
@@ -2445,6 +2526,31 @@ def build_outsource_summary_tables(
             key=outsource_agent_sort_key
         )
 
+        # Referral fees on the outsource side exist only where someone typed
+        # one on the dashboard, so they are worked out straight from the
+        # overrides against each customer's basic sales. Computed here, before
+        # the agent rows are built, so the agent total and the customer rows
+        # below quote the same figure.
+        out_referral_by_agent: dict[str, float] = {}
+        out_referral_names_by_agent: dict[str, list] = {}
+        _out_overrides = referral_overrides(year)
+        if _out_overrides:
+            for ln in month_basic_lines:
+                if getattr(ln, "_skip_override", False):
+                    continue
+                hit = _out_overrides.get((ln.agent_name.strip().lower(),
+                                          ln.customer_name.strip().lower()))
+                if not hit or not hit["name"]:
+                    continue
+                rate = float(hit["rate"]) if hit["rate"] is not None else 0.02
+                agent_key = ln.agent_name.strip()
+                out_referral_by_agent[agent_key] = (
+                    out_referral_by_agent.get(agent_key, 0.0)
+                    + float(ln.sales_price) * rate)
+                names = out_referral_names_by_agent.setdefault(agent_key, [])
+                if hit["name"] not in names:
+                    names.append(hit["name"])
+
         agent_rows = []
         for agent in month_agents:
             basic_comm = basic_comm_by_agent.get(agent, 0.0)
@@ -2497,7 +2603,7 @@ def build_outsource_summary_tables(
                 agent=agent,
                 basic_dates=basic_dates,
                 basic_comm_rm=basic_total,
-                basic_referral_rm=0.0,
+                basic_referral_rm=out_referral_by_agent.get(agent, 0.0),
                 basic_safwan_rm=basic_override,
                 nfp_dates=nfp_dates,
                 nfp_comm_rm=nfp_comm,
@@ -2684,6 +2790,19 @@ def build_outsource_summary_tables(
 
                     basic_comm_val = f"{basic_info['comm']:,.2f}" if basic_info['comm'] != 0 else ("pending full payment" if basic_dates[0] and "2026" in str(basic_dates[0]) else "-")
                     row_other_commission = format_other_commission_for_customer(out_override_by_customer[agent].get(customer, {}))
+                    # Outsource invoices carry no referrer in the ERP, so the
+                    # only referral an outsource row can have is one typed on
+                    # the dashboard. Charged on the same basis as internal:
+                    # the rate against this customer's basic sales price.
+                    ref_name_cell, ref_fee_cell = "-", "-"
+                    ref_hit = referral_overrides(year).get(
+                        (agent.strip().lower(), customer.strip().lower()))
+                    if ref_hit and ref_hit["name"]:
+                        ref_rate = float(ref_hit["rate"]) if ref_hit["rate"] is not None else 0.02
+                        ref_fee = float(basic_display_sales) * ref_rate
+                        ref_name_cell = to_title_case(ref_hit["name"])
+                        ref_fee_cell = ensure_rm_prefix(f"{ref_fee:,.2f}") if ref_fee else "-"
+                        out_referral_by_agent[agent] = out_referral_by_agent.get(agent, 0.0) + ref_fee
                     basic_row = [show_agent, customer, basic_display_dates[0], basic_display_dates[1]]
                     if m >= 7:
                         basic_row.append(rm300_display)
@@ -2695,7 +2814,8 @@ def build_outsource_summary_tables(
                         ensure_rm_prefix(f"{basic_display_sales:,.2f}" if basic_display_sales != 0 else "-"),
                         "Basic Commission", ensure_rm_prefix(basic_comm_val),
                         row_other_commission,
-                        ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"), ensure_rm_prefix(f"{row_gan_lai_soon:,.2f}" if row_gan_lai_soon != 0 else "-"), "-", "-",
+                        ensure_rm_prefix(f"{row_safwan_rm:,.2f}" if row_safwan_rm != 0 else "-"), ensure_rm_prefix(f"{row_gan_lai_soon:,.2f}" if row_gan_lai_soon != 0 else "-"),
+                        ref_name_cell, ref_fee_cell,
                         rate_basic,
                         f"{basic_info.get('advance', 0.0):,.2f}" if basic_info.get("advance") else "-",
                         basic_info.get("advance_date") or "-",
