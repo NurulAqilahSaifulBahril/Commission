@@ -571,23 +571,19 @@
                     </div>
                     <div class="section-hint">
                         Who holds which role and who they report to — this drives the override
-                        attribution. Agent Name, Agent Type, Branch and Role are pulled live from
-                        eeAdmin every time this page loads; <strong>Reports To is never in
-                        eeAdmin</strong> and must always be entered here.
-                        <strong>One row per role.</strong> An agent who carries several role tags
-                        at once — a promotion usually adds the new tag without removing the old
-                        one, and a transfer can leave an Internal and an Outsource tag side by
-                        side — gets a separate row for each, so all of them can be kept with the
-                        period each actually applied to.
-                        <strong>eeAdmin tags carry no dates</strong>, so every pulled role arrives
-                        marked "⚠ Set effective date". Until you enter that month the row is not
-                        saved and no commission calculation uses it. Once dated it behaves like the
-                        rates: recalculating an old month uses the hierarchy as it stood then.
-                        An undated row disappears by itself if its tag is removed in eeAdmin; a row
-                        you have dated is kept and marked "no longer tagged in eeAdmin" instead,
-                        because earlier months were priced with it — delete it here if it was
-                        entered in error. Until an agent is listed here the calculation falls back
-                        to the old hardcoded name matching.
+                        attribution. <strong>Only the Agent Name is pulled from eeAdmin</strong>,
+                        so a newly tagged agent appears here by itself; Agent Type, Role, Reports
+                        To, Branch, IC No and Nick Name are entered and kept on this page and are
+                        never changed by eeAdmin.
+                        <strong>One row per role.</strong> A promotion or transfer is a new
+                        effective-dated row, not an edit, so every role can be kept with the
+                        period it actually applied to.
+                        A new name arrives marked "⚠ Set effective date". Until you enter that
+                        month the row is not saved and no commission calculation uses it. Once
+                        dated it behaves like the rates: recalculating an old month uses the
+                        hierarchy as it stood then. An agent who leaves or is blocked in eeAdmin
+                        keeps their rows here until you delete them. Until an agent is listed
+                        here the calculation falls back to the old hardcoded name matching.
                     </div>
 
                     <!-- Needs-review summary: only shown when something is flagged -->
@@ -620,7 +616,7 @@
                             <input type="checkbox" id="rolesNeedsReviewFilter"> Needs review only
                         </label>
                         <button class="btn btn-secondary" id="refreshPgAgentsBtn" style="font-size:12.5px; padding:6px 14px;">🔄 Refresh from Postgres</button>
-                        <span id="rolesSyncedAt" style="font-size:11.5px; color:var(--text-muted);" title="This page re-pulls from eeAdmin when you come back to the tab and every 5 minutes while it is open. It never refreshes while the edit window is open."></span>
+                        <span id="rolesSyncedAt" style="font-size:11.5px; color:var(--text-muted);" title="This page re-pulls the agent name list from eeAdmin when you come back to the tab and every 5 minutes while it is open. It never refreshes while the edit window is open."></span>
                         <span class="save-status" id="pgAgentsStatus"></span>
                     </div>
 
@@ -650,9 +646,9 @@
                         </div>
                         <div class="section-hint" style="margin-bottom:8px;">
                             Deleted through this grid. They stay off the table above and are never
-                            re-added by Seed or a Postgres refresh, even if eeAdmin still tags them.
+                            re-added by Seed or a Postgres refresh, even if eeAdmin still lists them.
                             Restore puts an agent back exactly as if they had never been deleted —
-                            they reappear next load using whatever eeAdmin currently tags them.
+                            they reappear next load as a name-only row to fill in again.
                         </div>
                         <div class="table-container">
                             <table class="dashboard-table" style="table-layout:auto;">
@@ -759,6 +755,48 @@
                                 </tr>
                             </thead>
                             <tbody id="egaListBody"></tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <!-- ── EGA CARRY-OVER CASES ────────────────────────────────── -->
+                <!-- Typed in by hand: no field in eeAdmin reproduces the counts
+                     the printed sales report uses, and the figure is closed
+                     history once the year ends, so it is entered once. -->
+                <section class="card table-card" id="egaCarryCard" style="display:none;">
+                    <div class="card-header">
+                        <h3>EGA Carry-Over Cases</h3>
+                        <div style="display:flex; gap:12px; align-items:center;">
+                            <span class="save-status" id="egaCarryStatus"></span>
+                            <button class="btn btn-secondary" id="egaCarryAddBtn" style="display:none;">+ Add agent</button>
+                            <button class="btn btn-primary" id="egaCarrySaveBtn" style="display:none;">Save</button>
+                        </div>
+                    </div>
+                    <p class="section-hint" style="padding:0 24px 10px;">
+                        <strong>No calculation uses this any more.</strong> These counts were
+                        entered when the May multiplier was thought to reward cases closed before
+                        the 2025 cutoff. Re-reading the printed report on 9 Sep 2026 showed it
+                        counts cases invoiced <strong>inside the 1 May – 10 June window</strong>,
+                        which the Sales Report already counts for itself, so nothing typed here
+                        reaches EP. Kept as a record of the printed figures, and as the likely home
+                        for the one rule still missing: whether an agent's campaign cases are the
+                        before-31/12/25 vintage, worth half a point per ringgit for every three
+                        cases, or the after-1/1/26 vintage, which appears to pay double.
+                    </p>
+                    <div class="data-toolbar">
+                        <label for="egaCarryYear" style="font-weight:600; font-size:13px;">Year</label>
+                        <input type="number" id="egaCarryYear" value="2026" min="2020" max="2099"
+                               style="width:100px; padding:6px 12px; border-radius:8px; border:1px solid var(--border-color); font-size:13px; background:#f8fafc; color:var(--text-main);">
+                        <span style="font-size:11.5px; color:var(--text-muted);">Rows for other years are kept and saved untouched.</span>
+                    </div>
+                    <div class="table-container">
+                        <table class="dashboard-table unified-grid" style="table-layout:auto;">
+                            <thead>
+                                <tr><th>Agent</th><th style="width:130px;">Cases before cutoff</th>
+                                    <th style="width:150px;">Sales before cutoff (RM)</th>
+                                    <th style="width:110px;">Bonus tier</th><th style="width:56px;"></th></tr>
+                            </thead>
+                            <tbody id="egaCarryBody"></tbody>
                         </table>
                     </div>
                 </section>
@@ -1202,10 +1240,17 @@
                 <button id="closeAgentRoleModalBtn" class="btn-close">&times;</button>
             </div>
             <div class="modal-body" style="padding: 24px; gap: 18px; overflow-y: auto;">
-                <!-- Agent Name -->
+                <!-- Agent Name. Read-only when editing an existing row — the
+                     name is eeAdmin's, and Full Name / Nick Name are there to
+                     change what is displayed. Typeable only when adding, where
+                     it searches eeAdmin by name (see roleModalAgentSuggest). -->
                 <div class="form-row">
                     <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Agent Name (from eeAdmin)</label>
-                    <input type="text" id="roleModalAgent" readonly title="Fixed — sourced from eeAdmin (Postgres) and cannot be edited here. Use Full Name / Nick Name to customise what's displayed." style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box; background:var(--bg-muted, #f1f3f5); color:var(--text-muted); cursor:not-allowed;">
+                    <div style="position:relative;">
+                        <input type="text" id="roleModalAgent" readonly autocomplete="off" style="padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;">
+                        <div id="roleModalAgentSuggest" class="card" style="display:none; position:absolute; z-index:20; left:0; right:0; top:100%; margin-top:2px; max-height:220px; overflow-y:auto; overflow-x:hidden; padding:4px 0; box-shadow:0 6px 18px rgba(0,0,0,0.12);"></div>
+                    </div>
+                    <div id="roleModalAgentStatus" style="display:none; font-size:11px; margin-top:6px; line-height:1.45;"></div>
                 </div>
 
                 <!-- Full Name -->
@@ -1295,6 +1340,6 @@
         </div>
     </div>
 
-    <script src="/static/data.js?v=20260813_eff_present_v1"></script>
+    <script src="/static/data.js?v=20260909-carryover-note"></script>
 </body>
 </html>

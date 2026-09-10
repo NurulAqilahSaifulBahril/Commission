@@ -353,7 +353,8 @@
         if (isAdmin) {
             ["editModeBtn", "nfpAddBtn", "nfpUploadBtn", "seedRolesBtn", "addRoleBtn", "showExcludedRolesBtn", "saveRolesBtn",
              "contestSaveBtn", "contestNewBtn", "contestAddRosterBtn",
-             "anpSaveBtn", "anpAddTierBtn", "egaSaveBtn", "egaAddMonthBtn", "egaNewBtn", "pbSaveBtn"].forEach((id) => {
+             "anpSaveBtn", "anpAddTierBtn", "egaSaveBtn", "egaAddMonthBtn", "egaNewBtn", "pbSaveBtn",
+             "egaCarryAddBtn", "egaCarrySaveBtn"].forEach((id) => {
                 const el = document.getElementById(id);
                 if (el) el.style.display = "";
             });
@@ -1237,18 +1238,19 @@
     }
 
     // ── Agent roles & hierarchy ──────────────────────────────────────────────
-    // Postgres is the LIVE source for agent names/types/IC/branch.
-    // SQLite (loadedRoles) stores Role and Reports-To overrides only.
+    // Postgres supplies agent NAMES only — it is how a newly tagged agent shows
+    // up here without being typed in. Everything else on a row (Agent Type,
+    // Role, Reports To, Branch, IC No, Nick Name, Full Name, effective month)
+    // lives in SQLite (loadedRoles) and is entered on this page. Since
+    // 2026-09 eeAdmin's tags never prefill, overwrite or flag those fields.
 
     let loadedRoles = [];
-    // Live Postgres agent data (from /api/agent-roles/pg-list)
+    // Live Postgres agent names (from /api/agent-roles/pg-list): [{bubble_id, name}]
     let pgAgentsCache = [];
-    // eeAdmin ids tagged "blocked". They are already absent from pgAgentsCache;
-    // this set is what stops a row saved before the block from reappearing
-    // through the "agent not in Postgres" path further down.
-    let pgBlockedIds = new Set();
-    // Saved rows kept out of the grid entirely — blocked in eeAdmin, or a
-    // tombstone written by the Delete button (hidden:1). Neither is ever
+    // Saved rows kept out of the grid entirely — tombstones written by the
+    // Delete button (hidden:1). A blocked-in-eeAdmin agent is NOT hidden by
+    // this page any more: their saved row stays until deleted by hand. It is
+    // never
     // rendered into rolesList (every branch of rebuildRolesList() below skips
     // hidden rows on purpose), so they must be written back on every save
     // exactly as loaded: a save replaces the whole table with whatever
@@ -1300,34 +1302,21 @@
         return loadedRoles.filter((r) => !r.pg_bubble_id && String(r.agent || "").trim().toLowerCase() === key);
     }
 
-    /** Every role eeAdmin's tags name for this person, as
-     *  [{hierarchy, agent_type}] — one entry per role, most senior first.
-     *  Falls back to the single `hierarchy` field so the page still works
-     *  against an API that predates the split. */
-    function pgRolesFor(pg) {
-        if (!pg) return [];
-        if (Array.isArray(pg.roles) && pg.roles.length) return pg.roles;
-        return pg.hierarchy
-            ? [{ hierarchy: pg.hierarchy, agent_type: pg.agent_type || "" }]
-            : [];
-    }
-
-    /** A row derived from an eeAdmin tag rather than read back from the
-     *  database. eeAdmin tags carry no dates, so the effective month is left
-     *  blank for an admin to fill in — and while it is blank the row is never
-     *  saved and never reaches a commission calculation. */
-    function derivedRoleRow(pg, role) {
+    /** A row for an agent Postgres names but nobody has saved anything for.
+     *  Only the name comes from Postgres; every other field is blank for an
+     *  admin to fill in, and while the effective month is blank the row is
+     *  never saved and never reaches a commission calculation. */
+    function derivedRoleRow(pg) {
         return {
             agent:          toSentenceCase(pg.name),
-            agent_type:     (role && role.agent_type) || pg.agent_type || "",
-            ic_no:          pg.ic_no || "",
-            nick_name:      pg.nick_name || "",
+            agent_type:     "",
+            ic_no:          "",
+            nick_name:      "",
             full_name:      "",
-            branch:         pg.branch || "",
+            branch:         "",
             effective_from: "",
             needs_date:     true,
-            hierarchy:      (role && role.hierarchy) || "",
-            type_unknown:   !(role && role.agent_type) && !!pg.type_unknown,
+            hierarchy:      "",
             reports_to:     "",
             pg_bubble_id:   pg.bubble_id || "",
         };
@@ -1339,133 +1328,43 @@
         // Every hidden row qualifies, not only blocked ones: a plain Delete
         // tombstone (hidden:1, not blocked) needs exactly the same write-back
         // treatment or it vanishes on the next unrelated save.
-        suppressedRoles = loadedRoles.filter((r) =>
-            r.hidden || (r.pg_bubble_id && pgBlockedIds.has(r.pg_bubble_id)));
+        suppressedRoles = loadedRoles.filter((r) => r.hidden);
         if (pgAgentsCache.length) {
             rolesList = [];
             pgAgentsCache.forEach((pg) => {
                 const savedRows = savedRolesForPg(pg);
                 const visibleRows = savedRows.filter((r) => !r.hidden);
-                const pgRoles = pgRolesFor(pg);
                 if (!savedRows.length) {
-                    // Nobody has entered anything for this person yet, so every
-                    // role their tags name becomes its own undated row. An agent
-                    // with three role tags gets three rows to date, not one row
-                    // that has to pick a winner.
-                    if (pgRoles.length) {
-                        pgRoles.forEach((role) => rolesList.push(derivedRoleRow(pg, role)));
-                    } else {
-                        // Tags name no role at all — still list the person, so
-                        // their Role can be entered by hand.
-                        rolesList.push(derivedRoleRow(pg, null));
-                    }
+                    // Nobody has entered anything for this person yet — list
+                    // the name so their details can be entered by hand.
+                    rolesList.push(derivedRoleRow(pg));
                 } else if (!visibleRows.length) {
                     // Every saved row for this person is a hidden tombstone —
                     // they were explicitly deleted. Postgres still lists them
                     // (that's exactly why a plain delete kept reappearing), so
-                    // skip creating any row at all instead of falling back to
-                    // a fresh Postgres baseline.
+                    // skip creating any row at all.
                 } else {
                     // One row per saved effective-dated entry — this is what
                     // lets the same agent carry an old Role and a new Role as
                     // two separate rows instead of one overwriting the other.
-                    //
-                    // Drift is only ever measured against the newest row, and is
-                    // never applied on its own. Postgres tags carry no date, so
-                    // they can only answer "what is true now" — letting them
-                    // rewrite a dated row would reprice periods that are already
-                    // paid out. What they can do is notice that the newest row
-                    // has fallen behind and offer a new row dated from today.
-                    // Rank on the start month: a range would otherwise sort
-                    // above the plain month it starts in, on string length.
-                    const latestYm = visibleRows.reduce(
-                        (m, x) => (effStart(x.effective_from) > m ? effStart(x.effective_from) : m), "");
-                    const pgRoleKeys = new Set(pgRoles.map((p) => canonRole(p.hierarchy)).filter(Boolean));
-
+                    // Every field is exactly what was saved: Postgres has no
+                    // say over a row that exists.
                     visibleRows.forEach((r) => {
-                        const role = r.hierarchy || (pgRoles[0] && pgRoles[0].hierarchy) || "";
-                        // Compare this row's own role against eeAdmin, not the
-                        // agent's headline role: with one row per role, the
-                        // question is whether THIS tier is still tagged and
-                        // whether it is still tagged under the same agent type.
-                        const match = pgRoles.find((p) => canonRole(p.hierarchy) === canonRole(role));
-                        const pgType = match
-                            ? (match.agent_type || "")
-                            : (pg.type_unknown ? "" : (pg.agent_type || ""));
                         rolesList.push({
                             agent:          toSentenceCase(r.agent),
-                            agent_type:     r.agent_type   || pgType || pg.agent_type || "",
-                            ic_no:          r.ic_no         || pg.ic_no || "",
-                            nick_name:      r.nick_name     || pg.nick_name || "",
-                            full_name:      r.full_name     || "",
-                            branch:         r.branch        || pg.branch || "",
+                            agent_type:     r.agent_type     || "",
+                            ic_no:          r.ic_no          || "",
+                            nick_name:      r.nick_name      || "",
+                            full_name:      r.full_name      || "",
+                            branch:         r.branch         || "",
                             effective_from: r.effective_from || "",
                             needs_date:     !(r.effective_from || "").trim(),
-                            hierarchy:      role,
-                            // Only unresolved when nobody has saved a type for
-                            // this dated row; a saved Internal/Outsource is a
-                            // human decision and outranks the tag guess.
-                            type_unknown:   !r.agent_type && !pgType && !!pg.type_unknown,
+                            hierarchy:      r.hierarchy      || "",
                             reports_to:     r.reports_to     || "",
                             // Heal legacy rows (saved before this field existed)
                             // by stamping the ID the moment they're re-saved.
                             pg_bubble_id:   r.pg_bubble_id || pg.bubble_id || "",
-                            // This row's role is no longer tagged in eeAdmin —
-                            // either replaced by a different role (pgRoleKeys
-                            // names something else) or eeAdmin currently names
-                            // no role at all for this agent (pgRoleKeys is
-                            // empty). The row survives either way because
-                            // somebody dated or edited it — deleting it would
-                            // erase that work and change what an already-paid
-                            // month recalculates to. Untouched derived rows
-                            // need no tombstone: they are never written, so
-                            // they simply stop being generated.
-                            //
-                            // An empty pgRoleKeys is not proof the tag was
-                            // ever removed — eeAdmin may simply never have
-                            // carried a tier tag for this person — so that
-                            // case gets its own, softer wording below rather
-                            // than asserting a change that may not have
-                            // happened.
-                            tag_removed: !!(r.hierarchy && !pgRoleKeys.has(canonRole(r.hierarchy))),
-                            tag_gone: !!(r.hierarchy && pgRoleKeys.size === 0),
-                            // Role disagreements are no longer drift — an extra
-                            // eeAdmin role becomes its own row below. Only the
-                            // agent type can still disagree on a row-by-row
-                            // basis, and both sides must hold a value: a blank
-                            // saved field is an unfilled row, not a
-                            // disagreement, and already falls through above.
-                            //
-                            // The role eeAdmin gives for the NEW type travels
-                            // with the drift. Applying a type change used to
-                            // keep the old role, which produced rows like
-                            // "Internal / OSA/OSA1" — an Outsource role sitting
-                            // on an Internal row, matching no rate at all.
-                            pg_drift: (effStart(r.effective_from) === latestYm
-                                && pgType && r.agent_type && pgType !== r.agent_type)
-                                ? { agent_type: pgType,
-                                    hierarchy: (pgRoles.find((p) => p.agent_type === pgType) || {}).hierarchy || "" }
-                                : null,
                         });
-                    });
-
-                    // Any eeAdmin role that no saved row covers is a role change
-                    // nobody has recorded yet — it gets its own undated row
-                    // rather than overwriting the dated row already there.
-                    const savedKeys = new Set(
-                        visibleRows.map((r) => canonRole(r.hierarchy)).filter(Boolean));
-                    pgRoles.forEach((role) => {
-                        if (savedKeys.has(canonRole(role.hierarchy))) return;
-                        const extra = derivedRoleRow(pg, role);
-                        // Carry the details already entered for this person, so a
-                        // new role row doesn't arrive with a blank IC or branch.
-                        const ref = visibleRows[visibleRows.length - 1] || {};
-                        extra.full_name = ref.full_name || "";
-                        extra.nick_name = ref.nick_name || pg.nick_name || "";
-                        extra.ic_no     = ref.ic_no     || pg.ic_no || "";
-                        extra.branch    = ref.branch    || pg.branch || "";
-                        extra.reports_to = ref.reports_to || "";
-                        rolesList.push(extra);
                     });
                 }
             });
@@ -1482,10 +1381,9 @@
                 const alreadyShown = r.pg_bubble_id
                     ? pgIds.has(r.pg_bubble_id)
                     : (r.agent && pgNames.has(r.agent.trim().toLowerCase()));
-                // Blocked in eeAdmin means gone from this page. Without this the
-                // row falls through to the branch below, which exists to keep
-                // agents that eeAdmin no longer lists — the opposite intent.
-                if (r.pg_bubble_id && pgBlockedIds.has(r.pg_bubble_id)) return;
+                // An agent eeAdmin no longer lists (left, or blocked) keeps
+                // their saved rows: earlier months were priced with them, and
+                // removing them is a decision for the Delete button, not a tag.
                 if (hasIdentity && !alreadyShown && !r.hidden) {
                     rolesList.push({
                         agent:          toSentenceCase(r.agent),
@@ -1574,7 +1472,6 @@
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || "Failed to load");
             pgAgentsCache = data.agents || [];
-            pgBlockedIds = new Set(data.blocked_ids || []);
             if (statusEl && !quiet) {
                 statusEl.className = "save-status ok";
                 statusEl.textContent = `${pgAgentsCache.length} agent${pgAgentsCache.length === 1 ? "" : "s"} loaded from Postgres.`;
@@ -1674,14 +1571,14 @@
     }
 
     /** True when a row carries any of the amber/red warnings the grid can
-     *  show below the Role badge — drifted, no-longer-tagged, expired/soon
-     *  to expire, or a Role that matches no rate row. An undated row is
+     *  show below the Role badge — expired/soon to expire, or a Role that
+     *  matches no rate row. An undated row is
      *  excluded on purpose: "⚠ Set effective date" is its own, expected,
      *  one-time housekeeping step (every freshly-tagged agent starts there),
      *  not a staleness signal worth mixing into the same count. */
     function rowNeedsReview(r) {
         if (r.needs_date || !String(r.effective_from || "").trim()) return false;
-        return !!(r.tag_removed || r.pg_drift || r.role_expired || r.role_expiring
+        return !!(r.role_expired || r.role_expiring
             || !roleBelongsToType(r.hierarchy, r.agent_type));
     }
 
@@ -1696,7 +1593,7 @@
         }
         banner.style.display = "flex";
         textEl.textContent = `⚠ ${flagged.length} agent${flagged.length === 1 ? "" : "s"} `
-            + `${flagged.length === 1 ? "has" : "have"} a Postgres/role warning below —`;
+            + `${flagged.length === 1 ? "has" : "have"} a role warning below —`;
     }
 
     /**
@@ -1749,10 +1646,10 @@
             const tr = document.createElement("tr");
             tr.className = "role-row";
             
-            // eeAdmin tags carry no date, so a role read straight from them has
-            // no effective month until somebody enters one. Until then the row
-            // is never written to the database and every commission lookup
-            // skips it, so it has to read as an open to-do, not as a date.
+            // A row that only carries a Postgres name has no effective month
+            // until somebody enters one. Until then the row is never written
+            // to the database and every commission lookup skips it, so it has
+            // to read as an open to-do, not as a date.
             const needsDate = !!r.needs_date || !String(r.effective_from || "").trim();
             // A range that has run out (or is about to) on the agent's newest
             // row leaves them with no role from then on, so it has to be
@@ -1774,7 +1671,7 @@
                 ? ` <span style="color:#047857; font-weight:600;" title="Present — this role applies from ${escapeHtml(fmtMonth(effStart(r.effective_from)))} onwards, including every future month. Untick Present in the popup to set an end month.">→ Present</span>`
                 : "";
             const monthCell = needsDate
-                ? `<span title="This role came from eeAdmin's tags, which carry no dates. It is not saved and no commission calculation uses it until you set the month here." style="color:#b45309; font-weight:600;">⚠ Set effective date</span>`
+                ? `<span title="Only this agent's name came from eeAdmin. Nothing is saved and no commission calculation uses this row until you set the month and fill in the details here." style="color:#b45309; font-weight:600;">⚠ Set effective date</span>`
                 : escapeHtml(fmtMonth(r.effective_from)) + presentHtml + expiryHtml;
             const displayAgent = r.agent || "—";
             const displayFullName = r.full_name || "—";
@@ -1786,20 +1683,11 @@
             // reprice periods that already paid out.
             const displayAtype = r.agent_type === "Sales"
                 ? "⚠ Sales (needs review)"
-                : (r.agent_type || (r.type_unknown ? "⚠ needs review" : "—"));
+                : (r.agent_type || "—");
             const displayRole = r.hierarchy || "—";
             const displayReports = r.reports_to || "—";
             const displayBranch = r.branch || "—";
 
-            const drift = r.pg_drift;
-            const driftBits = drift
-                ? [drift.agent_type && drift.agent_type !== r.agent_type ? drift.agent_type : "",
-                   drift.hierarchy  && drift.hierarchy  !== r.hierarchy  ? drift.hierarchy  : ""]
-                    .filter(Boolean).join(" / ")
-                : "";
-            const driftHtml = driftBits
-                ? `<div style="margin-top:3px; font-size:10px; color:#92400e;" title="Postgres tags no longer match this row. Applying adds a NEW row dated ${escapeHtml(fmtMonth(CURRENT_YM))}; this row is kept as history.">⚠ Postgres: ${escapeHtml(driftBits)}</div>`
-                : "";
             // Kept, not deleted: the row holds an effective date somebody
             // entered, and past months were priced with it.
             // A role from the other agent type matches no rate row, so the
@@ -1808,17 +1696,6 @@
             const mismatchHtml = !roleBelongsToType(r.hierarchy, r.agent_type)
                 ? `<div style="margin-top:3px; font-size:10px; color:#b91c1c; font-weight:600;" title="${escapeHtml(r.hierarchy)} is a ${r.agent_type === "Internal" ? "Outsource" : "Internal"} role but this row is ${escapeHtml(r.agent_type || "—")}. No rate row matches that combination, so this agent falls back to the hardcoded default rate. Fix the Role or the Agent Type.">⚠ not a ${escapeHtml(r.agent_type || "—")} role — no rate matches</div>`
                 : "";
-            // Two different situations share the amber "review this" family
-            // but say different things: re-tagged to something else is a
-            // fact (eeAdmin names another role today), while "no role at
-            // all" cannot claim the tag was ever removed — it may simply
-            // never have carried one — so it asks rather than asserts.
-            const removedHtml = r.tag_removed
-                ? (r.tag_gone
-                    ? `<div style="margin-top:3px; font-size:10px; color:#b45309;" title="eeAdmin currently names no role at all for this agent — it may have been removed, or may never have been tagged. The row is kept because it has been dated by hand — earlier months were calculated with it. Verify this Role is still correct; delete it here if it was entered in error.">⚠ eeAdmin tags no role — verify</div>`
-                    : `<div style="margin-top:3px; font-size:10px; color:var(--text-muted);" title="This role is no longer tagged in eeAdmin. The row is kept because it has been dated by hand — earlier months were calculated with it. Delete it here if it was entered in error.">no longer tagged in eeAdmin</div>`)
-                : "";
-
             tr.innerHTML = `
                 <td class="sm-cell">${monthCell}</td>
                 <td class="sm-cell" style="font-weight:600;">${escapeHtml(displayAgent)}</td>
@@ -1826,21 +1703,16 @@
                 <td class="sm-cell">${escapeHtml(displayNick)}</td>
                 <td class="sm-cell">${escapeHtml(displayIc)}</td>
                 <td class="sm-cell">${escapeHtml(displayAtype)}</td>
-                <td class="sm-cell"><span class="role-badge" style="background:#e0e7ff; color:#3730a3; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600;">${escapeHtml(displayRole)}</span>${mismatchHtml}${driftHtml}${removedHtml}</td>
+                <td class="sm-cell"><span class="role-badge" style="background:#e0e7ff; color:#3730a3; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600;">${escapeHtml(displayRole)}</span>${mismatchHtml}</td>
                 <td class="sm-cell">${escapeHtml(displayReports)}</td>
                 <td class="sm-cell">${escapeHtml(displayBranch)}</td>
                 <td style="white-space:nowrap;">
                     ${isAdmin ? `<button class="btn btn-secondary row-edit-btn" title="Edit agent details" style="padding:4px 8px; font-size:12px;">✏️ Edit</button>` : ""}
-                    ${isAdmin && driftBits ? `<button class="btn btn-secondary row-apply-pg-btn" title="Add a new dated row matching Postgres" style="padding:4px 8px; font-size:12px;">⤴ Apply</button>` : ""}
                 </td>
             `;
 
             tr.querySelector(".row-edit-btn")?.addEventListener("click", () => {
                 openAgentRoleModal(r);
-            });
-
-            tr.querySelector(".row-apply-pg-btn")?.addEventListener("click", () => {
-                applyPgDrift(r);
             });
 
             tbody.appendChild(tr);
@@ -1901,6 +1773,143 @@
 
     let editingAgentObj = null;
 
+    // ── eeAdmin name search (Add Agent only) ─────────────────────────────────
+    // The hierarchy list itself comes from /api/agent-roles/pg-list, which
+    // keeps only people tagged internal/outsource/sales. Someone whose
+    // agent_type was never set in eeAdmin is therefore invisible there — and
+    // is exactly who you open this modal to add. So the search below calls
+    // /api/agent-roles/pg-search, which drops that tag filter, and remembers
+    // the eeAdmin id of whatever you pick so the saved row links to the real
+    // record instead of being matched by name forever after.
+
+    // { bubble_id, name } of the search hit currently chosen, or null.
+    let pickedPgAgent = null;
+    let agentSearchTimer = null;
+    let agentSearchSeq = 0;
+
+    /** Coloured one-liner under the Agent Name box; "" hides it. */
+    function setAgentSearchStatus(text, tone) {
+        const el = document.getElementById("roleModalAgentStatus");
+        if (!el) return;
+        el.textContent = text || "";
+        el.style.display = text ? "" : "none";
+        el.style.color = tone === "ok" ? "var(--success-color, #15803d)"
+            : tone === "warn" ? "#b45309"
+            : "var(--text-muted)";
+    }
+
+    function hideAgentSuggest() {
+        const box = document.getElementById("roleModalAgentSuggest");
+        if (box) { box.style.display = "none"; box.innerHTML = ""; }
+    }
+
+    /** Put the Agent Name box into edit-a-row mode (locked, greyed) or
+     *  add-a-row mode (typeable, searches eeAdmin). */
+    function setAgentNameMode(editable) {
+        const input = document.getElementById("roleModalAgent");
+        if (!input) return;
+        input.readOnly = !editable;
+        input.style.background = editable ? "" : "var(--bg-muted, #f1f3f5)";
+        input.style.color = editable ? "" : "var(--text-muted)";
+        input.style.cursor = editable ? "" : "not-allowed";
+        input.placeholder = editable ? "Type a name to search eeAdmin…" : "";
+        input.title = editable
+            ? "Type at least 2 letters to search every eeAdmin record, including people with no agent type set."
+            : "Fixed — sourced from eeAdmin (Postgres) and cannot be edited here. Use Full Name / Nick Name to customise what's displayed.";
+        hideAgentSuggest();
+        setAgentSearchStatus(editable
+            ? "Type at least 2 letters to search eeAdmin. Untagged people are included."
+            : "");
+    }
+
+    function renderAgentSuggest(list, term) {
+        const box = document.getElementById("roleModalAgentSuggest");
+        if (!box) return;
+        if (!list.length) {
+            hideAgentSuggest();
+            setAgentSearchStatus(`No eeAdmin record matches "${term}". You can still save this as a manual row.`, "warn");
+            return;
+        }
+        box.innerHTML = list.map((a, i) => {
+            const type = a.agent_type ? a.agent_type : "no agent type set";
+            return `<div class="pg-suggest-item" data-idx="${i}" style="padding:7px 12px; cursor:pointer; font-size:13px; line-height:1.35;">
+                        <div style="font-weight:600;">${escapeHtml(a.name)}</div>
+                        <div style="font-size:11px; color:var(--text-muted);">${escapeHtml(type)}</div>
+                    </div>`;
+        }).join("");
+        box.querySelectorAll(".pg-suggest-item").forEach((el) => {
+            el.addEventListener("mouseenter", () => { el.style.background = "var(--bg-hover, #f1f3f5)"; });
+            el.addEventListener("mouseleave", () => { el.style.background = ""; });
+            el.addEventListener("mousedown", (ev) => {
+                // mousedown, not click: the input's blur handler closes this
+                // list, and blur fires first on a click.
+                ev.preventDefault();
+                choosePgAgent(list[Number(el.dataset.idx)]);
+            });
+        });
+        box.style.display = "";
+        setAgentSearchStatus(`${list.length} match${list.length === 1 ? "" : "es"} in eeAdmin — pick one.`);
+    }
+
+    function choosePgAgent(a) {
+        pickedPgAgent = { bubble_id: a.bubble_id || "", name: a.name || "" };
+        const input = document.getElementById("roleModalAgent");
+        if (input) input.value = a.name || "";
+        hideAgentSuggest();
+        setAgentSearchStatus(
+            a.agent_type
+                ? `Linked to eeAdmin (${a.agent_type}).`
+                : "Linked to eeAdmin. This person has no agent type there, so pick one below.",
+            "ok");
+    }
+
+    /** One search. Returns [] and shows the reason when the lookup fails —
+     *  a dead proxy must not look like "this person does not exist". */
+    async function searchPgAgents(term) {
+        const mySeq = ++agentSearchSeq;
+        try {
+            const res = await api(`/api/agent-roles/pg-search?q=${encodeURIComponent(term)}`);
+            const data = await res.json();
+            if (mySeq !== agentSearchSeq) return null;  // a newer keystroke won
+            if (!res.ok) {
+                setAgentSearchStatus(data.error || "eeAdmin search failed.", "warn");
+                return null;
+            }
+            return data.agents || [];
+        } catch (e) {
+            if (mySeq !== agentSearchSeq) return null;
+            setAgentSearchStatus(`eeAdmin search failed: ${e.message}`, "warn");
+            return null;
+        }
+    }
+
+    document.getElementById("roleModalAgent")?.addEventListener("input", () => {
+        const input = document.getElementById("roleModalAgent");
+        if (!input || input.readOnly) return;
+        // Editing the text after picking someone means the link no longer
+        // describes what is in the box.
+        if (pickedPgAgent && input.value.trim().toLowerCase() !== pickedPgAgent.name.toLowerCase()) {
+            pickedPgAgent = null;
+        }
+        const term = input.value.trim();
+        clearTimeout(agentSearchTimer);
+        if (term.length < 2) {
+            hideAgentSuggest();
+            setAgentSearchStatus("Type at least 2 letters to search eeAdmin. Untagged people are included.");
+            return;
+        }
+        setAgentSearchStatus("Searching eeAdmin…");
+        agentSearchTimer = setTimeout(async () => {
+            const list = await searchPgAgents(term);
+            if (list) renderAgentSuggest(list, term);
+        }, 300);
+    });
+
+    document.getElementById("roleModalAgent")?.addEventListener("blur", () => {
+        setTimeout(hideAgentSuggest, 150);
+    });
+
+
     function openAgentRoleModal(r) {
         editingAgentObj = r;
         const modal = document.getElementById("agentRoleModal");
@@ -1933,6 +1942,11 @@
         if (r) {
             const needsDate = !!r.needs_date || !String(r.effective_from || "").trim();
             document.getElementById("agentRoleModalTitle").textContent = "Edit Agent Details";
+            // The name of an existing row is eeAdmin's to change, not this
+            // modal's — searching would only invite retargeting the row at a
+            // different person by accident.
+            pickedPgAgent = r.pg_bubble_id ? { bubble_id: r.pg_bubble_id, name: r.agent || "" } : null;
+            setAgentNameMode(false);
             // Left blank on purpose for a role read from eeAdmin's tags: the
             // date is the one thing eeAdmin cannot tell us, so pre-filling this
             // month would just be a guess the admin might not notice.
@@ -1951,11 +1965,11 @@
             // Set after the options exist (populated above), so a legacy value
             // still selects instead of silently falling back to blank.
             // Nothing to delete yet — an undated row exists only because
-            // eeAdmin tags the role, and it is re-derived on every load. Remove
-            // the tag in eeAdmin to make it go away; date it here to keep it.
+            // Postgres lists the name, and it is re-derived on every load.
+            // Date it here to keep it.
             document.getElementById("roleModalDeleteBtn").style.display = needsDate ? "none" : "";
             setRoleModalNote(needsDate
-                ? "This role comes from this agent's eeAdmin tags, which carry no dates. Set the effective month to save it — until then no commission calculation uses it, and it disappears if the tag is removed in eeAdmin."
+                ? "Only this agent's name came from eeAdmin. Fill in the details and set the effective month to save the row — until then no commission calculation uses it."
                 : "");
         } else {
             document.getElementById("agentRoleModalTitle").textContent = "Add Agent Details";
@@ -1970,6 +1984,9 @@
             document.getElementById("roleModalBranch").value = "";
             document.getElementById("roleModalDeleteBtn").style.display = "none";
             setRoleModalNote("");
+            pickedPgAgent = null;
+            setAgentNameMode(true);
+            setTimeout(() => document.getElementById("roleModalAgent")?.focus(), 50);
         }
 
         modal.classList.remove("hidden");
@@ -2016,7 +2033,7 @@
         const present = !!document.getElementById("roleModalMonthPresent")?.checked;
         const to = (document.getElementById("roleModalMonthTo")?.value || "").trim();
         if (!from) {
-            return { error: "Enter the month this role starts From.\n\nIt decides which months are calculated with it, and eeAdmin's tags carry no date, so it has to be entered here." };
+            return { error: "Enter the month this role starts From.\n\nIt decides which months are calculated with it, so it has to be entered here." };
         }
         if (present) return { value: from };
         if (!to) {
@@ -2047,6 +2064,33 @@
         if (!agentName && !fullName && !nickNameCheck) {
             alert("Enter at least one of Agent Name (from eeAdmin), Full Name, or Nick Name.");
             return;
+        }
+
+        // Adding a row: settle what this name points at in eeAdmin before
+        // anything is written. Typing a name in full and pressing Save without
+        // touching the dropdown is the normal case, so an exact match is
+        // adopted silently rather than being treated as unmatched.
+        if (!editingAgentObj && agentName) {
+            const dup = rolesList.find((x) =>
+                String(x.agent || "").trim().toLowerCase() === agentName.toLowerCase());
+            if (dup) {
+                alert(`${dup.agent} is already on this page.\n\nOpen that row and add a new effective month instead of adding a second row for the same person.`);
+                return;
+            }
+            if (!pickedPgAgent || pickedPgAgent.name.toLowerCase() !== agentName.toLowerCase()) {
+                const hits = await searchPgAgents(agentName);
+                const exact = (hits || []).find((a) =>
+                    String(a.name || "").trim().toLowerCase() === agentName.toLowerCase());
+                if (exact) {
+                    choosePgAgent(exact);
+                } else if (hits === null) {
+                    // The lookup itself failed, so we do not know either way.
+                    if (!confirm(`Could not reach eeAdmin to check "${agentName}".\n\nSave the row anyway? It will be a manual entry with no eeAdmin link.`)) return;
+                    pickedPgAgent = null;
+                } else if (!confirm(`"${agentName}" was not found in eeAdmin.\n\nSave it anyway as a manual row? Check the spelling first — a typo here creates a second copy of a person who is already there.`)) {
+                    return;
+                }
+            }
         }
 
         // Required, never defaulted: an effective month decides which invoices
@@ -2085,6 +2129,12 @@
         } else {
             const newAgent = {
                 effective_from: effMonth,
+                // The eeAdmin id of the person picked in the search, when
+                // there was one. Rows keyed by id survive a rename in eeAdmin;
+                // a manual row saved past the "not found" warning has no id
+                // and stays matched by name.
+                pg_bubble_id: (pickedPgAgent && pickedPgAgent.name.toLowerCase() === agentName.toLowerCase())
+                    ? pickedPgAgent.bubble_id : "",
                 agent: agentName,
                 full_name: fullName,
                 nick_name: nickName,
@@ -2155,64 +2205,6 @@
     document.getElementById("roleModalCancelBtn")?.addEventListener("click", closeRoleModal);
     document.getElementById("closeAgentRoleModalBtn")?.addEventListener("click", closeRoleModal);
 
-    /** Accept the Postgres tag change for one agent by adding a NEW effective-dated
-     * row instead of editing the existing one. The old row has to survive: earlier
-     * periods were priced with it, and the commission packs already issued for
-     * those months still have to reproduce. The one exception is a row already
-     * dated this month — that is the same period, not history, so a second row
-     * would just make the month ambiguous. */
-    async function applyPgDrift(r) {
-        const drift = r.pg_drift;
-        if (!drift) return;
-
-        const newType = drift.agent_type || r.agent_type || "";
-        // Never carry a role across an agent-type change. An Outsource role on
-        // an Internal row (or the reverse) matches no rate row at all, so the
-        // agent silently drops to the hardcoded default — which is exactly how
-        // "Internal / OSA/OSA1" rows got written. Prefer the role eeAdmin gives
-        // for the new type; if it names none, leave it blank for a human.
-        const newRole = drift.hierarchy
-            || (roleBelongsToType(r.hierarchy, newType) ? r.hierarchy : "");
-        const thisMonth = fmtMonth(CURRENT_YM);
-        const sameMonth = (r.effective_from || "") === CURRENT_YM;
-        const roleDropped = r.hierarchy && !newRole;
-
-        const ok = confirm(
-            `${r.agent}\n\n`
-            + `Now:  ${r.agent_type || "-"} / ${r.hierarchy || "-"}   (from ${fmtMonth(r.effective_from || CURRENT_YM)})\n`
-            + `eeAdmin:  ${newType || "-"} / ${newRole || "-"}\n\n`
-            + (roleDropped
-                ? `"${r.hierarchy}" is not a ${newType} role, and eeAdmin's tags name no ${newType} role for them, so the Role is left blank — set it yourself afterwards or the agent has no rate for these months.\n\n`
-                : "")
-            + (sameMonth
-                ? `That row is already dated ${thisMonth}, so it will be updated in place.`
-                : `A new row dated ${thisMonth} will be added. The existing row stays as history.`)
-        );
-        if (!ok) return;
-
-        if (sameMonth) {
-            r.agent_type = newType;
-            r.hierarchy = newRole;
-            r.pg_drift = null;
-        } else {
-            rolesList.push({
-                ...r,
-                effective_from: CURRENT_YM,
-                // Spread from a row that may itself be undated — this new row
-                // has a date, so it must not inherit the "needs a date" flag
-                // that would stop it being saved.
-                needs_date: false,
-                agent_type: newType,
-                hierarchy: newRole,
-                type_unknown: false,
-                tag_removed: false,
-                tag_gone: false,
-                pg_drift: null,
-            });
-        }
-        await saveRoles();
-    }
-
     // Mirrors AGENT_ROLE_FIELDS in db.py — the columns a save writes.
     const AGENT_ROLE_FIELDS = ["effective_from", "agent", "agent_type", "hierarchy",
         "reports_to", "branch", "remarks", "start_date", "ic_no", "nick_name",
@@ -2250,14 +2242,12 @@
                 : "edited via roles grid"
         }))
             .filter(r => r.agent || r.full_name || r.nick_name)
-            // An undated row is a role eeAdmin knows about that nobody has
-            // dated yet. It must never be written: the old `|| CURRENT_YM`
-            // stamped it with this month on the next unrelated save, which both
+            // An undated row is a name Postgres lists that nobody has dated
+            // yet. It must never be written: the old `|| CURRENT_YM` stamped
+            // it with this month on the next unrelated save, which both
             // invented an effective date nobody chose and let an unreviewed
-            // role reach the calculation. Leaving it out is also what makes
-            // "an untouched row disappears when its tag goes" work — it is
-            // re-derived from eeAdmin on every load, so it stops appearing the
-            // moment the tag does.
+            // row reach the calculation. It is re-derived from the Postgres
+            // name list on every load until someone fills it in.
             .filter(r => r.effective_from || r.hidden)
             // Appended last and unfiltered: a save replaces the whole table, so
             // anything left out here is deleted. A blocked agent is hidden, not
@@ -2294,19 +2284,129 @@
             const res = await api("/api/agent-roles/seed", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ month: "2026-01" })
+                body: JSON.stringify({})
             });
             const d = await res.json();
             if (!res.ok) throw new Error(d.error || "Seed failed");
             status.className = "save-status ok";
             status.textContent = `Added ${d.added} agent(s); ${d.total} listed. ` +
-                `Now fill in Role and Reports To.`;
+                `Now fill in each new agent's details.`;
             await loadRoles();
         } catch (e) {
             status.className = "save-status err";
             status.textContent = e.message;
         }
     }
+
+    // ── EGA carry-over cases ─────────────────────────────────────────────────
+    // Cases closed before the scheme cutoff. Only the COUNT matters: it picks
+    // the multiplier applied to the agent's 1 May – 10 Jun campaign sales on
+    // the Sales Report. Held here because nothing in eeAdmin reproduces the
+    // counts the printed report uses.
+
+    let egaCarryRows = [];
+
+    /** Every third case adds another half point per ringgit. Mirrors
+     *  _campaign_bonus_tier() in app.py — keep the two in step. */
+    function carryTier(cases) {
+        const n = parseInt(String(cases || "0").replace(/[^0-9]/g, ""), 10) || 0;
+        return Math.floor(n / 3) * 0.5;
+    }
+
+    function egaCarryYear() {
+        const el = document.getElementById("egaCarryYear");
+        return String((el && el.value) || "2026").trim();
+    }
+
+    async function loadEgaCarryover() {
+        try {
+            const res = await api("/api/ega-carryover");
+            egaCarryRows = await res.json();
+            if (!Array.isArray(egaCarryRows)) egaCarryRows = [];
+        } catch (e) {
+            egaCarryRows = [];
+        }
+        renderEgaCarry();
+    }
+
+    function renderEgaCarry() {
+        const body = document.getElementById("egaCarryBody");
+        if (!body) return;
+        const year = egaCarryYear();
+        const mine = egaCarryRows.filter(r => String(r.year || "").trim() === year);
+        body.innerHTML = "";
+        if (!mine.length) {
+            body.innerHTML = `<tr><td colspan="5" style="text-align:center; padding:18px; color:var(--text-muted);">`
+                + `No carry-over cases recorded for ${escapeHtml(year)}. `
+                + `Every agent scores EP from their sales alone until a row is added here.</td></tr>`;
+            return;
+        }
+        mine.forEach((r) => {
+            const tr = document.createElement("tr");
+            const tier = carryTier(r.cases);
+            tr.innerHTML = `
+                <td><input type="text" list="agentNameList" value="${escapeHtml(r.agent || "")}"
+                     data-f="agent" style="width:100%;" ${isAdmin ? "" : "disabled"}></td>
+                <td><input type="number" min="0" step="1" value="${escapeHtml(r.cases || "")}"
+                     data-f="cases" style="width:100%;" ${isAdmin ? "" : "disabled"}></td>
+                <td><input type="number" min="0" step="0.01" value="${escapeHtml(r.sales || "")}"
+                     data-f="sales" style="width:100%;" ${isAdmin ? "" : "disabled"}></td>
+                <td class="carry-tier" style="font-weight:600;"
+                    title="Multiplier applied to this agent's 1 May – 10 Jun campaign sales.">
+                    ${tier ? tier.toFixed(1) + "&times;" : "—"}</td>
+                <td>${isAdmin ? `<button class="btn btn-secondary carry-del" style="padding:4px 8px; font-size:12px;">✕</button>` : ""}</td>`;
+            tr.querySelectorAll("input").forEach((inp) => {
+                inp.addEventListener("input", () => {
+                    r[inp.dataset.f] = inp.value;
+                    if (inp.dataset.f === "cases") {
+                        const cell = tr.querySelector(".carry-tier");
+                        const t = carryTier(inp.value);
+                        cell.innerHTML = t ? t.toFixed(1) + "&times;" : "—";
+                    }
+                });
+            });
+            tr.querySelector(".carry-del")?.addEventListener("click", () => {
+                egaCarryRows = egaCarryRows.filter(x => x !== r);
+                renderEgaCarry();
+            });
+            body.appendChild(tr);
+        });
+    }
+
+    async function saveEgaCarryover() {
+        const status = document.getElementById("egaCarryStatus");
+        if (status) { status.className = "save-status"; status.textContent = "Saving..."; }
+        // Every year is sent, not just the one on screen: the save replaces the
+        // whole table, so omitting the others would delete them.
+        const entries = egaCarryRows
+            .map(r => ({ year: String(r.year || "").trim(), agent: String(r.agent || "").trim(),
+                         cases: String(r.cases || "").trim(), sales: String(r.sales || "").trim() }))
+            .filter(r => r.year && r.agent);
+        try {
+            const res = await api("/api/ega-carryover", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ entries })
+            });
+            const d = await res.json();
+            if (!res.ok) throw new Error(d.error || "Save failed");
+            if (status) {
+                status.className = "save-status ok";
+                status.textContent = "Saved. Sales Report EP recalculated.";
+                setTimeout(() => { status.textContent = ""; }, 3000);
+            }
+            await loadEgaCarryover();
+        } catch (e) {
+            if (status) { status.className = "save-status err"; status.textContent = e.message; }
+        }
+    }
+
+    document.getElementById("egaCarryAddBtn")?.addEventListener("click", () => {
+        egaCarryRows.push({ year: egaCarryYear(), agent: "", cases: "", sales: "" });
+        renderEgaCarry();
+    });
+    document.getElementById("egaCarrySaveBtn")?.addEventListener("click", saveEgaCarryover);
+    document.getElementById("egaCarryYear")?.addEventListener("input", renderEgaCarry);
 
     // ── NFP price list viewer ────────────────────────────────────────────────
 
@@ -3745,7 +3845,7 @@
      *  the same state they would be in had they never been deleted. */
     async function restoreExcludedAgent(r) {
         const name = r.agent || r.full_name || r.nick_name || "this agent";
-        if (!confirm(`Restore ${name}? They will show up again next load, using whatever eeAdmin currently tags them — you may need to date the row again.`)) return;
+        if (!confirm(`Restore ${name}? They will show up again next load as a name-only row — you will need to fill in their details and date the row again.`)) return;
         const bid = String(r.pg_bubble_id || "");
         const nameKey = String(r.agent || "").trim().toLowerCase();
         loadedRoles = loadedRoles.filter((row) => {
@@ -4706,6 +4806,12 @@
         // above just hid — leaving the section would strand it over the page.
         if (ruleKey !== "ega") closeEgaModal();
 
+        // Carry-over cases belong to the EGA scheme but are per agent, not per
+        // agent type, so they sit on the section page rather than in the
+        // per-scheme modal.
+        const carryCard = document.getElementById("egaCarryCard");
+        if (carryCard) carryCard.style.display = (ruleKey === "ega") ? "block" : "none";
+
         if (rolesCard) {
             rolesCard.style.display = isRoles ? "block" : "none";
         }
@@ -4786,6 +4892,7 @@
         // show IC numbers without an extra round-trip per row.
         loadRoles();
         loadPgAgents();
+        loadEgaCarryover();
         startRolesAutoRefresh();
         // updateDataSectionView() already ran, before isAdmin was known, so a
         // deep link straight to the contest section would have rendered its

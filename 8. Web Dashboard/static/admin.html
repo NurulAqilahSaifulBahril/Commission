@@ -25,6 +25,10 @@
         .row-actions { display: flex; gap: 8px; }
         .row-actions .btn { padding: 6px 12px; font-size: 12px; }
         tr.inactive-row td { opacity: 0.5; }
+        /* The row is dimmed so it reads as inactive, but its buttons are the
+           one thing you went to that row to click -- Reactivate especially.
+           Dimming them made the only live control look disabled. */
+        tr.inactive-row td.row-actions { opacity: 1; }
         .audit-filters { padding: 20px 24px 0; }
         .audit-filters select {
             background-color: #f8fafc; border: 1px solid var(--border-color); border-radius: 8px;
@@ -32,6 +36,25 @@
         }
         .audit-detail-cell details summary { cursor: pointer; color: var(--accent-blue); font-size: 12px; }
         .audit-detail-cell .audit-diff { font-size: 12px; color: var(--text-muted); white-space: pre-wrap; word-break: break-word; margin-top: 6px; max-width: 360px; }
+        /* Set-password dialog. This is a dialog rather than a prompt() because
+           the Portal runs inside Electron, where window.prompt() is not
+           implemented -- the old Reset password button silently did nothing. */
+        .pw-modal-content { max-width: 420px; }
+        .pw-target { font-size: 13px; color: var(--text-muted); margin: -4px 0 0; }
+        .pw-target b { color: var(--text-main); }
+        .pw-field { display: flex; flex-direction: column; gap: 6px; }
+        .pw-field label { font-size: 13px; font-weight: 500; color: var(--text-muted); }
+        .pw-field input {
+            background-color: #f8fafc; border: 1px solid var(--border-color); border-radius: 8px;
+            padding: 10px 14px; font-size: 14px; outline: none; color: var(--text-main); width: 100%;
+        }
+        .pw-field input:focus {
+            border-color: var(--accent-blue); background-color: #ffffff;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+        .pw-check { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-main); }
+        .pw-check input { width: auto; margin: 0; }
+        .pw-error { color: #dc2626; font-size: 13px; min-height: 18px; }
     </style>
 </head>
 <body>
@@ -145,6 +168,39 @@
         </main>
     </div>
 
-    <script src="/static/admin.js"></script>
+    <div id="pwModal" class="modal" style="display:none;">
+        <div class="modal-content pw-modal-content">
+            <div class="modal-header">
+                <h2>Set a new password</h2>
+                <button class="modal-close" id="pwModalClose">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p class="pw-target">Account: <b id="pwTargetName"></b></p>
+                <div class="pw-field">
+                    <label for="pwNew">New password</label>
+                    <input type="password" id="pwNew" autocomplete="new-password" placeholder="min 6 characters">
+                </div>
+                <div class="pw-field">
+                    <label for="pwConfirm">Confirm password</label>
+                    <input type="password" id="pwConfirm" autocomplete="new-password" placeholder="type it again">
+                </div>
+                <label class="pw-check">
+                    <input type="checkbox" id="pwShow"> Show password
+                </label>
+                <label class="pw-check" id="pwReactivateRow" style="display:none;">
+                    <input type="checkbox" id="pwReactivate" checked> Reactivate this account as well
+                </label>
+                <div class="pw-error" id="pwError"></div>
+            </div>
+            <div class="modal-footer">
+                <button id="pwCancelBtn" class="btn btn-secondary">Cancel</button>
+                <div class="modal-footer-actions">
+                    <button id="pwSaveBtn" class="btn btn-primary">Save password</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/admin.js?v=20260903-reactivate-setpassword"></script>
 </body>
 </html>

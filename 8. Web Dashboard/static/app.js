@@ -558,6 +558,24 @@ document.addEventListener("DOMContentLoaded", () => {
             if (e.target.id === "pdfModal") closePdfModal();
         });
 
+        // Referral editor handlers
+        const referralModal = document.getElementById("referralModal");
+        if (referralModal) {
+            document.getElementById("referralModalClose").addEventListener("click", closeReferralModal);
+            document.getElementById("referralCancelBtn").addEventListener("click", closeReferralModal);
+            document.getElementById("referralSaveBtn").addEventListener("click", saveReferralModal);
+            referralModal.addEventListener("click", (e) => {
+                if (e.target.id === "referralModal") closeReferralModal();
+            });
+            ["referralNameInput", "referralRateInput"].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.addEventListener("input", referralFeePreview);
+            });
+            document.getElementById("referralRateInput").addEventListener("keydown", (e) => {
+                if (e.key === "Enter") saveReferralModal();
+            });
+        }
+
         // Sync cache action
         if (syncDataBtn) {
             syncDataBtn.addEventListener("click", async () => {
@@ -1173,9 +1191,17 @@ document.addEventListener("DOMContentLoaded", () => {
         if (modalAgentCustomerDisplayRow) modalAgentCustomerDisplayRow.classList.toggle("hidden", isCustomerMode);
         if (modalProfitSharingRow) modalProfitSharingRow.classList.remove("hidden");
         if (previewProfitSharingRow) previewProfitSharingRow.classList.remove("hidden");
+        // The Restated Total / Invoice Number pair only makes sense for a
+        // hand-added customer -- a standard case restates an existing row that
+        // already has its own real invoice/dates.
+        if (modalRestatementRow) modalRestatementRow.classList.toggle("hidden", !isCustomerMode);
         if (!isCustomerMode) {
             state.selectedSpecialCaseAgent = "";
             state.selectedSpecialCaseCustomer = "";
+            state.customerInvoices = [];
+            state.restatementPlacement = null;
+            if (modalInvoiceNumberRow) modalInvoiceNumberRow.classList.add("hidden");
+            if (modalRestatementPreviewRow) modalRestatementPreviewRow.classList.add("hidden");
         }
         if (modalAgentName) modalAgentName.disabled = true;
         if (modalCustomerName) modalCustomerName.disabled = true;
@@ -1510,6 +1536,127 @@ document.addEventListener("DOMContentLoaded", () => {
         updateSpecialCasePreview();
     }
 
+    // A customer's invoices, for the Special Case Customer modal's invoice
+    // picker. The picker only shows when there's more than one -- a
+    // single-invoice customer (the common case) is inferred silently, and
+    // `preselectInvoiceNumber` (re-opening a saved case) is restored either
+    // way once the list is in.
+    async function loadCustomerInvoicesForModal(customerName, preselectInvoiceNumber) {
+        state.customerInvoices = [];
+        state.selectedInvoiceNumber = "";
+        if (modalInvoiceNumberSelect) {
+            modalInvoiceNumberSelect.innerHTML = '<option value="">-- Choose Invoice --</option>';
+        }
+        if (modalInvoiceNumberRow) modalInvoiceNumberRow.classList.add("hidden");
+        if (!customerName) {
+            updateRestatementPreview();
+            return;
+        }
+        try {
+            const res = await fetch(`/api/customer-invoices?customer=${encodeURIComponent(customerName)}`);
+            const data = res.ok ? await res.json() : { invoices: [] };
+            const invoices = Array.isArray(data.invoices) ? data.invoices : [];
+            state.customerInvoices = invoices;
+            if (invoices.length > 1) {
+                invoices.forEach(inv => {
+                    const opt = document.createElement("option");
+                    opt.value = inv.invoice_number;
+                    const amt = Number(inv.total_amount || 0)
+                        .toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                    opt.textContent = `${inv.invoice_number} — RM ${amt} (${inv.invoice_date || "-"})`;
+                    modalInvoiceNumberSelect.appendChild(opt);
+                });
+                if (modalInvoiceNumberRow) modalInvoiceNumberRow.classList.remove("hidden");
+                if (preselectInvoiceNumber && modalInvoiceNumberSelect) {
+                    modalInvoiceNumberSelect.value = preselectInvoiceNumber;
+                }
+            } else if (invoices.length === 1) {
+                state.selectedInvoiceNumber = invoices[0].invoice_number;
+            } else if (preselectInvoiceNumber) {
+                // Lookup came back empty (e.g. a transient proxy error) but the
+                // case's own stored invoice number is still known -- keep it
+                // rather than silently dropping it.
+                state.selectedInvoiceNumber = preselectInvoiceNumber;
+            }
+        } catch (err) {
+            console.error("Error loading customer invoices:", err);
+            if (preselectInvoiceNumber) state.selectedInvoiceNumber = preselectInvoiceNumber;
+        }
+        updateRestatementPreview();
+    }
+
+    // The invoice a restated total is being checked against: the picker's own
+    // selection once a customer has more than one invoice, else whichever
+    // single invoice loadCustomerInvoicesForModal inferred silently.
+    function currentRestatementInvoiceNumber() {
+        if (modalInvoiceNumberRow && !modalInvoiceNumberRow.classList.contains("hidden")) {
+            return modalInvoiceNumberSelect ? modalInvoiceNumberSelect.value : "";
+        }
+        return state.selectedInvoiceNumber || "";
+    }
+
+    let restatementPreviewTimer = null;
+
+    // Live preview of where a restated case would land and how much of it is
+    // paid, mirroring the check special_cases_api() enforces server-side at
+    // save time (_resolve_restated_case_placement in app.py) so whoever is
+    // adding the case sees it before even trying to save.
+    function updateRestatementPreview() {
+        clearTimeout(restatementPreviewTimer);
+        if (state.specialCaseMode !== "customer" || !modalRestatementPreview) return;
+        const invoiceNumber = currentRestatementInvoiceNumber();
+        const restatedTotal = parseFloat(modalRestatedTotal?.value) || 0;
+        state.restatementPlacement = null;
+        if (!invoiceNumber || !restatedTotal) {
+            if (modalRestatementPreviewRow) modalRestatementPreviewRow.classList.add("hidden");
+            return;
+        }
+        restatementPreviewTimer = setTimeout(async () => {
+            try {
+                const res = await fetch("/api/special-cases/resolve-restatement", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ invoice_number: invoiceNumber, restated_total: restatedTotal })
+                });
+                const data = res.ok ? await res.json() : { error: "Could not resolve placement" };
+                if (modalRestatementPreviewRow) modalRestatementPreviewRow.classList.remove("hidden");
+                const amtStr = restatedTotal.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                if (data.placed) {
+                    state.restatementPlacement = data;
+                    const monthName = new Date(data.year, data.month - 1, 1)
+                        .toLocaleString(undefined, { month: "long" });
+                    modalRestatementPreview.textContent =
+                        `As of ${data.crossing_date}: ${data.pct_paid}% of RM ${amtStr} paid — will appear in ${monthName} ${data.year}.`;
+                    modalRestatementPreview.style.color = "#166534";
+                } else {
+                    modalRestatementPreview.textContent = data.error
+                        ? data.error
+                        : `${data.pct_paid ?? 0}% of RM ${amtStr} paid so far — not yet placeable on the report.`;
+                    modalRestatementPreview.style.color = "#b91c1c";
+                }
+            } catch (err) {
+                console.error("Error resolving restatement placement:", err);
+                if (modalRestatementPreviewRow) modalRestatementPreviewRow.classList.remove("hidden");
+                modalRestatementPreview.textContent = "Could not check payment status.";
+                modalRestatementPreview.style.color = "#b91c1c";
+            }
+        }, 400);
+    }
+
+    // Restated Total drives System/Sales Price directly (both stay disabled
+    // display fields) instead of being typed separately -- every real
+    // restated case has system == sales, and typing them independently would
+    // let the two silently drift.
+    function onRestatedTotalChange() {
+        if (state.specialCaseMode === "customer" && modalRestatedTotal) {
+            const val = modalRestatedTotal.value;
+            if (modalSystemPrice) modalSystemPrice.value = val;
+            if (modalSalesPrice) modalSalesPrice.value = val;
+            updateSpecialCasePreview();
+        }
+        updateRestatementPreview();
+    }
+
     function selectAgentForSpecialCase(agentName) {
         state.selectedSpecialCaseAgent = agentName;
         if (modalAgentSearch) modalAgentSearch.value = agentName;
@@ -1592,6 +1739,118 @@ modalPackageType.value = defaults.pkg || "-";
             console.error("Error loading PDF:", error);
             alert("Error loading PDF: " + error.message);
             closePdfModal();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Referral editor (Basic & NFP table)
+    // ------------------------------------------------------------------
+    // The ERP records a referrer on barely any invoice, so the name and the
+    // rate are typed here. What is saved feeds the same builder the printed
+    // packs use, so the fee on screen is the fee that gets paid.
+    let referralModalRow = null;
+
+    function referralFeePreview() {
+        const calc = document.getElementById("referralModalCalc");
+        if (!calc || !referralModalRow) return;
+        const name = (document.getElementById("referralNameInput").value || "").trim();
+        const rateText = (document.getElementById("referralRateInput").value || "").trim();
+        const rate = parseFloat(rateText);
+        if (!name) {
+            calc.textContent = "No name, so no referral fee on this row.";
+            return;
+        }
+        if (!rateText || isNaN(rate)) {
+            calc.textContent = "Enter a rate to see the fee.";
+            return;
+        }
+        const sales = Number(referralModalRow.sales) || 0;
+        calc.textContent = `${rate}% of ${formatRM(sales)} sales = ${formatRM(sales * rate / 100)}`;
+    }
+
+    function openReferralModal(row) {
+        referralModalRow = row;
+        const modal = document.getElementById("referralModal");
+        if (!modal) return;
+        const nameInput = document.getElementById("referralNameInput");
+        const rateInput = document.getElementById("referralRateInput");
+        const existing = (row.name || "").trim();
+        nameInput.value = existing === "-" ? "" : existing;
+        // The rate is not on the row, so it comes from what was saved before,
+        // falling back to the standard 2% for a referral being added now.
+        const saved = state.referralOverrides
+            && state.referralOverrides[referralKey(row.agent, row.customer)];
+        rateInput.value = saved && saved.rate ? saved.rate : "2";
+        document.getElementById("referralModalWho").textContent =
+            `${row.agent} — ${row.customer}, sales ${formatRM(Number(row.sales) || 0)}`;
+        referralFeePreview();
+        modal.style.display = "flex";
+        nameInput.focus();
+    }
+
+    function closeReferralModal() {
+        const modal = document.getElementById("referralModal");
+        if (modal) modal.style.display = "none";
+        referralModalRow = null;
+    }
+
+    function referralKey(agent, customer) {
+        return `${String(agent || "").trim().toLowerCase()}|${String(customer || "").trim().toLowerCase()}`;
+    }
+
+    /** What has been saved for this year, so the editor can show the rate back
+     *  even though the table itself carries only the resulting fee. */
+    async function loadReferralOverrides() {
+        try {
+            const res = await fetch(`/api/referral-overrides?year=${encodeURIComponent(state.activeYear)}`);
+            if (!res.ok) return;
+            const rows = await res.json();
+            const map = {};
+            (Array.isArray(rows) ? rows : []).forEach(r => {
+                map[referralKey(r.agent, r.customer)] = r;
+            });
+            state.referralOverrides = map;
+        } catch (err) {
+            console.error("Failed to read referral overrides:", err);
+        }
+    }
+
+    async function saveReferralModal() {
+        if (!referralModalRow) return;
+        const btn = document.getElementById("referralSaveBtn");
+        const name = (document.getElementById("referralNameInput").value || "").trim();
+        const rate = (document.getElementById("referralRateInput").value || "").trim();
+        btn.disabled = true;
+        const label = btn.textContent;
+        btn.textContent = "Saving…";
+        try {
+            const res = await fetch("/api/referral-overrides", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    year: state.activeYear,
+                    agent: referralModalRow.agent,
+                    customer: referralModalRow.customer,
+                    referral_name: name,
+                    rate: rate,
+                }),
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                alert(body.error || "Could not save the referral.");
+                return;
+            }
+            closeReferralModal();
+            // The fee is recomputed server-side, so the table has to come back
+            // from the server rather than being patched here.
+            await loadReferralOverrides();
+            await fetchData();
+        } catch (err) {
+            console.error("Failed to save the referral:", err);
+            alert("Could not save the referral: " + err.message);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = label;
         }
     }
 
@@ -2698,8 +2957,16 @@ modalPackageType.value = defaults.pkg || "-";
                 <span>${label}:</span> <strong>${escapeHtml(shown(value))}</strong>
             </div>`;
 
+        // The advance is earned by reaching 5% payment, so it is dated by that
+        // milestone. It used to show the invoice's 1st Payment Date, which is a
+        // different thing: a first payment can fall short of the trigger, and
+        // the row then credited it with earning an advance it had not earned.
+        // Falls back to the old cell for payloads cached before this column.
+        const advDateIdx = findIdx(n => n === "advance payment date");
+        const advanceDate = advDateIdx === -1 ? cell(firstPayIdx) : cell(advDateIdx);
+
         const out = [];
-        if (!isPreJuly) out.push(line("Advance RM 300 (1st Payment)", cell(firstPayIdx)));
+        if (!isPreJuly) out.push(line("Advance RM 300 (5% Payment)", advanceDate));
         out.push(line(isPreJuly ? "Payout (100% Payment)" : "Balance Payout (75% Payment)", payoutDate));
         return out.join("");
     }
@@ -2814,6 +3081,26 @@ modalPackageType.value = defaults.pkg || "-";
                     subtext: `Basic Commission = Sales Price × Rate % = ${fmtNum(sales)} × Rate = ${commValStr}` + clickTip
                 };
             }
+            // The rate the agent was actually assigned, carried on the row.
+            // It is NOT commission / sales: on a Balance Payout row the
+            // commission is already net of the RM300 advance, so dividing it
+            // back out invented a rate nobody assigned (4.38% for an agent on
+            // 5%). Show the assigned rate and subtract the advance in the open.
+            const rateIdx = headers.findIndex(h => h.toLowerCase().trim() === "basic rate %");
+            const advIdx = headers.findIndex(h => h.toLowerCase().trim() === "advance deducted");
+            const assignedRate = rateIdx !== -1 ? String(row[rateIdx] || "").trim() : "";
+            const advance = advIdx !== -1 ? parseNum(row[advIdx]) : 0;
+            if (sales > 0 && assignedRate && assignedRate !== "-") {
+                const advanceStr = advance > 0 ? ` - ${fmtNum(advance)}` : "";
+                return {
+                    title: `Basic Commission — ${custName}`,
+                    preformula: milestones,
+                    formula: `Sales Price = Total Amount - EPP Effective`,
+                    subtext: `Basic Commission = Sales Price × Rate % = ${fmtNum(sales)} × ${assignedRate}${advanceStr} = ${commValStr}` + clickTip
+                };
+            }
+            // Cached payloads built before the rate column existed: fall back to
+            // the old derived figure rather than showing no rate at all.
             if (sales > 0 && commPrice > 0) {
                 const ratePct = ((commPrice / sales) * 100).toFixed(2);
                 return {
@@ -3321,7 +3608,9 @@ modalPackageType.value = defaults.pkg || "-";
         // 1st Payment Date, and every merge/rowspan pass below is index-based.
         // Removing them from the array would shift all of that; skipping them
         // when the cells are emitted changes only what is drawn.
-        const HIDDEN_DETAIL_HEADERS = ["1st payment date", "basic commission (rm300)", "75% payment date"];
+        const HIDDEN_DETAIL_HEADERS = ["1st payment date", "basic commission (rm300)", "75% payment date",
+                                       "basic rate %", "advance deducted",
+                                       "advance payment date"];
         const hiddenDetailCols = new Set(
             state.activeSection !== "basic_nfp" ? [] : headers.reduce((acc, h, i) => {
                 if (HIDDEN_DETAIL_HEADERS.includes(String(h).toLowerCase().trim())) acc.push(i);
@@ -3343,6 +3632,11 @@ modalPackageType.value = defaults.pkg || "-";
             return n === "safwan" || n === "safwan (rm)";
         });
         const overrideColIdx = headers.findIndex(h => h.toLowerCase().includes("override"));
+        // The two referral cells open the same editor, so a row with no
+        // referral yet can be reached from either of them.
+        const referralNameIdx = headers.findIndex(h => h.toLowerCase().trim() === "referral name");
+        const referralFeeIdx = headers.findIndex(h => h.toLowerCase().trim() === "referral fee");
+        const salesPriceIdx = headers.findIndex(h => h.toLowerCase().trim() === "sales price");
         const totalInvColIdx = getCountColumnIdx(headers);
         const stageIdx = payoutStageIndexes(headers);
         const rm300ColIdx = stageIdx.rm300;
@@ -3897,6 +4191,26 @@ modalPackageType.value = defaults.pkg || "-";
                         }
                     }
 
+                    // Referral name and fee are hand-entered: the ERP names a
+                    // referrer on barely any invoice, so both cells open an
+                    // editor rather than being read-only. Basic rows only --
+                    // the fee is charged on the customer's basic sales, and the
+                    // NFP line of the same customer would double it.
+                    if ((ci === referralNameIdx || ci === referralFeeIdx)
+                        && !isTotalRow && custName && custName !== "-"
+                        && rowCommType.toLowerCase().includes("basic")) {
+                        td.classList.add("referral-editable");
+                        td.title = "Click to set the referral name and rate for this customer.";
+                        const salesText = salesPriceIdx !== -1 ? String(row[salesPriceIdx] || "") : "";
+                        td.addEventListener("click", () => openReferralModal({
+                            agent: agentName,
+                            customer: custName,
+                            name: referralNameIdx !== -1 ? String(row[referralNameIdx] || "") : "",
+                            fee: referralFeeIdx !== -1 ? String(row[referralFeeIdx] || "") : "",
+                            sales: parseMoneyValue(salesText),
+                        }));
+                    }
+
                     if (ci === overrideColIdx && !isTotalRow && displayVal !== "-") {
                         const ovrInfo = getOverrideBreakdownTooltip(row, headers, custName, displayVal);
                         if (ovrInfo) {
@@ -3973,8 +4287,13 @@ modalPackageType.value = defaults.pkg || "-";
                     }
 
                     // Factory: Safwan's own separate profit-sharing rate --
-                    // independent of the agent's own rate above.
-                    if (!isTotalRow && !isSpecialRow && safwanColIdx !== -1 && ci === safwanColIdx && isFactoryBasicCommission(row, headers, agentName, custName)) {
+                    // independent of the agent's own rate above. Unlike the
+                    // agent's commission price cell, this stays live on a
+                    // special-case row too: a hand-added factory customer has
+                    // no Safwan figure baked into the case, so it must fall
+                    // back to the same clickable rate-entry flow as an organic
+                    // factory row rather than showing a dead "-".
+                    if (!isTotalRow && safwanColIdx !== -1 && ci === safwanColIdx && isFactoryBasicCommission(row, headers, agentName, custName)) {
                         const safwanDisplay = getFactoryCellDisplay(row, headers, agentName, custName, "safwan");
                         if (safwanDisplay) td.innerHTML = safwanDisplay;
                         if (userObj && !userObj.readOnly) {
@@ -5133,8 +5452,11 @@ modalPackageType.value = defaults.pkg || "-";
         if (packageIdx === -1 || commissionIdx === -1) return false;
         const pkg = String(row[packageIdx] || "").toLowerCase();
         const comm = String(row[commissionIdx] || "").toLowerCase().trim();
+        // "New Basic Commission" is the same row for a hand-added special-case
+        // factory customer (e.g. a Durapower-style restatement) -- it must
+        // qualify the same way an organic "Basic Commission" row does.
         return pkg.includes("factory")
-            && comm === "basic commission"
+            && (comm === "basic commission" || comm === "new basic commission")
             && fullAgentName
             && customerName
             && customerName !== "-";
@@ -5471,6 +5793,12 @@ modalPackageType.value = defaults.pkg || "-";
     const modalRemarks = document.getElementById("modalRemarks");
     const modalProfitSharingRow = document.getElementById("modalProfitSharingRow");
     const modalProfitSharingPct = document.getElementById("modalProfitSharingPct");
+    const modalRestatementRow = document.getElementById("modalRestatementRow");
+    const modalInvoiceNumberRow = document.getElementById("modalInvoiceNumberRow");
+    const modalInvoiceNumberSelect = document.getElementById("modalInvoiceNumberSelect");
+    const modalRestatedTotal = document.getElementById("modalRestatedTotal");
+    const modalRestatementPreviewRow = document.getElementById("modalRestatementPreviewRow");
+    const modalRestatementPreview = document.getElementById("modalRestatementPreview");
 
     const modalCaseType = document.getElementById("modalCaseType");
     const modalBaselineRate = document.getElementById("modalBaselineRate");
@@ -5796,6 +6124,12 @@ modalPackageType.value = defaults.pkg || "-";
         // deliberately overrides it.
         if (modalGanOverridePct) modalGanOverridePct.value = "";
         modalRemarks.value = "";
+        if (modalRestatedTotal) modalRestatedTotal.value = "";
+        state.customerInvoices = [];
+        state.selectedInvoiceNumber = "";
+        state.restatementPlacement = null;
+        if (modalInvoiceNumberRow) modalInvoiceNumberRow.classList.add("hidden");
+        if (modalRestatementPreviewRow) modalRestatementPreviewRow.classList.add("hidden");
 
         confirmModalBtn.textContent = "Confirm & Add";
         onSpecialCaseTypeChange();
@@ -5826,6 +6160,11 @@ modalPackageType.value = defaults.pkg || "-";
         if (isCustomerMode) {
             populateAgentDropdown(data.agent);
             populateCustomerDropdown(data.agent, data.customer);
+            if (modalRestatedTotal) modalRestatedTotal.value = data.restatedTotal || "";
+            // Populates the invoice picker (if this customer has more than
+            // one invoice) and re-selects the case's own stored invoice,
+            // then re-runs the live preview against the values just set.
+            loadCustomerInvoicesForModal(data.customer, data.linkedInvoiceNumber || "");
         }
 
         modalPackageType.value = data.pkg;
@@ -5883,6 +6222,12 @@ modalPackageType.value = defaults.pkg || "-";
     if (modalCaseType) {
         modalCaseType.addEventListener("change", onSpecialCaseTypeChange);
     }
+    if (modalRestatedTotal) {
+        modalRestatedTotal.addEventListener("input", onRestatedTotalChange);
+    }
+    if (modalInvoiceNumberSelect) {
+        modalInvoiceNumberSelect.addEventListener("change", updateRestatementPreview);
+    }
     if (modalAgentSelect) {
         modalAgentSelect.addEventListener("change", (e) => {
             const selectedAgent = e.target.value;
@@ -5895,6 +6240,7 @@ modalPackageType.value = defaults.pkg || "-";
                 state.selectedSpecialCaseCustomer = selectedCust;
                 if (modalCustomerName) modalCustomerName.value = selectedCust;
                 selectCustomerForSpecialCase(selectedCust);
+                if (state.specialCaseMode === "customer") loadCustomerInvoicesForModal(selectedCust);
             } else {
                 modalCustomerName.value = "";
             }
@@ -5908,6 +6254,7 @@ modalPackageType.value = defaults.pkg || "-";
             if (selectedCust) {
                 selectCustomerForSpecialCase(selectedCust);
             }
+            if (state.specialCaseMode === "customer") loadCustomerInvoicesForModal(selectedCust);
         });
     }
 
@@ -5981,6 +6328,24 @@ modalPackageType.value = defaults.pkg || "-";
             if (state.specialCaseMode === "customer" && (!agent || !customer || customer === "(Unknown)")) {
                 alert("Please select both an agent and a customer from the database list first.");
                 return;
+            }
+
+            const restatedTotalVal = (state.specialCaseMode === "customer" && modalRestatedTotal)
+                ? (parseFloat(modalRestatedTotal.value) || 0) : 0;
+            const linkedInvoiceNumberVal = (state.specialCaseMode === "customer")
+                ? (currentRestatementInvoiceNumber() || "") : "";
+            if (state.specialCaseMode === "customer" && restatedTotalVal > 0) {
+                if (!linkedInvoiceNumberVal) {
+                    alert("Please choose which invoice this restated total is for.");
+                    return;
+                }
+                // Mirrors the check special_cases_api() makes server-side --
+                // checked here too so a doomed save never round-trips.
+                if (!state.restatementPlacement || !state.restatementPlacement.placed) {
+                    const pct = state.restatementPlacement ? state.restatementPlacement.pct_paid : 0;
+                    alert(`Not yet fully paid against the restated total (${pct}% paid so far) — this case can't be placed on the report yet.`);
+                    return;
+                }
             }
 
             const basicComm = salesForCalc * ((rate + profitSharingPct) / 100);
@@ -6096,7 +6461,9 @@ modalPackageType.value = defaults.pkg || "-";
                 agent, customer, pkg, system, nfp, sales, rate, remarks,
                 profitSharingPct, specialCaseType, feeWaiver, adjustedSalesPrice,
                 caseType: state.specialCaseMode, rowKind,
-                ganOverridePct: ganOverridePctRaw
+                ganOverridePct: ganOverridePctRaw,
+                restatedTotal: restatedTotalVal || null,
+                linkedInvoiceNumber: linkedInvoiceNumberVal || null
             };
 
             // Gan-only: nothing is restated, so the row the user clicked keeps
@@ -6593,19 +6960,12 @@ modalPackageType.value = defaults.pkg || "-";
         fetch("/api/agent-roles")
             .then(res => res.json())
             .then(roles => {
+                // IC No comes from the Data page's roles table only — Postgres
+                // never carried it as text, and since 2026-09 supplies nothing
+                // but agent names.
                 const matched = Array.isArray(roles) && roles.find(r => r.agent && r.agent.toLowerCase().trim() === resolvedName.toLowerCase().trim());
                 if (matched && matched.ic_no) {
                     setSlipIcValue(matched.ic_no);
-                } else {
-                    fetch("/api/agent-roles/pg-list")
-                        .then(res => res.json())
-                        .then(data => {
-                            const pgMatched = data.agents && data.agents.find(a => a.name && a.name.toLowerCase().trim() === resolvedName.toLowerCase().trim());
-                            if (pgMatched && pgMatched.ic_no) {
-                                setSlipIcValue(pgMatched.ic_no);
-                            }
-                        })
-                        .catch(() => {});
                 }
             })
             .catch(() => {});
@@ -6866,7 +7226,12 @@ modalPackageType.value = defaults.pkg || "-";
     // Load the agent full-name map before the first data render so every table
     // shows canonical full names from the outset.
     initAgentNameMap().finally(() =>
-        invalidateStaleCommissionCacheOnServerRestart().finally(() => fetchData())
+        // The saved referral rates ride along with the first load: the table
+        // carries only the resulting fee, so the editor needs them to show a
+        // rate back when someone reopens a row.
+        loadReferralOverrides().finally(() =>
+            invalidateStaleCommissionCacheOnServerRestart().finally(() => fetchData())
+        )
     );
 });
 

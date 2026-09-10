@@ -46,8 +46,10 @@
                 <td>${fmtDate(u.created_at)}</td>
                 <td class="row-actions">
                     <button class="btn btn-secondary" data-action="role" data-id="${u.id}" data-role="${u.role}">Toggle role</button>
-                    <button class="btn btn-secondary" data-action="reset" data-id="${u.id}">Reset password</button>
-                    ${u.is_active ? `<button class="btn btn-danger" data-action="deactivate" data-id="${u.id}">Deactivate</button>` : ""}
+                    <button class="btn btn-secondary" data-action="password" data-id="${u.id}" data-username="${escapeHtml(u.username)}" data-active="${u.is_active ? "1" : "0"}">Set password</button>
+                    ${u.is_active
+                        ? `<button class="btn btn-danger" data-action="deactivate" data-id="${u.id}">Deactivate</button>`
+                        : `<button class="btn btn-primary" data-action="reactivate" data-id="${u.id}">Reactivate</button>`}
                 </td>
             `;
             tbody.appendChild(tr);
@@ -58,47 +60,141 @@
         });
     }
 
+    // These calls used to ignore the response, so anything the server
+    // rejected -- a password under six characters, a name already taken --
+    // still looked like it had worked.
+    async function sendUserUpdate(id, payload, method) {
+        const options = { method: method || "PUT" };
+        if (payload) {
+            options.headers = { "Content-Type": "application/json" };
+            options.body = JSON.stringify(payload);
+        }
+        const res = await api(`/api/admin/users/${id}`, options);
+        let data = {};
+        try {
+            data = await res.json();
+        } catch (e) {
+            // some responses carry no body; the status is what matters
+        }
+        if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+        return data;
+    }
+
     async function handleUserAction(btn) {
         const id = btn.getAttribute("data-id");
         const action = btn.getAttribute("data-action");
 
-        if (action === "deactivate") {
-            if (!confirm("Deactivate this user? They will no longer be able to log in.")) return;
-            await api(`/api/admin/users/${id}`, { method: "DELETE" });
-            loadUsers();
-            loadAudit();
+        if (action === "password") {
+            openPasswordModal(id, btn.getAttribute("data-username"),
+                              btn.getAttribute("data-active") === "1");
             return;
         }
 
-        if (action === "role") {
+        let payload = null;
+        let method = "PUT";
+
+        if (action === "deactivate") {
+            if (!confirm("Deactivate this user? They will no longer be able to log in.")) return;
+            method = "DELETE";
+        } else if (action === "reactivate") {
+            if (!confirm("Reactivate this user? They will be able to log in again with their existing password.")) return;
+            payload = { is_active: true };
+        } else if (action === "role") {
             const currentRole = btn.getAttribute("data-role");
             const newRole = currentRole === "admin" ? "staff" : "admin";
             if (!confirm(`Change role to '${newRole}'?`)) return;
-            await api(`/api/admin/users/${id}`, {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ role: newRole })
-            });
-            loadUsers();
-            loadAudit();
+            payload = { role: newRole };
+        } else {
             return;
         }
 
-        if (action === "reset") {
-            const password = prompt("New password (min 6 characters):");
-            if (!password) return;
-            if (password.length < 6) {
-                alert("Password must be at least 6 characters.");
-                return;
-            }
-            await api(`/api/admin/users/${id}`, {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ password })
-            });
-            alert("Password reset.");
-            loadAudit();
+        btn.disabled = true;
+        try {
+            await sendUserUpdate(id, payload, method);
+        } catch (e) {
+            alert(e.message);
+            return;
+        } finally {
+            btn.disabled = false;
         }
+        loadUsers();
+        loadAudit();
+    }
+
+    // ── Set-password dialog ──────────────────────────────────────────────────
+    // A dialog rather than prompt(): the Portal runs inside Electron, which
+    // does not implement window.prompt(), so the old Reset password button
+    // did nothing at all on the desktop app.
+    let pwUserId = null;
+
+    function setPwVisibility(show) {
+        const type = show ? "text" : "password";
+        document.getElementById("pwNew").type = type;
+        document.getElementById("pwConfirm").type = type;
+    }
+
+    function openPasswordModal(id, username, isActive) {
+        pwUserId = id;
+        document.getElementById("pwTargetName").textContent = username;
+        document.getElementById("pwNew").value = "";
+        document.getElementById("pwConfirm").value = "";
+        document.getElementById("pwShow").checked = false;
+        setPwVisibility(false);
+        document.getElementById("pwError").textContent = "";
+        // Reactivating someone and handing them a new password is one errand,
+        // so a deactivated account offers both in the same dialog.
+        document.getElementById("pwReactivateRow").style.display = isActive ? "none" : "flex";
+        document.getElementById("pwReactivate").checked = !isActive;
+        document.getElementById("pwModal").style.display = "flex";
+        document.getElementById("pwNew").focus();
+    }
+
+    function closePasswordModal() {
+        document.getElementById("pwModal").style.display = "none";
+        // Do not leave the typed password sitting in the DOM.
+        document.getElementById("pwNew").value = "";
+        document.getElementById("pwConfirm").value = "";
+        pwUserId = null;
+    }
+
+    async function savePassword() {
+        if (pwUserId === null) return;
+        const password = document.getElementById("pwNew").value;
+        const confirmation = document.getElementById("pwConfirm").value;
+        const errorBox = document.getElementById("pwError");
+        errorBox.textContent = "";
+
+        if (password.length < 6) {
+            errorBox.textContent = "Password must be at least 6 characters.";
+            return;
+        }
+        if (password !== confirmation) {
+            errorBox.textContent = "The two passwords do not match.";
+            return;
+        }
+
+        const payload = { password };
+        const reactivate = document.getElementById("pwReactivateRow").style.display !== "none"
+            && document.getElementById("pwReactivate").checked;
+        if (reactivate) payload.is_active = true;
+
+        const saveBtn = document.getElementById("pwSaveBtn");
+        saveBtn.disabled = true;
+        try {
+            await sendUserUpdate(pwUserId, payload);
+        } catch (e) {
+            errorBox.textContent = e.message;
+            return;
+        } finally {
+            saveBtn.disabled = false;
+        }
+
+        closePasswordModal();
+        loadUsers();
+        loadAudit();
+        alert(reactivate
+            ? "Password set, and the account can log in again."
+            : "Password set.");
     }
 
     async function addUser() {
@@ -182,6 +278,23 @@
     }
 
     document.getElementById("addUserBtn").addEventListener("click", addUser);
+    document.getElementById("pwSaveBtn").addEventListener("click", savePassword);
+    document.getElementById("pwCancelBtn").addEventListener("click", closePasswordModal);
+    document.getElementById("pwModalClose").addEventListener("click", closePasswordModal);
+    document.getElementById("pwModal").addEventListener("click", (e) => {
+        if (e.target.id === "pwModal") closePasswordModal();
+    });
+    document.getElementById("pwShow").addEventListener("change", (e) => setPwVisibility(e.target.checked));
+    ["pwNew", "pwConfirm"].forEach((id) => {
+        document.getElementById(id).addEventListener("keydown", (e) => {
+            if (e.key === "Enter") savePassword();
+        });
+    });
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && document.getElementById("pwModal").style.display !== "none") {
+            closePasswordModal();
+        }
+    });
     document.getElementById("entityFilter").addEventListener("change", loadAudit);
     document.getElementById("logoutBtn").addEventListener("click", async () => {
         await fetch("/logout", { method: "POST" });

@@ -13,11 +13,20 @@
         other: "#5CCEB4",
     };
 
+    // Deliberately not the greens above: this bar splits sales by who sold it,
+    // not commission by scheme, and sharing a palette would invite reading one
+    // as a subdivision of the other.
+    const CHANNEL_COLORS = {
+        internal: "#2563EB",
+        outsource: "#7C9CF5",
+    };
+
     const state = { year: "2026", month: "8" };
 
     const yearSelect = document.getElementById("yearSelect");
     const monthSelect = document.getElementById("monthSelect");
-    const cardsRow = document.getElementById("overviewCards");
+    const moneyRow = document.getElementById("overviewCardsMoney");
+    const countsRow = document.getElementById("overviewCardsCounts");
     const loader = document.getElementById("overviewLoader");
     const emptyView = document.getElementById("overviewEmpty");
 
@@ -85,19 +94,30 @@
 
     function renderCards(totals, prev) {
         const p = prev || {};
-        cardsRow.innerHTML = [
+        // Two rows, deliberately. The four ringgit figures on the first, the
+        // three headcounts on the second, so the eye is not jumping between
+        // money and people along one line. Effective Rate joins the second row
+        // rather than making a fifth on the first, where it wrapped onto a line
+        // of its own and read as an orphan.
+        moneyRow.innerHTML = [
             makeCard("Total Sales", fmtCompact(totals.sales), deltaText(totals.sales, prev ? p.sales : null)),
             makeCard("Total Commission", fmtRM(totals.total), deltaText(totals.total, prev ? p.total : null)),
-            makeCard("Effective Rate", `${(Number(totals.effective_rate) || 0).toFixed(2)}%`,
-                deltaText(totals.effective_rate, prev ? p.effective_rate : null, "points")),
+            makeCard("Total Other Commission", fmtRM(totals.other_commission),
+                deltaText(totals.other_commission, prev ? p.other_commission : null)),
+            makeCard("Total Referral Fee", fmtRM(totals.referral_fee),
+                deltaText(totals.referral_fee, prev ? p.referral_fee : null)),
+        ].join("");
+        countsRow.innerHTML = [
             makeCard("Total Agents", String(totals.agents ?? 0),
                 deltaText(totals.agents, prev ? p.agents : null, "count")),
             makeCard("Total Customers/ Invoices", String(totals.customers ?? 0),
                 deltaText(totals.customers, prev ? p.customers : null, "count")),
-            makeCard("Total Other Commission", fmtRM(totals.other_commission),
-                deltaText(totals.other_commission, prev ? p.other_commission : null)),
-            makeCard("Referral Fee", fmtRM(totals.referral_fee),
-                deltaText(totals.referral_fee, prev ? p.referral_fee : null)),
+            // Distinct referrers, counted once each however many cases they
+            // brought, so it reads beside the other two headcounts.
+            makeCard("Total Referral", String(totals.referrals ?? 0),
+                deltaText(totals.referrals, prev ? p.referrals : null, "count")),
+            makeCard("Effective Rate", `${(Number(totals.effective_rate) || 0).toFixed(2)}%`,
+                deltaText(totals.effective_rate, prev ? p.effective_rate : null, "points")),
         ].join("");
     }
 
@@ -142,10 +162,13 @@
         return `<span class="rank-badge flat">—</span>`;
     }
 
-    function renderTopPerformers(rows) {
-        const box = document.getElementById("topPerformers");
+    /** Both leaderboards share this: the only differences are which figure
+     *  is ranked and what to say when there is nothing to rank. */
+    function renderLeaderboard(boxId, rows, field, emptyText) {
+        const box = document.getElementById(boxId);
+        if (!box) return;
         if (!rows || !rows.length) {
-            box.innerHTML = `<div class="top-row"><span>No agents with commission this period.</span></div>`;
+            box.innerHTML = `<div class="top-row"><span>${escapeHtml(emptyText)}</span></div>`;
             return;
         }
         box.innerHTML = rows.map((r, i) => `
@@ -153,8 +176,48 @@
                 <span class="top-rank">${String(i + 1).padStart(2, "0")}</span>
                 <span class="top-tag ${r.type === "Internal" ? "int" : "out"}">${r.type === "Internal" ? "INT" : "OUT"}</span>
                 <span class="top-name">${escapeHtml(r.agent)}</span>
-                <span class="top-amt">${fmtRM(r.total)}</span>
+                <span class="top-amt">${fmtRM(r[field])}</span>
                 ${rankBadge(r.rank_change)}
+            </div>`).join("");
+    }
+
+    function renderTopPerformers(rows) {
+        renderLeaderboard("topPerformers", rows, "total",
+            "No agents with commission this period.");
+    }
+
+    function renderTopSales(rows) {
+        renderLeaderboard("topSalesPerformers", rows, "sales",
+            "No agents with sales this period.");
+    }
+
+    /** Sales split by who sold it. Same shape as Commission by Type so the two
+     *  read as a pair, but only two segments. */
+    function renderSalesByType(byType) {
+        const segments = [
+            { key: "internal", label: "Internal", value: Number((byType || {}).internal) || 0 },
+            { key: "outsource", label: "Outsource", value: Number((byType || {}).outsource) || 0 },
+        ];
+        const sum = segments.reduce((a, x) => a + x.value, 0);
+        const bar = document.getElementById("salesBar");
+        const legend = document.getElementById("salesLegend");
+        if (!bar || !legend) return;
+
+        if (!sum) {
+            bar.innerHTML = `<div class="payout-seg" style="width:100%; background:var(--border-color);"></div>`;
+            legend.innerHTML = `<div class="payout-legend-row"><span>No sales this period</span></div>`;
+            return;
+        }
+        bar.innerHTML = segments.filter(x => x.value > 0).map(x =>
+            `<div class="payout-seg" title="${escapeHtml(x.label)}"
+                  style="width:${(x.value / sum * 100).toFixed(2)}%; background:${CHANNEL_COLORS[x.key]};"></div>`
+        ).join("");
+        legend.innerHTML = segments.map(x => `
+            <div class="payout-legend-row">
+                <span class="payout-dot" style="background:${CHANNEL_COLORS[x.key]}"></span>
+                <span class="payout-name">${escapeHtml(x.label)}</span>
+                <span class="payout-pct">${(x.value / sum * 100).toFixed(1)}%</span>
+                <strong class="payout-amt">${fmtRM(x.value)}</strong>
             </div>`).join("");
     }
 
@@ -181,10 +244,14 @@
             if (!res.ok) throw new Error(data.error || "Failed to load overview");
 
             if (!data.ready) {
-                cardsRow.innerHTML = "";
+                moneyRow.innerHTML = "";
+                countsRow.innerHTML = "";
                 document.getElementById("payoutBar").innerHTML = "";
                 document.getElementById("payoutLegend").innerHTML = "";
                 document.getElementById("topPerformers").innerHTML = "";
+                document.getElementById("salesBar").innerHTML = "";
+                document.getElementById("salesLegend").innerHTML = "";
+                document.getElementById("topSalesPerformers").innerHTML = "";
                 const keepTrying = retries < MAX_RETRIES;
                 document.getElementById("overviewEmptyMsg").textContent = keepTrying
                     ? `${data.message || "Commission data is still being prepared."} Retrying…`
@@ -200,9 +267,15 @@
             renderCards(data.totals, data.prev_totals);
             renderPayoutByType(data.totals);
             renderTopPerformers(data.top_performers);
+            renderSalesByType(data.sales_by_type);
+            renderTopSales(data.top_sales);
 
-            document.getElementById("overviewPeriod").textContent =
-                `${MONTH_NAMES[parseInt(state.month, 10) - 1]} ${state.year}`;
+            // A year-to-date view names its range rather than a single month,
+            // so the heading cannot be read as one month's figures.
+            const mth = parseInt(state.month, 10);
+            document.getElementById("overviewPeriod").textContent = (mth > 0)
+                ? `${MONTH_NAMES[mth - 1]} ${state.year}`
+                : `January – ${MONTH_NAMES[(data.ytd_through || 12) - 1]} ${state.year}`;
             document.getElementById("overviewSubHeader").textContent = data.scoped_to_agent
                 ? `Sales & commission analysis — ${data.scoped_to_agent}`
                 : "Sales & commission analysis — all agents";

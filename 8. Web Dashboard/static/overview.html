@@ -30,6 +30,7 @@
                 <label class="group-label">Reporting Period</label>
                 <div class="select-wrapper">
                     <select id="monthSelect">
+                        <option value="0">All months (year to date)</option>
                         <option value="1">January 2026</option>
                         <option value="2">February 2026</option>
                         <option value="3">March 2026</option>
@@ -51,7 +52,7 @@
                  only difference is which item carries .active: Overview here,
                  the chosen section there. -->
             <div class="sidebar-group">
-                <label class="group-label">Navigation</label>
+                <label class="group-label">Sales Section</label>
                 <ul class="nav-list">
                     <li class="active"><span class="bullet"></span> Overview</li>
                     <li class="nav-link-item"><a href="/sales-report"><span class="bullet"></span> Sales Report</a></li>
@@ -128,7 +129,13 @@
                 </div>
             </header>
 
-            <section class="metrics-row" id="overviewCards"></section>
+            <!-- Two grids, not one wrapping grid: the money figures and the
+                 headcounts each need to sit on their own line whatever the
+                 window width, and an auto-fitting grid would reflow them
+                 together. -->
+            <section class="metrics-row" id="overviewCardsMoney"></section>
+            <section class="metrics-row" id="overviewCardsCounts"
+                     style="margin-top: 24px;"></section>
 
             <section class="overview-grid">
                 <div class="card overview-panel">
@@ -140,6 +147,21 @@
                 <div class="card overview-panel">
                     <div class="card-header"><h3>Top Performers</h3></div>
                     <div class="top-performers" id="topPerformers"></div>
+                </div>
+            </section>
+
+            <!-- The same two shapes again, for sales rather than commission.
+                 Kept as their own row so both pairs can be read at once. -->
+            <section class="overview-grid" style="margin-top: 24px;">
+                <div class="card overview-panel">
+                    <div class="card-header"><h3>Sales by Type</h3></div>
+                    <div class="payout-bar" id="salesBar"></div>
+                    <div class="payout-legend" id="salesLegend"></div>
+                </div>
+
+                <div class="card overview-panel">
+                    <div class="card-header"><h3>Top Sales Performers</h3></div>
+                    <div class="top-performers" id="topSalesPerformers"></div>
                 </div>
             </section>
 
@@ -155,7 +177,7 @@
         </main>
     </div>
 
-    <script src="/static/overview.js?v=20260812-overview-v2"></script>
+    <script src="/static/overview.js?v=20260910-salesboxes"></script>
     <script src="/static/updater.js?v=20260731-ota-v1"></script>
 </body>
 </html>

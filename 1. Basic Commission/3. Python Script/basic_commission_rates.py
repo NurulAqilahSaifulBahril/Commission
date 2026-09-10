@@ -692,6 +692,11 @@ def milestone_sql_parts(thresholds=None, exclusions: str = None):
     running total reached that share of the invoice. 100% compares against the
     total directly rather than multiplying by 1.0, so an invoice paid to the cent
     is not pushed below the line by binary rounding.
+
+    That 100% comparison also allows one cent of slack: total_amount is a
+    numeric column carrying float-conversion noise on some rows (e.g.
+    25593.440000000002), which made a handful of invoices paid to the cent
+    fail a strict >= by a fraction of a sen and sit unrecognised forever.
     """
     thresholds = list(thresholds or payout_thresholds_in_use())
     if Decimal("100") not in thresholds:
@@ -702,7 +707,7 @@ def milestone_sql_parts(thresholds=None, exclusions: str = None):
         name = f"pct_{_threshold_slug(t)}"
         col = milestone_column(t)
         if t == Decimal("100"):
-            cmp_sql = "sub.running_total >= sub.total_amount"
+            cmp_sql = "sub.running_total >= sub.total_amount - 0.01"
         else:
             frac = (Decimal(t) / Decimal("100")).normalize()
             cmp_sql = f"sub.running_total >= sub.total_amount * {format(frac, 'f')}"

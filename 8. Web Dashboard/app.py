@@ -366,6 +366,199 @@ def _annotate_gan_override(rows: list, headers: list, agent_i: int, customer_i: 
         return
 
 
+# Process-lifetime cache for _fetch_live_customer_dates: special cases are
+# rare and their invoice/payment dates never change once paid, so there is no
+# need to re-hit the proxy on every request that renders this customer's row.
+_LIVE_CUSTOMER_DATES_CACHE: dict[str, dict] = {}
+_RESTATED_PLACEMENT_CACHE: dict[tuple[str, float], dict] = {}
+
+
+def _fetch_live_customer_dates(customer_name: str, invoice_number: str | None = None) -> dict:
+    """Invoice/1st-payment/full-payment dates for a customer straight from the
+    live DB, keyed the same way _organic_dates/_lines_dates return them.
+
+    A hand-added special case (e.g. a Durapower-style restatement) can name a
+    customer whose only invoice falls outside the report year -- the cached
+    commission bundle _lines_dates reads from is scoped to that one year, so
+    it never finds it. This looks the customer up directly, with no year
+    restriction, and -- critically -- takes the full/last payment date from
+    SUM'd payment rows rather than invoice.full_payment_date: that column
+    goes stale whenever a payment is recorded through the newer payment app,
+    which is exactly the kind of invoice a special case gets raised for.
+
+    All three dates come back shifted from UTC to Asia/Kuala_Lumpur (+8h,
+    no DST) before truncation to a calendar date -- Bubble-era rows store
+    local midnight as 16:00 UTC the prior day, so truncating the raw UTC
+    string reads one day early.
+
+    `invoice_number`, when given, narrows the match to that one invoice
+    instead of every invoice under the customer's name -- needed once a
+    customer can have more than one invoice and only one of them is the
+    restated deal this case is about.
+    """
+    invoice_number = str(invoice_number or "").strip()
+    key = f"{customer_name.strip().lower()}|{invoice_number}"
+    if not customer_name.strip():
+        return {}
+    if key in _LIVE_CUSTOMER_DATES_CACHE:
+        return _LIVE_CUSTOMER_DATES_CACHE[key]
+
+    out: dict = {}
+    try:
+        import urllib.request
+        from datetime import timedelta
+
+        token, proxy_url, db_name = build_commission_pack._resolve_proxy_credentials()
+        if not token:
+            return {}
+        # The pg-proxy for this DB rejects the extended-query protocol (a %s
+        # placeholder errors with "syntax error at or near \"%\""); every
+        # other query in this codebase inlines its literals for the same
+        # reason, so this does too, with the customer name's own quotes
+        # doubled per standard SQL string-literal escaping.
+        safe_customer = customer_name.replace("'", "''")
+        invoice_filter = ""
+        if invoice_number:
+            safe_inv = invoice_number.replace("'", "''")
+            invoice_filter = f" AND TRIM(i.invoice_number) = '{safe_inv}'"
+        sql = f"""
+            SELECT i.invoice_date, i."1st_payment_date" AS first_payment_date,
+                   MAX(p.payment_date) AS live_full_pay,
+                   i.full_payment_date AS stale_full_pay
+            FROM invoice i
+            LEFT JOIN customer c ON c.customer_id = i.linked_customer
+            LEFT JOIN payment p ON p.linked_invoice = i.bubble_id
+            WHERE i.is_deleted IS NOT TRUE
+              AND LOWER(TRIM(COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name))) = LOWER(TRIM('{safe_customer}')){invoice_filter}
+            GROUP BY i.bubble_id, i.invoice_date, i."1st_payment_date", i.full_payment_date
+        """
+        body = json.dumps({"db_name": db_name, "sql": sql, "params": []}).encode()
+        req = urllib.request.Request(
+            proxy_url, data=body, method="POST",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode())
+
+        def _local_date(v) -> str:
+            if not v or str(v).lower() in ("none", "null"):
+                return ""
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(str(v).replace("Z", "+00:00")) + timedelta(hours=8)
+                return dt.strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                return str(v)[:10]
+
+        inv_dates, first_dates, full_dates = set(), set(), set()
+        for r in payload.get("rows") or []:
+            d = _local_date(r.get("invoice_date"))
+            if d:
+                inv_dates.add(d)
+            d = _local_date(r.get("first_payment_date"))
+            if d:
+                first_dates.add(d)
+            d = _local_date(r.get("live_full_pay") or r.get("stale_full_pay"))
+            if d:
+                full_dates.add(d)
+
+        cells: dict[str, str] = {}
+        if inv_dates:
+            cells["invoice_date"] = "<br/>".join(sorted(inv_dates))
+        if first_dates:
+            cells["first_payment_date"] = "<br/>".join(sorted(first_dates))
+        if full_dates:
+            cells["full_payment_date"] = "<br/>".join(sorted(full_dates))
+        if cells:
+            out = cells
+    except Exception:
+        out = {}
+
+    _LIVE_CUSTOMER_DATES_CACHE[key] = out
+    return out
+
+
+def _resolve_restated_case_placement(invoice_number: str, restated_total: float) -> dict:
+    """Where/how-paid a restated-total special case is, from real payments.
+
+    A restated customer case (e.g. Durapower) names a deal total that isn't
+    anywhere in the invoice data -- the invoice's own total_amount is the
+    pre-restatement figure. This mirrors the running-total-vs-threshold
+    pattern basic_commission_rates.milestone_sql_parts uses for the 100%
+    milestone (same -0.01 tolerance, same MILESTONE_PAYMENT_EXCLUSIONS), but
+    against `restated_total` instead of invoice.total_amount, and in Python
+    rather than SQL since there is only ever one invoice to walk.
+
+    Returns {"placed": True, "year", "month", "crossing_date", "pct_paid"}
+    once cumulative payments reach the restated total, else
+    {"placed": False, "pct_paid": ...} (optionally with "error").
+    """
+    invoice_number = str(invoice_number or "").strip()
+    try:
+        restated_total = float(restated_total)
+    except (TypeError, ValueError):
+        restated_total = 0.0
+    if not invoice_number or restated_total <= 0:
+        return {"placed": False, "pct_paid": 0.0, "error": "Missing invoice number or restated total"}
+
+    cache_key = (invoice_number.lower(), restated_total)
+    if cache_key in _RESTATED_PLACEMENT_CACHE:
+        return _RESTATED_PLACEMENT_CACHE[cache_key]
+
+    try:
+        rates_dir = str(REPO_ROOT / "1. Basic Commission" / "3. Python Script")
+        if rates_dir not in sys.path:
+            sys.path.append(rates_dir)
+        from basic_commission_rates import MILESTONE_PAYMENT_EXCLUSIONS
+
+        safe_inv = invoice_number.replace("'", "''")
+        rows = _pg_query(f"""
+            SELECT p.id, p.payment_date, p.amount
+            FROM payment p
+            JOIN invoice i ON i.bubble_id = p.linked_invoice
+            WHERE TRIM(i.invoice_number) = '{safe_inv}'
+              AND p.id NOT IN ({MILESTONE_PAYMENT_EXCLUSIONS})
+            ORDER BY p.payment_date ASC, p.id ASC
+        """)
+    except Exception:
+        _log("[RESTATED CASE PLACEMENT ERROR]\n" + traceback.format_exc())
+        return {"placed": False, "pct_paid": 0.0, "error": "Could not read payments"}
+
+    def _local_date(v):
+        if not v:
+            return None
+        try:
+            from datetime import datetime, timedelta
+            # Same +8h (Asia/Kuala_Lumpur, no DST) shift as _fetch_live_customer_dates:
+            # Bubble-era rows store local midnight as 16:00 UTC the prior day, so a raw
+            # UTC truncation would push a late-day payment into the wrong month.
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00")) + timedelta(hours=8)
+        except (ValueError, TypeError):
+            return None
+
+    running = 0.0
+    crossing_dt = None
+    for r in rows:
+        try:
+            amt = float(r.get("amount") or 0)
+        except (TypeError, ValueError):
+            amt = 0.0
+        running += amt
+        if crossing_dt is None and running >= restated_total - 0.01:
+            crossing_dt = _local_date(r.get("payment_date"))
+
+    pct_paid = round((running / restated_total * 100) if restated_total else 0.0, 1)
+    result = ({"placed": False, "pct_paid": pct_paid} if crossing_dt is None else {
+        "placed": True,
+        "year": crossing_dt.year,
+        "month": crossing_dt.month,
+        "crossing_date": crossing_dt.strftime("%Y-%m-%d"),
+        "pct_paid": pct_paid,
+    })
+    _RESTATED_PLACEMENT_CACHE[cache_key] = result
+    return result
+
+
 def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, agent_type: str) -> None:
     """Overlay special cases (added via the "Add Special Case" / "Add Special
     Case Customer" modal) onto the commission rows returned to the browser.
@@ -409,6 +602,7 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
     comm_i = idx("Commission", "Commission Type")
     price_i = idx("Commission Price")
     gan_i = idx("Gan Lai Soon", "Gan Lai Soon (RM)")
+    safwan_i = idx("Safwan (RM)")
     remarks_i = idx("Remarks")
     inv_date_i = idx("Invoice Date")
     first_pay_i = idx("1st Payment Date")
@@ -420,6 +614,29 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
     # and takes no override on his own invoices.
     def _is_ogm(name: str) -> bool:
         return name.lower().strip() == "gan lai soon"
+
+    # Safwan's own factory profit-sharing rate, keyed by (agent, customer),
+    # from the same factory_rates bucket build_commission_pack.py reads for
+    # organic invoices (get_dashboard_factory_rate in outsource_basic_commission.py).
+    # A hand-added factory special case has no invoice for that lookup to run
+    # against, so it must read the same table directly to land on the same
+    # figure instead of always falling back to 0%.
+    try:
+        _factory_rate_rows = db.get_factory_rates_rows(str(year), str(month), agent_type)
+    except Exception:
+        _factory_rate_rows = []
+
+    def _safwan_sharing_pct(agent_name: str, customer_name: str) -> float:
+        want_agent = agent_name.strip().lower()
+        want_cust = customer_name.strip().lower()
+        for r in _factory_rate_rows:
+            if str(r.get("agent") or "").strip().lower() == want_agent \
+               and str(r.get("customer") or "").strip().lower() == want_cust:
+                try:
+                    return float(r.get("safwan_rate") or 0) / 100.0
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
 
     def _organic_dates(agent_name: str, customer_name: str) -> dict:
         """Date cells ('basic'/'nfp' -> {col: value}) of the customer's own rows
@@ -517,6 +734,9 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
                                     else db.DEFAULT_GAN_OVERRIDE_PCT)
             except (TypeError, ValueError):
                 gan_override_pct = db.DEFAULT_GAN_OVERRIDE_PCT
+            linked_invoice_number = str(case.get("linkedInvoiceNumber") or "").strip()
+            restated_total_raw = case.get("restatedTotal")
+            restated_total = float(restated_total_raw) if restated_total_raw else 0.0
         except (TypeError, ValueError):
             continue
         if not agent or not customer:
@@ -560,12 +780,47 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
         gan_comm = (sales_for_calc * (gan_override_pct / 100)
                     if (agent_type == "outsource" and not _is_ogm(agent)) else 0.0)
 
+        # Safwan's own factory profit-sharing cut: 0.5% of sales by default,
+        # plus whatever rate was negotiated on the Factory "Profit Sharing"
+        # popup for this (agent, customer) pair -- same formula as the organic
+        # Factory path in build_commission_pack.py. He earns nothing on his
+        # own invoices, and only Factory-package cases carry this at all.
+        is_factory_case = "factory" in pkg.lower()
+        safwan_comm = (sales_for_calc * (0.005 + _safwan_sharing_pct(agent, customer))
+                       if (is_factory_case and agent.strip().lower() != "safwan") else 0.0)
+
         data_json = json.dumps({k: case.get(k) for k in db.SPECIAL_CASE_FIELDS})
 
         # Invoice/payment dates for this case's customer: their rows already in
         # the table first, else the cached commission lines (a hand-added
-        # customer has no rows this month). A customer with neither keeps "-".
+        # customer has no rows this month), else a direct live-DB lookup for a
+        # customer whose only invoice falls outside this report's year (e.g. a
+        # 2025 invoice restated into a 2026 month). A customer with none of
+        # these keeps "-".
         organic_dates = _organic_dates(agent, customer) or _lines_dates(customer)
+        if not organic_dates and date_cols:
+            live = _fetch_live_customer_dates(customer, linked_invoice_number or None)
+            if live:
+                live_cells = {}
+                if inv_date_i != -1 and live.get("invoice_date"):
+                    live_cells[inv_date_i] = live["invoice_date"]
+                if first_pay_i != -1 and live.get("first_payment_date"):
+                    live_cells[first_pay_i] = live["first_payment_date"]
+                if full_pay_i != -1 and live.get("full_payment_date"):
+                    live_cells[full_pay_i] = live["full_payment_date"]
+                if live_cells:
+                    organic_dates = {"basic": live_cells}
+
+        # A restated case's Full Payment Date is the date cumulative payments
+        # crossed its own restated total -- what placed it in this month in
+        # the first place -- not the invoice's raw last-payment date, which
+        # can land later once an already-restated deal is overpaid. The
+        # placement engine is the single source of truth for that date.
+        if restated_total and linked_invoice_number and full_pay_i != -1:
+            placement = _resolve_restated_case_placement(linked_invoice_number, restated_total)
+            if placement.get("placed") and placement.get("crossing_date"):
+                organic_dates.setdefault("basic", {})[full_pay_i] = placement["crossing_date"]
+                organic_dates.setdefault("nfp", {})[full_pay_i] = placement["crossing_date"]
 
         def build_row(comm_type: str, price_val: str, sales_val: str) -> list:
             row = ["-"] * len(headers)
@@ -580,6 +835,9 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
             # The override rides on the basic commission row only.
             if gan_i != -1:
                 row[gan_i] = _special_case_money(gan_comm) if "basic" in comm_type.lower() else "-"
+            if safwan_i != -1:
+                row[safwan_i] = (_special_case_money(safwan_comm)
+                                 if (safwan_comm and "basic" in comm_type.lower()) else "-")
             if remarks_i != -1: row[remarks_i] = remarks
             # Each restated row takes the dates of the commission row it
             # replaces, falling back to the other side of the pair.
@@ -1221,7 +1479,23 @@ def admin_user_detail_api(user_id: int):
         updates["is_active"] = bool(req_data["is_active"])
 
     db.update_user(user_id, **updates)
-    db.insert_audit(actor["username"], "update", "user", f"Updated user '{target['username']}'", user_id=actor["id"])
+    # Every change to a user used to land in the audit log as the same
+    # "Updated user 'x'", so a password reset and a reactivation were
+    # indistinguishable after the fact -- which is most of what the log is
+    # for. Say which fields moved, never the values of the secret ones.
+    changed = []
+    if "username" in updates:
+        changed.append(f"renamed to '{updates['username']}'")
+    if "role" in updates:
+        changed.append(f"role -> {updates['role']}")
+    if "password_hash" in updates:
+        changed.append("password set")
+    if "is_active" in updates:
+        changed.append("reactivated" if updates["is_active"] else "deactivated")
+    summary = f"Updated user '{target['username']}'"
+    if changed:
+        summary += ": " + ", ".join(changed)
+    db.insert_audit(actor["username"], "update", "user", summary, user_id=actor["id"])
     return jsonify({"status": "success"})
 
 
@@ -1654,6 +1928,93 @@ def _overview_scope_agent() -> str | None:
     return None
 
 
+def _overview_referral_people(*row_lists) -> set:
+    """The distinct people named as referrers on the detail rows.
+
+    Counted once each however many cases they brought, so it reads beside
+    Total Agents rather than beside Total Customers.
+
+    Referral Name sits five columns from the end in both layouts. The outsource
+    table carries one extra column before it ("Gan Lai Soon"), making its rows
+    20 wide against internal's 19, so the index is taken from each row's own
+    width instead of being hardcoded per channel.
+    """
+    people = set()
+    for rows in row_lists:
+        for row in rows or []:
+            if not row or len(row) < 6:
+                continue
+            name = str(row[len(row) - 5] or "").strip()
+            if not name or name == "-":
+                continue
+            low = name.lower()
+            if "total" in low or "summary" in low or "grand" in low:
+                continue
+            # A bare "Referral" with no name after it is a placeholder, not a
+            # person, and must not add to the headcount.
+            name = agent_names.clean_referral_name(name)
+            if not name:
+                continue
+            key = agent_names.normalize_key(name)
+            if key:
+                people.add(key)
+    return people
+
+
+def _overview_public_totals(totals):
+    """The totals without the private key sets used to union a date range."""
+    if not totals:
+        return totals
+    return {k: v for k, v in totals.items() if not k.startswith("_")}
+
+
+def _overview_unified_for_range(year: int, months):
+    """(unified_agent_rows, totals) summed across several months.
+
+    Money adds up, but the counts cannot: an agent selling in March and in July
+    is one agent, not two, and the same customer or referrer recurring across
+    months must be counted once. So the per-month keys are unioned rather than
+    summed, and the effective rate is recomputed from the merged totals instead
+    of being averaged.
+    """
+    merged: dict = {}
+    customers: set = set()
+    referrers: set = set()
+    other_commission = 0.0
+    referral_fee = 0.0
+    got_any = False
+
+    for mth in months:
+        unified, totals = _overview_unified_for_month(year, int(mth))
+        if unified is None:
+            continue
+        got_any = True
+        for r in unified:
+            key = (r["agent"], r["type"])
+            acc = merged.setdefault(key, {
+                "agent": r["agent"], "type": r["type"], "basic": 0.0,
+                "nfp": 0.0, "anp": 0.0, "sales": 0.0, "invoices": 0, "total": 0.0,
+            })
+            for field in ("basic", "nfp", "anp", "sales", "total"):
+                acc[field] += float(r.get(field) or 0.0)
+            acc["invoices"] += int(r.get("invoices") or 0)
+        customers |= totals.get("_customer_keys") or set()
+        referrers |= totals.get("_referral_keys") or set()
+        other_commission += float(totals.get("other_commission") or 0.0)
+        referral_fee += float(totals.get("referral_fee") or 0.0)
+
+    if not got_any:
+        return None, None
+
+    unified = sorted(merged.values(), key=lambda r: r["total"], reverse=True)
+    totals = build_commission_pack._report_overview_totals(unified)
+    totals["customers"] = len(customers)
+    totals["referrals"] = len(referrers)
+    totals["other_commission"] = other_commission
+    totals["referral_fee"] = referral_fee
+    return unified, totals
+
+
 def _overview_unified_for_month(year: int, month: int):
     """(unified_agent_rows, overview_totals) for one month, across Internal and
     Outsource together.
@@ -1758,9 +2119,17 @@ def _overview_unified_for_month(year: int, month: int):
     referral_fee = sum(v.get("referral", 0.0) for v in int_totals_by_month.get(month, {}).values())
     referral_fee += sum(v.get("referral", 0.0) for v in out_totals_by_month.get(month, {}).values())
 
+    referrers = _overview_referral_people(int_customer_summary.get(month, []),
+                                          out_customer_summary.get(month, []))
+
     totals["customers"] = len(customers)
+    totals["referrals"] = len(referrers)
     totals["other_commission"] = other_commission
     totals["referral_fee"] = referral_fee
+    # Kept so a multi-month view can union them; a count cannot be summed
+    # across months without double-counting anyone who appears in two.
+    totals["_customer_keys"] = customers
+    totals["_referral_keys"] = referrers
     return unified, totals
 
 
@@ -1770,9 +2139,16 @@ def get_overview():
     """Sales and commission analysis for the landing page."""
     year = request.args.get("year", 2026, type=int)
     month = request.args.get("month", 8, type=int)
+    # month=0 asks for the year to date: January through the latest month the
+    # ledger reaches. Every other value is that single month, as before.
+    ytd = month <= 0
+    months = list(range(1, _sales_report_last_month(year) + 1)) if ytd else []
 
     try:
-        unified, totals = _overview_unified_for_month(year, month)
+        if ytd:
+            unified, totals = _overview_unified_for_range(year, months)
+        else:
+            unified, totals = _overview_unified_for_month(year, month)
         if unified is None:
             _trigger_background_refresh(year, "internal")
             _trigger_background_refresh(year, "outsource")
@@ -1787,7 +2163,9 @@ def get_overview():
             unified = [r for r in unified if _normalize_search_text(r.get("agent")) == target]
             totals = build_commission_pack._report_overview_totals(unified)
 
-        prev_month = month - 1 if month > 1 else None
+        # No month-on-month arrow on a year-to-date view: there is no single
+        # prior period to compare it against.
+        prev_month = None if ytd else (month - 1 if month > 1 else None)
         prev_unified, prev_totals = (None, None)
         if prev_month:
             prev_unified, prev_totals = _overview_unified_for_month(year, prev_month)
@@ -1800,17 +2178,44 @@ def get_overview():
         rank_changes = (build_commission_pack._rank_changes(unified, prev_unified)
                         if prev_unified else {})
 
+        # The sales leaderboard is its own ranking, not the commission one
+        # reordered: an agent with one large low-rate deal can top sales while
+        # sitting well down on commission, so the movement arrows have to be
+        # measured against last month's SALES order too.
+        by_sales = sorted(unified, key=lambda r: r.get("sales") or 0.0, reverse=True)
+        prev_by_sales = (sorted(prev_unified, key=lambda r: r.get("sales") or 0.0, reverse=True)
+                         if prev_unified else None)
+        sales_rank_changes = (build_commission_pack._rank_changes(by_sales, prev_by_sales)
+                              if prev_by_sales else {})
+
         return jsonify({
             "ready": True,
             "year": year,
-            "month": month,
+            "month": 0 if ytd else month,
+            "ytd": ytd,
+            "ytd_through": months[-1] if months else None,
             "scoped_to_agent": scope_agent,
-            "totals": totals,
-            "prev_totals": prev_totals,
+            # The key sets are internal working state for the year-to-date
+            # union and are not JSON-serialisable, so neither payload carries
+            # them out.
+            "totals": _overview_public_totals(totals),
+            "prev_totals": _overview_public_totals(prev_totals),
             "top_performers": [
                 {**r, "rank_change": rank_changes.get(r["agent"], "flat")}
                 for r in unified[:10]
             ],
+            "top_sales": [
+                {**r, "rank_change": sales_rank_changes.get(r["agent"], "flat")}
+                for r in by_sales[:10]
+            ],
+            # Sales split by who sold it. Summed from the agent rows already in
+            # hand rather than re-read, so the two can never disagree.
+            "sales_by_type": {
+                "internal": sum(r.get("sales") or 0.0
+                                for r in unified if r.get("type") == "Internal"),
+                "outsource": sum(r.get("sales") or 0.0
+                                 for r in unified if r.get("type") != "Internal"),
+            },
             "agent_count": len(unified),
         })
     except Exception as e:
@@ -1827,7 +2232,28 @@ def get_overview():
 
 SALES_REPORT_SPLIT_MONTH = 6     # the EGA campaign window closes 10 June
 SALES_REPORT_SPLIT_DAY = 10      # June is shown as 1-10 / 11-30, per the campaign
+# The order the branch blocks read in, which is not alphabetical: Kluang comes
+# before Klang. A branch not named here follows the named ones, alphabetically,
+# so a new branch appears without anyone having to touch this list.
+SALES_REPORT_BRANCH_ORDER = ("(unassigned)", "JB", "Kluang", "Klang")
+# Not sales agents, so never listed on the report even when an invoice carries
+# their name. Same exclusion the commission tables apply via remove_agent_block
+# ("Safwan"); matched on the normalized first word so "Safwan Nazri" is caught.
+SALES_REPORT_EXCLUDED_AGENTS = ("safwan",)
+
+
+def _sales_report_excluded(raw: str) -> bool:
+    key = _normalize_search_text(raw)
+    return any(key.startswith(x) for x in SALES_REPORT_EXCLUDED_AGENTS)
 SALES_REPORT_TARGETS = {"Internal": 600000.0, "Outsource": 720000.0}
+# ESA is the higher award and runs to December, where EGA closes in June.
+# Both are overridden per channel by the Data page; these are only the fallback
+# for a year nobody has set up yet.
+SALES_REPORT_ESA_TARGETS = {"Internal": 1300000.0, "Outsource": 1560000.0}
+# From this date a case is placed by when it was created rather than by when it
+# was first paid. A one-off change of system, not a yearly cycle, so later years
+# are all created-date by the same comparison.
+SALES_REPORT_CREATED_FROM = "2026-08-01"
 
 
 def _sales_report_last_month(year: int) -> int:
@@ -1843,20 +2269,563 @@ def _sales_report_last_month(year: int) -> int:
     return min(12, max(SALES_REPORT_SPLIT_MONTH, today.month))
 
 
-def _sales_report_targets(year: int) -> dict[str, float]:
-    """EGA qualifying thresholds, from the Data page where it has them."""
-    targets = dict(SALES_REPORT_TARGETS)
+SALES_REPORT_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _award_qualified_month(rows, threshold, ladder, max_month: int):
+    """The month these EP rows first win the award, or None.
+
+    An early-bird rung is checked first and the earliest one wins, which is the
+    whole point of the ladder; failing that, the month the running total first
+    clears the full threshold. Nothing past `max_month` is considered, so a
+    month that has not happened yet can never be named -- the award modules'
+    own walk carries the running total forward indefinitely and will happily
+    report an October rung in September.
+    """
+    from decimal import Decimal as _D
+
+    monthly: dict[int, "_D"] = {}
+    running = _D("0")
+    for when, ep in sorted(rows, key=lambda x: str(x[0])):
+        try:
+            mth = int(str(when)[5:7])
+        except (TypeError, ValueError):
+            continue
+        running += ep
+        monthly[mth] = running
+    if not monthly:
+        return None
+
+    def cumulative_by(month: int):
+        """Carried forward, so a month with no invoices still counts what came
+        before it -- the same reading the award ladder uses."""
+        best = _D("0")
+        for m in sorted(monthly):
+            if m <= month:
+                best = monthly[m]
+        return best
+
+    for month in sorted(ladder or {}):
+        if month > max_month:
+            continue
+        rung = ladder[month]
+        rung = rung[0] if isinstance(rung, (tuple, list)) else rung
+        if cumulative_by(month) >= _D(str(rung)):
+            return month
+
+    for month in sorted(monthly):
+        if month <= max_month and monthly[month] >= threshold:
+            return month
+    return None
+
+
+def _qualifier_label(month) -> str:
+    """"Apr Qualifier", in the printed report's wording."""
+    if not month or not (1 <= int(month) <= 12):
+        return "Qualifier"
+    return f"{SALES_REPORT_MONTHS[int(month) - 1]} Qualifier"
+
+
+def _sales_report_award_targets(year: int) -> tuple[dict[str, float], dict[str, float]]:
+    """(EGA thresholds, ESA thresholds) per channel, from the Data page.
+
+    Read from the same ega_rules rows the EGA/ESA Award section and the printed
+    packs use, so the three cannot drift apart: change a threshold on the Data
+    page and every one of them moves with it.
+    """
+    ega = dict(SALES_REPORT_TARGETS)
+    esa = dict(SALES_REPORT_ESA_TARGETS)
     for key, agent_type in (("Internal", "internal"), ("Outsource", "outsource")):
         try:
-            payload = db.get_ega_rules(str(year), agent_type)
-            raw = str((payload.get("rules") or {}).get("ega_threshold") or "").replace(",", "")
-            if raw:
-                targets[key] = float(raw)
+            rules = db.get_ega_rules(str(year), agent_type).get("rules") or {}
+            for field, bag in (("ega_threshold", ega), ("esa_threshold", esa)):
+                raw = str(rules.get(field) or "").replace(",", "").strip()
+                if raw:
+                    bag[key] = float(raw)
         except Exception:
             # A missing or unreadable rules row must not take the page down; the
             # defaults above are the thresholds the printed report used.
-            _log(f"[SALES REPORT] could not read {agent_type} ega_rules; using default threshold")
-    return targets
+            _log(f"[SALES REPORT] could not read {agent_type} ega_rules; using default thresholds")
+    return ega, esa
+
+
+def _sales_report_targets(year: int) -> dict[str, float]:
+    """EGA qualifying thresholds only. Kept for callers that predate ESA."""
+    return _sales_report_award_targets(year)[0]
+
+
+_FIRST_PAYMENT_CACHE: dict[int, tuple[float, dict]] = {}
+_PAYMENTS_CACHE: dict[tuple[int, int], tuple[float, dict]] = {}
+_PAYMENT_ROWS_CACHE: dict[tuple[int, int], tuple[float, dict]] = {}
+
+
+def _sales_report_local_day(value) -> str:
+    """A stored timestamp as its Kuala Lumpur calendar day, "2026-06-10".
+
+    Bubble-era rows keep local midnight as 16:00 UTC the day before, so reading
+    the raw date would show a payment on the wrong day. Same +8h shift the rest
+    of the dashboard applies. Asia/Kuala_Lumpur has no daylight saving.
+    """
+    if not value or str(value).lower() in ("none", "null"):
+        return ""
+    try:
+        from datetime import datetime, timedelta
+        return (datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                + timedelta(hours=8)).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return str(value)[:10]
+
+
+def _sales_report_case_dates(year: int) -> dict[str, str]:
+    """invoice bubble_id -> the date that decides which month a case falls in.
+
+    Two regimes, and the switch is a change of system rather than a yearly
+    cycle:
+
+      * created before 1 Aug 2026 -- the case belongs to the month its FIRST
+        PAYMENT landed. Teo Kim Seng is invoiced 5 February but first paid 31
+        January, and the printed report counts him in January; Lim Lee Peng is
+        invoiced 5 January but first paid 30 December, so he is not in 2026 at
+        all.
+      * created on or after 1 Aug 2026 -- the case belongs to the month it was
+        CREATED. Diong Wei Yuan is created 7 September and first paid 29
+        August, and belongs to September.
+
+    `created_at` is in practice the invoice date: across 2026's 3,472 invoices
+    it is never null and falls on the same day 3,468 times. It is read rather
+    than invoice_date because it is what the rule names.
+
+    Keyed on bubble_id, not invoice number: one number can carry several
+    revisions with different dates -- 1008358 has first payments at 2026-01-03
+    and 2025-12-30 -- so keying on the number can return a revision the report
+    is not using. The same "latest revision" rule the report applies keeps the
+    date and the money on one row.
+    """
+    key = int(year)
+    hit = _FIRST_PAYMENT_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _RESPONSE_CACHE_TTL_SECONDS:
+        return hit[1]
+
+    sql = f"""
+        SELECT bubble_id, p1, c FROM (
+          SELECT i.bubble_id,
+                 i."1st_payment_date"::date AS p1,
+                 i.created_at::date AS c,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY i.bubble_id
+                   ORDER BY COALESCE(i.is_latest, FALSE) DESC,
+                            i.invoice_date DESC NULLS LAST, i.id DESC) AS rn
+            FROM invoice i
+           WHERE i.invoice_date IS NOT NULL
+             AND EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
+             AND COALESCE(i.is_deleted, FALSE) IS NOT TRUE
+        ) z WHERE rn = 1
+    """
+    # Worth retrying: the proxy fails intermittently, and an empty map does not
+    # blank the page, it silently re-buckets every case by invoice date. That
+    # moves every figure and moves it back on the next refresh, which is far
+    # worse than a slow load.
+    rows = None
+    for attempt in range(3):
+        try:
+            rows = _pg_query(sql)
+            break
+        except Exception:
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    if rows is None:
+        if hit:
+            _log("[SALES REPORT] case dates unavailable; reusing the last good set")
+            _FIRST_PAYMENT_CACHE[key] = (time.time(), hit[1])
+            return hit[1]
+        _log("[SALES REPORT] could not read case dates after 3 tries; "
+             "falling back to invoice dates")
+        return {}
+
+    out: dict[str, str] = {}
+    for r in rows or []:
+        bid = str(r.get("bubble_id") or "").strip()
+        if not bid:
+            continue
+        created = str(r.get("c") or "")[:10]
+        paid = str(r.get("p1") or "")[:10]
+        chosen = created if (created and created >= SALES_REPORT_CREATED_FROM) else paid
+        if chosen:
+            out[bid] = chosen
+    _FIRST_PAYMENT_CACHE[key] = (time.time(), out)
+    return out
+
+
+_PAYMENT_ROWS_CACHE: dict[tuple[int, int], tuple[float, dict]] = {}
+
+
+def _sales_report_payment_rows(year: int, upto_month: int) -> dict[str, list]:
+    """invoice bubble_id -> the payments against it, for the case hover panel.
+
+    Each payment is {"a": amount, "d": paid on, "m": entered on}. "Entered" is
+    when it was keyed in, which can be well after the money arrived -- Diong Wei
+    Yuan's 500 was paid on 29 August and entered on 9 September -- and that gap
+    is the thing someone reconciling the report needs to see.
+
+    Cut off at the end of `upto_month`, like the collected column, so every
+    figure on a row describes the same window.
+    """
+    key = (int(year), int(upto_month))
+    hit = _PAYMENT_ROWS_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _RESPONSE_CACHE_TTL_SECONDS:
+        return hit[1]
+
+    end_year, end_month = (year + 1, 1) if upto_month >= 12 else (year, upto_month + 1)
+    sql = f"""
+        WITH inv AS (
+          SELECT bubble_id FROM invoice
+           WHERE invoice_date >= DATE '{year:04d}-01-01'
+             AND invoice_date <  DATE '{year + 1:04d}-01-01'
+             AND COALESCE(is_deleted, FALSE) IS NOT TRUE
+        )
+        SELECT p.linked_invoice AS inv,
+               COALESCE(p.amount, 0)::numeric AS a,
+               p.payment_date::date AS d,
+               COALESCE(p.created_date, p.created_at)::date AS m
+          FROM payment p
+          JOIN inv ON inv.bubble_id = p.linked_invoice
+         WHERE p.payment_date IS NOT NULL
+           AND p.payment_date < DATE '{end_year:04d}-{end_month:02d}-01'
+         ORDER BY p.payment_date DESC
+    """
+    try:
+        rows = _pg_query(sql)
+    except Exception:
+        _log("[SALES REPORT] could not read payment rows; case hover will be empty")
+        return {}
+
+    out: dict[str, list] = {}
+    for r in rows or []:
+        inv = str(r.get("inv") or "").strip()
+        if not inv:
+            continue
+        out.setdefault(inv, []).append({
+            "a": float(r.get("a") or 0),
+            "d": str(r.get("d") or "")[:10],
+            "m": str(r.get("m") or "")[:10],
+        })
+    _PAYMENT_ROWS_CACHE[key] = (time.time(), out)
+    return out
+
+
+def _case_hover_entry(customer_name, payments):
+    """One case for the hover panel, or None when there is no customer to name.
+
+    An entry with no payments is still worth returning: the panel says "no
+    payment recorded in this period", which is a real answer rather than a
+    silently missing row.
+    """
+    name = str(customer_name or "").strip()
+    if not name:
+        return None
+    return {"n": name, "p": list(payments or [])}
+
+
+def _sales_report_payments(year: int, upto_month: int) -> dict[str, "Decimal"]:
+    """Cash received against `year`'s invoices, keyed by invoice bubble_id.
+
+    Counts money settling this year's invoices only, so the figure sits beside
+    the ANS and EP columns built from those same invoices and the row reads as
+    "invoiced this much, collected this much". Cash arriving this year against
+    an earlier year's invoice is a different question and is left out -- it is
+    RM 3m company-wide and would not reconcile with anything else on the row.
+
+    Payments are cut off at the end of `upto_month` so every column on a row
+    describes the same window: asking for January to June must not show cash
+    that arrived in August.
+
+    `actual_received` is a text column and is empty on every row, so `amount`
+    is the only figure available. A failure here returns nothing rather than
+    taking the page down -- the column then reads as zero, which the caller
+    surfaces as a dash.
+    """
+    from decimal import Decimal as _D
+
+    key = (int(year), int(upto_month))
+    hit = _PAYMENTS_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _RESPONSE_CACHE_TTL_SECONDS:
+        return hit[1]
+
+    end_year, end_month = (year + 1, 1) if upto_month >= 12 else (year, upto_month + 1)
+    sql = f"""
+        WITH inv AS (
+          SELECT bubble_id FROM invoice
+           WHERE invoice_date >= DATE '{year:04d}-01-01'
+             AND invoice_date <  DATE '{year + 1:04d}-01-01'
+             AND COALESCE(is_deleted, FALSE) IS NOT TRUE
+        )
+        SELECT p.linked_invoice AS inv, SUM(COALESCE(p.amount, 0))::numeric AS paid
+          FROM payment p
+          JOIN inv ON inv.bubble_id = p.linked_invoice
+         WHERE p.payment_date IS NOT NULL
+           AND p.payment_date < DATE '{end_year:04d}-{end_month:02d}-01'
+         GROUP BY p.linked_invoice
+    """
+    try:
+        rows = _pg_query(sql)
+    except Exception:
+        _log("[SALES REPORT] could not read payments; collected column left blank")
+        return {}
+
+    out: dict[str, "Decimal"] = {}
+    for r in rows or []:
+        inv = str(r.get("inv") or "").strip()
+        if not inv:
+            continue
+        try:
+            out[inv] = _D(str(r.get("paid") or 0))
+        except Exception:
+            continue
+    _PAYMENTS_CACHE[key] = (time.time(), out)
+    return out
+
+
+def _sales_report_carryover(year: int) -> dict[str, dict]:
+    """Pre-cutoff case counts for `year`, keyed by normalized agent name.
+
+    Feeds the campaign bonus below. Entered by hand on the Data page because
+    nothing in Postgres reproduces the printed report's counts -- see the
+    ega_carryover table comment in db.py.
+    """
+    index: dict[str, dict] = {}
+    try:
+        rows = db.list_ega_carryover()
+    except Exception:
+        _log("[SALES REPORT] could not read ega_carryover; campaign bonus skipped")
+        return index
+    for r in rows:
+        if str(r.get("year") or "").strip() != str(year):
+            continue
+        key = agent_names.normalize_key(str(r.get("agent") or ""))
+        if key:
+            index[key] = r
+    return index
+
+
+def _carryover_for(carryover: dict, *names) -> dict:
+    """The carry-over row for an agent under any name they are known by.
+
+    The Data page stores whatever name was typed into it, which may be the
+    eeAdmin spelling, the Agent Roles spelling, or the display name this report
+    shows -- for Elyn Pua Yee Ling those are three different strings. Trying
+    each in turn stops a correctly entered row from silently scoring no bonus
+    because it was filed under a different one of them.
+    """
+    for name in names:
+        key = agent_names.normalize_key(str(name or ""))
+        if key and key in carryover:
+            return carryover[key]
+    return {}
+
+
+def _carryover_cases(raw) -> int:
+    """The case count as an int, tolerating blanks and thousands separators."""
+    try:
+        return max(0, int(float(str(raw or "0").replace(",", "").strip() or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _campaign_bonus_tier(campaign_cases: int) -> "Decimal":
+    """Multiplier applied to the 1 May - 10 Jun campaign sales.
+
+    Driven by how many cases the agent invoiced INSIDE that window: every third
+    one adds another half point per ringgit, so 3-5 cases give 0.5, 6-8 give
+    1.0 and 9-11 give 1.5.
+
+    Derived from the printed report ("ETERNALGY SALES REPORT AT YEAR 2026",
+    updated 6 July 2026). Its multiplier column carries a case count and a
+    ringgit figure, and the ringgit figure is the campaign sales with the
+    multiplier already applied -- Chan Jia Wei's campaign of 320,463 plus his
+    480,694.50 bonus is exactly the 801,157.50 printed there, and the same
+    holds for every agent whose row can be read in full. The count matches the
+    agent's own May and 1-10 June case counts wherever those can be pinned
+    exactly (Ching Zhe Hang 6+3=9, Tan Jia Hao 6+1=7, Ah Zhu 4+2=6, Martin
+    2+1=3, Sunny 3+0=3, Woon Jia Keat 2+0=2).
+
+    This was read as "cases closed before the 2025 cutoff" until 2026-09-09,
+    which is why no database query ever reproduced the counts and why they had
+    to be typed in by hand. They were campaign cases all along, and the report
+    already counts those itself.
+
+    Known gap: the printed column splits those cases into before-31/12/25 and
+    after-1/1/26 vintages, and the after side appears to pay double -- Najwa's
+    3 cases there earned 1.0x where 3 on the before side earn 0.5x. Nothing
+    available here says which vintage a case belongs to, so every agent is
+    charged the before-side rate. An agent on the after side is understated.
+    """
+    from decimal import Decimal as _D
+    return _D(int(campaign_cases) // 3) * _D("0.5")
+
+
+def _resolve_channel(raw: str, role: dict, out_mod, year: int, as_at_month: int,
+                     row: dict) -> str:
+    """"Internal" or "Outsource" for one agent, as at `as_at_month`.
+
+    Decided by the role the agent holds now, not by whichever invoice happens
+    to come first. Classifying on the first invoice put Chan Jia Wei (Outsource
+    until April, Internal since) and Pua Yee Ling (first invoice in March,
+    Internal role dated from June) on the Outsource table despite both being
+    internal agents today.
+
+    The roles override is looked up by exact name, so a misspelled ERP variant
+    finds nothing on its own; asking again under the roles table's own spelling
+    is what stops a merged agent's channel depending on which spelling happened
+    to be invoiced first. Only when the roles page says nothing at all about the
+    agent does the invoice's own classification still decide.
+    """
+    as_at = f"{year:04d}-{int(as_at_month):02d}-01"
+    canonical = str((role or {}).get("agent") or "").strip()
+    current = out_mod.get_agent_type_override(raw, as_at)
+    if not current and canonical and canonical.lower() != raw.lower():
+        current = out_mod.get_agent_type_override(canonical, as_at)
+    if current:
+        return "Outsource" if current == "outsource" else "Internal"
+    return ("Outsource" if out_mod.is_outsource_agent(
+        raw, (row or {}).get("agent_type"), (row or {}).get("invoice_date"))
+        else "Internal")
+
+
+def _company_ega_rows(year: int):
+    """Every agent's invoices for `year`, both channels.
+
+    The outsource pull carries no agent_type filter, so its rows are the whole
+    company; the internal pull is filtered in SQL and would drop the months an
+    agent spent on the other side. Returns None when that bundle is not cached,
+    and the caller keeps its own rows.
+    """
+    bundle = get_cached_data(year, "outsource")
+    if not bundle or "ega_raw" not in bundle:
+        load_disk_cache()
+        bundle = get_cached_data(year, "outsource")
+    return (bundle or {}).get("ega_raw") or None
+
+
+class _AwardLine:
+    """One invoice on the EGA/ESA detail table. Mirrors the AwardLine the award
+    modules build, but defined here so the dashboard's own assembly does not
+    depend on their internals."""
+
+    __slots__ = ("agent_name", "customer_name", "invoice_number", "prop_type",
+                 "invoice_date", "sales_price", "ep_points", "panel_qty", "accum_ep")
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            setattr(self, k, kw.get(k))
+
+
+def _ega_award_report(mod, out_mod, rows, year, upto_month, channel, carryover, roles,
+                      first_paid=None):
+    """The EGA/ESA award tables for one channel, with the campaign bonus.
+
+    Differs from the award modules' own build_report() in two ways, both chosen
+    on the Data page's terms rather than the invoice's:
+
+      * membership is the channel the agent holds as at `upto_month`, so an
+        agent who transferred mid-year is judged on their whole year in one
+        report instead of being split across both;
+      * EP carries the campaign bonus -- every third pre-cutoff case adds half
+        a point per ringgit of 1 May - 10 Jun sales -- so this page agrees with
+        the Sales Report and with the printed report it was derived from.
+
+    The bonus enters the cumulative walk dated 10 June, the day the campaign
+    closes, so an early-bird rung can never be reached on it before it is
+    earned. Returns the same 4-tuple build_report() does.
+    """
+    from collections import defaultdict as _dd
+    from decimal import Decimal as _D, ROUND_HALF_UP as _RH
+
+    lines: list = []
+    agent_ep: dict = _dd(_D)
+    agent_sales: dict = _dd(_D)
+    agent_invoice_ep: dict = _dd(list)
+    campaign: dict = _dd(_D)
+    campaign_n: dict = _dd(int)
+    channel_of: dict = {}
+    named_as: dict = {}
+
+    first_paid = first_paid or {}
+    for row in rows:
+        # Same rule as the Sales Report: a case belongs to the month its first
+        # payment arrived, so the two pages agree case for case.
+        paid_on = first_paid.get(str(row.get("bubble_id") or ""))
+        when = mod._parse_invoice_date(paid_on) if paid_on else None
+        if when is None and not first_paid:
+            when = mod._parse_invoice_date(row.get("invoice_date"))
+        if when is None or when.year != year or when.month > upto_month:
+            continue
+        raw = str(row.get("agent_name") or "(unknown)").strip()
+        if _sales_report_excluded(raw):
+            continue
+        if raw not in channel_of:
+            role = _sales_report_lookup_role(raw, roles)
+            # One person, one row, even when the ERP spells them two ways
+            # ("OLIVIER KOH CHONG LEE" / "...CONG LEE"). Splitting them halves
+            # each half's EP and can report someone short of a target they met.
+            # Same identity rule the Sales Report uses, so the pages agree.
+            channel_of[raw] = _resolve_channel(raw, role, out_mod, year, upto_month, row)
+            named_as[raw] = str(role.get("agent") or "").strip() or raw
+        if channel_of[raw] != channel:
+            continue
+        agent = named_as[raw]
+
+        prop = mod.classify_property_type(row)
+        panel_qty = int(row.get("panel_qty") or 0)
+        sales_price = (_D(str(row.get("total_amount") or 0))
+                       - _D(str(row.get("epp_interest") or 0)))
+        ep = mod.calc_ep_points(sales_price, prop, row.get("invoice_date"),
+                                panel_qty).quantize(_D("0.01"), rounding=_RH)
+        inv_dt = str(row.get("invoice_date") or "")[:10]
+
+        agent_ep[agent] += ep
+        agent_sales[agent] += sales_price
+        agent_invoice_ep[agent].append((inv_dt, ep))
+        if when.month == 5 or (when.month == SALES_REPORT_SPLIT_MONTH
+                               and when.day <= SALES_REPORT_SPLIT_DAY):
+            campaign[agent] += sales_price
+            campaign_n[agent] += 1
+
+        lines.append(_AwardLine(
+            agent_name=agent,
+            customer_name=str(row.get("customer_name") or "(unknown)").strip(),
+            invoice_number=str(row.get("invoice_number") or "").strip(),
+            prop_type=prop, invoice_date=inv_dt, sales_price=sales_price,
+            ep_points=ep, panel_qty=panel_qty, accum_ep=_D("0")))
+
+    # Campaign bonus, dated the day the window closes.
+    bonus_date = f"{year:04d}-{SALES_REPORT_SPLIT_MONTH:02d}-{SALES_REPORT_SPLIT_DAY:02d}"
+    bonuses: dict = {}
+    for agent in list(agent_ep):
+        tier = _campaign_bonus_tier(campaign_n.get(agent, 0))
+        if not tier or not campaign.get(agent):
+            continue
+        bonus = (tier * campaign[agent]).quantize(_D("0.01"), rounding=_RH)
+        bonuses[agent] = bonus
+        agent_ep[agent] += bonus
+        agent_invoice_ep[agent].append((bonus_date, bonus))
+
+    # Running EP down each agent's invoices, in date order. The bonus is not an
+    # invoice, so it is folded into every line from 10 June onwards rather than
+    # inventing a row for it -- the column still ends on the agent's total EP.
+    per_agent: dict = _dd(list)
+    for ln in lines:
+        per_agent[ln.agent_name].append(ln)
+    for agent, ln_list in per_agent.items():
+        ln_list.sort(key=lambda x: (x.invoice_date, x.invoice_number))
+        running = _D("0")
+        bonus = bonuses.get(agent, _D("0"))
+        for ln in ln_list:
+            running += ln.ep_points
+            ln.accum_ep = running + (bonus if ln.invoice_date >= bonus_date else _D("0"))
+
+    eligibility = {a: mod.determine_eligibility(agent_invoice_ep[a]) for a in agent_ep}
+    return lines, dict(agent_ep), dict(agent_sales), eligibility
 
 
 def _sales_report_role_index() -> dict[str, dict]:
@@ -1888,6 +2857,30 @@ def _sales_report_lookup_role(raw: str, index: dict[str, dict]) -> dict:
     import difflib
     close = difflib.get_close_matches(key, list(index), n=1, cutoff=0.9)
     return index[close[0]] if close else {}
+
+
+def _sales_report_identity(raw: str, role: dict) -> str:
+    """The key every spelling of one person shares.
+
+    The ERP holds more than one spelling for some agents -- "OLIVIER KOH CHONG
+    LEE" and "OLIVIER KOH CONG LEE" are one person -- and keying the ledger on
+    the raw invoice name split them into two rows that displayed the same name,
+    each carrying part of the cases and sales. EGA qualification compares each
+    row's EP against the target, so a split could report someone as short of a
+    target they had actually met.
+
+    Identity comes from the Agent Roles row the name resolves to, which is the
+    same close-match test that already decides the displayed name and branch,
+    so no two agents merge here that were not already being shown as one. When
+    no roles row matches, the normalized raw name is the key: two unidentified
+    spellings stay apart rather than being guessed into one person.
+    """
+    if role:
+        for field in ("pg_bubble_id", "full_name", "agent", "nick_name"):
+            value = str(role.get(field) or "").strip()
+            if value:
+                return "role:" + agent_names.normalize_key(value)
+    return "raw:" + agent_names.normalize_key(raw)
 
 
 def _is_initials_of(word: str, words: list[str]) -> bool:
@@ -1936,13 +2929,37 @@ def _sales_report_display_name(raw: str, role: dict) -> str:
     return " ".join(lead + [full]) if lead else full
 
 
-def _sales_report_payload(year: int) -> dict | None:
+def _sales_report_campaign_label(last_month: int) -> str:
+    """What the campaign column covers for a period ending in `last_month`.
+    The campaign runs 1 May to 10 June, so a period ending in May covers only
+    part of it and one ending before May covers none."""
+    if last_month < 5:
+        return "1/5 - 10/6 (outside period)"
+    if last_month == 5:
+        return "1/5 - 31/5"
+    return f"1/5 - {SALES_REPORT_SPLIT_DAY}/{SALES_REPORT_SPLIT_MONTH}"
+
+
+def _sales_report_payload(year: int, through: int | None = None) -> dict | None:
     """Per-agent sales ledger for Jan..last_month of `year`, or None when the
     cache is cold. Like the overview, this is a page people land on -- it reads
-    whatever the prefetch already built rather than starting a multi-minute job."""
+    whatever the prefetch already built rather than starting a multi-minute job.
+
+    `through` shortens the reporting period: the report always opens in January
+    and runs to that month, so picking June accumulates Jan-Jun and nothing
+    after it. Every figure follows, EP included -- an invoice outside the period
+    is not counted at all, so the campaign bonus of a period that stops before
+    10 June rests only on the campaign sales the period actually covers.
+
+    EP is not simply the sales total. It follows the printed report: accumulated
+    sales for the year, plus a bonus on the 1 May - 10 Jun campaign window whose
+    size is set by how many cases the agent closed before the cutoff. See
+    _campaign_bonus_tier().
+    """
     from decimal import Decimal
 
-    last_month = _sales_report_last_month(year)
+    max_month = _sales_report_last_month(year)
+    last_month = max_month if through is None else max(1, min(int(through), max_month))
     bundle = get_cached_data(year, "outsource")
     if not bundle or "ega_raw" not in bundle:
         load_disk_cache()
@@ -1964,8 +2981,28 @@ def _sales_report_payload(year: int) -> dict | None:
         out_mod = out_mod or build_commission_pack._load_module(
             "out_ega_esa", ega_dir / "outsource_EGA_ESA_Awards.py")
 
+    # The early-bird ladders are module globals that ensure_rules_applied()
+    # rewrites from the Data page, and Internal and Outsource have their own.
+    # Read them per channel so a rung edited on the Data page moves the month
+    # named in the qualifier column with it.
+    ladders: dict[str, tuple[dict, dict]] = {}
+    for label, mod in (("Internal", int_mod), ("Outsource", out_mod)):
+        try:
+            mod.ensure_rules_applied(year)
+        except Exception:
+            _log(f"[SALES REPORT] could not apply {label} EGA rules; using built-in ladder")
+        ladders[label] = (dict(getattr(mod, "EGA_EARLY_BIRD", {}) or {}),
+                          dict(getattr(mod, "ESA_EARLY_BIRD", {}) or {}))
+
     roles = _sales_report_role_index()
-    targets = _sales_report_targets(year)
+    payments = _sales_report_payments(year, last_month)
+    payment_rows = _sales_report_payment_rows(year, last_month)
+    case_dates = _sales_report_case_dates(year)
+    carryover = _sales_report_carryover(year)
+    targets, esa_targets = _sales_report_award_targets(year)
+    # The multiplier is a first-half device. A report that runs into July or
+    # beyond applies none at all.
+    multiplier_in_period = last_month <= SALES_REPORT_SPLIT_MONTH
     zero = Decimal("0")
     agents: dict[str, dict] = {}
     seen_bubble: set = set()
@@ -1977,48 +3014,85 @@ def _sales_report_payload(year: int) -> dict | None:
             continue
         seen_bubble.add(bubble)
 
-        when = int_mod._parse_invoice_date(r.get("invoice_date"))
-        if when is None or when.month > last_month:
+        # A case lands in the month its money first arrived. An invoice
+        # raised in December and first paid in January is January's; one raised
+        # in January but first paid last December belongs to last year and
+        # drops out of this report entirely.
+        placed_on = case_dates.get(str(bubble or ""))
+        when = int_mod._parse_invoice_date(placed_on) if placed_on else None
+        if when is None and not case_dates:
+            # The lookup failed outright; fall back to invoice dates rather
+            # than emptying the report.
+            when = int_mod._parse_invoice_date(r.get("invoice_date"))
+        if when is None or when.year != year or when.month > last_month:
             continue
 
         raw = str(r.get("agent_name") or "").strip()
+        if _sales_report_excluded(raw):
+            continue
         sales = (Decimal(str(r.get("total_amount") or 0))
                  - Decimal(str(r.get("epp_interest") or 0)))
         prop = int_mod.classify_property_type(r)
         prop_counts[prop] = prop_counts.get(prop, 0) + 1
         kind = "RES" if prop.lower().startswith("resid") else "COM"
 
-        entry = agents.get(raw)
+        role = _sales_report_lookup_role(raw, roles)
+        identity = _sales_report_identity(raw, role)
+        entry = agents.get(identity)
         if entry is None:
-            role = _sales_report_lookup_role(raw, roles)
             branch = str(role.get("branch") or "").strip().replace("Team-", "")
-            entry = agents[raw] = {
-                "agent": _sales_report_display_name(raw, role),
+            channel = _resolve_channel(raw, role, out_mod, year, last_month, r)
+            display = _sales_report_display_name(raw, role)
+            carry = _carryover_for(carryover, raw, role.get("agent"),
+                                   role.get("full_name"), role.get("nick_name"), display)
+            entry = agents[identity] = {
+                "agent": display,
+                "carry_cases": _carryover_cases(carry.get("cases")),
+                "carry_sales": carry.get("sales") or "",
                 "branch": branch or "(unassigned)",
-                "channel": ("Outsource" if out_mod.is_outsource_agent(
-                    raw, r.get("agent_type"), r.get("invoice_date")) else "Internal"),
+                "channel": channel,
+                # Every ERP spelling folded into this row, so the scope filter
+                # below can still be asked in the ERP's own terms.
+                "raw_names": set(),
                 "lines": {},              # kind -> month -> [noc, ans]
+                # kind -> month -> [customer, ...], so a NOC cell can say who
+                # its cases were. Names only; the counts stay in "lines".
+                "custs": {},
+                "campaign_custs": [],
                 "jun": {},                # kind -> [1-10, 11-30]
                 "campaign_cases": 0, "campaign_ans": zero,
-                "acc_noc": 0, "acc_ans": zero, "ep": zero, "ep_rows": [],
+                "acc_noc": 0, "acc_ans": zero, "collected": zero,
+                "ep": zero, "ep_rows": [],
             }
+
+        entry["raw_names"].add(raw)
 
         months = entry["lines"].setdefault(kind, {})
         cell = months.setdefault(when.month, [0, zero])
         cell[0] += 1
         cell[1] += sales
+        customer = _case_hover_entry(r.get("customer_name"),
+                                     payment_rows.get(str(bubble or "")))
+        if customer:
+            entry["custs"].setdefault(kind, {}).setdefault(when.month, []).append(customer)
         if when.month == SALES_REPORT_SPLIT_MONTH:
             split = entry["jun"].setdefault(kind, [zero, zero])
             split[0 if when.day <= SALES_REPORT_SPLIT_DAY else 1] += sales
         # Campaign window: 1 May through 10 June. Fixed to the actual EGA
-        # campaign dates regardless of how far the ledger now extends.
+        # campaign dates regardless of how far the ledger now extends -- a
+        # period that stops earlier simply never reaches the later rows.
         if when.month == 5 or (when.month == SALES_REPORT_SPLIT_MONTH
                                and when.day <= SALES_REPORT_SPLIT_DAY):
             entry["campaign_cases"] += 1
             entry["campaign_ans"] += sales
+            if customer:
+                entry["campaign_custs"].append(customer)
 
         entry["acc_noc"] += 1
         entry["acc_ans"] += sales
+        # One invoice is visited once (seen_bubble above), so its receipts are
+        # added once. An invoice nobody has paid simply contributes nothing.
+        entry["collected"] += payments.get(str(bubble or ""), zero)
         entry["ep_rows"].append((
             when.strftime("%Y-%m-%d"),
             int_mod.calc_ep_points(sales, prop, r.get("invoice_date"),
@@ -2030,13 +3104,55 @@ def _sales_report_payload(year: int) -> dict | None:
         target = _normalize_search_text(scope_agent)
         agents = {k: v for k, v in agents.items()
                   if _normalize_search_text(v["agent"]) == target
-                  or _normalize_search_text(k) == target}
+                  or any(_normalize_search_text(n) == target
+                         for n in v["raw_names"])}
 
     out_agents = []
     for entry in agents.values():
-        entry["ep"] = sum((ep for _, ep in entry["ep_rows"]), zero)
+        # Base points, one per ringgit of sales (large factory jobs earn less
+        # -- calc_ep_points decides that per invoice).
+        base_ep = sum((ep for _, ep in entry["ep_rows"]), zero)
+        tier = _campaign_bonus_tier(entry["campaign_cases"])
+        # The May multiplier belongs to the first half of the year and to EGA.
+        # It is applied only while the report still ends inside that half: from
+        # a July period onward no multiplier is applied anywhere, so the EP on
+        # screen is plain sales points. ESA never uses it at all, whatever the
+        # period, so ESA is always judged on base_ep below.
+        bonus = (tier * entry["campaign_ans"]) if multiplier_in_period else zero
+        entry["ep"] = base_ep + bonus
+        # EGA is settled at the June deadline and cannot be reached on later
+        # sales, so it reads EP as at then.
+        jun_end = f"{year:04d}-{SALES_REPORT_SPLIT_MONTH:02d}-31"
+        jun_rows = [(d, e) for d, e in entry["ep_rows"] if d <= jun_end]
+        if bonus:
+            jun_rows.append(
+                (f"{year:04d}-{SALES_REPORT_SPLIT_MONTH:02d}-{SALES_REPORT_SPLIT_DAY:02d}", bonus))
+        ep_jun = sum((e for _, e in jun_rows), zero)
+
         threshold = Decimal(str(targets.get(entry["channel"], 720000.0)))
-        qualified = entry["ep"] >= threshold
+        esa_threshold = Decimal(str(esa_targets.get(entry["channel"], 1560000.0)))
+        # Qualification is the EGA one -- that is what the summary card counts
+        # and what the printed report's own qualifier column means.
+        ega_ladder, esa_ladder = ladders.get(entry["channel"], ({}, {}))
+        # EGA is settled at the June deadline; ESA keeps running, so it is read
+        # against every month the report covers.
+        ega_month = _award_qualified_month(
+            jun_rows, threshold, ega_ladder, min(SALES_REPORT_SPLIT_MONTH, last_month))
+        # ESA on plain sales points: the campaign multiplier is an EGA device
+        # and does not count toward it.
+        esa_month = _award_qualified_month(
+            list(entry["ep_rows"]), esa_threshold, esa_ladder, last_month)
+
+        # Clearing an early-bird rung IS qualifying -- that is what the ladder
+        # is for, and the printed report lists agents who never reach the full
+        # threshold (Denise Ng at 523,484 against a 600,000 bar) as April
+        # qualifiers. Testing the full threshold alone dropped every one of
+        # them. The balance shown to those still short stays measured against
+        # the full threshold, as the printed report measures it.
+        qualified = ega_month is not None
+        ega_double = ep_jun >= threshold * 2
+        esa_qualified = esa_month is not None
+        esa_ep = base_ep
         types = [k for k in ("RES", "COM") if entry["lines"].get(k)]
         out_agents.append({
             "agent": entry["agent"],
@@ -2046,7 +3162,8 @@ def _sales_report_payload(year: int) -> dict | None:
                 "type": kind,
                 "months": [
                     {"noc": entry["lines"][kind].get(m, [0, zero])[0],
-                     "ans": float(entry["lines"][kind].get(m, [0, zero])[1])}
+                     "ans": float(entry["lines"][kind].get(m, [0, zero])[1]),
+                     "custs": entry["custs"].get(kind, {}).get(m, [])}
                     for m in range(1, last_month + 1)
                 ],
                 "jun_early": float(entry["jun"].get(kind, [zero, zero])[0]),
@@ -2056,24 +3173,84 @@ def _sales_report_payload(year: int) -> dict | None:
             } for kind in types],
             "acc_noc": entry["acc_noc"],
             "acc_ans": float(entry["acc_ans"]),
+            # Cash in against the invoices on this row, so a reader can see how
+            # much of the sales figure has actually been paid.
+            "collected": float(entry["collected"]),
             "campaign_cases": entry["campaign_cases"],
             "campaign_ans": float(entry["campaign_ans"]),
+            "campaign_custs": entry["campaign_custs"],
             "ep": float(entry["ep"]),
+            # Shown alongside EP so the bonus can be checked without recomputing
+            # it by hand, and so an agent with a blank carry-over row is
+            # visibly blank rather than silently scoring zero bonus.
+            "base_ep": float(base_ep),
+            "carry_cases": entry["carry_cases"],
+            "carry_sales": entry["carry_sales"],
+            "bonus_tier": float(tier),
+            "campaign_bonus": float(bonus),
+            # EP as at the EGA deadline, so the EGA column can be read without
+            # recomputing it, and so the difference from the running EP is
+            # visible rather than implied.
+            "ep_jun": float(ep_jun),
             "qualified": qualified,
-            "balance": 0.0 if qualified else float(threshold - entry["ep"]),
-            "status": int_mod.determine_eligibility(entry["ep_rows"]) if qualified else "",
+            "balance": 0.0 if qualified else float(threshold - ep_jun),
+            "ega_threshold": float(threshold),
+            # Twice the target earns a second trip ticket. Only one agent in the
+            # printed report reaches it, so this rests on a single example --
+            # treat the label as provisional until a second one appears.
+            "ega_double": ega_double,
+            "esa_threshold": float(esa_threshold),
+            "esa_qualified": esa_qualified,
+            # Measured on plain sales points, so the shortfall shown matches
+            # the basis the award is judged on.
+            "esa_ep": float(esa_ep),
+            "esa_balance": 0.0 if esa_qualified else float(esa_threshold - esa_ep),
+            # "Apr Qualifier" and the like, in the printed report's wording.
+            "status": _qualifier_label(ega_month) if qualified else "",
+            "esa_status": _qualifier_label(esa_month) if esa_qualified else "",
         })
 
-    out_agents.sort(key=lambda a: a["ep"], reverse=True)
-    branches = sorted({a["branch"] for a in out_agents})
+    # Qualifiers first, then everyone else, each group by EP descending.
+    # Sorting on EP alone buried them: EGA is settled on EP as at June while
+    # the column sorts on the running total, so an agent who qualified in April
+    # can sit below one who has out-earned them since without winning anything.
+    # Either award counts as qualifying -- today every ESA winner is also an
+    # EGA winner, but ranking on EGA alone would drop that out one day.
+    out_agents.sort(key=lambda a: (0 if (a["qualified"] or a["esa_qualified"]) else 1,
+                                   -a["ep"]))
+    def _branch_key(name: str) -> tuple:
+        try:
+            return (SALES_REPORT_BRANCH_ORDER.index(name), "")
+        except ValueError:
+            return (len(SALES_REPORT_BRANCH_ORDER), name)
+
+    branches = sorted({a["branch"] for a in out_agents}, key=_branch_key)
     return {
         "ready": True,
         "year": year,
         "last_month": last_month,
+        # How far the ledger could go, so the period picker can offer every
+        # month there is data for without guessing at today's date.
+        "max_month": max_month,
         "split_month": SALES_REPORT_SPLIT_MONTH,
         "split_day": SALES_REPORT_SPLIT_DAY,
+        # The slice of the 1 May - 10 June campaign this period covers, said
+        # plainly in the column heading rather than left to be inferred.
+        "campaign_label": _sales_report_campaign_label(last_month),
+        # False when the period stops before 1 May: the carry-over cases earn
+        # nothing then, and printing a count next to a zero bonus reads as if
+        # they did. Both cells say "not in this period" instead.
+        "campaign_in_period": last_month >= 5,
+        # One award column at a time, whichever the period is still deciding.
+        # EGA is settled on EP as at 30 June, so a period reaching July can no
+        # longer move it; ESA runs to December and is what those months are
+        # still playing for.
+        "show_ega": last_month <= SALES_REPORT_SPLIT_MONTH,
+        "show_esa": last_month > SALES_REPORT_SPLIT_MONTH,
         "scoped_to_agent": scope_agent,
         "targets": targets,
+        "esa_targets": esa_targets,
+        "multiplier_in_period": multiplier_in_period,
         "branches": branches,
         "agents": out_agents,
         "totals": {
@@ -2100,8 +3277,9 @@ def sales_report_page():
 @login_required
 def get_sales_report():
     year = request.args.get("year", 2026, type=int)
+    through = request.args.get("month", type=int)
     try:
-        payload = _sales_report_payload(year)
+        payload = _sales_report_payload(year, through)
         if payload is None:
             _trigger_background_refresh(year, "outsource")
             return jsonify({"ready": False,
@@ -2110,6 +3288,475 @@ def get_sales_report():
     except Exception as e:
         _log("[SALES REPORT ERROR]\n" + traceback.format_exc())
         return jsonify({"error": str(e)}), 500
+
+
+def _sales_report_visible(payload: dict, search: str) -> list[dict]:
+    """The agents a given search box would show, in report order. Mirrors
+    normalizeName()/visibleAgents() in static/sales_report.js so the PDF and
+    the screen never disagree about who is in the report."""
+    q = _normalize_search_text(search or "")
+    if not q:
+        return payload.get("agents") or []
+    return [a for a in (payload.get("agents") or [])
+            if q in _normalize_search_text(a.get("agent") or "")]
+
+
+def _sales_report_pdf(payload: dict, search: str) -> bytes:
+    """Render the sales ledger as a landscape A3 PDF, block for block the same
+    as the page: Company-wide Internal/Outsource first, then each branch."""
+    import io
+    from datetime import datetime
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A3, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate,
+                                    Paragraph, Spacer, Table, TableStyle)
+
+    MONTH_ABBR = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                  "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+    MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+                   "July", "August", "September", "October", "November", "December"]
+
+    lm = int(payload.get("last_month") or 6)
+    sm = int(payload.get("split_month") or 6)
+    # June splits into 1-10 and 11-30 only to measure the campaign window, so a
+    # period with no multiplier prints it as an ordinary month.
+    split_june = payload.get("multiplier_in_period") is not False
+    sd = int(payload.get("split_day") or 10)
+    year = payload.get("year")
+    targets = payload.get("targets") or {}
+    shown = _sales_report_visible(payload, search)
+    # The campaign opens on 1 May; a period stopping before then earns no bonus,
+    # so the carry-over cases and the bonus both read as a dash, as on the page.
+    # Dropped when the period ends before the window opens, and equally when it
+    # runs into July or beyond, where no multiplier is applied at all.
+    no_campaign = (payload.get("campaign_in_period") is False
+                   or payload.get("multiplier_in_period") is False)
+
+    def rm(v) -> str:
+        """Two decimals, rounded the way the page's toLocaleString rounds.
+        Formatting the float directly rounds half to even off the exact binary
+        value and prints a cent less than the screen does on a tie, which is
+        exactly the kind of difference someone would read as a bug."""
+        from decimal import Decimal, ROUND_HALF_UP
+        d = Decimal(repr(float(v or 0))).quantize(Decimal("0.01"),
+                                                  rounding=ROUND_HALF_UP)
+        return f"{d:,.2f}"
+
+    # Two header rows, in exactly the column order agentRows() emits on screen.
+    top = ["NO", "NAME", "TYPE"]
+    sub = ["", "", ""]
+    spans = []
+    col = 3
+    for m in range(1, lm + 1):
+        if m == sm and split_june:
+            top += [MONTH_ABBR[m - 1], "", ""]
+            sub += ["NOC", f"1-{sd} {MONTH_ABBR[m - 1]}",
+                    f"{sd + 1}-30 {MONTH_ABBR[m - 1]}"]
+            spans.append(("SPAN", (col, 0), (col + 2, 0)))
+            col += 3
+        else:
+            top += [MONTH_ABBR[m - 1], ""]
+            sub += ["NOC", "ANS"]
+            spans.append(("SPAN", (col, 0), (col + 1, 0)))
+            col += 2
+    campaign_label = payload.get("campaign_label") or f"1/5 - {sd}/{sm}"
+    # The multiplier columns only exist while the period reaches the campaign.
+    groups = [("TOTAL", ("NOC", "ANS")), ("ACC", ("NOC", "ANS"))]
+    if not no_campaign:
+        groups += [("MAY MULTIPLIER POINT " + campaign_label,
+                    ("CASES", "BEFORE\n31/12/25")),
+                   ("", ("CASES", "AFTER 1/1/26"))]
+    for label, pair in groups:
+        top += [label, ""]
+        sub += list(pair)
+        spans.append(("SPAN", (col, 0), (col + 1, 0)))
+        col += 2
+    # One award column, whichever the period is still deciding: EGA up to June,
+    # ESA from July. Same rule the page follows, from the same payload flags.
+    show_ega = payload.get("show_ega", lm <= sm) is not False
+    show_esa = bool(payload.get("show_esa", lm > sm))
+    top += ["COLLECTED\nPAYMENT", "UP TO DATE\nEP POINT"]
+    sub += ["", ""]
+    collected_col, ep_col = col, col + 1
+    col += 2
+    ega_col = esa_col = None
+    if show_ega:
+        top += [""]
+        sub += [""]
+        ega_col = col
+        col += 1
+    if show_esa:
+        top += [""]
+        sub += [""]
+        esa_col = col
+        col += 1
+    ncols = col
+    # NO/NAME/TYPE and the trailing columns are one logical cell each.
+    spans += [("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1)),
+              ("SPAN", (2, 0), (2, 1)),
+              ("SPAN", (collected_col, 0), (collected_col, 1)),
+              ("SPAN", (ep_col, 0), (ep_col, 1))]
+    for award in (ega_col, esa_col):
+        if award is not None:
+            spans.append(("SPAN", (award, 0), (award, 1)))
+
+    def fmt_threshold(value) -> str:
+        """"600K", "1.3M" -- the page's own shorthand for a bar."""
+        n = float(value or 0)
+        if n >= 1e6:
+            return f"{n / 1e6:.2f}".rstrip("0").rstrip(".") + "M"
+        if n >= 1e3:
+            return f"{round(n / 1e3):.0f}K"
+        return rm(n)
+
+    def header_rows(channel: str) -> list[list]:
+        """The two header rows for one block. The print carries both channels'
+        bars in one heading, "600K/720K", over the Internal and Outsource
+        tables alike, and headerFor() follows it; so does this."""
+        def bars(bag) -> str:
+            bag = bag or {}
+            return (f"{fmt_threshold(bag.get('Internal'))}"
+                    f"/{fmt_threshold(bag.get('Outsource'))}")
+
+        head = list(top)
+        if ega_col is not None:
+            head[ega_col] = ("EGA - HANOI\nBalance to Qualify\n"
+                             f"({bars(payload.get('targets'))} EP Point Till 30Jun)")
+        if esa_col is not None:
+            head[esa_col] = ("ESA - CHINA\nBalance to Qualify\n"
+                             f"({bars(payload.get('esa_targets'))} EP Point Till 31Dec)")
+        return [head, list(sub)]
+
+    page_w, page_h = landscape(A3)
+    avail = page_w - 24 * mm
+    no_w, name_w, type_w = 15.0, 74.0, 20.0
+    num_w = (avail - no_w - name_w - type_w) / (ncols - 3)
+    col_widths = [no_w, name_w, type_w] + [num_w] * (ncols - 3)
+    # A longer period means more month columns and less room in each, so the
+    # type shrinks to keep "1,234,567.89" inside its cell instead of letting it
+    # run over the neighbour. Capped at 5pt, which is what the shorter periods
+    # get and as large as the widest report can be.
+    font_size = max(3.8, min(5.0, (num_w - 3.0) / 6.7))
+
+    # A long name has to wrap rather than run over the JAN column, so the
+    # name cell is a Paragraph while every other cell stays a plain string.
+    name_style = ParagraphStyle("srName", fontName="Helvetica", fontSize=font_size,
+                                leading=font_size + 0.8,
+                                textColor=colors.HexColor("#0f172a"))
+
+    def agent_rows(agent: dict, no: int) -> list[list]:
+        types = agent.get("types") or [{"type": "RES", "months": [], "jun_early": 0,
+                                        "jun_late": 0, "total_noc": 0, "total_ans": 0}]
+        out = []
+        for i, t in enumerate(types):
+            first, last = i == 0, i == len(types) - 1
+            row = [str(no) if first else "",
+                   Paragraph(html.escape(str(agent.get("agent", ""))), name_style)
+                   if first else "",
+                   t.get("type", "")]
+            months = t.get("months") or []
+            for m in range(1, lm + 1):
+                cell = months[m - 1] if m - 1 < len(months) else {}
+                if m == sm and split_june:
+                    row += [str(cell.get("noc", 0)), rm(t.get("jun_early")),
+                            rm(t.get("jun_late"))]
+                else:
+                    row += [str(cell.get("noc", 0)), rm(cell.get("ans"))]
+            tier = float(agent.get("bonus_tier") or 0)
+            row += [
+                str(t.get("total_noc", 0)), rm(t.get("total_ans")),
+                str(agent.get("acc_noc", 0)) if last else "",
+                rm(agent.get("acc_ans")) if last else "",
+            ]
+            if not no_campaign:
+                row += [
+                    str(agent.get("campaign_cases", 0)) if first else "",
+                    # The window's sales with the multiplier already in them, as
+                    # the printed report carries it. Blank when no multiplier is
+                    # earned, since there is then nothing to award.
+                    (("-" if not tier else
+                      rm((agent.get("campaign_ans") or 0)
+                         + (agent.get("campaign_bonus") or 0)))
+                     if first else ""),
+                    # The newer vintage is not derivable, so its pair stays empty
+                    # rather than carrying a figure nobody can stand behind.
+                    ("-" if first else ""), ("-" if first else ""),
+                ]
+            row += [
+                ((rm(agent.get("collected")) if agent.get("collected") else "-")
+                 if first else ""),
+                rm(agent.get("ep")) if first else "",
+            ]
+            if not first:
+                row += [""] * ((1 if show_ega else 0) + (1 if show_esa else 0))
+            else:
+                if show_ega:
+                    if agent.get("ega_double"):
+                        row.append("DOUBLE TICKET")
+                    elif agent.get("qualified"):
+                        row.append(agent.get("status") or "Qualifier")
+                    else:
+                        row.append(rm(agent.get("balance")))
+                if show_esa:
+                    if agent.get("esa_qualified"):
+                        row.append(agent.get("esa_status") or "Qualifier")
+                    else:
+                        row.append(rm(agent.get("esa_balance")))
+            out.append(row)
+        return out
+
+    def subtotal_row(members: list[dict]) -> list:
+        row = ["", "SUBTOTAL", ""]
+        for m in range(1, lm + 1):
+            noc = sum((t.get("months") or [{}] * m)[m - 1].get("noc", 0)
+                      for a in members for t in (a.get("types") or [])
+                      if m - 1 < len(t.get("months") or []))
+            if m == sm and split_june:
+                row += [str(noc),
+                        rm(sum(t.get("jun_early") or 0
+                               for a in members for t in (a.get("types") or []))),
+                        rm(sum(t.get("jun_late") or 0
+                               for a in members for t in (a.get("types") or [])))]
+            else:
+                ans = sum((t.get("months") or [{}] * m)[m - 1].get("ans", 0)
+                          for a in members for t in (a.get("types") or [])
+                          if m - 1 < len(t.get("months") or []))
+                row += [str(noc), rm(ans)]
+        acc_noc = sum(a.get("acc_noc", 0) for a in members)
+        acc_ans = sum(a.get("acc_ans", 0) for a in members)
+        row += [str(acc_noc), rm(acc_ans), str(acc_noc), rm(acc_ans)]
+        if not no_campaign:
+            row += [str(sum(a.get("campaign_cases", 0) for a in members)),
+                    rm(sum((a.get("campaign_ans") or 0)
+                           + (a.get("campaign_bonus") or 0)
+                           for a in members if a.get("bonus_tier"))),
+                    "-", "-"]
+        # Collected, EP, then one blank per award column in the header.
+        row += [rm(sum(a.get("collected") or 0 for a in members)), ""]
+        row += [""] * ((1 if show_ega else 0) + (1 if show_esa else 0))
+        return row
+
+    def block(title: str, members: list[dict], channel: str) -> list:
+        if not members:
+            return []
+        rows = header_rows(channel)
+        for i, a in enumerate(members):
+            rows += agent_rows(a, i + 1)
+        rows.append(subtotal_row(members))
+        style = [
+            ("FONTNAME", (0, 0), (-1, 1), "Helvetica-Bold"),
+            ("FONTNAME", (0, 2), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 0), (-1, -1), font_size),
+            ("LEADING", (0, 0), (-1, -1), font_size + 1.2),
+            ("BACKGROUND", (0, 0), (-1, 1), colors.HexColor("#1f2a44")),
+            ("TEXTCOLOR", (0, 0), (-1, 1), colors.white),
+            ("ALIGN", (3, 0), (-1, -1), "RIGHT"),
+            ("ALIGN", (0, 0), (2, -1), "CENTER"),
+            ("ALIGN", (3, 0), (-1, 1), "CENTER"),
+            ("ALIGN", (1, 2), (1, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#c8cedb")),
+            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#eef1f7")),
+            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 1.5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 1.5),
+            ("TOPPADDING", (0, 0), (-1, -1), 1.2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 1.2),
+        ] + spans
+        # Qualified reads green and short reads red, the same signal the page
+        # gives with .sr-qualified / .sr-short.
+        green, red = colors.HexColor("#166534"), colors.HexColor("#b91c1c")
+        r = 2
+        for a in members:
+            for i in range(max(1, len(a.get("types") or []))):
+                if i == 0:
+                    if ega_col is not None:
+                        style.append(("TEXTCOLOR", (ega_col, r), (ega_col, r),
+                                      green if a.get("qualified") else red))
+                    if esa_col is not None:
+                        style.append(("TEXTCOLOR", (esa_col, r), (esa_col, r),
+                                      green if a.get("esa_qualified") else red))
+                r += 1
+        target = float(targets.get(channel, 0) or 0)
+        head = Paragraph(
+            f"<b>{html.escape(title)}</b> &nbsp;&nbsp;{len(members)} agent"
+            f"{'' if len(members) == 1 else 's'} &middot; target RM {target:,.2f} EP",
+            ParagraphStyle("blockHead", fontName="Helvetica", fontSize=8,
+                           textColor=colors.HexColor("#334155"), spaceAfter=3))
+        table = Table(rows, colWidths=col_widths, repeatRows=2)
+        table.setStyle(TableStyle(style))
+        return [head, table, Spacer(1, 8)]
+
+    title_style = ParagraphStyle("srTitle", fontName="Helvetica-Bold", fontSize=15,
+                                 textColor=colors.HexColor("#0f172a"), spaceAfter=2)
+    meta_style = ParagraphStyle("srMeta", fontName="Helvetica", fontSize=8,
+                                textColor=colors.HexColor("#64748b"), spaceAfter=10)
+    section_style = ParagraphStyle("srSection", fontName="Helvetica-Bold", fontSize=10,
+                                   textColor=colors.HexColor("#0f172a"),
+                                   spaceBefore=4, spaceAfter=4)
+
+    def fmt_compact(value) -> str:
+        n = float(value or 0)
+        if abs(n) >= 1e6:
+            return f"RM {n / 1e6:.2f}m"
+        if abs(n) >= 1e3:
+            return f"RM {n / 1e3:.1f}k"
+        return f"RM {rm(n)}"
+
+    def plural(count: int, noun: str) -> str:
+        return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+    def summary_cards():
+        """The five cards the page shows above the tables, in the same order
+        and computed the same way -- from the agents on screen, not from
+        data.totals, so a search moves them."""
+        internal = [a for a in shown if a.get("channel") == "Internal"]
+        outsource = [a for a in shown if a.get("channel") == "Outsource"]
+        qual = sum(1 for a in shown if a.get("qualified"))
+        cards = [
+            ("Total Cases", str(sum(a.get("acc_noc", 0) for a in shown)),
+             plural(len(shown), "agent")),
+            ("Total Net Sales", fmt_compact(sum(a.get("acc_ans", 0) for a in shown)),
+             "net of EPP interest"),
+            ("Internal", fmt_compact(sum(a.get("acc_ans", 0) for a in internal)),
+             f"{plural(len(internal), 'agent')} · "
+             f"{plural(sum(a.get('acc_noc', 0) for a in internal), 'case')}"),
+            ("Outsource", fmt_compact(sum(a.get("acc_ans", 0) for a in outsource)),
+             f"{plural(len(outsource), 'agent')} · "
+             f"{plural(sum(a.get('acc_noc', 0) for a in outsource), 'case')}"),
+            ("Qualified", f"{qual} / {len(shown)}",
+             f"RM {rm(targets.get('Internal'))} internal · "
+             f"RM {rm(targets.get('Outsource'))} outsource"),
+        ]
+        width = (page_w - 24 * mm) / len(cards)
+        table = Table([[c[0] for c in cards], [c[1] for c in cards],
+                       [c[2] for c in cards]],
+                      colWidths=[width] * len(cards))
+        table.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica"),
+            ("FONTSIZE", (0, 0), (-1, 0), 6.5),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#64748b")),
+            ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 1), (-1, 1), 12),
+            ("TEXTCOLOR", (0, 1), (-1, 1), colors.HexColor("#0f172a")),
+            ("FONTNAME", (0, 2), (-1, 2), "Helvetica"),
+            ("FONTSIZE", (0, 2), (-1, 2), 6),
+            ("TEXTCOLOR", (0, 2), (-1, 2), colors.HexColor("#94a3b8")),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+            ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#e2e8f0")),
+            ("LINEAFTER", (0, 0), (-2, -1), 0.4, colors.HexColor("#e2e8f0")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, 0), 6),
+            ("BOTTOMPADDING", (0, 2), (-1, 2), 6),
+        ]))
+        return table
+
+    period = f"January &ndash; {MONTH_NAMES[lm - 1]} {year}"
+    cases = sum(a.get("acc_noc", 0) for a in shown)
+    sales = sum(a.get("acc_ans", 0) for a in shown)
+    qualified = sum(1 for a in shown if a.get("qualified"))
+    meta = (f"Generated {datetime.now().strftime('%d %b %Y %H:%M')} &middot; "
+            f"{len(shown)} agents &middot; {cases} cases &middot; "
+            f"RM {sales:,.2f} net sales &middot; {qualified} qualified for EGA")
+    if search:
+        meta += f" &middot; filtered to &ldquo;{html.escape(search)}&rdquo;"
+
+    story = [Paragraph(f"Sales Report &mdash; {period}", title_style),
+             Paragraph(meta, meta_style), summary_cards(), Spacer(1, 12)]
+
+    def pick(channel, branch):
+        return [a for a in shown if a.get("channel") == channel
+                and (branch is None or a.get("branch") == branch)]
+
+    if not shown:
+        story.append(Paragraph("No agent matches the current filter.", meta_style))
+    else:
+        story.append(Paragraph("Company-wide", section_style))
+        story += block("Internal Sales Agent", pick("Internal", None), "Internal")
+        story += block("Outsource Sales Agent", pick("Outsource", None), "Outsource")
+        for branch in (payload.get("branches") or []):
+            internal, outsource = pick("Internal", branch), pick("Outsource", branch)
+            if not internal and not outsource:
+                continue
+            story.append(Paragraph(f"{html.escape(str(branch))} Branch", section_style))
+            story += block("Internal Sales Agent", internal, "Internal")
+            story += block("Outsource Sales Agent", outsource, "Outsource")
+
+    # The page carries a note about the three columns that differ from the
+    # printed report. Leaving it out of the file would let the RES/COM split be
+    # read as data loss, so it travels with the tables.
+    mix = payload.get("property_mix") or {}
+    mix_total = sum(mix.values())
+    res = mix.get("Residential", 0)
+    if mix_total and res >= mix_total * 0.9:
+        others = ", ".join(f"{v} {k}" for k, v in mix.items()
+                           if k != "Residential") or "none"
+        note_style = ParagraphStyle("srNote", fontName="Helvetica", fontSize=6.5,
+                                    leading=8.5, spaceBefore=6,
+                                    textColor=colors.HexColor("#64748b"))
+        story.append(Paragraph(
+            "<b>Three columns differ from the printed report.</b> "
+            f"<b>RES / COM</b> - the property classifier returned Residential for {res} "
+            f"of {mix_total} invoices (others: {html.escape(others)}); it falls back to "
+            "Residential whenever SEDA nem type, referral project type and the package "
+            "fields are all silent, so most agents show a single RES line where the print "
+            "splits them. <b>EP point</b> - 1 point per RM1 of sales, plus the campaign "
+            "bonus: every third case an agent closed before the cutoff adds half a point "
+            "per ringgit of their campaign sales. Those case counts are typed in under "
+            "Data &rarr; EGA/ESA Award; an agent with no row there earns no bonus, shown "
+            "as a dash. The print also splits the campaign window into cases before "
+            "31/12/25 and after 1/1/26, which is not derivable here, so it is shown as "
+            "one figure.", note_style))
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.HexColor("#94a3b8"))
+        canvas.drawString(12 * mm, 8 * mm,
+                          f"Eternalgy Commission Portal - Sales Report {year}")
+        canvas.drawRightString(page_w - 12 * mm, 8 * mm,
+                               f"Page {canvas.getPageNumber()}")
+        canvas.restoreState()
+
+    buf = io.BytesIO()
+    doc = BaseDocTemplate(buf, pagesize=landscape(A3),
+                          leftMargin=12 * mm, rightMargin=12 * mm,
+                          topMargin=12 * mm, bottomMargin=14 * mm,
+                          title=f"Sales Report {year}", author="Eternalgy")
+    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="body")
+    doc.addPageTemplates([PageTemplate(id="sr", frames=[frame], onPage=footer)])
+    doc.build(story)
+    return buf.getvalue()
+
+
+@app.route("/api/sales-report/pdf")
+@login_required
+def get_sales_report_pdf():
+    """The sales ledger as a PDF, honouring the page's agent search so the file
+    holds what is on screen rather than always the whole company."""
+    year = request.args.get("year", 2026, type=int)
+    through = request.args.get("month", type=int)
+    search = (request.args.get("agent") or "").strip()
+    try:
+        payload = _sales_report_payload(year, through)
+        if payload is None:
+            _trigger_background_refresh(year, "outsource")
+            return jsonify({"ready": False,
+                            "message": "Sales data is still being prepared. "
+                                       "Refresh shortly."}), 409
+        pdf = _sales_report_pdf(payload, search)
+        abbr = ["jan", "feb", "mar", "apr", "may", "jun",
+                "jul", "aug", "sep", "oct", "nov", "dec"][int(payload.get("last_month") or 6) - 1]
+        name = f"sales_report_{payload.get('year')}_jan_{abbr}.pdf"
+        resp = make_response(pdf)
+        resp.headers["Content-Type"] = "application/pdf"
+        resp.headers["Content-Disposition"] = f'attachment; filename="{name}"'
+        return _no_store(resp)
+    except Exception:
+        _log("[SALES REPORT PDF ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": "Failed to build the sales report PDF."}), 500
 
 
 @app.route("/api/commission")
@@ -2211,41 +3858,26 @@ def get_commission():
                 month=month
             )
 
-            # Determine headers and pop Safwan column if no factory deal exists
+            # Determine headers. The Safwan column is popped further below, AFTER
+            # special-case rows are injected -- a hand-added factory customer
+            # (e.g. a Durapower-style restatement) only exists in those injected
+            # rows, so checking has_factory before injection always missed it.
             if month >= 7:
-                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Referral Name", "Referral Fee"]
+                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
             else:
-                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Referral Name", "Referral Fee"]
+                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
 
             # Extract ANP rows before column removal
             anp_rows = _apply_anp_agent_display_names(int_customer_anp.get(month, []))
             anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Accumulated Total Amount", "Commission Price", "Clawback"]
 
             basic_nfp_rows = remove_agent_block(int_customer_summary.get(month, []), "Safwan")
-            has_factory = any("factory" in str(r[6 if month >= 7 else 5]).lower() for r in basic_nfp_rows if len(r) > (6 if month >= 7 else 5))
-            if not has_factory:
-                if "Safwan (RM)" in basic_nfp_headers:
-                    safwan_idx = basic_nfp_headers.index("Safwan (RM)")
-                    basic_nfp_headers.pop(safwan_idx)
-                    for r in reversed(basic_nfp_rows):
-                        if len(r) > safwan_idx:
-                            r.pop(safwan_idx)
-                    for r in reversed(anp_rows):
-                        if len(r) > safwan_idx:
-                            r.pop(safwan_idx)
-                for r in basic_nfp_rows:
-                    while len(r) < len(basic_nfp_headers):
-                        r.append("-")
-                for r in anp_rows:
-                    while len(r) < len(basic_nfp_headers):
-                        r.append("-")
-            else:
-                for r in basic_nfp_rows:
-                    while len(r) < len(basic_nfp_headers):
-                        r.append("-")
-                for r in anp_rows:
-                    while len(r) < len(basic_nfp_headers):
-                        r.append("-")
+            for r in basic_nfp_rows:
+                while len(r) < len(basic_nfp_headers):
+                    r.append("-")
+            for r in anp_rows:
+                while len(r) < len(basic_nfp_headers):
+                    r.append("-")
             if "Remarks" not in basic_nfp_headers:
                 basic_nfp_headers.append("Remarks")
             for r in basic_nfp_rows:
@@ -2256,6 +3888,20 @@ def get_commission():
                     r.append("-")
 
             _inject_special_case_rows(basic_nfp_headers, basic_nfp_rows, year, month, "internal")
+
+            pkg_i = basic_nfp_headers.index("Package Type") if "Package Type" in basic_nfp_headers else -1
+            has_factory = pkg_i != -1 and any(
+                "factory" in str(r[pkg_i]).lower() for r in basic_nfp_rows if len(r) > pkg_i
+            )
+            if not has_factory and "Safwan (RM)" in basic_nfp_headers:
+                safwan_idx = basic_nfp_headers.index("Safwan (RM)")
+                basic_nfp_headers.pop(safwan_idx)
+                for r in reversed(basic_nfp_rows):
+                    if len(r) > safwan_idx:
+                        r.pop(safwan_idx)
+                for r in reversed(anp_rows):
+                    if len(r) > safwan_idx:
+                        r.pop(safwan_idx)
 
             agent_summary_rows = remove_agent_block(int_agent_summary.get(month, []), "Safwan")
             agent_summary_headers = ["Agent", "Count of Customer", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission Price", "Other Commission"]
@@ -2289,7 +3935,15 @@ def get_commission():
             # process to apply the Data page's thresholds. Without this the
             # award grades against the constants hardcoded in the script.
             int_ega_mod.ensure_rules_applied(year)
-            lines, agent_ep, agent_sales, agent_eligibility = int_ega_mod.build_report(filtered_ega_raw)
+            # Company-wide rows so an agent who transferred mid-year is judged
+            # on their whole year here, exactly as the Sales Report shows them.
+            # Falls back to this section's own rows when that bundle is cold.
+            _ega_rows = _company_ega_rows(year) or filtered_ega_raw
+            lines, agent_ep, agent_sales, agent_eligibility = _ega_award_report(
+                int_ega_mod, sys.modules.get("out_ega_esa") or int_ega_mod,
+                _ega_rows, year, month, "Internal",
+                _sales_report_carryover(year), _sales_report_role_index(),
+                _sales_report_case_dates(year))
 
             # Build Table 1: Agent Name, Customer Count, Accumulated Sales Price, Accumulated EP Point, Eligibility
             t1_rows = []
@@ -2424,9 +4078,9 @@ def get_commission():
             )
 
             if month >= 7:
-                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee"]
+                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
             else:
-                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee"]
+                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
 
             out_anp_rows = _apply_anp_agent_display_names(build_anp_customer_rows_custom(
                 anp_summary=out_anp_summary,
@@ -2437,30 +4091,12 @@ def get_commission():
             ))
 
             basic_nfp_rows = remove_agent_block(out_customer_summary.get(month, []), "Safwan")
-            has_factory = any("factory" in str(r[6 if month >= 7 else 5]).lower() for r in basic_nfp_rows if len(r) > (6 if month >= 7 else 5))
-            if not has_factory:
-                if "Safwan (RM)" in basic_nfp_headers:
-                    safwan_idx = basic_nfp_headers.index("Safwan (RM)")
-                    basic_nfp_headers.pop(safwan_idx)
-                    for r in reversed(basic_nfp_rows):
-                        if len(r) > safwan_idx:
-                            r.pop(safwan_idx)
-                    for r in reversed(out_anp_rows):
-                        if len(r) > safwan_idx:
-                            r.pop(safwan_idx)
-                for r in basic_nfp_rows:
-                    while len(r) < len(basic_nfp_headers):
-                        r.append("-")
-                for r in out_anp_rows:
-                    while len(r) < len(basic_nfp_headers):
-                        r.append("-")
-            else:
-                for r in basic_nfp_rows:
-                    while len(r) < len(basic_nfp_headers):
-                        r.append("-")
-                for r in out_anp_rows:
-                    while len(r) < len(basic_nfp_headers):
-                        r.append("-")
+            for r in basic_nfp_rows:
+                while len(r) < len(basic_nfp_headers):
+                    r.append("-")
+            for r in out_anp_rows:
+                while len(r) < len(basic_nfp_headers):
+                    r.append("-")
             if "Remarks" not in basic_nfp_headers:
                 basic_nfp_headers.append("Remarks")
             for r in basic_nfp_rows:
@@ -2471,6 +4107,20 @@ def get_commission():
                     r.append("-")
 
             _inject_special_case_rows(basic_nfp_headers, basic_nfp_rows, year, month, "outsource")
+
+            pkg_i = basic_nfp_headers.index("Package Type") if "Package Type" in basic_nfp_headers else -1
+            has_factory = pkg_i != -1 and any(
+                "factory" in str(r[pkg_i]).lower() for r in basic_nfp_rows if len(r) > pkg_i
+            )
+            if not has_factory and "Safwan (RM)" in basic_nfp_headers:
+                safwan_idx = basic_nfp_headers.index("Safwan (RM)")
+                basic_nfp_headers.pop(safwan_idx)
+                for r in reversed(basic_nfp_rows):
+                    if len(r) > safwan_idx:
+                        r.pop(safwan_idx)
+                for r in reversed(out_anp_rows):
+                    if len(r) > safwan_idx:
+                        r.pop(safwan_idx)
 
             anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Accumulated Total Amount", "Commission Price", "Clawback"]
 
@@ -2503,7 +4153,11 @@ def get_commission():
             # process to apply the Data page's thresholds. Without this the
             # award grades against the constants hardcoded in the script.
             out_ega_mod.ensure_rules_applied(year)
-            lines, agent_ep, agent_sales, agent_eligibility = out_ega_mod.build_report(filtered_ega_raw)
+            _ega_rows = _company_ega_rows(year) or filtered_ega_raw
+            lines, agent_ep, agent_sales, agent_eligibility = _ega_award_report(
+                out_ega_mod, out_ega_mod, _ega_rows, year, month, "Outsource",
+                _sales_report_carryover(year), _sales_report_role_index(),
+                _sales_report_case_dates(year))
 
             # Build Table 1: Agent Name, Customer Count, Accumulated Sales Price, Accumulated EP Point, Eligibility
             t1_rows = []
@@ -2739,6 +4393,35 @@ def special_cases_api():
         return (str(c.get("agent") or "").strip().lower(),
                 str(c.get("customer") or "").strip().lower())
 
+    # A restated-customer case (caseType "customer" with a restatedTotal +
+    # linkedInvoiceNumber) never trusts the (year, month) the browser posted
+    # -- that's just whichever tab was open -- it goes wherever
+    # _resolve_restated_case_placement says cumulative payments actually
+    # crossed the restated total, computed fresh here server-side. Split
+    # those out before the ordinary merge-into-one-bucket logic below runs.
+    restated_placed, restated_pending = [], []
+    plain_sc_list = []
+    for c in new_sc_list:
+        linked_invoice_number = str(c.get("linkedInvoiceNumber") or "").strip()
+        restated_total = c.get("restatedTotal")
+        if (str(c.get("caseType") or "").strip().lower() == "customer"
+                and linked_invoice_number and restated_total):
+            placement = _resolve_restated_case_placement(linked_invoice_number, restated_total)
+            if not placement.get("placed"):
+                restated_pending.append(
+                    (str(c.get("customer") or "").strip(), placement.get("pct_paid", 0.0)))
+                continue
+            placed_case = dict(c)
+            placed_case["year"], placed_case["month"] = str(placement["year"]), str(placement["month"])
+            restated_placed.append(placed_case)
+        else:
+            plain_sc_list.append(c)
+
+    if restated_pending:
+        detail = "; ".join(f"{name}: {pct}% paid" for name, pct in restated_pending)
+        return jsonify({"error": "Not yet fully paid against the restated total, so this "
+                                 f"case can't be placed on the report yet ({detail})."}), 400
+
     try:
         if str(req_data.get("mode") or "merge").lower() != "replace":
             merged = {}
@@ -2746,15 +4429,34 @@ def special_cases_api():
                 merged[_case_key(c)] = c
             for c in deleted:
                 merged.pop(_case_key(c), None)
-            for c in new_sc_list:
+            for c in plain_sc_list:
                 # A case with no agent can never be rendered again
                 # (_inject_special_case_rows skips it), so refuse to store one.
                 if not str(c.get("agent") or "").strip():
                     continue
                 merged[_case_key(c)] = c
-            new_sc_list = list(merged.values())
+            plain_sc_list = list(merged.values())
 
-        db.save_special_cases(year, month, agent_type, new_sc_list, auth.current_user()["username"])
+        db.save_special_cases(year, month, agent_type, plain_sc_list, auth.current_user()["username"])
+
+        # Each restated case is merged into its OWN computed bucket the same
+        # way, then pruned from whatever bucket it used to live in if that
+        # bucket differs -- e.g. its restated total was edited and now
+        # crosses in a different month than it used to.
+        for placed_case in restated_placed:
+            r_year, r_month = placed_case["year"], placed_case["month"]
+            r_bucket = {c2: c1 for c1, c2 in
+                        ((c, _case_key(c)) for c in db.get_special_cases(r_year, r_month, agent_type))}
+            r_bucket[_case_key(placed_case)] = placed_case
+            db.save_special_cases(r_year, r_month, agent_type, list(r_bucket.values()),
+                                  auth.current_user()["username"])
+            if (r_year, r_month) != (year, month):
+                stale_bucket = db.get_special_cases(year, month, agent_type)
+                if any(_case_key(c) == _case_key(placed_case) for c in stale_bucket):
+                    pruned = [c for c in stale_bucket if _case_key(c) != _case_key(placed_case)]
+                    db.save_special_cases(year, month, agent_type, pruned,
+                                          auth.current_user()["username"])
+
         clear_commission_cache()
         return jsonify({"status": "success"})
     except Exception as e:
@@ -2774,6 +4476,52 @@ def _pg_query(sql: str):
     client = anp_mod.PostgresProxyClient(
         base_url.rstrip("/").replace("/api/sql", ""), token, db_name)
     return client.query(sql)
+
+
+@app.route("/api/special-cases/resolve-restatement", methods=["POST"])
+@login_required
+def resolve_restatement_api():
+    """Live preview for the "Restated Total" field on the Special Case Customer
+    modal: where a restated deal would land and how much of it is paid,
+    computed the same way special_cases_api() enforces at save time."""
+    req_data = request.json or {}
+    invoice_number = str(req_data.get("invoice_number") or "").strip()
+    restated_total = req_data.get("restated_total")
+    if not invoice_number or not restated_total:
+        return jsonify({"error": "invoice_number and restated_total are required"}), 400
+    return jsonify(_resolve_restated_case_placement(invoice_number, restated_total))
+
+
+@app.route("/api/customer-invoices")
+@login_required
+def customer_invoices_api():
+    """A customer's invoices (number, total, status), for the Special Case
+    Customer modal's invoice picker -- only shown when a customer has more
+    than one, since a restated total has to name exactly which one it's for."""
+    customer = str(request.args.get("customer", "") or "").strip()
+    if not customer:
+        return jsonify({"error": "customer is required"}), 400
+    safe_customer = customer.replace("'", "''")
+    try:
+        rows = _pg_query(f"""
+            SELECT i.invoice_number, i.invoice_date, i.total_amount, i.status
+            FROM invoice i
+            LEFT JOIN customer c ON c.customer_id = i.linked_customer
+            WHERE i.is_deleted IS NOT TRUE
+              AND LOWER(TRIM(COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name))) = LOWER(TRIM('{safe_customer}'))
+            ORDER BY i.invoice_date DESC
+        """)
+        invoices = [{
+            "invoice_number": str(r.get("invoice_number") or "").strip(),
+            "invoice_date": str(r.get("invoice_date") or "")[:10],
+            "total_amount": float(r.get("total_amount") or 0),
+            "status": str(r.get("status") or "").strip(),
+        } for r in rows if str(r.get("invoice_number") or "").strip()]
+        return jsonify({"invoices": invoices})
+    except Exception as e:
+        _log("[CUSTOMER INVOICES ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": _public_error_message(e, "Could not load invoices"),
+                        "invoices": []}), 500
 
 
 @app.route("/api/invoice-payments")
@@ -2868,6 +4616,53 @@ def pb_refunds_api():
         return jsonify({"status": "success", "invoice_number": invoice_number, "refund": saved})
     except Exception as e:
         _log("[PB REFUND SAVE ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/referral-overrides", methods=["GET", "POST"])
+@login_required
+def referral_overrides_api():
+    """The referral name and rate typed on the Basic & NFP table.
+
+    A save clears the commission cache, because the fee is recomputed by the
+    same builder the printed packs use -- the row on screen and the money in
+    the pack come from one place, so they cannot drift apart.
+    """
+    if request.method == "GET":
+        year = request.args.get("year", "2026")
+        try:
+            return jsonify(db.list_referral_overrides(year))
+        except Exception as e:
+            _log("[REFERRAL OVERRIDES READ ERROR]\n" + traceback.format_exc())
+            return jsonify({"error": str(e)}), 500
+
+    req = request.json or {}
+    try:
+        rate = str(req.get("rate") or "").strip().replace("%", "")
+        if rate:
+            value = float(rate)
+            if value < 0 or value > 100:
+                return jsonify({"error": "Rate must be between 0 and 100 percent."}), 400
+        saved = db.save_referral_override(
+            str(req.get("year") or "2026"),
+            str(req.get("agent") or ""),
+            str(req.get("customer") or ""),
+            str(req.get("referral_name") or ""),
+            rate,
+            auth.current_user()["username"],
+        )
+        clear_commission_cache()
+        # Cached under (year, month, agent_type); the referral belongs to the
+        # customer, so every month of that year has to be rebuilt.
+        try:
+            build_commission_pack._REFERRAL_OVERRIDE_CACHE.clear()
+        except Exception:
+            pass
+        return jsonify({"status": "success", "saved": saved})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        _log("[REFERRAL OVERRIDE SAVE ERROR]\n" + traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
@@ -3023,54 +4818,41 @@ def commission_rates_api():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/agent-roles/pg-list")
-@login_required
-def agent_roles_pg_list_api():
-    """Query Postgres for users/agents with status=active or pending signup
-    whose active tags contain outsource, internal, or sales. Also pulls IC No.
-    from My Kad / Agent IC document tables. Used to populate the Agent Roles &
-    Hierarchy table with live Postgres data."""
-    try:
-        mod = _basic_module()
-        mod._load_dotenv()
-        proxy_url = mod._normalize_proxy_url(os.environ.get("PG_PROXY_URL")) or \
-            "https://pg-proxy-production.up.railway.app/api/sql"
-        db_name = os.environ.get("PG_PROXY_DB") or os.environ.get("PG_DB_NAME")
-        token = os.environ.get("PG_PROXY_TOKEN")
-        if not token:
-            return jsonify({"error": "PG_PROXY_TOKEN is not configured"}), 400
+def _pg_agent_names():
+    """Names of the agents eeAdmin currently lists as internal/outsource/sales,
+    as [{"bubble_id", "name"}], one row per person, sorted by name.
 
-        # â”€â”€ Main query: UNION ALL across "user" + "agent" tables â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # The seed query already proved this pattern works.  We extend it with:
-        #   â€¢ status filter (active OR pending signup)
-        #   â€¢ sales tag in addition to internal/outsource
-        #   â€¢ bubble_id so we can join IC numbers later
+    Since 2026-09 this is the ONLY thing the Agent Roles & Hierarchy page
+    takes from Postgres. Agent type, Role, Branch, IC No, Nick Name and start
+    date are entered and kept on the Data page itself; eeAdmin's tags no
+    longer prefill, overwrite or flag any of them. The query still filters on
+    the tags so office staff never show up, and still leaves blocked accounts
+    out of the pull -- a row already saved for a blocked agent stays on the
+    page until someone deletes it by hand.
+    """
+    mod = _basic_module()
+    mod._load_dotenv()
+    proxy_url = mod._normalize_proxy_url(os.environ.get("PG_PROXY_URL")) or \
+        "https://pg-proxy-production.up.railway.app/api/sql"
+    db_name = os.environ.get("PG_PROXY_DB") or os.environ.get("PG_DB_NAME")
+    token = os.environ.get("PG_PROXY_TOKEN")
+    if not token:
+        raise RuntimeError("PG_PROXY_TOKEN is not configured")
 
-        def _try_users_sql(sql_str):
-            try:
-                r = mod._proxy_sql(proxy_url=proxy_url, db_name=db_name, token=token,
-                                   sql=sql_str, params=[])
-                return r.get("rows") or r.get("data") or [], None
-            except Exception as ex:
-                return [], str(ex)
+    def _try_users_sql(sql_str):
+        try:
+            r = mod._proxy_sql(proxy_url=proxy_url, db_name=db_name, token=token,
+                               sql=sql_str, params=[])
+            return r.get("rows") or r.get("data") or [], None
+        except Exception as ex:
+            return [], str(ex)
 
-# Query Postgres with a schema-correct single query that joins user and agent tables,
-        # filters status from access_level, and excludes blocked users.
+    if True:  # keeps the SQL below at its original indentation
         # One row per PERSON. Merged primarily by link_key -- an agent row's own
         # linked_user_login, resolved through the join below -- because that is
         # the one signal a typo cannot break: eeAdmin's own foreign key, not a
-        # name comparison. A name mismatch on an otherwise-linked pair (e.g. the
-        # user account spelled "Chong Lee", the agent record spelled "Cong Lee")
-        # used to produce two rows for one person, the agent-table typo
-        # unnoticed because eeAdmin's own UI reads the user record. Falling back
-        # to the normalized name only when link_key is NULL (no linked_user_login
-        # at all) keeps today's behaviour for agent records with no user account
-        # to link to -- matching on whitespace-collapsed name still catches
-        # "KOH YEONG CHERNG" vs "KOH  YEONG CHERNG" for those.
-        #
-        # role_rank decides which record survives the merge first, then whichever
-        # side actually carries a non-blank agent_type (a blank must never beat
-        # a real one merely because it belongs to the row ranked first), then pri.
+        # name comparison. Falling back to the normalized name only when
+        # link_key is NULL keeps agent records with no user account to link to.
         user_rows, err_sql = _try_users_sql("""
             SELECT DISTINCT ON (COALESCE(au.link_key, LOWER(regexp_replace(BTRIM(au.name), '[[:space:]]+', ' ', 'g'))))
                    au.bubble_id,
@@ -3136,7 +4918,6 @@ def agent_roles_pg_list_api():
                      au.pri
         """)
 
-        # If it failed, log the error
         if err_sql:
             _log(f"[PG LIST ERROR] Query failed: {err_sql}")
 
@@ -3182,273 +4963,151 @@ def agent_roles_pg_list_api():
                  ORDER BY LOWER(BTRIM(au.name)), au.pri
             """)
 
-        # â”€â”€ IC photo from agent/user.ic_front â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # Postgres never stores the IC number as text â€” ic_front/ic_back are
-        # photos of the physical card. There is no OCR step here, so the IC
-        # No. itself stays a manually-entered field in the roles grid (from
-        # someone reading the uploaded photo). We only surface the photo URL,
-        # matched by name since agent.bubble_id and user.bubble_id are two
-        # unrelated ID sequences (matching by linked_user_login can miss).
-        ic_photo_by_name = {}
+    def to_sentence_case(name):
+        return " ".join(word.capitalize() for word in str(name).strip().split())
 
-        def _try_optional_query(sql_str, label="OPTIONAL"):
-            """Run a query whose failure must not take the whole page down."""
-            try:
-                r = mod._proxy_sql(proxy_url=proxy_url, db_name=db_name, token=token,
-                                   sql=sql_str, params=[])
-                return r.get("rows") or r.get("data") or []
-            except Exception as ex:
-                _log(f"[{label} QUERY SKIPPED] {ex}")
-                return []
+    seen, result = set(), []
+    for r in user_rows:
+        name = to_sentence_case(str(r.get("name") or "").strip())
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({"bubble_id": str(r.get("bubble_id") or "").strip(),
+                       "name": name})
+    result.sort(key=lambda x: x["name"].lower())
+    return result
 
-        ic_photo_rows = _try_optional_query("""
-            SELECT LOWER(BTRIM(name)) AS name_key, ic_front FROM agent WHERE ic_front IS NOT NULL
-            UNION ALL
-            SELECT LOWER(BTRIM(name)) AS name_key, ic_front FROM "user" WHERE ic_front IS NOT NULL
-        """, "IC PHOTO")
-        for row in ic_photo_rows:
-            key = str(row.get("name_key") or "").strip()
-            url = str(row.get("ic_front") or "").strip()
-            if key and url and key not in ic_photo_by_name:
-                ic_photo_by_name[key] = url
 
-        # ── Blocked accounts ─────────────────────────────────────────────────
-        # The main query already leaves blocked accounts out of the pull, but
-        # that alone does not keep them off the page: a row saved before someone
-        # was blocked is still drawn by the "agent not in Postgres" path, which
-        # exists for Excel-only entries and for people deleted from eeAdmin.
-        # Naming the blocked ids is what lets the page tell those cases apart —
-        # deleted from eeAdmin means keep the row, blocked means drop it.
-        #
-        # Matching is by bubble_id only. Names are not unique here (one person
-        # can hold several eeAdmin records under different spellings), so a
-        # name match could hide the wrong agent's hierarchy.
-        blocked_ids = []
-        for row in _try_optional_query("""
-            SELECT u.bubble_id FROM "user" u WHERE 'blocked' = ANY(u.access_level)
-            UNION ALL
-            SELECT ag.bubble_id FROM agent ag
-              JOIN "user" u2 ON u2.bubble_id = ag.linked_user_login
-             WHERE 'blocked' = ANY(u2.access_level)
-        """, "BLOCKED IDS"):
-            bid = str(row.get("bubble_id") or "").strip()
-            if bid:
-                blocked_ids.append(bid)
-
-        # ── Build response ───────────────────────────────────────────────────
-        def to_sentence_case(name):
-            """Convert name to Sentence Case (Title Case per word)."""
-            if not name:
-                return name
-            return " ".join(word.capitalize() for word in str(name).strip().split())
-
-        # Tags that describe role/type/branch/permission, not a person's nickname.
-        _KNOWN_TAG_RE = re.compile(
-            r'^(team-|tam-)|'
-            r'\b(sales|internal|outsource|admin|hr|seda|finance|engineer(?:ing)?|'
-            r'electrical|project|notification|superadmin|ceo|support|ec|ee-core|'
-            r'invoiceapprove|kc|o&m|inventory|cameraman|dealer|manual|pending|blocked|'
-            r'referral\s+program|report|special|invoice\s+editor|js)\b',
-            re.IGNORECASE,
-        )
-
-        # ── Role vocabulary ──────────────────────────────────────────────────
-        # Outsource tiers, most senior first — checked before the Internal tiers
-        # so an outsource agent's tags never fall through to an Internal label.
-        # The acronyms are matched on a word boundary, never as a bare substring:
-        # "osa" inside a nickname tag like "Rosa" is not a role.
-        _OUTSOURCE_TIER_PATTERNS = [
-            # OGM is retired — kept only so the handful of agents still carrying
-            # the tag keep resolving instead of silently losing their role.
-            (re.compile(r"\bogm\b", re.IGNORECASE), "OGM"),
-            (re.compile(r"\boum\b", re.IGNORECASE), "OUM"),
-            (re.compile(r"\bosa\b", re.IGNORECASE), "OSA"),
-        ]
-        # Internal tiers, most senior first. The specific multi-word titles have
-        # to precede the two loose entries at the bottom: "senior sales
-        # consultant" and "senior branch director" both contain "senior", and
-        # the looser rule would otherwise swallow them.
-        _INTERNAL_TIER_PATTERNS = [
-            # Retired like OGM, and kept for the same reason.
-            (re.compile(r"regional\s+sales\s+director", re.IGNORECASE), "Regional Sales Director"),
-            (re.compile(r"senior\s+branch\s+director", re.IGNORECASE), "Senior Branch Director"),
-            (re.compile(r"branch\s+sales\s+manager", re.IGNORECASE), "Branch Sales Manager"),
-            (re.compile(r"sales\s+development\s+manager", re.IGNORECASE), "Sales Development Manager"),
-            (re.compile(r"sales\s+team\s+manager", re.IGNORECASE), "Sales Team Manager"),
-            (re.compile(r"senior\s+sales\s+consultant", re.IGNORECASE), "Senior Sales Consultant"),
-            (re.compile(r"sales\s+consultant", re.IGNORECASE), "Sales Consultant"),
-            # Deliberately loose: any leftover tag carrying "senior" or
-            # "executive" is that tier, whether or not it spells out the full
-            # "sales senior" / "sales executive". eeAdmin tags are typed by hand
-            # and both spellings are in use.
-            (re.compile(r"senior", re.IGNORECASE), "Sales Senior"),
-            (re.compile(r"executive", re.IGNORECASE), "Sales Executive"),
-        ]
-
-        def _classify_role_tag(tag):
-            """(agent_type, Role) for one tag, or None. Each tag is classified on
-            its own rather than against a joined blob, so a phrase like "senior
-            sales consultant" can never bleed into a separate "senior" tag."""
-            for pat, role in _OUTSOURCE_TIER_PATTERNS:
-                if pat.search(tag):
-                    return ("Outsource", role)
-            for pat, role in _INTERNAL_TIER_PATTERNS:
-                if pat.search(tag):
-                    return ("Internal", role)
-            return None
-
-        def extract_nick_name(access_level):
-            """The one access_level tag that is neither a known
-            role/branch/permission label nor a role title is treated as the
-            agent's nickname (e.g. 'jerry', 'lk'). Role tags have to be excluded
-            explicitly as well as by _KNOWN_TAG_RE: a bare "senior" or
-            "executive" tag names a role under the loose matching above but
-            carries none of the words that pattern looks for."""
-            for tag in (access_level or []):
-                tag = str(tag).strip()
-                if tag and not _KNOWN_TAG_RE.search(tag) and not _classify_role_tag(tag):
-                    return to_sentence_case(tag)
-            return ""
-
-        def extract_roles(access_level):
-            """Every distinct role the agent's tags name, most senior first, as
-            [{"hierarchy": ..., "agent_type": ...}].
-
-            An agent routinely holds several at once — a promotion adds the new
-            tag without removing the old one, and a transfer can leave an
-            Internal and an Outsource tag side by side. The tags carry no dates,
-            so Postgres cannot say which period each covers and this must not
-            guess: every role is returned and the page turns each into its own
-            row for a human to date. Collapsing them to one role (or refusing
-            to pick, as the old "needs split" flag did) either invented history
-            or hid it."""
-            seen, out = set(), []
-            classified = set()
-            for tag in (access_level or []):
-                hit = _classify_role_tag(str(tag).strip())
-                if hit:
-                    classified.add(hit)
-            # Emit in seniority order rather than tag order, so the row a reader
-            # sees first is the agent's most senior title.
-            for pat_list, want_type in ((_OUTSOURCE_TIER_PATTERNS, "Outsource"),
-                                        (_INTERNAL_TIER_PATTERNS, "Internal")):
-                for _, role in pat_list:
-                    if (want_type, role) in classified and role not in seen:
-                        seen.add(role)
-                        out.append({"hierarchy": role, "agent_type": want_type})
-            return out
-
-        # "tam-" is a misspelling of "team-" that a handful of eeAdmin records
-        # carry. _KNOWN_TAG_RE above already allows for it so those tags are not
-        # mistaken for nicknames; matching it here too is what stops the same
-        # agents silently showing no branch at all.
-        # Named after the eeAdmin tag they come from, so the value on screen and
-        # the tag an admin sees in eeAdmin are the same word. Anything not on
-        # this list is not a branch.
-        _BRANCH_TAG_KEYWORDS = [
-            ("jb", "Team-JB"),
-            ("kluang", "Team-Kluang"),
-            ("klang", "Team-Klang"),
-            ("seremban", "Team-Seremban"),
-        ]
-        _BRANCH_TAG_PREFIX_RE = re.compile(r"^t(?:e)?am-", re.IGNORECASE)
-
-        def extract_branch(access_level):
-            """A 'team-xxx' active tag names the branch far more reliably than
-            main_department, which is blank for most agents. Only the part after
-            the prefix is compared, so "klang" can never match inside
-            "team-kluang" — the two branch names differ by one letter."""
-            for tag in (access_level or []):
-                low = str(tag).strip().lower()
-                if not _BRANCH_TAG_PREFIX_RE.match(low):
-                    continue
-                suffix = _BRANCH_TAG_PREFIX_RE.sub("", low, count=1).strip()
-                for kw, branch in _BRANCH_TAG_KEYWORDS:
-                    if suffix == kw:
-                        return branch
-            return ""
-
-        result = []
-        for r in user_rows:
-            bid = str(r.get("bubble_id") or "").strip()
-            name = to_sentence_case(str(r.get("name") or "").strip())
-            raw_type = str(r.get("agent_type") or "").strip()
-            access_level = r.get("access_level") or []
-            
-            # Normalise agent type label by checking both agent_type and access_level
-            low_type = raw_type.lower()
-            access_text = " ".join(access_level).lower()
-            combined_text = f"{low_type} {access_text}"
-            
-            # Only "internal" and "outsource" name a rate table. A bare "sales"
-            # tag (or no matching tag at all) does not, so it must not resolve to
-            # one silently: agent_type picks which RATE_ROLES table prices the
-            # commission, and "Sales" was landing on the Internal list by way of
-            # a missing key rather than by anyone's decision. Leave it blank and
-            # let the page ask for a human call instead.
-            type_unknown = False
-            if "outsource" in combined_text:
-                agent_type = "Outsource"
-            elif "internal" in combined_text:
-                agent_type = "Internal"
-            else:
-                agent_type = ""
-                type_unknown = True
-                
-            status = str(r.get("status") or "Active").strip().title()
-            # Only the four sales branches are branches. main_department is NOT
-            # a fallback for them — it holds things like "Sales Dept",
-            # "Engineering Dept" or "Strategy & Partnership; C&I Project",
-            # which are departments, not the branch this page means. Letting it
-            # through is how 38 rows ended up with a Branch that is not one.
-            branch = extract_branch(access_level)
-            ic_no = ""
-            ic_photo_url = ic_photo_by_name.get(name.strip().lower(), "")
-            nick_name = extract_nick_name(access_level)
-            roles = extract_roles(access_level)
-            # `hierarchy` stays in the payload for any reader that predates the
-            # split and expects one role — it names the most senior. The page
-            # itself reads `roles` and draws a row per entry.
-            hierarchy = roles[0]["hierarchy"] if roles else ""
-            # An agent whose tags name only outsource (or only internal) roles
-            # settles the agent type that the tag blob left unknown.
-            role_types = {r["agent_type"] for r in roles}
-            if type_unknown and len(role_types) == 1:
-                agent_type = next(iter(role_types))
-                type_unknown = False
-
-            start_date_raw = r.get("start_date")
-            start_date = ""
-            if start_date_raw:
-                try:
-                    start_date = str(start_date_raw)[:10]
-                except Exception:
-                    pass
-
-            result.append({
-                "bubble_id": bid,
-                "name": name,
-                "agent_type": agent_type,
-                "type_unknown": type_unknown,
-                "status": status,
-                "branch": branch,
-                "ic_no": ic_no,
-                "ic_photo_url": ic_photo_url,
-                "nick_name": nick_name,
-                "hierarchy": hierarchy,
-                "roles": roles,
-                # Retired: several role tags at once is the normal case now and
-                # produces one row each, not an error a human has to unpick.
-                "role_conflict": False,
-                "start_date": start_date,
-            })
-
-        result.sort(key=lambda x: x.get("name", "").lower())
-        return jsonify({"agents": result, "total": len(result),
-                        "blocked_ids": sorted(set(blocked_ids))})
+@app.route("/api/agent-roles/pg-list")
+@login_required
+def agent_roles_pg_list_api():
+    """Live agent NAMES from Postgres, used to list every current agent on the
+    Agent Roles & Hierarchy page. Nothing else is pulled -- see
+    _pg_agent_names()."""
+    try:
+        result = _pg_agent_names()
+        return jsonify({"agents": result, "total": len(result)})
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         _log("[AGENT PG LIST ERROR]\n" + traceback.format_exc())
         return jsonify({"error": _public_error_message(e, "Failed to load agent list from Postgres")}), 500
+
+
+def _pg_search_people(term):
+    """Every eeAdmin person whose name contains `term`, tagged or not.
+
+    Deliberately wider than _pg_agent_names(): that one filters on the
+    internal/outsource/sales tags so office staff stay off the hierarchy page,
+    which also hides anyone whose agent_type was simply never filled in. The
+    Add Agent modal has to be able to find exactly those people, so the tag
+    filter is dropped here and only blocked accounts are left out. Rows are
+    merged per person the same way the list is -- by the agent row's linked
+    user, falling back to the normalized name -- so a linked pair shows once.
+    """
+    mod = _basic_module()
+    mod._load_dotenv()
+    proxy_url = mod._normalize_proxy_url(os.environ.get("PG_PROXY_URL")) or \
+        "https://pg-proxy-production.up.railway.app/api/sql"
+    db_name = os.environ.get("PG_PROXY_DB") or os.environ.get("PG_DB_NAME")
+    token = os.environ.get("PG_PROXY_TOKEN")
+    if not token:
+        raise RuntimeError("PG_PROXY_TOKEN is not configured")
+
+    # The term reaches the proxy as a quoted literal, so the escaping is what
+    # makes it safe; this second pass just drops anything with no business in a
+    # person's name. Characters are dropped rather than refused because real
+    # eeAdmin names carry "@" and brackets, and a typed name should still find
+    # them instead of returning an error.
+    safe = re.sub(r"[^\w .,'&/@()-]", " ", term, flags=re.UNICODE).strip()
+    if len(safe) < 2:
+        return []
+    lit = mod._sql_string_literal("%" + safe + "%")
+
+    sql = f"""
+        SELECT d.bubble_id, d.name, d.agent_type, d.branch
+          FROM (
+            SELECT DISTINCT ON (COALESCE(au.link_key,
+                     LOWER(regexp_replace(BTRIM(au.name), '[[:space:]]+', ' ', 'g'))))
+                   au.bubble_id, au.name, au.agent_type, au.branch
+              FROM (
+                SELECT u.bubble_id,
+                       u.bubble_id AS link_key,
+                       u.name,
+                       u.agent_type,
+                       u.main_department AS branch,
+                       1 AS pri
+                  FROM "user" u
+                 WHERE COALESCE(BTRIM(u.name), '') <> ''
+                   AND (u.access_level IS NULL OR NOT ('blocked' = ANY(u.access_level)))
+                   AND u.name ILIKE {lit}
+
+                UNION ALL
+
+                SELECT ag.bubble_id,
+                       u.bubble_id AS link_key,
+                       ag.name,
+                       COALESCE(ag.agent_type, u.agent_type) AS agent_type,
+                       u.main_department AS branch,
+                       2 AS pri
+                  FROM agent ag
+                  LEFT JOIN "user" u ON u.bubble_id = ag.linked_user_login
+                 WHERE COALESCE(BTRIM(ag.name), '') <> ''
+                   AND (u.access_level IS NULL OR NOT ('blocked' = ANY(u.access_level)))
+                   AND ag.name ILIKE {lit}
+              ) au
+             ORDER BY COALESCE(au.link_key,
+                        LOWER(regexp_replace(BTRIM(au.name), '[[:space:]]+', ' ', 'g'))),
+                      CASE WHEN COALESCE(au.agent_type, '') = '' THEN 1 ELSE 0 END,
+                      au.pri
+          ) d
+         ORDER BY LOWER(d.name)
+         LIMIT 25
+    """
+
+    rows = mod._proxy_sql(proxy_url=proxy_url, db_name=db_name, token=token,
+                          sql=sql, params=[])
+    rows = rows.get("rows") or rows.get("data") or []
+
+    def to_sentence_case(name):
+        return " ".join(word.capitalize() for word in str(name).strip().split())
+
+    seen, result = set(), []
+    for r in rows:
+        # Sentence case on purpose: it is what the page's own list uses, so a
+        # row saved from a search hit matches its Postgres twin by name later.
+        name = to_sentence_case(str(r.get("name") or "").strip())
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        result.append({
+            "bubble_id": str(r.get("bubble_id") or "").strip(),
+            "name": name,
+            "agent_type": str(r.get("agent_type") or "").strip(),
+            "branch": str(r.get("branch") or "").strip(),
+        })
+    return result
+
+
+@app.route("/api/agent-roles/pg-search")
+@login_required
+def agent_roles_pg_search_api():
+    """Name lookup behind the Add Agent modal. See _pg_search_people() for why
+    it does not reuse the hierarchy page's own list."""
+    term = (request.args.get("q") or "").strip()
+    if len(term) < 2:
+        return jsonify({"agents": [], "total": 0})
+    try:
+        result = _pg_search_people(term)
+        return jsonify({"agents": result, "total": len(result)})
+    except (RuntimeError, ValueError) as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        _log("[AGENT PG SEARCH ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": _public_error_message(e, "Failed to search eeAdmin")}), 500
 
 
 @app.route("/api/agent-roles", methods=["GET", "POST"])
@@ -3567,6 +5226,39 @@ def ega_rule_sets_api():
         return jsonify(db.list_ega_rule_sets())
     except Exception as e:
         _log("[EGA RULE SETS LOAD ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ega-carryover", methods=["GET", "POST"])
+@login_required
+def ega_carryover_api():
+    """Cases each agent closed before the EGA carry-over cutoff.
+
+    The count picks the campaign bonus tier on the Sales Report, so a wrong
+    figure moves an agent's EP by half their May campaign sales per three
+    cases. Admin-only to write, like every other rules grid."""
+    if request.method == "GET":
+        return jsonify(db.list_ega_carryover())
+
+    user = auth.current_user()
+    if user["role"] != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    try:
+        entries = (request.json or {}).get("entries", [])
+        rows = []
+        for e in entries:
+            agent = str(e.get("agent") or "").strip()
+            year = str(e.get("year") or "").strip()
+            if not agent or not year:
+                continue
+            rows.append({"year": year, "agent": agent,
+                         "cases": str(e.get("cases") or "").strip(),
+                         "sales": str(e.get("sales") or "").strip()})
+        db.save_ega_carryover(rows, user["username"])
+        clear_commission_cache()
+        return jsonify({"status": "success", "total": len(rows)})
+    except Exception as e:
+        _log("[EGA CARRYOVER SAVE ERROR]\n" + traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
@@ -3752,150 +5444,41 @@ def agent_ic_api():
 @app.route("/api/agent-roles/seed", methods=["POST"])
 @login_required
 def agent_roles_seed_api():
-    """Pull the agent list from Postgres (name, agent type, branch) so the
-    hierarchy only needs Role and Reports To filled in by hand. Never
-    overwrites an existing row — only adds agents not already listed."""
+    """Pull the agent NAMES from Postgres so the hierarchy only needs the
+    rest filled in by hand. Adds a name-only row for each agent not already
+    listed; never touches or prunes an existing row -- the Data page is the
+    source of truth for everything but the name."""
     user = auth.current_user()
     if user["role"] != "admin":
         return jsonify({"error": "Admin access required"}), 403
     try:
-        month = (request.json or {}).get("month") or "2026-01"
-        mod = _basic_module()
-        mod._load_dotenv()
-        proxy_url = mod._normalize_proxy_url(os.environ.get("PG_PROXY_URL")) or             "https://pg-proxy-production.up.railway.app/api/sql"
-        db_name = os.environ.get("PG_PROXY_DB") or os.environ.get("PG_DB_NAME")
-        token = os.environ.get("PG_PROXY_TOKEN")
-        if not token:
-            return jsonify({"error": "PG_PROXY_TOKEN is not configured"}), 400
+        month = (request.json or {}).get("month") or ""
+        rows = _pg_agent_names()
 
-        # Query Postgres with a schema-correct single query that joins user and agent tables,
-        # filters status from access_level, and excludes blocked users.
-        sql = """
-            SELECT DISTINCT ON (COALESCE(au.link_key, LOWER(BTRIM(au.name))))
-                   au.name, au.agent_type, au.access_level, au.branch, au.start_date
-            FROM (
-              -- Users
-              SELECT u.bubble_id AS link_key,
-                     u.name,
-                     u.agent_type,
-                     u.access_level,
-                     u.main_department AS branch,
-                     u.created_at AS start_date,
-                     1 AS pri
-              FROM "user" u
-              WHERE COALESCE(BTRIM(u.name), '') <> ''
-                -- Exclude blocked
-                AND (u.access_level IS NULL OR NOT ('blocked' = ANY(u.access_level)))
-                -- Filter tags/type
-                AND (
-                  LOWER(COALESCE(u.agent_type, '')) ~ '(internal|outsource|sales)'
-                  OR LOWER(COALESCE(u.access_level::text, '')) ~ '(internal|outsource|sales)'
-                )
-
-              UNION ALL
-
-              -- Agents joined with users. Same link_key trick as the pg-list
-              -- query above: merge with the linked user's row by bubble_id
-              -- when linked_user_login resolves to one, so a name typo on
-              -- either side can no longer seed a duplicate agent.
-              SELECT u.bubble_id AS link_key,
-                     ag.name,
-                     COALESCE(ag.agent_type, u.agent_type) AS agent_type,
-                     u.access_level,
-                     u.main_department AS branch,
-                     COALESCE(ag.created_date, u.created_at) AS start_date,
-                     2 AS pri
-              FROM agent ag
-              LEFT JOIN "user" u ON u.bubble_id = ag.linked_user_login
-              WHERE COALESCE(BTRIM(ag.name), '') <> ''
-                -- Exclude blocked if user is blocked
-                AND (u.access_level IS NULL OR NOT ('blocked' = ANY(u.access_level)))
-                -- Filter tags/type
-                AND (
-                  LOWER(COALESCE(ag.agent_type, '')) ~ '(internal|outsource|sales)'
-                  OR LOWER(COALESCE(u.agent_type, '')) ~ '(internal|outsource|sales)'
-                  OR LOWER(COALESCE(u.access_level::text, '')) ~ '(internal|outsource|sales)'
-                )
-            ) au
-            ORDER BY COALESCE(au.link_key, LOWER(BTRIM(au.name))),
-                     CASE WHEN COALESCE(au.agent_type, '') = '' THEN 1 ELSE 0 END,
-                     au.pri
-        """
-        res = mod._proxy_sql(proxy_url=proxy_url, db_name=db_name, token=token,
-                             sql=sql, params=[])
-        rows = res.get("rows") or res.get("data") or []
-
-        valid_pg_names = {str(r.get("name") or "").strip().lower() for r in rows if r.get("name")}
-
-        existing = db.list_agent_roles()
-        # Prune seeded placeholder rows that are no longer in Postgres's active internal/outsource list
-        merged = []
-        for ex in existing:
-            ex_name = str(ex.get("agent") or "").strip().lower()
-            ex_hier = str(ex.get("hierarchy") or "").strip()
-            ex_rep = str(ex.get("reports_to") or "").strip()
-            # A hidden row is a deliberate exclusion made through the roles
-            # grid's Delete button, not an unfilled placeholder. It must
-            # survive this prune even after the agent drops out of Postgres
-            # entirely — otherwise the exclusion is erased the moment they
-            # leave, and silently undone if they are ever re-tagged again
-            # later under the same name.
-            if (not ex.get("hidden") and not ex_hier and not ex_rep
-                    and ex_name not in valid_pg_names):
-                continue
-            merged.append(ex)
-
-        known = {str(r.get("agent") or "").strip().lower() for r in merged}
+        merged = db.list_agent_roles()
+        known_names = {str(r.get("agent") or "").strip().lower() for r in merged}
+        known_ids = {str(r.get("pg_bubble_id") or "").strip() for r in merged
+                     if r.get("pg_bubble_id")}
         added = 0
         for r in rows:
-            name = str(r.get("name") or "").strip()
-            if not name or name.lower() in known:
+            name = r["name"]
+            if name.lower() in known_names or (r["bubble_id"] and r["bubble_id"] in known_ids):
                 continue
-            
-            raw_type = str(r.get("agent_type") or "").strip()
-            access_level = r.get("access_level") or []
-            
-            # Normalise agent type label
-            low_type = raw_type.lower()
-            access_text = " ".join(access_level).lower()
-            combined_text = f"{low_type} {access_text}"
-            
-            # Same rule as the pg-list endpoint: only "internal" and "outsource"
-            # name a rate table. Seeding is the worse place to guess, because the
-            # guess is written to SQLite and then outranks Postgres forever after
-            # (a saved type is treated as a human decision), so a bare "sales"
-            # tag is stored blank and shown as needing review instead.
-            if "outsource" in combined_text:
-                atype = "Outsource"
-            elif "internal" in combined_text:
-                atype = "Internal"
-            else:
-                atype = ""
-                
-            branch = str(r.get("branch") or "").strip()
-            if "branch" not in branch.lower():
-                branch = ""
-            
-            start_date_raw = r.get("start_date")
-            start_date = ""
-            if start_date_raw:
-                try:
-                    start_date = str(start_date_raw)[:10]
-                except Exception:
-                    pass
-                    
             merged.append({
                 "effective_from": month, "agent": name,
-                "agent_type": atype,
-                "hierarchy": "", "reports_to": "", "branch": branch,
-                "remarks": "seeded from Postgres",
-                "start_date": start_date,
+                "agent_type": "", "hierarchy": "", "reports_to": "", "branch": "",
+                "ic_no": "", "nick_name": "", "full_name": "",
+                "pg_bubble_id": r["bubble_id"],
+                "remarks": "seeded from Postgres (name only)",
+                "start_date": "",
             })
-            known.add(name.lower())
+            known_names.add(name.lower())
             added += 1
 
         db.save_agent_roles(merged, user["username"])
         return jsonify({"status": "success", "added": added, "total": len(merged)})
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         _log("[AGENT ROLES SEED ERROR]\n" + traceback.format_exc())
         return jsonify({"error": str(e)}), 500
