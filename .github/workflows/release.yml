@@ -11,8 +11,15 @@ name: Release
 # installer compiled in another, on a different runner with a different
 # filesystem. dist/payload simply did not exist when ISCC ran, and a Windows
 # build that had worked for several releases failed at "Compile Windows
-# installer" for no reason visible in the step name. Nothing crosses a job
-# boundary here except finished artifacts.
+# installer" for no reason visible in the step name.
+#
+# NOTHING CROSSES A JOB BOUNDARY THROUGH ACTIONS ARTIFACTS. The version job
+# opens a draft release and each platform job attaches its own finished
+# installers to it; the publish job pulls them back down only to write one
+# SHA256SUMS.txt over the lot, then flips the draft live. The artifact
+# hand-off this replaced is what broke v1.2.29: both platforms built and
+# verified cleanly, then the run failed on "Artifact storage quota has been
+# hit" -- a limit no change in this repository could have raised.
 #
 # The Windows asset is the Inno installer compiled from
 # installer/CommissionDashboard.iss over dist/payload -- NOT electron-builder's
@@ -64,6 +71,16 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "tag=v$v" >> "$GITHUB_OUTPUT"
           echo "Building version $v"
+
+      # Opened here, before either platform job runs, so both have somewhere
+      # to upload to and neither races the other into creating it. It stays a
+      # draft until the publish job has attached the checksums.
+      - name: Open a draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          draft: true
 
   windows:
     runs-on: windows-latest
@@ -186,14 +203,19 @@ jobs:
             throw "Installer is ${mb} MB - too small to contain the bundled Python runtime."
           }
 
-      - name: Upload Windows assets
-        uses: actions/upload-artifact@v4
+      # Straight to the draft release, not to an Actions artifact. The
+      # artifact hand-off is what broke v1.2.29: both platforms built and
+      # verified cleanly, then the run died on "Artifact storage quota has been
+      # hit" and threw finished installers away at the last step. Nothing about
+      # the build was wrong, and nothing in the repo could have fixed it.
+      - name: Attach Windows assets to the draft release
+        uses: softprops/action-gh-release@v2
         with:
-          name: windows-assets
-          path: |
+          tag_name: ${{ needs.version.outputs.tag }}
+          draft: true
+          files: |
             dist/CommissionDashboard-Setup-*.exe
             dist/CommissionDashboard-update-*.zip
-          retention-days: 1
 
   macos:
     runs-on: macos-latest
@@ -396,32 +418,51 @@ jobs:
             hdiutil detach "$mnt" -quiet
           done
 
-      - name: Upload macOS assets
-        uses: actions/upload-artifact@v4
+      # Same reasoning as the Windows job -- see the note there.
+      - name: Attach macOS assets to the draft release
+        uses: softprops/action-gh-release@v2
         with:
-          name: macos-assets
-          path: dist/CommissionDashboard-Setup-*-macos*.dmg
-          retention-days: 1
+          tag_name: ${{ needs.version.outputs.tag }}
+          draft: true
+          files: dist/CommissionDashboard-Setup-*-macos*.dmg
 
   publish:
     runs-on: ubuntu-latest
     needs: [version, windows, macos]
     steps:
-      # Must precede download-artifact: checkout defaults to clean:true, which
-      # git-cleans untracked paths and would delete artifacts/ out from under
-      # the next step. Needed here only for docs/Commission-Portal-User-Guide.pdf.
+      # Needed only for docs/Commission-Portal-User-Guide.pdf, and it must
+      # precede the download below: checkout defaults to clean:true, which
+      # would git-clean dist/ out from under the next step.
       - uses: actions/checkout@v4
 
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Collect assets
+      # Both platform jobs have already attached their assets to the draft.
+      # They come back down here for one reason: SHA256SUMS.txt has to cover
+      # every file in a single listing, and updater.py matches its lines by
+      # exact asset name.
+      - name: Download the assets already on the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p dist
-          cp artifacts/windows-assets/* dist/
-          cp artifacts/macos-assets/* dist/
+          gh release download "${{ needs.version.outputs.tag }}" --dir dist --clobber
+          ls -lh dist/
+
+      # A draft that is missing a platform must not be published. Without this
+      # the run would happily go on to publish whichever half arrived, and the
+      # gap would only surface when someone on that platform tried to download.
+      - name: Verify every platform is present
+        run: |
+          v="${{ needs.version.outputs.version }}"
+          for f in "CommissionDashboard-Setup-$v.exe"                    "CommissionDashboard-Setup-$v-macos-arm64.dmg"                    "CommissionDashboard-Setup-$v-macos-intel.dmg"                    "CommissionDashboard-update-$v.zip"; do
+            if [ ! -f "dist/$f" ]; then
+              echo "dist/$f is missing - the draft is incomplete, refusing to publish."
+              exit 1
+            fi
+          done
+          echo "All four platform assets are on the draft."
+
+      - name: Add the user guide
+        run: |
           # The user guide ships alongside the installer: staff land on the
           # Releases page to download, and that is where they need it. It is
           # committed rather than built here, so no reportlab/font toolchain
@@ -432,21 +473,24 @@ jobs:
             exit 1
           fi
           cp "$guide" dist/
-          ls -lh dist/
 
       # updater.py matches SHA256SUMS lines by exact asset name, so this has to
       # cover everything the release publishes.
       - name: Generate checksums
         run: |
           cd dist
+          rm -f SHA256SUMS.txt
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Create release
+      # draft:false is what makes the release visible. The installers are
+      # already attached, so only the two new files are uploaded here.
+      - name: Publish the release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: ${{ needs.version.outputs.tag }}
+          draft: false
           generate_release_notes: true
           body: |
             ## Commission Dashboard ${{ needs.version.outputs.tag }}
@@ -482,8 +526,5 @@ jobs:
 
             Existing users: auto-update is enabled in the dashboard.
           files: |
-            dist/CommissionDashboard-Setup-*.exe
-            dist/CommissionDashboard-Setup-*-macos-*.dmg
-            dist/CommissionDashboard-update-*.zip
             dist/Commission-Portal-User-Guide.pdf
             dist/SHA256SUMS.txt
