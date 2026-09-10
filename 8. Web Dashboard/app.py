@@ -245,9 +245,29 @@ def clear_commission_cache():
     ]
     for m in dynamic_mods:
         sys.modules.pop(m, None)
-        
+
+    _clear_derived_caches()
+
     _log("Cleared commission cache (raw proxy data preserved). Triggering background re-build...")
     start_prefetch(2026)
+
+
+def _clear_derived_caches():
+    """Drop every in-process cache built ON TOP of the commission data.
+
+    These live in module globals rather than _data_cache, so the loop above
+    never reached them and a rebuild left them standing. Two of them have no
+    expiry at all, and the rest sit on a five-minute timer -- so after an admin
+    edited a rate, the Sales Report went on showing the previous numbers with
+    nothing on screen to say so.
+
+    Only derived values are dropped. Raw proxy data is preserved, which is the
+    whole point of clearing the commission cache rather than everything.
+    """
+    for cache in (_SALES_REPORT_PAYLOAD_CACHE, _FIRST_PAYMENT_CACHE,
+                  _PAYMENTS_CACHE, _PAYMENT_ROWS_CACHE,
+                  _LIVE_CUSTOMER_DATES_CACHE, _RESTATED_PLACEMENT_CACHE):
+        cache.clear()
 
 
 def _commission_response_cache_key(year: int, month: int, agent_type: str) -> tuple[str, int, int, str]:
@@ -2357,7 +2377,6 @@ def _sales_report_targets(year: int) -> dict[str, float]:
 
 _FIRST_PAYMENT_CACHE: dict[int, tuple[float, dict]] = {}
 _PAYMENTS_CACHE: dict[tuple[int, int], tuple[float, dict]] = {}
-_PAYMENT_ROWS_CACHE: dict[tuple[int, int], tuple[float, dict]] = {}
 
 
 def _sales_report_local_day(value) -> str:
@@ -2946,11 +2965,15 @@ _SALES_REPORT_PAYLOAD_CACHE: dict[tuple, tuple[float, dict]] = {}
 def _sales_report_payload(year: int, through: int | None = None) -> dict | None:
     """_sales_report_payload_uncached(), memoised for the period picker.
 
-    Building one period costs several seconds of pure Python over the whole
-    ega_raw set, and the picker asks for a different period on every change.
-    Without this, switching month looks broken: nothing moves for eight
-    seconds, and a second change while the first is still running can land its
-    answer last and leave the wrong month on screen.
+    Building one period costs a few seconds, and the picker asks for a
+    different period on every change. Without this, switching month looks
+    broken: nothing moves, and a second change while the first is still
+    running can land its answer last and leave the wrong month on screen.
+
+    The cost is round trips to the proxy, not Python -- profiling put nearly
+    all of a 15-second build in socket reads. Those six lookups now run
+    together (see _sales_report_payload_uncached), which took a cold build to
+    under five seconds; this cache is what makes a repeat visit instant.
 
     Keyed on the agent scope as well as the period -- an agent-scoped user sees
     only their own row, and that view must never be served to anyone else.
@@ -3026,12 +3049,32 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         ladders[label] = (dict(getattr(mod, "EGA_EARLY_BIRD", {}) or {}),
                           dict(getattr(mod, "ESA_EARLY_BIRD", {}) or {}))
 
-    roles = _sales_report_role_index()
-    payments = _sales_report_payments(year, last_month)
-    payment_rows = _sales_report_payment_rows(year, last_month)
-    case_dates = _sales_report_case_dates(year)
-    carryover = _sales_report_carryover(year)
-    targets, esa_targets = _sales_report_award_targets(year)
+    # Six independent lookups, fetched together rather than one after another.
+    # Run in sequence they cost about 15 seconds, and profiling puts nearly all
+    # of that in socket reads -- this is not Python being slow, it is six round
+    # trips to the proxy taken one at a time. In parallel the wait is the
+    # slowest of them instead of their sum.
+    #
+    # Safe to thread: none of the six touches the Flask request context, and
+    # db.py takes its lock for writes only, so these reads do not serialise
+    # against each other. The scope filter that DOES read the request is
+    # applied further down, on this thread.
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        f_roles = ex.submit(_sales_report_role_index)
+        f_payments = ex.submit(_sales_report_payments, year, last_month)
+        f_payment_rows = ex.submit(_sales_report_payment_rows, year, last_month)
+        f_case_dates = ex.submit(_sales_report_case_dates, year)
+        f_carryover = ex.submit(_sales_report_carryover, year)
+        f_targets = ex.submit(_sales_report_award_targets, year)
+
+        # .result() re-raises in this thread, so a failing lookup still fails
+        # the request the way it did when these ran in a straight line.
+        roles = f_roles.result()
+        payments = f_payments.result()
+        payment_rows = f_payment_rows.result()
+        case_dates = f_case_dates.result()
+        carryover = f_carryover.result()
+        targets, esa_targets = f_targets.result()
     # The multiplier is a first-half device. A report that runs into July or
     # beyond applies none at all.
     multiplier_in_period = last_month <= SALES_REPORT_SPLIT_MONTH
