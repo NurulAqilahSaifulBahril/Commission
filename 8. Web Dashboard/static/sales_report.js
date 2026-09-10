@@ -230,7 +230,7 @@
                 <th rowspan="2" title="Cash received against this agent's invoices in the period shown. Sales are counted when invoiced, so this is how much of that has actually been paid.">COLLECTED<br>PAYMENT</th>
                 <th rowspan="2">UP TO DATE<br>EP POINT</th>
                 ${showEga(data) ? `<th rowspan="2" title="Balance to qualify for the EGA Hanoi trip. EGA closes at the end of June, so this is measured on EP as at 30 June and cannot be reached on later sales.">EGA - HANOI<br>Balance to Qualify<br>(${egaBar} EP Point Till 30Jun)</th>` : ""}
-                ${showEsa(data) ? `<th rowspan="2" title="Balance to qualify for the ESA China trip. ESA runs to the end of December, so this is measured on the running EP.">ESA - CHINA<br>Balance to Qualify<br>(${esaBar} EP Point Till 31Dec)</th>` : ""}
+                ${showEsa(data) ? `<th rowspan="2" title="Balance to qualify for the ESA Chongqing trip. ESA runs to the end of December, so this is measured on the running EP.">ESA - CHONGQING<br>Balance to Qualify<br>(${esaBar} EP Point Till 31Dec)</th>` : ""}
             </tr>
             <tr>
                 ${subCols.join("")}
@@ -738,15 +738,22 @@
     const MAX_RETRIES = 24;
     let retries = 0;
 
+    // Each load takes a ticket. Changing the month again before the first
+    // answer arrives makes that answer stale, and rendering it would leave the
+    // wrong period on screen under the right label in the picker.
+    let loadSeq = 0;
+
     async function loadReport(isRetry) {
         if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
         if (!isRetry) retries = 0;
+        const seq = ++loadSeq;
         setBusy(true);
         emptyView.classList.add("hidden");
         try {
             const res = await fetch(`/api/sales-report?year=${encodeURIComponent(state.year)}`
                 + `&month=${encodeURIComponent(state.through || "")}`);
             const data = await res.json().catch(() => ({}));
+            if (seq !== loadSeq) return;      // overtaken; a newer period wins
             if (!res.ok) throw new Error(data.error || "Failed to load sales report");
 
             if (!data.ready) {
@@ -781,11 +788,14 @@
                 ? `Cases and net sales — ${data.scoped_to_agent}`
                 : "Cases and net sales per agent, with EGA qualification";
         } catch (err) {
+            if (seq !== loadSeq) return;
             console.error("Sales report load failed:", err);
             document.getElementById("srEmptyMsg").textContent = err.message;
             emptyView.classList.remove("hidden");
         } finally {
-            setBusy(false);
+            // The spinner belongs to the newest request, so an overtaken one
+            // must not clear it while that request is still in flight.
+            if (seq === loadSeq) setBusy(false);
         }
     }
 

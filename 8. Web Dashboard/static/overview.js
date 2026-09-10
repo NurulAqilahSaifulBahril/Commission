@@ -94,11 +94,10 @@
 
     function renderCards(totals, prev) {
         const p = prev || {};
-        // Two rows, deliberately. The four ringgit figures on the first, the
-        // three headcounts on the second, so the eye is not jumping between
-        // money and people along one line. Effective Rate joins the second row
-        // rather than making a fifth on the first, where it wrapped onto a line
-        // of its own and read as an orphan.
+        // Two rows, deliberately. The three headcounts lead, then the four
+        // ringgit figures, so the eye is not jumping between people and money
+        // along one line. Each row keeps its own grid so they never reflow
+        // into each other at an awkward width.
         moneyRow.innerHTML = [
             makeCard("Total Sales", fmtCompact(totals.sales), deltaText(totals.sales, prev ? p.sales : null)),
             makeCard("Total Commission", fmtRM(totals.total), deltaText(totals.total, prev ? p.total : null)),
@@ -116,8 +115,6 @@
             // brought, so it reads beside the other two headcounts.
             makeCard("Total Referral", String(totals.referrals ?? 0),
                 deltaText(totals.referrals, prev ? p.referrals : null, "count")),
-            makeCard("Effective Rate", `${(Number(totals.effective_rate) || 0).toFixed(2)}%`,
-                deltaText(totals.effective_rate, prev ? p.effective_rate : null, "points")),
         ].join("");
     }
 

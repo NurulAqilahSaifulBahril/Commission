@@ -2940,7 +2940,39 @@ def _sales_report_campaign_label(last_month: int) -> str:
     return f"1/5 - {SALES_REPORT_SPLIT_DAY}/{SALES_REPORT_SPLIT_MONTH}"
 
 
+_SALES_REPORT_PAYLOAD_CACHE: dict[tuple, tuple[float, dict]] = {}
+
+
 def _sales_report_payload(year: int, through: int | None = None) -> dict | None:
+    """_sales_report_payload_uncached(), memoised for the period picker.
+
+    Building one period costs several seconds of pure Python over the whole
+    ega_raw set, and the picker asks for a different period on every change.
+    Without this, switching month looks broken: nothing moves for eight
+    seconds, and a second change while the first is still running can land its
+    answer last and leave the wrong month on screen.
+
+    Keyed on the agent scope as well as the period -- an agent-scoped user sees
+    only their own row, and that view must never be served to anyone else.
+    Same TTL as the other response caches, so a rebuild is picked up as
+    promptly as it is everywhere else.
+    """
+    try:
+        scope = _overview_scope_agent() or ""
+    except Exception:
+        scope = ""          # called outside a request; treat as unscoped
+    key = (int(year), None if through is None else int(through), scope)
+    hit = _SALES_REPORT_PAYLOAD_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _RESPONSE_CACHE_TTL_SECONDS:
+        return hit[1]
+
+    payload = _sales_report_payload_uncached(year, through)
+    if payload is not None:
+        _SALES_REPORT_PAYLOAD_CACHE[key] = (time.time(), payload)
+    return payload
+
+
+def _sales_report_payload_uncached(year: int, through: int | None = None) -> dict | None:
     """Per-agent sales ledger for Jan..last_month of `year`, or None when the
     cache is cold. Like the overview, this is a page people land on -- it reads
     whatever the prefetch already built rather than starting a multi-minute job.
@@ -3425,7 +3457,7 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
             head[ega_col] = ("EGA - HANOI\nBalance to Qualify\n"
                              f"({bars(payload.get('targets'))} EP Point Till 30Jun)")
         if esa_col is not None:
-            head[esa_col] = ("ESA - CHINA\nBalance to Qualify\n"
+            head[esa_col] = ("ESA - CHONGQING\nBalance to Qualify\n"
                              f"({bars(payload.get('esa_targets'))} EP Point Till 31Dec)")
         return [head, list(sub)]
 
