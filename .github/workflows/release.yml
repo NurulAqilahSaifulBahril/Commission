@@ -75,12 +75,85 @@ jobs:
       # Opened here, before either platform job runs, so both have somewhere
       # to upload to and neither races the other into creating it. It stays a
       # draft until the publish job has attached the checksums.
+      #
+      # THE BODY IS WRITTEN HERE, AT CREATION, AND NOWHERE ELSE. That is not a
+      # stylistic choice. action-gh-release only applies body when it CREATES a
+      # release; on an existing one it "will retain its original info", which is
+      # its documented behaviour. Before the artifact-quota rewrite the publish
+      # job's call was the first call for the tag, so the body it carried took
+      # effect. Opening the draft here made publish an UPDATE instead, and the
+      # body it passed was silently dropped -- v1.2.30 through v1.2.34 all
+      # published with completely empty release notes, so the install
+      # instructions never reached the page staff actually land on. Nothing in
+      # the run goes red when this happens; every job reports success.
+      #
+      # So: write it at creation, and do not pass body from publish.
       - name: Open a draft release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ${{ steps.ver.outputs.tag }}
           draft: true
+          body: |
+            ## Commission Dashboard ${{ steps.ver.outputs.tag }}
+
+            **Download for your platform:**
+            - **Windows**: CommissionDashboard-Setup-${{ steps.ver.outputs.version }}.exe
+            - **macOS** (Apple Silicon, M1 or newer): CommissionDashboard-Setup-${{ steps.ver.outputs.version }}-macos-arm64.dmg
+            - **macOS** (Intel): CommissionDashboard-Setup-${{ steps.ver.outputs.version }}-macos-intel.dmg
+
+            Not sure which Mac you have? Apple menu → About This Mac. "Chip: Apple M…" means arm64; "Processor: Intel…" means intel.
+
+            ### Installing on a Mac
+
+            Open **Terminal** (Applications → Utilities), paste this one
+            line, and press Return:
+
+            ```
+            curl -fsSL https://raw.githubusercontent.com/NurulAqilahSaifulBahril/Commission/main/tools/install-macos.sh | bash
+            ```
+
+            That is the entire install. It picks the right build for your
+            Mac, checks the download, installs it and opens it. **There is
+            no security warning to click through** — that warning only
+            appears for downloads made in a browser, and this one is not.
+
+            The first start unpacks about 700 MB and takes a minute or two.
+            The window says what it is doing.
+
+            <details>
+            <summary>Prefer to download the .dmg by hand?</summary>
+
+            You can, but macOS will block the app once and you have to clear
+            it yourself:
+
+            1. Download the `.dmg` for your Mac — **arm64** for Apple
+               Silicon, **intel** for Intel.
+            2. Open it and drag **CommissionDashboard** onto **Applications**.
+            3. Clear the block, either way:
+               - **Terminal, one line:**
+                 `xattr -d -r com.apple.quarantine /Applications/CommissionDashboard.app`
+               - **Clicks only:** double-click the app and *let it fail*,
+                 click Done, then **System Settings → Privacy & Security**,
+                 scroll to **Security**, **Open Anyway** → **Open**. The
+                 failed launch is required — it is what creates the button,
+                 and the button clears itself after about an hour.
+
+            Right-click → Open no longer works: Apple removed that shortcut
+            in macOS Sequoia (15).
+
+            </details>
+
+            Full steps are in the user guide below.
+
+            **New here?** Read `Commission-Portal-User-Guide.pdf` below — it
+            walks through installing and updating, step by step.
+
+            Sign in with the username and password IT gave you — the installer
+            does not ask you to create an account. Ask IT for your access keys
+            and add them to `.env` in the install folder.
+
+            Existing users: auto-update is enabled in the dashboard.
 
   windows:
     runs-on: windows-latest
@@ -485,73 +558,41 @@ jobs:
 
       # draft:false is what makes the release visible. The installers are
       # already attached, so only the two new files are uploaded here.
+      #
+      # NO body AND NO generate_release_notes HERE, deliberately. This call
+      # updates a release that already exists, and an update cannot set the
+      # body -- passing one here is what looked correct for five releases while
+      # publishing nothing. Omitting it means the release keeps what the
+      # version job wrote at creation, which is the documented behaviour and
+      # the only thing that actually works.
       - name: Publish the release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           name: ${{ needs.version.outputs.tag }}
           draft: false
-          generate_release_notes: true
-          body: |
-            ## Commission Dashboard ${{ needs.version.outputs.tag }}
-
-            **Download for your platform:**
-            - **Windows**: CommissionDashboard-Setup-${{ needs.version.outputs.version }}.exe
-            - **macOS** (Apple Silicon, M1 or newer): CommissionDashboard-Setup-${{ needs.version.outputs.version }}-macos-arm64.dmg
-            - **macOS** (Intel): CommissionDashboard-Setup-${{ needs.version.outputs.version }}-macos-intel.dmg
-
-            Not sure which Mac you have? Apple menu → About This Mac. "Chip: Apple M…" means arm64; "Processor: Intel…" means intel.
-
-            ### Installing on a Mac
-
-            Open **Terminal** (Applications → Utilities), paste this one
-            line, and press Return:
-
-            ```
-            curl -fsSL https://raw.githubusercontent.com/NurulAqilahSaifulBahril/Commission/main/tools/install-macos.sh | bash
-            ```
-
-            That is the entire install. It picks the right build for your
-            Mac, checks the download, installs it and opens it. **There is
-            no security warning to click through** — that warning only
-            appears for downloads made in a browser, and this one is not.
-
-            The first start unpacks about 700 MB and takes a minute or two.
-            The window says what it is doing.
-
-            <details>
-            <summary>Prefer to download the .dmg by hand?</summary>
-
-            You can, but macOS will block the app once and you have to clear
-            it yourself:
-
-            1. Download the `.dmg` for your Mac — **arm64** for Apple
-               Silicon, **intel** for Intel.
-            2. Open it and drag **CommissionDashboard** onto **Applications**.
-            3. Clear the block, either way:
-               - **Terminal, one line:**
-                 `xattr -d -r com.apple.quarantine /Applications/CommissionDashboard.app`
-               - **Clicks only:** double-click the app and *let it fail*,
-                 click Done, then **System Settings → Privacy & Security**,
-                 scroll to **Security**, **Open Anyway** → **Open**. The
-                 failed launch is required — it is what creates the button,
-                 and the button clears itself after about an hour.
-
-            Right-click → Open no longer works: Apple removed that shortcut
-            in macOS Sequoia (15).
-
-            </details>
-
-            Full steps are in the user guide below.
-
-            **New here?** Read `Commission-Portal-User-Guide.pdf` below — it
-            walks through installing and updating, step by step.
-
-            Sign in with the username and password IT gave you — the installer
-            does not ask you to create an account. Ask IT for your access keys
-            and add them to `.env` in the install folder.
-
-            Existing users: auto-update is enabled in the dashboard.
           files: |
             dist/Commission-Portal-User-Guide.pdf
             dist/SHA256SUMS.txt
+
+      # The failure this whole arrangement exists to prevent is silent: every
+      # job goes green and the release page is simply blank. Assert on the
+      # published body so a regression fails the run instead of reaching staff.
+      - name: Verify the release notes actually published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          body=$(gh release view "${{ needs.version.outputs.tag }}" \
+                   --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')
+          len=${#body}
+          echo "Release body is $len characters."
+          if [ "$len" -lt 200 ]; then
+            echo "Release notes are empty or truncated - staff would land on a"
+            echo "blank page with no install instructions. The body must be set"
+            echo "on the CREATE call in the version job, not here."
+            exit 1
+          fi
+          case "$body" in
+            *install-macos.sh*) echo "ok: install command is present." ;;
+            *) echo "The macOS install command is missing from the notes."; exit 1 ;;
+          esac
