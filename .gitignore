@@ -6,10 +6,21 @@
 
 # Local dashboard database (password hashes, audit history).
 # The .backup-* copies hold exactly the same thing — this repo is public.
+#
+# MATCH EVERY SQLite FILE, not just the exact name. "**/dashboard.db" was the
+# rule here and it looked sufficient, but Windows writes a machine-suffixed
+# copy -- dashboard-DESKTOP-QV69BG0.db -- which the pattern does not match.
+# That file was committed to this public repository carrying six password
+# hashes, 26 login records, 147 audit entries and 91 agent rows. Nothing
+# warned; it simply was not ignored. No .db in this project is ever meant to
+# be tracked, so the rule is now the broad one and the specific lines below
+# are kept only to say what they are.
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.db.backup*
 **/dashboard.db
-**/dashboard.db.backup*
-**/dashboard.db-wal
-**/dashboard.db-shm
+**/dashboard*.db
 
 # Database backups — contain password hashes and full audit history
 /backups/
