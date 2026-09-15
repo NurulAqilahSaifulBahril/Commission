@@ -21,12 +21,8 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":5001 " ^| findstr "LISTENIN
 )
 timeout /t 1 >nul
 
-:: Drop the cached commission data so a restart (e.g. after a code fix) never
-:: serves stale computed results carried over from the previous run
-if exist "8. Web Dashboard\data\dashboard_cache.pkl" (
-    echo Clearing stale dashboard cache...
-    del /f /q "8. Web Dashboard\data\dashboard_cache.pkl" >nul 2>&1
-)
+:: The data cache is kept between launches. app.py discards it only when
+:: the code that built it has changed, so there is nothing to delete here.
 
 echo Starting local web server...
 start "Finance Commission Dashboard" cmd /k python "8. Web Dashboard/app.py"

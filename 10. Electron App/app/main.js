@@ -271,8 +271,11 @@ let launchFailure = null;
 function startFlask(root) {
   freePort();
 
-  const cachePkl = path.join(root, "8. Web Dashboard", "data", "dashboard_cache.pkl");
-  try { fs.unlinkSync(cachePkl); } catch {}
+  // The data cache is NOT deleted here any more. Deleting it on every launch
+  // made each start rebuild all commission data -- about two minutes of
+  // "still being prepared" on every page. app.py now stamps the cache with a
+  // fingerprint of the code that built it and discards it only when that code
+  // has changed, which covers the after-an-update case this used to handle.
 
   // The bundled runtime first: an install ships with its own interpreter and
   // dependencies, so nothing needs to be on the machine. .venv is the fallback

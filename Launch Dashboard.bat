@@ -25,11 +25,8 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":5001 " ^| findstr "LISTENIN
     taskkill /PID %%a /F >nul 2>&1
 )
 
-:: Drop the computed-data cache so a restart after an update never serves
-:: results shaped by the previous version.
-if exist "8. Web Dashboard\data\dashboard_cache.pkl" (
-    del /f /q "8. Web Dashboard\data\dashboard_cache.pkl" >nul 2>&1
-)
+:: The data cache is kept between launches. app.py discards it only when
+:: the code that built it has changed, so there is nothing to delete here.
 
 start "Finance Commission Dashboard" /min "%PYEXE%" "8. Web Dashboard\app.py"
 

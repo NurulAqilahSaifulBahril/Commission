@@ -293,7 +293,7 @@
                 ${plural(entry.cases.length, "case")}</div>
             <table class="sr-tip-table">
                 <thead><tr><th>Customer</th><th>Amount</th>
-                    <th>Paid</th><th>Entered</th></tr></thead>
+                    <th>Paid</th><th>Created</th></tr></thead>
                 <tbody>${rows.join("")}</tbody>
             </table>`;
     }

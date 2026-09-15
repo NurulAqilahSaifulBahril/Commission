@@ -140,12 +140,55 @@ def add_header(r):
     return r
 
 # â”€â”€ Persistent disk cache for PG proxy data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-CACHE_FILE = CURRENT_DIR / "data" / "dashboard_cache.pkl"
+# The cache is kept between launches and thrown away only when the code that
+# built it has changed -- see _cache_stamp(). It used to be deleted on every
+# start by all three launchers (the Electron shell, Launch Dashboard.bat and
+# start_dashboard.bat), so every launch began with a two-minute rebuild and
+# every page sat on "still being prepared" until it finished.
+#
+# The file name changed with that. The Electron shell sits outside the OTA
+# update's reach and still deletes "dashboard_cache.pkl" on every start; under
+# a name it does not know, installs that update in place keep their cache
+# without anyone having to reinstall.
+CACHE_FILE = CURRENT_DIR / "data" / "dashboard_cache_stamped.pkl"
+_CACHE_STAMP_KEY = "__stamp__"
 _data_cache = {}
 _disk_cache_lock = threading.RLock()
 _response_refresh_lock = threading.Lock()
 _refreshing_response_keys: set[tuple[int, int, str]] = set()
 _RESPONSE_CACHE_TTL_SECONDS = 300
+
+def _cache_stamp() -> str:
+    """Fingerprint of everything that shapes what the cache holds.
+
+    The version number alone is not enough: a code fix restarted on a
+    development copy keeps the same version.json, and that is exactly the case
+    the old delete-on-launch existed for. So the stamp also hashes the source of
+    the dashboard and every commission script. Reading them costs a few
+    milliseconds at startup, against a rebuild measured at about two minutes.
+    """
+    import hashlib
+    h = hashlib.sha1()
+    files = [REPO_ROOT / "version.json", CURRENT_DIR / "app.py",
+             REPO_ROOT / "7. Presentation" / "build_commission_pack.py",
+             REPO_ROOT / "agent_names.py"]
+    for folder in ("1. Basic Commission", "2. NFP Commission", "3. ANP Commission",
+                   "4. EGA ESA Awards", "5. Production Bonus"):
+        base = REPO_ROOT / folder
+        if base.is_dir():
+            files.extend(sorted(p for p in base.rglob("*.py")
+                                if "__pycache__" not in p.parts))
+    for path in files:
+        try:
+            h.update(str(path.relative_to(REPO_ROOT)).encode("utf-8"))
+            h.update(path.read_bytes())
+        except OSError:
+            h.update(b"<missing>")
+    return h.hexdigest()
+
+
+_CACHE_STAMP = _cache_stamp()
+
 
 def load_disk_cache():
     global _data_cache
@@ -153,11 +196,20 @@ def load_disk_cache():
         if CACHE_FILE.exists():
             try:
                 with open(CACHE_FILE, "rb") as f:
-                    _data_cache = pickle.load(f)
-                _log(f"Loaded cache from disk: {list(_data_cache.keys())}")
+                    loaded = pickle.load(f)
             except Exception as e:
                 _log(f"Failed to load cache from disk: {e}\n" + traceback.format_exc())
                 _data_cache = {}
+                return
+            if not isinstance(loaded, dict) or loaded.get(_CACHE_STAMP_KEY) != _CACHE_STAMP:
+                # Built by different code. Serving it could show figures shaped
+                # by rules that no longer exist, which is what deleting the file
+                # on launch used to guard against -- now only when it applies.
+                _log("Discarding disk cache: it was built by a different version of the code.")
+                _data_cache = {}
+                return
+            _data_cache = loaded
+            _log(f"Loaded cache from disk: {[k for k in _data_cache if k != _CACHE_STAMP_KEY]}")
 
 def save_disk_cache():
     """Write the cache atomically: full pickle to a temp file alongside it, then
@@ -176,6 +228,7 @@ def save_disk_cache():
             CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(dir=str(CACHE_FILE.parent),
                                             prefix=CACHE_FILE.name + ".", suffix=".tmp")
+            _data_cache[_CACHE_STAMP_KEY] = _CACHE_STAMP
             with os.fdopen(fd, "wb") as f:
                 pickle.dump(_data_cache, f)
                 f.flush()
@@ -960,31 +1013,30 @@ def prefetch_data_worker(year=2026):
         if basic_mod is None:
             basic_path = REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "full_internal_basic_commission.py"
             basic_mod = build_commission_pack._load_module("int_basic_commission", basic_path)
-        # Pull the heavy bundle fetches in parallel so startup warm-up is faster.
+        # Invoice dates and both channels' bundles are fetched together. The
+        # internal bundle used to wait for the outsource one to finish -- a
+        # leftover from chasing down a hang -- which put the two back to back
+        # and made a cold rebuild about two minutes long.
         _log("Pre-fetching commission bundles in parallel...")
         try:
             with ThreadPoolExecutor(max_workers=3) as ex:
                 fut_invoice_dates = ex.submit(build_commission_pack.fetch_invoice_dates, year, basic_mod)
                 fut_outsource = ex.submit(_fetch_commission_bundle, year, "outsource")
+                fut_internal = ex.submit(_fetch_commission_bundle, year, "internal")
 
                 invoice_dates_map = fut_invoice_dates.result()
                 _log("Invoice dates fetched successfully")
                 out_bundle = fut_outsource.result()
                 _log("Outsource bundle fetched successfully")
-                
-                # Fetch internal separately to identify which specific fetch hangs
-                _log("Fetching internal bundle separately...")
-                try:
-                    int_bundle = _fetch_commission_bundle(year, "internal")
-                    _log("Internal bundle fetched successfully")
-                except Exception as e:
-                    _log(f"Internal bundle fetch failed: {e}. Using empty data.")
-                    int_bundle = {
-                        "basic": ([], [], [], [], [], []),
-                        "anp": ([], [], {}),
-                        "nfp": ([], [], {}, [], {}),
-                        "ega": []
-                    }
+                # A failure here aborts the refresh and leaves whatever is
+                # already cached in place. It used to swap in an empty internal
+                # bundle, which could not even be saved -- it had no ega_raw, so
+                # the next line raised -- and, had it been, would have blanked
+                # every internal figure. Now that a refresh runs over data the
+                # pages are already showing, keeping the old copy is the only
+                # safe outcome.
+                int_bundle = fut_internal.result()
+                _log("Internal bundle fetched successfully")
         except Exception as e:
             _log(f"[PARALLEL FETCH ERROR] {e}\n{traceback.format_exc()}")
             raise
@@ -1029,7 +1081,21 @@ def prefetch_data_worker(year=2026):
             }
             save_disk_cache()
         _log("Outsource data pre-fetched and saved to disk.")
-        
+
+        # Everything computed from the bundles just replaced is now out of date.
+        # Cached commission responses in particular were never dropped by a
+        # rebuild: past their five-minute mark they asked for a fresh prefetch
+        # and went on being served regardless. That hardly mattered while every
+        # launch deleted the cache; now that the cache outlives a restart, a
+        # response from yesterday would otherwise stay on screen indefinitely.
+        with _disk_cache_lock:
+            for k in [k for k in _data_cache
+                      if isinstance(k, tuple) and len(k) == 4 and k[0] == "commission_response"]:
+                del _data_cache[k]
+            save_disk_cache()
+        _clear_derived_caches()
+        _log("Dropped results computed from the previous data.")
+
     except Exception as e:
         _log("[PREFETCH ERROR]\n" + traceback.format_exc())
     finally:
@@ -1042,58 +1108,55 @@ def start_prefetch(year=2026):
 
 
 def _fetch_commission_bundle(year: int, agent_type: str):
-    """Fetch basic, ANP, NFP, and EGA data for one agent type in parallel."""
+    """Fetch basic, ANP, NFP, EGA and raw EGA data for one agent type.
+
+    The five run together. Each is its own round of proxy queries with nothing
+    shared between them -- the commission modules are loaded once at startup and
+    each fetch only reads them -- and run one after another they took about a
+    minute per channel, the slowest single one about twenty seconds.
+    """
     _log(f"Starting fetch for {agent_type} agents...")
+    B = build_commission_pack
     if agent_type == "internal":
-        basic_fn = lambda: build_commission_pack.fetch_internal_basic(year, h1_only=False)
-        anp_fn = lambda: build_commission_pack.fetch_internal_anp(year, h1_only=False)
-        nfp_fn = lambda: build_commission_pack.fetch_internal_nfp(year, h1_only=False)
-        ega_fn = lambda: build_commission_pack.fetch_internal_ega_esa(year, may_only=False)
+        fns = {
+            "basic": lambda: B.fetch_internal_basic(year, h1_only=False),
+            "anp": lambda: B.fetch_internal_anp(year, h1_only=False),
+            "nfp": lambda: B.fetch_internal_nfp(year, h1_only=False),
+            "ega": lambda: B.fetch_internal_ega_esa(year, may_only=False),
+            "ega_raw": lambda: B.fetch_internal_ega_raw(year),
+        }
     else:
-        basic_fn = lambda: build_commission_pack.fetch_outsource_basic(year, h1_only=False)
-        anp_fn = lambda: build_commission_pack.fetch_outsource_anp(year, h1_only=False)
-        nfp_fn = lambda: build_commission_pack.fetch_outsource_nfp(year, h1_only=False)
-        ega_fn = lambda: build_commission_pack.fetch_outsource_ega_esa(year, may_only=False)
+        fns = {
+            "basic": lambda: B.fetch_outsource_basic(year, h1_only=False),
+            "anp": lambda: B.fetch_outsource_anp(year, h1_only=False),
+            "nfp": lambda: B.fetch_outsource_nfp(year, h1_only=False),
+            "ega": lambda: B.fetch_outsource_ega_esa(year, may_only=False),
+            "ega_raw": lambda: B.fetch_outsource_ega_raw(year),
+        }
+
+    def _with_retries(name, fn):
+        # The proxy fails intermittently -- "HTTP 502 from proxy: upstream error"
+        # -- and more often when several queries arrive at once. One retry
+        # after a short pause clears nearly all of it, so a blip no longer
+        # throws away a refresh that is otherwise complete.
+        for attempt in range(3):
+            try:
+                return fn()
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                _log(f"{name} fetch for {agent_type} failed ({e}); retrying...")
+                time.sleep(2 * (attempt + 1))
 
     try:
-        _log(f"Fetching basic data for {agent_type}...")
-        
-        # Use threading for timeout (works on Windows)
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(basic_fn)
-            try:
-                basic = future.result(timeout=180)
-            except concurrent.futures.TimeoutError:
-                _log(f"Basic data fetch for {agent_type} timed out after 180 seconds")
-                raise
-                
-        _log(f"Basic data fetched for {agent_type}")
-        
-        _log(f"Fetching ANP data for {agent_type}...")
-        anp = anp_fn()
-        _log(f"ANP data fetched for {agent_type}")
-        
-        _log(f"Fetching NFP data for {agent_type}...")
-        nfp = nfp_fn()
-        _log(f"NFP data fetched for {agent_type}")
-        
-        _log(f"Fetching EGA data for {agent_type}...")
-        ega = ega_fn()
-        _log(f"EGA data fetched for {agent_type}")
-        
-        _log(f"Fetching raw EGA data for {agent_type}...")
-        ega_raw_fn = lambda: build_commission_pack.fetch_internal_ega_raw(year) if agent_type == "internal" else build_commission_pack.fetch_outsource_ega_raw(year)
-        ega_raw = ega_raw_fn()
-        _log(f"Raw EGA data fetched for {agent_type}")
-        
-        return {
-            "basic": basic,
-            "anp": anp,
-            "nfp": nfp,
-            "ega": ega,
-            "ega_raw": ega_raw,
-        }
+        with ThreadPoolExecutor(max_workers=len(fns)) as ex:
+            futures = {name: ex.submit(_with_retries, name, fn) for name, fn in fns.items()}
+            out = {}
+            for name, fut in futures.items():
+                # The basic fetch keeps the three-minute ceiling it always had.
+                out[name] = fut.result(timeout=180) if name == "basic" else fut.result()
+                _log(f"{name} data fetched for {agent_type}")
+        return out
     except Exception as e:
         _log(f"[BUNDLE FETCH ERROR for {agent_type}] {e}\n{traceback.format_exc()}")
         raise
@@ -1241,12 +1304,16 @@ with _disk_cache_lock:
 if SETUP_ERROR is not None:
     # No keys, no data: every fetch would fail the same way init_db just did.
     has_main_keys = True
-FAST_START = False  # Disabled to ensure full pre-fetch when cache is incomplete
-if not has_main_keys and not FAST_START:
+if not has_main_keys:
     _log("Cache is missing internal or outsource data on startup. Triggering background pre-fetch...")
     start_prefetch(2026)
-elif not has_main_keys:
-    _log("Fast-start enabled: skipping startup pre-fetch so the dashboard can open immediately.")
+elif SETUP_ERROR is None:
+    # Pages open straight away on the data saved last time, and the rebuild
+    # runs behind them. Each piece replaces its old copy only once the new one
+    # is complete, so nobody ever sees a half-built figure -- just figures that
+    # catch up to the database a minute or two after launch.
+    _log("Serving cached data from the last session; refreshing it in the background...")
+    start_prefetch(2026)
 
 def _no_store(resp):
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -2270,10 +2337,6 @@ SALES_REPORT_TARGETS = {"Internal": 600000.0, "Outsource": 720000.0}
 # Both are overridden per channel by the Data page; these are only the fallback
 # for a year nobody has set up yet.
 SALES_REPORT_ESA_TARGETS = {"Internal": 1300000.0, "Outsource": 1560000.0}
-# From this date a case is placed by when it was created rather than by when it
-# was first paid. A one-off change of system, not a yearly cycle, so later years
-# are all created-date by the same comparison.
-SALES_REPORT_CREATED_FROM = "2026-08-01"
 
 
 def _sales_report_last_month(year: int) -> int:
@@ -2399,21 +2462,14 @@ def _sales_report_local_day(value) -> str:
 def _sales_report_case_dates(year: int) -> dict[str, str]:
     """invoice bubble_id -> the date that decides which month a case falls in.
 
-    Two regimes, and the switch is a change of system rather than a yearly
-    cycle:
+    One rule for every case: it belongs to the month its FIRST PAYMENT landed.
+    Teo Kim Seng is invoiced 5 February but first paid 31 January, and the
+    printed report counts him in January; Lim Lee Peng is invoiced 5 January but
+    first paid 30 December, so he is not in 2026 at all.
 
-      * created before 1 Aug 2026 -- the case belongs to the month its FIRST
-        PAYMENT landed. Teo Kim Seng is invoiced 5 February but first paid 31
-        January, and the printed report counts him in January; Lim Lee Peng is
-        invoiced 5 January but first paid 30 December, so he is not in 2026 at
-        all.
-      * created on or after 1 Aug 2026 -- the case belongs to the month it was
-        CREATED. Diong Wei Yuan is created 7 September and first paid 29
-        August, and belongs to September.
-
-    `created_at` is in practice the invoice date: across 2026's 3,472 invoices
-    it is never null and falls on the same day 3,468 times. It is read rather
-    than invoice_date because it is what the rule names.
+    Until 15 September 2026 invoices created from 1 August were placed by their
+    created date instead. That second regime was withdrawn, so Diong Wei Yuan --
+    created 7 September, first paid 29 August -- now counts in August.
 
     Keyed on bubble_id, not invoice number: one number can carry several
     revisions with different dates -- 1008358 has first payments at 2026-01-03
@@ -2467,11 +2523,9 @@ def _sales_report_case_dates(year: int) -> dict[str, str]:
         bid = str(r.get("bubble_id") or "").strip()
         if not bid:
             continue
-        created = str(r.get("c") or "")[:10]
         paid = str(r.get("p1") or "")[:10]
-        chosen = created if (created and created >= SALES_REPORT_CREATED_FROM) else paid
-        if chosen:
-            out[bid] = chosen
+        if paid:
+            out[bid] = paid
     _FIRST_PAYMENT_CACHE[key] = (time.time(), out)
     return out
 
@@ -3791,6 +3845,7 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
         canvas.setFillColor(colors.HexColor("#94a3b8"))
         canvas.drawString(12 * mm, 8 * mm,
                           f"Eternalgy Commission Portal - Sales Report {year}")
+        canvas.drawCentredString(page_w / 2, 8 * mm, "Template prepared by HR")
         canvas.drawRightString(page_w - 12 * mm, 8 * mm,
                                f"Page {canvas.getPageNumber()}")
         canvas.restoreState()
