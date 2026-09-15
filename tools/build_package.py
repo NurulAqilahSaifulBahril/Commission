@@ -727,9 +727,17 @@ def _codesign_mac(app: Path) -> None:
     what an M-series Mac saw on every build before this one.
 
     An ad-hoc signature ("-") needs no Apple account and no money, and it turns
-    the dead end into the ordinary unidentified-developer prompt -- which the
-    installer script clears outright by stripping quarantine. Set
-    MAC_SIGN_IDENTITY to a real "Developer ID Application: ..." to sign for
+    the dead end into the ordinary unidentified-developer prompt.
+
+    NOTE, because this used to claim otherwise: nothing clears that prompt for
+    a Mac user who downloads the disk image in a browser. There is no macOS
+    installer script -- the install is a drag in Finder, and the quarantine
+    attribute survives it. Whoever installs must clear it once by hand, and
+    READ ME FIRST.txt carries both routes. The way to avoid the prompt entirely
+    is tools/install-macos.sh: curl does not set com.apple.quarantine, so an
+    image fetched that way has nothing for Gatekeeper to object to.
+
+    Set MAC_SIGN_IDENTITY to a real "Developer ID Application: ..." to sign for
     distribution instead. Signing with a Developer ID and then notarising is
     the only way to remove the prompt itself rather than work around it;
     notarisation is not wired up here, because it needs a paid Apple Developer
@@ -859,15 +867,44 @@ def _write_mac_readme(dmg_root: Path) -> None:
 2. Open your Applications folder and double-click
    CommissionDashboard.
 
-3. The first time only, macOS will say it is from an
-   unidentified developer and refuse to open it. That is
-   expected — this app is not distributed through the App
-   Store. Right-click (or Control-click) CommissionDashboard,
-   choose Open, then choose Open again.
+3. The first time only, macOS refuses to open it and says it
+   "cannot be verified". That is expected — this app is not
+   distributed through the App Store.
 
-   On macOS Sequoia or newer there is no Open button in that
-   dialog. Go to Apple menu > System Settings > Privacy &
-   Security, scroll down, and click "Open Anyway".
+   THE QUICK WAY. Open Terminal (Applications > Utilities),
+   paste this one line, and press Return:
+
+     xattr -d -r com.apple.quarantine /Applications/CommissionDashboard.app
+
+   Then double-click the app. It opens normally and the
+   warning never comes back. That line removes the "downloaded
+   from the internet" mark which is what makes macOS block it.
+   It asks for no password and changes nothing else.
+
+   THE CLICK-ONLY WAY, if you would rather not use Terminal:
+
+   a. Double-click CommissionDashboard and LET IT FAIL, then
+      click Done. Do not skip this. The button in step (b)
+      does not exist until a launch has been blocked.
+
+   b. Apple menu > System Settings > Privacy & Security.
+      Scroll to the "Security" section near the bottom. It
+      now reads "CommissionDashboard was blocked to protect
+      your Mac", with an "Open Anyway" button beside it.
+      Click it, authenticate, then click Open in the dialog.
+
+   Do (b) within about an hour of (a) — the button clears
+   itself after a while. If it is not there, do (a) again and
+   look once more.
+
+   (On macOS Sonoma (14) and earlier you could right-click the
+   app and choose Open instead. Apple removed that shortcut in
+   macOS Sequoia (15), so on a current Mac use one of the two
+   routes above.)
+
+   Next time you can skip all of this: install with the single
+   command in the release notes instead of downloading this
+   disk image, and there is no warning to clear at all.
 
 4. The first launch sets itself up before the dashboard
    appears — it unpacks about 700 MB and takes a minute or
