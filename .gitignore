@@ -3,6 +3,7 @@
 **/.env
 **/pg_proxy_token.txt
 **/.pg_proxy_token
+**/pg_proxy_token*.txt
 
 # Local dashboard database (password hashes, audit history).
 # The .backup-* copies hold exactly the same thing — this repo is public.
