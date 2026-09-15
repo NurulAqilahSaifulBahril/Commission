@@ -69,9 +69,45 @@ def _normalize_proxy_url(url: str) -> str:
     return f"{base}/api/sql"
 
 
+def _bundled_token() -> str | None:
+    """The proxy token that already ships with this project, or None.
+
+    Every other constant here has a working default, so a fresh install runs
+    with no configuration at all -- except the token, which did not, and that
+    one gap is the whole of "Portal needs its access keys" on first launch.
+    Staff had to be sent a token out of band and paste it into .env by hand
+    before the dashboard would show a single row.
+
+    It was never actually missing. 6. Monthly Contest/3. Python Script/
+    monthly_contest.py has carried a FALLBACK_TOKEN for the same proxy and the
+    same database all along, and that file ships in the payload. So read it
+    from there rather than keeping a second copy in sync: one literal, one
+    place, and no install step.
+
+    Parsed rather than imported -- monthly_contest.py pulls in requests and
+    pandas at module scope, which the dashboard does not need and which would
+    turn a missing wheel into an import error here.
+
+    An environment variable still wins. A deployment that sets PG_MIRROR_TOKEN
+    (CI seeding, or a site with its own credentials) never reaches this.
+    """
+    src = (REPO_ROOT / "6. Monthly Contest" / "3. Python Script" /
+           "monthly_contest.py")
+    try:
+        text = src.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'^FALLBACK_TOKEN\s*=\s*["\'](.+?)["\']\s*$',
+                  text, re.MULTILINE)
+    if not m:
+        return None
+    # It is stored with the header prefix; post() adds its own "Bearer ".
+    return re.sub(r'^\s*Bearer\s+', '', m.group(1)).strip() or None
+
+
 PROXY_URL = _normalize_proxy_url(
     os.environ.get("PG_PROXY_URL", "https://pg-proxy-production.up.railway.app/api/sql"))
-PROXY_TOKEN = os.environ.get("PG_MIRROR_TOKEN")
+PROXY_TOKEN = os.environ.get("PG_MIRROR_TOKEN") or _bundled_token()
 PROXY_DB = os.environ.get("PG_MIRROR_DB", "NUrul_DB")
 SCHEMA = os.environ.get("PG_MIRROR_SCHEMA", "dashboard")
 
