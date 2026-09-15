@@ -1185,6 +1185,16 @@ def handle_404(e):
 build_commission_pack._load_env_files()
 
 app.secret_key = os.environ.get("FLASK_SECRET_KEY")
+# Keep people signed in. The login cookie used to last only while the window
+# was open, so every launch of the dashboard began at the sign-in page. It now
+# lasts 30 days and each visit pushes that out again, so anyone who uses the
+# dashboard at least monthly stays signed in. auth.current_user() re-checks the
+# account, so deactivating a user or resetting a password still signs them out.
+from datetime import timedelta as _timedelta
+app.config["PERMANENT_SESSION_LIFETIME"] = _timedelta(days=30)
+app.config["SESSION_REFRESH_EACH_REQUEST"] = True
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 if not app.secret_key:
     # Generate one rather than refusing to boot. Historically Setup
     # Environment.bat wrote this, so a fresh machine where that step failed
@@ -1545,6 +1555,7 @@ def admin_user_detail_api(user_id: int):
 
     if request.method == "DELETE":
         db.deactivate_user(user_id)
+        auth.forget_user(user_id)
         db.insert_audit(actor["username"], "delete", "user", f"Deactivated user '{target['username']}'", user_id=actor["id"])
         return jsonify({"status": "success"})
 
@@ -1566,6 +1577,7 @@ def admin_user_detail_api(user_id: int):
         updates["is_active"] = bool(req_data["is_active"])
 
     db.update_user(user_id, **updates)
+    auth.forget_user(user_id)
     # Every change to a user used to land in the audit log as the same
     # "Updated user 'x'", so a password reset and a reactivation were
     # indistinguishable after the fact -- which is most of what the log is
