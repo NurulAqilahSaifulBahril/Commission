@@ -902,9 +902,9 @@ def _write_mac_readme(dmg_root: Path) -> None:
    macOS Sequoia (15), so on a current Mac use one of the two
    routes above.)
 
-   Next time you can skip all of this: install with the single
-   command in the release notes instead of downloading this
-   disk image, and there is no warning to clear at all.
+   This is a one-time step for this install. Updates come
+   through the dashboard itself and are never blocked this
+   way, so you will not see this message again.
 
 4. The first launch sets itself up before the dashboard
    appears — it unpacks about 700 MB and takes a minute or

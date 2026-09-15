@@ -104,33 +104,29 @@ jobs:
 
             Not sure which Mac you have? Apple menu → About This Mac. "Chip: Apple M…" means arm64; "Processor: Intel…" means intel.
 
-            ### Installing on a Mac
+            ### Installing on a Mac — for anyone with access to this repo
 
-            Open **Terminal** (Applications → Utilities), paste this one
-            line, and press Return:
+            This repository is private, so the download needs a GitHub token
+            with **Contents:read**. Create one at
+            https://github.com/settings/tokens, then in **Terminal**:
 
             ```
-            curl -fsSL https://raw.githubusercontent.com/NurulAqilahSaifulBahril/Commission/main/tools/install-macos.sh | bash
+            GITHUB_TOKEN=your_token_here bash <(curl -fsSL -H "Authorization: Bearer your_token_here" https://raw.githubusercontent.com/NurulAqilahSaifulBahril/Commission/main/tools/install-macos.sh)
             ```
 
-            That is the entire install. It picks the right build for your
-            Mac, checks the download, installs it and opens it. **There is
-            no security warning to click through** — that warning only
-            appears for downloads made in a browser, and this one is not.
+            It picks the right build for your Mac, verifies the checksum,
+            installs it and opens it. **No security warning appears** — that
+            warning is triggered by the quarantine flag, which only browsers
+            set, and curl does not.
 
-            The first start unpacks about 700 MB and takes a minute or two.
-            The window says what it is doing.
+            ### Installing on a Mac — for staff
 
-            <details>
-            <summary>Prefer to download the .dmg by hand?</summary>
+            Staff do not need a GitHub account. Ask IT for the `.dmg`, then:
 
-            You can, but macOS will block the app once and you have to clear
-            it yourself:
-
-            1. Download the `.dmg` for your Mac — **arm64** for Apple
-               Silicon, **intel** for Intel.
-            2. Open it and drag **CommissionDashboard** onto **Applications**.
-            3. Clear the block, either way:
+            1. Open the `.dmg` and drag **CommissionDashboard** onto
+               **Applications**.
+            2. macOS blocks it the first time — this is expected and happens
+               once. Clear it either way:
                - **Terminal, one line:**
                  `xattr -d -r com.apple.quarantine /Applications/CommissionDashboard.app`
                - **Clicks only:** double-click the app and *let it fail*,
@@ -140,20 +136,26 @@ jobs:
                  and the button clears itself after about an hour.
 
             Right-click → Open no longer works: Apple removed that shortcut
-            in macOS Sequoia (15).
+            in macOS Sequoia (15). The same steps are on the disk image in
+            `READ ME FIRST.txt`.
 
-            </details>
-
-            Full steps are in the user guide below.
+            The first start unpacks about 700 MB and takes a minute or two.
+            The window says what it is doing.
 
             **New here?** Read `Commission-Portal-User-Guide.pdf` below — it
             walks through installing and updating, step by step.
 
             Sign in with the username and password IT gave you — the installer
-            does not ask you to create an account. Ask IT for your access keys
-            and add them to `.env` in the install folder.
+            does not ask you to create an account.
 
             Existing users: auto-update is enabled in the dashboard.
+
+            ---
+
+            > **Handling note.** While the `PG_*` repository secrets are set,
+            > these disk images carry a live `.env` and therefore live
+            > database credentials. Share them only with named people, never
+            > on a public or "anyone with the link" share.
 
   windows:
     runs-on: windows-latest
