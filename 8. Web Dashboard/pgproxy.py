@@ -69,45 +69,36 @@ def _normalize_proxy_url(url: str) -> str:
     return f"{base}/api/sql"
 
 
-def _bundled_token() -> str | None:
-    """The proxy token that already ships with this project, or None.
-
-    Every other constant here has a working default, so a fresh install runs
-    with no configuration at all -- except the token, which did not, and that
-    one gap is the whole of "Portal needs its access keys" on first launch.
-    Staff had to be sent a token out of band and paste it into .env by hand
-    before the dashboard would show a single row.
-
-    It was never actually missing. 6. Monthly Contest/3. Python Script/
-    monthly_contest.py has carried a FALLBACK_TOKEN for the same proxy and the
-    same database all along, and that file ships in the payload. So read it
-    from there rather than keeping a second copy in sync: one literal, one
-    place, and no install step.
-
-    Parsed rather than imported -- monthly_contest.py pulls in requests and
-    pandas at module scope, which the dashboard does not need and which would
-    turn a missing wheel into an import error here.
-
-    An environment variable still wins. A deployment that sets PG_MIRROR_TOKEN
-    (CI seeding, or a site with its own credentials) never reaches this.
-    """
-    src = (REPO_ROOT / "6. Monthly Contest" / "3. Python Script" /
-           "monthly_contest.py")
-    try:
-        text = src.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    m = re.search(r'^FALLBACK_TOKEN\s*=\s*["\'](.+?)["\']\s*$',
-                  text, re.MULTILINE)
-    if not m:
-        return None
-    # It is stored with the header prefix; post() adds its own "Bearer ".
-    return re.sub(r'^\s*Bearer\s+', '', m.group(1)).strip() or None
+# ── The dashboard's proxy token ──────────────────────────────────────────────
+#
+# PASTE THE NUrul_DB TOKEN BETWEEN THE QUOTES BELOW. The JWT only -- no
+# "Bearer " prefix, post() adds its own, and "Bearer Bearer ..." fails as an
+# auth error that names nothing useful.
+#
+# IT MUST BE SCOPED TO NUrul_DB. There is a second token in this project, in
+# 6. Monthly Contest/3. Python Script/monthly_contest.py, and reaching for it
+# here does not work: that one is issued for prod_main, and the proxy answers
+# every dashboard query with {"error":"Token does not allow this db_name"}.
+# The two databases need two tokens. Check a candidate before pasting it --
+# the middle segment of the JWT is base64 and carries "db_name".
+#
+# Left empty, the dashboard serves its "Setup needed" page and asks for a key,
+# which is the behaviour whenever neither this nor PG_MIRROR_TOKEN is set.
+#
+# This is a live full-access credential in tracked source. It is here because
+# the alternative was sending every staff member a token out of band and
+# talking them through editing .env, and monthly_contest.py already
+# establishes the pattern. Treat the repository as holding a secret: keep it
+# private, and rotate this line whenever that stops being true.
+DASHBOARD_FALLBACK_TOKEN = ""
 
 
 PROXY_URL = _normalize_proxy_url(
     os.environ.get("PG_PROXY_URL", "https://pg-proxy-production.up.railway.app/api/sql"))
-PROXY_TOKEN = os.environ.get("PG_MIRROR_TOKEN") or _bundled_token()
+# The environment still wins, so CI seeding and any site with its own
+# credentials override the bundled one without touching this file.
+PROXY_TOKEN = (os.environ.get("PG_MIRROR_TOKEN")
+               or DASHBOARD_FALLBACK_TOKEN.strip() or None)
 PROXY_DB = os.environ.get("PG_MIRROR_DB", "NUrul_DB")
 SCHEMA = os.environ.get("PG_MIRROR_SCHEMA", "dashboard")
 
@@ -235,8 +226,10 @@ def post(sql: str, params: list[Any] | None = None, *, timeout: int = 120,
          retries: int = 3) -> dict[str, Any]:
     if not PROXY_TOKEN:
         raise ProxyError(
-            f"PG_MIRROR_TOKEN not set. Add it to {REPO_ROOT / '.env'} "
-            "(full-access token for NUrul_DB)."
+            "No proxy token for NUrul_DB. Either set DASHBOARD_FALLBACK_TOKEN "
+            f"in {Path(__file__).name}, or add PG_MIRROR_TOKEN to "
+            f"{REPO_ROOT / '.env'}. It must be scoped to NUrul_DB -- the token "
+            "in monthly_contest.py is for prod_main and the proxy refuses it."
         )
     body = json.dumps({"db_name": PROXY_DB, "sql": sql, "params": params or []},
                       default=str).encode()
