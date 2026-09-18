@@ -10,6 +10,14 @@ import uuid
 from pathlib import Path
 from flask import Flask, jsonify, request, send_file, send_from_directory, session, redirect, make_response
 
+# Before db, auth, updater or any commission engine is imported. Each reads its
+# proxy token from the environment at import time, so anything filling gaps has
+# to run first or it runs too late to matter. It loads .env itself before
+# filling anything, so a machine carrying real credentials still wins -- see
+# bundled_keys for why that order is load-bearing.
+import bundled_keys
+bundled_keys.apply()
+
 import db
 import auth
 import updater
