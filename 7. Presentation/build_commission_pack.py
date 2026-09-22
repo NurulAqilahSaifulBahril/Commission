@@ -280,6 +280,26 @@ def _replace_line(ln, **changes):
     return new
 
 
+def _basic_line_rate_label(ln) -> str:
+    """Assigned Basic Rate % for a line, including an EV add-on when present."""
+    display = str(getattr(ln, "rate_display", "") or "").strip()
+    if display:
+        if (getattr(ln, "package", "") == "Factory"
+                and float(getattr(ln, "profit_sharing", 0) or 0) > 0
+                and "+" not in display):
+            display += f" + {float(ln.profit_sharing) * 100:g}%"
+        return display
+    rate = getattr(ln, "commission_rate", None)
+    if rate is None:
+        rate = getattr(ln, "rate", None)
+    if rate is None:
+        return ""
+    rate_str = f"{float(rate) * 100:g}%"
+    if getattr(ln, "package", "") == "Factory" and float(getattr(ln, "profit_sharing", 0) or 0) > 0:
+        rate_str += f" + {float(ln.profit_sharing) * 100:g}%"
+    return rate_str
+
+
 def _expand_basic_lines_for_month(basic_lines: list, m: int) -> list:
     """
     July 2026 onwards, Basic Commission pays out in two milestones: a flat
@@ -1224,8 +1244,14 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
             # Rate (and the Role it's looked up against) are based on Invoice
             # Date, not Payment Date — a sale invoiced in September still gets
             # September's rate/role even if payment completes months later.
-            rate = basic.get_own_commission_rate(info, agent_comm_field, inv_dt, property_type=prop_type)
-            own_comm = sales_price * rate
+            from basic_commission_rates import basic_commission_for_row
+            own_comm, rate, ev_rate, ev_comm, ev_amt, rate_display = basic_commission_for_row(
+                r, sales_price,
+                lambda job, ev: basic.get_own_commission_rate(
+                    info, agent_comm_field, inv_dt, property_type=prop_type,
+                    job_type=job, ev_type=ev,
+                ),
+            )
             agent_own_commissions[canonical_name] += own_comm
             agent_sales_totals[canonical_name] += total
 
@@ -1261,6 +1287,10 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
                 pct100_date=pct100_str,
                 first_payment_date=first_pay_str,
                 payout_policy=policy,
+                ev_item_amount=float(ev_amt or 0),
+                ev_rate=float(ev_rate) if ev_rate is not None else None,
+                ev_commission=float(ev_comm or 0),
+                rate_display=rate_display,
             )
             processed_invoices.append(obj)
 
@@ -1545,7 +1575,7 @@ def _full_payment_display(dates: tuple) -> str:
     return full_pay
 
 
-def _balance_payment_display(cust_basic_lines: list, dates: tuple) -> str:
+def _balance_payment_display(cust_basic_lines: list, dates: tuple, as_at: str = "") -> str:
     """The "75% Payment Date" cell for a Basic Commission customer row.
 
     A multi-stage invoice settles its balance at the 75% milestone, so that is
@@ -1559,18 +1589,100 @@ def _balance_payment_display(cust_basic_lines: list, dates: tuple) -> str:
     display, as do NFP rows, which are never advanced and so never reach this
     function.
     """
-    if not any(_is_new_policy_line(ln) for ln in cust_basic_lines):
-        return _full_payment_display(dates)
+    # The milestone that actually released this customer's commission, whatever
+    # percentage it is: 75% under the multi-stage policy, 100% before it, or
+    # whatever the Data page names now. Dates after the month being reported
+    # are left out -- see _is_after_month.
     reached = sorted({
         str(getattr(ln, "pct75_date", "") or "").strip()
         for ln in cust_basic_lines
-        if _is_new_policy_line(ln) and str(getattr(ln, "pct75_date", "") or "").strip()
+        if str(getattr(ln, "pct75_date", "") or "").strip()
+        and not _is_after_month(getattr(ln, "pct75_date", ""), as_at)
     })
     if reached:
         return "<br/>".join(reached)
-    # Multi-stage but the 75% milestone has not been reached: genuinely pending.
+    if not any(_is_new_policy_line(ln) for ln in cust_basic_lines):
+        # Pre-policy: the invoice's own full payment date, unless the invoice
+        # did not get there until after this month.
+        full = dates[2] if dates and len(dates) > 2 else ""
+        if _is_after_month(full, as_at):
+            inv_date = dates[0] if dates else ""
+            return "pending" if inv_date and inv_date != "-" else _full_payment_display(dates)
+        return _full_payment_display(dates)
+    # Multi-stage, and the balance milestone has not been reached: pending.
     inv_date = dates[0] if dates else ""
     return "pending" if inv_date and inv_date != "-" else _full_payment_display(dates)
+
+
+def _nfp_payment_display(cust_basic_lines: list, nfp_dates: tuple, as_at: str = "") -> str:
+    """The payment-date cell on a Net Floor Price row.
+
+    NFP is earned at 100% payment, so that milestone is the date this column
+    means. It used to print the invoice's LAST payment date, which is a later
+    day whenever a settled invoice is topped up again -- Liew Chan Sang's
+    August row carried 2026-09-25, a date that had not happened when August
+    was reported, for a commission August had already paid.
+    """
+    raw = str((nfp_dates[2] if nfp_dates and len(nfp_dates) > 2 else "") or "").strip()
+    if raw and not _is_after_month(raw, as_at):
+        return raw
+    hundreds = sorted({
+        str(getattr(ln, "pct100_date", "") or "").strip()
+        for ln in cust_basic_lines or []
+        if str(getattr(ln, "pct100_date", "") or "").strip()
+        and not _is_after_month(getattr(ln, "pct100_date", ""), as_at)
+    })
+    if hundreds:
+        return "<br/>".join(hundreds)
+    inv_date = nfp_dates[0] if nfp_dates else ""
+    return "pending" if inv_date and inv_date != "-" else raw
+
+
+def as_at_ym(year, month) -> str:
+    """The reporting month as "YYYY-MM", for hiding what had not happened yet."""
+    try:
+        return f"{int(year):04d}-{int(month):02d}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _is_after_month(date_str, as_at: str) -> bool:
+    """True when this date falls after the month being reported.
+
+    July's report is July as it stood. A milestone an invoice only reached in
+    August is not July's news: printing the August date on the July row says
+    the payment had arrived when it had not.
+    """
+    text = str(date_str or "").strip()
+    return bool(as_at) and len(text) >= 7 and text[:7] > as_at
+
+
+def _nfp_awaiting_full_payment(cust_basic_lines, nfp_by_inv_all, as_at: str = "") -> bool:
+    """True when this customer's Net Floor Price commission is unpaid only
+    because the invoice is not settled in full yet.
+
+    NFP is earned at 100% payment. A customer part way there has no NFP row in
+    any month, so the cell had nothing to date itself by and fell back to "-",
+    which reads as "nothing due" rather than "not yet due". Lim Khong Chien is
+    the case in point: invoiced July 2026, 80% paid, his Basic Commission
+    balance settled while his NFP row showed a dash.
+
+    Read off the NFP engine's own record of the invoice, so an invoice that IS
+    fully paid -- whose NFP was earned in an earlier month -- is not labelled
+    pending here.
+    """
+    for ln in cust_basic_lines or []:
+        inv = str(getattr(ln, "invoice_number", "") or "").strip()
+        r = (nfp_by_inv_all or {}).get(inv)
+        if r is None:
+            continue
+        if "2026" not in str(getattr(r, "invoice_date", "") or ""):
+            continue
+        full = str(getattr(r, "full_payment_date", "") or "").strip()
+        if full and not _is_after_month(full, as_at):
+            continue      # fully paid: its NFP belongs to the month it was paid
+        return True       # unpaid, or not paid until a later month than this
+    return False
 
 
 def _is_cleaning_inspection_service(r_nfp) -> bool:
@@ -1963,11 +2075,7 @@ def build_internal_summary_tables(
             comm = float(ln.basic_commission)
             basic_comm_by_agent[agent] = basic_comm_by_agent.get(agent, 0.0) + comm
 
-            rate_val = float(ln.commission_rate) * 100
-            rate_str = f"{rate_val:g}%"
-            if getattr(ln, "package", "") == "Factory" and float(getattr(ln, "profit_sharing", 0)) > 0:
-                ps_str = f"{float(ln.profit_sharing)*100:g}%"
-                rate_str += f" + {ps_str}"
+            rate_str = _basic_line_rate_label(ln)
             existing = basic_rate_by_agent.get(agent, "")
             if rate_str not in existing:
                 basic_rate_by_agent[agent] = (existing + "<br/>" + rate_str).lstrip("<br/>")
@@ -2174,7 +2282,7 @@ def build_internal_summary_tables(
                 basic_by_cust[key]["net_floor_price"] += float(r_nfp.net_floor_price or 0.0)
                 if _is_cleaning_inspection_service(r_nfp):
                     basic_by_cust[key]["is_cleaning_service"] = True
-            rate_str = f"{float(ln.commission_rate) * 100:g}%"
+            rate_str = _basic_line_rate_label(ln)
             basic_by_cust[key]["rate"].add(rate_str)
 
         nfp_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False})
@@ -2299,14 +2407,18 @@ def build_internal_summary_tables(
                         )
                         nfp_comm_val = ensure_rm_prefix(
                             f"{nfp_info['comm']:,.2f}" if nfp_info['comm'] != 0
-                            else ("pending full payment" if nfp_dates[0] and "2026" in str(nfp_dates[0]) else "-")
+                            else ("pending full payment"
+                                  if (nfp_dates[0] and "2026" in str(nfp_dates[0]))
+                                  or _nfp_awaiting_full_payment(cust_basic_lines, nfp_by_inv_all,
+                                                                as_at_ym(year, m))
+                                  else "-")
                         )
 
                     basic_row = [show_agent, customer, basic_dates[0], basic_dates[1]]
                     if m >= 7:
                         basic_row.append(rm300_display)
                     basic_row.extend([
-                        _balance_payment_display(cust_basic_lines, basic_dates),
+                        _balance_payment_display(cust_basic_lines, basic_dates, as_at_ym(year, m)),
                         cust_basic_pkg_str,
                         ensure_rm_prefix(f"{basic_info['system_price']:,.2f}" if basic_info['system_price'] != 0 else "-"),
                         basic_nfp_cell,
@@ -2329,7 +2441,7 @@ def build_internal_summary_tables(
                     if m >= 7:
                         nfp_row.append("-")
                     nfp_row.extend([
-                        nfp_dates[2],
+                        _nfp_payment_display(cust_basic_lines, nfp_dates, as_at_ym(year, m)),
                         cust_nfp_pkg_str,
                         ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
                         nfp_nfp_cell,
@@ -2656,9 +2768,7 @@ def build_outsource_summary_tables(
                 basic_by_cust[key]["net_floor_price"] += float(r_nfp.net_floor_price or 0.0)
                 if _is_cleaning_inspection_service(r_nfp):
                     basic_by_cust[key]["is_cleaning_service"] = True
-            rate_str = f"{ln.rate * 100:.2g}%"
-            if hasattr(ln, "profit_sharing") and ln.profit_sharing > 0:
-                rate_str += f" + {ln.profit_sharing * 100:.2g}%"
+            rate_str = _basic_line_rate_label(ln)
             basic_by_cust[key]["rate"].add(rate_str)
 
         nfp_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False})
@@ -2785,7 +2895,11 @@ def build_outsource_summary_tables(
                         )
                         nfp_comm_val = ensure_rm_prefix(
                             f"{nfp_info['comm']:,.2f}" if nfp_info['comm'] != 0
-                            else ("pending full payment" if nfp_dates[0] and "2026" in str(nfp_dates[0]) else "-")
+                            else ("pending full payment"
+                                  if (nfp_dates[0] and "2026" in str(nfp_dates[0]))
+                                  or _nfp_awaiting_full_payment(cust_basic_lines, nfp_by_inv_all,
+                                                                as_at_ym(year, m))
+                                  else "-")
                         )
 
                     basic_comm_val = f"{basic_info['comm']:,.2f}" if basic_info['comm'] != 0 else ("pending full payment" if basic_dates[0] and "2026" in str(basic_dates[0]) else "-")
@@ -2807,7 +2921,7 @@ def build_outsource_summary_tables(
                     if m >= 7:
                         basic_row.append(rm300_display)
                     basic_row.extend([
-                        _balance_payment_display(cust_basic_lines, basic_display_dates),
+                        _balance_payment_display(cust_basic_lines, basic_display_dates, as_at_ym(year, m)),
                         basic_display_pkg,
                         ensure_rm_prefix(f"{basic_display_system:,.2f}" if basic_display_system != 0 else "-"),
                         basic_nfp_cell,
@@ -2827,7 +2941,7 @@ def build_outsource_summary_tables(
                     if m >= 7:
                         nfp_row.append("-")
                     nfp_row.extend([
-                        nfp_dates[2],
+                        _nfp_payment_display(cust_basic_lines, nfp_dates, as_at_ym(year, m)),
                         cust_nfp_pkg_str,
                         ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
                         nfp_nfp_cell,

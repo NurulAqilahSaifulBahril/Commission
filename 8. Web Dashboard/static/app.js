@@ -116,8 +116,11 @@ document.addEventListener("DOMContentLoaded", () => {
     // Canonical agent full-name lookup (nickname -> full name), sourced from
     // the Agent Roles & Hierarchy page (agent_roles table) via
     // /api/agent-name-map. Used to display full agent names in Title Case
-    // across every table.
+    // across every table. ic_map is the same table's IC No, keyed on every
+    // alias that page stores, so the Monthly Commission Slip can print it
+    // without depending on which spelling the commission row carries.
     let agentNameMap = {};
+    let agentIcMap = {};
 
     function normalizeAgentKey(name) {
         return String(name == null ? "" : name).replace(/\s+/g, "").toLowerCase();
@@ -148,9 +151,81 @@ document.addEventListener("DOMContentLoaded", () => {
             const res = await fetch("/api/agent-name-map");
             const data = await res.json();
             agentNameMap = data && data.map ? data.map : {};
+            agentIcMap = data && data.ic_map ? data.ic_map : {};
         } catch (err) {
             agentNameMap = {};
+            agentIcMap = {};
         }
+        agentAliasIndex = null;
+    }
+
+    // Letters and digits only, lower case: "Caryn Dong" -> "caryndong".
+    function searchKey(value) {
+        return String(value == null ? "" : value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+    }
+
+    // Canonical full name -> every name the Data page holds for that person,
+    // inverted from agentNameMap. Built on first use after the map loads.
+    let agentAliasIndex = null;
+    function aliasIndex() {
+        if (agentAliasIndex) return agentAliasIndex;
+        agentAliasIndex = new Map();
+        Object.entries(agentNameMap || {}).forEach(([alias, canon]) => {
+            const ck = searchKey(canon);
+            if (!ck) return;
+            if (!agentAliasIndex.has(ck)) agentAliasIndex.set(ck, new Set([ck]));
+            const ak = searchKey(alias);
+            if (ak) agentAliasIndex.get(ck).add(ak);
+        });
+        return agentAliasIndex;
+    }
+
+    /** True when the search matches any name this agent goes by. The table
+     *  shows the Full Name ("Dong Leong Moi") but people type whichever name
+     *  they know -- the eeAdmin name or a nickname ("Caryn Dong"). */
+    function agentAliasMatches(agentName, query) {
+        const q = searchKey(query);
+        if (!q) return false;
+        const clean = String(agentName == null ? "" : agentName).replace(/\*/g, "").trim();
+        const own = searchKey(clean);
+        if (!own) return false;
+        if (own.includes(q)) return true;
+        const index = aliasIndex();
+        const keys = index.get(searchKey(resolveAgentName(clean))) || index.get(own);
+        if (!keys) return false;
+        for (const k of keys) if (k.includes(q)) return true;
+        return false;
+    }
+
+    function rememberAgentIc(ic, ...names) {
+        const value = String(ic || "").trim();
+        names.forEach((n) => {
+            const k = normalizeAgentKey(n);
+            if (k) agentIcMap[k] = value;
+            const resolved = resolveAgentName(n);
+            const rk = normalizeAgentKey(resolved);
+            if (rk) agentIcMap[rk] = value;
+        });
+    }
+
+    function lookupAgentIc(...names) {
+        const keys = [];
+        names.forEach((n) => {
+            const k = normalizeAgentKey(n);
+            if (k) keys.push(k);
+            const resolved = resolveAgentName(n);
+            const rk = normalizeAgentKey(resolved);
+            if (rk) keys.push(rk);
+        });
+        for (const k of keys) {
+            if (agentIcMap[k]) return agentIcMap[k];
+            const fromState = state.rawData && state.rawData.agent_ics && state.rawData.agent_ics[k];
+            if (fromState) return fromState;
+            const fromRole = state.rawData && state.rawData.agent_roles && state.rawData.agent_roles[k]
+                && state.rawData.agent_roles[k].ic_no;
+            if (fromRole) return fromRole;
+        }
+        return "";
     }
 
     async function initContestMonths() {
@@ -748,6 +823,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function applyCommissionPayload(data, { persistCache = false } = {}) {
         state.rawData = data;
+        if (data && data.agent_ics && typeof data.agent_ics === "object") {
+            agentIcMap = Object.assign({}, agentIcMap, data.agent_ics);
+        }
         hydrateSpecialCaseState(data);
 
         // Don't block first paint on the rate lookup.
@@ -775,6 +853,10 @@ document.addEventListener("DOMContentLoaded", () => {
             if (!res.ok) return;
             const maps = await res.json();
             if (!maps || maps.error || !state.rawData) return;
+            if (maps.agent_ics && typeof maps.agent_ics === "object") {
+                agentIcMap = Object.assign({}, agentIcMap, maps.agent_ics);
+                state.rawData.agent_ics = maps.agent_ics;
+            }
             const changed =
                 JSON.stringify(state.rawData.agent_roles || null) !== JSON.stringify(maps.agent_roles || null) ||
                 JSON.stringify(state.rawData.agent_role_history || null) !== JSON.stringify(maps.agent_role_history || null);
@@ -1012,6 +1094,10 @@ document.addEventListener("DOMContentLoaded", () => {
             internalData?.sections?.basic_nfp?.system_details,
             outsourceData?.sections?.basic_nfp?.system_details
         );
+        basicNfp.payout_policies = mergeSystemDetails(
+            internalData?.sections?.basic_nfp?.payout_policies,
+            outsourceData?.sections?.basic_nfp?.payout_policies
+        );
         const agentSummaryMerged = unionMergeSections(internalData?.sections?.agent_summary, outsourceData?.sections?.agent_summary, agentSummaryHeaderAlias);
         const referralFeeByAgent = computeReferralFeeByAgent(basicNfp);
         return {
@@ -1035,7 +1121,8 @@ document.addEventListener("DOMContentLoaded", () => {
             // except that every agent-name hover in the combined view reports
             // "no role", which is exactly what happened.
             agent_roles: internalData?.agent_roles || outsourceData?.agent_roles || null,
-            agent_role_history: internalData?.agent_role_history || outsourceData?.agent_role_history || null
+            agent_role_history: internalData?.agent_role_history || outsourceData?.agent_role_history || null,
+            agent_ics: Object.assign({}, outsourceData?.agent_ics || {}, internalData?.agent_ics || {})
         };
     }
 
@@ -1070,6 +1157,38 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         }
     }
+
+    // An open report reloads itself when its figures change on the server --
+    // a rate, rule, role, special case or profit sharing rate saved on the Data
+    // page, from this browser or any other. The server rebuilds in a few
+    // seconds (see clear_commission_cache in app.py); this picks the result up
+    // without anyone pressing refresh. It waits for the rebuild to finish, and
+    // never reloads under an open editor, so a half-typed entry is not lost.
+    let lastDataVersion = null;
+    async function pollDataVersion() {
+        if (document.hidden || !state.rawData) return;
+        try {
+            const res = await fetch("/api/data-version");
+            if (!res.ok) return;
+            const v = await res.json();
+            if (lastDataVersion === null) { lastDataVersion = v.version; return; }
+            if (v.version === lastDataVersion || v.rebuilding || commissionRefreshInFlight) return;
+            const editorOpen = [...document.querySelectorAll(".modal")]
+                .some(m => !m.classList.contains("hidden") && m.style.display !== "none");
+            if (editorOpen) return;
+            lastDataVersion = v.version;
+            commissionRefreshInFlight = true;
+            try {
+                await loadFactoryRates();
+                await fetchCommissionPayload({ showErrors: false, persistCache: true });
+            } finally {
+                commissionRefreshInFlight = false;
+            }
+        } catch (_) {
+            // A missed poll is harmless; the next one tries again.
+        }
+    }
+    setInterval(pollDataVersion, 5000);
 
     // -------------------------------------------------------------
     // Data Loading & API Calls
@@ -1168,19 +1287,39 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    // Which agent-type buckets were read in full for the month on screen. A
+    // save replaces a whole bucket, so a bucket that failed to load must never
+    // be written back -- it would be saved as empty and wipe its rates.
+    let factoryBucketsLoaded = new Set();
+
+    async function fetchFactoryBucket(agentType) {
+        const res = await fetch(`/api/factory-rates?year=${state.activeYear}&month=${state.activeMonth}&agent_type=${agentType}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const rows = await res.json();
+        if (!Array.isArray(rows)) throw new Error("not a list");
+        // Remember where each rate came from, for an agent the All Agents
+        // view cannot place by name.
+        rows.forEach(r => { r._bucket = agentType; });
+        return rows;
+    }
+
     async function loadFactoryRates() {
-        if (state.activeAgentType === "all") {
-            state.factoryRates = [];
-            return;
-        }
-        try {
-            const res = await fetch(`/api/factory-rates?year=${state.activeYear}&month=${state.activeMonth}&agent_type=${state.activeAgentType}`);
-            state.factoryRates = res.ok ? await res.json() : [];
-            if (!Array.isArray(state.factoryRates)) state.factoryRates = [];
-        } catch (err) {
-            console.error("Error loading profit sharing rates:", err);
-            state.factoryRates = [];
-        }
+        factoryBucketsLoaded = new Set();
+        // The All Agents view shows internal and outsource factory jobs side by
+        // side, so it needs both buckets. It used to load neither: every
+        // factory cell read as unset, and a rate entered there was filed under
+        // "all", which the commission report never reads.
+        const types = state.activeAgentType === "all" ? ["internal", "outsource"] : [state.activeAgentType];
+        const loaded = [];
+        await Promise.all(types.map(async (t) => {
+            try {
+                loaded.push(...await fetchFactoryBucket(t));
+                factoryBucketsLoaded.add(t);
+            } catch (err) {
+                console.error(`Error loading ${t} profit sharing rates:`, err);
+            }
+        }));
+        state.factoryRates = loaded;
     }
 
     function setSpecialCaseModalMode(mode) {
@@ -1689,18 +1828,40 @@ modalPackageType.value = defaults.pkg || "-";
     }
 
     async function saveFactoryRates() {
+        // One POST per agent-type bucket, the same way saveSpecialCases() files
+        // special cases: each rate goes to its own agent's bucket, never to the
+        // view's name. Every loaded bucket is posted, even one left empty, so
+        // removing its last rate is saved too.
+        const buckets = new Map([...factoryBucketsLoaded].map(t => [t, []]));
+        const unfiled = [];
+        state.factoryRates.forEach(r => {
+            const type = agentTypeBucketFor(r.agent) || r._bucket;
+            if (!buckets.has(type)) { unfiled.push(r); return; }
+            const { _bucket, ...clean } = r;
+            buckets.get(type).push(clean);
+        });
+        if (unfiled.length) {
+            console.error("Profit sharing rates skipped — agent type could not be resolved:",
+                unfiled.map(r => r && r.agent));
+        }
+        if (buckets.size === 0) {
+            console.error("Profit sharing rates not saved — the month's rates failed to load.");
+            return;
+        }
         try {
-            const res = await fetch("/api/factory-rates", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    year: state.activeYear,
-                    month: state.activeMonth,
-                    agent_type: state.activeAgentType,
-                    factory_rates: state.factoryRates
+            const results = await Promise.all([...buckets.entries()].map(([agentType, rates]) =>
+                fetch("/api/factory-rates", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        year: state.activeYear,
+                        month: state.activeMonth,
+                        agent_type: agentType,
+                        factory_rates: rates
+                    })
                 })
-            });
-            if (!res.ok) console.error("Failed to save profit sharing rates to server");
+            ));
+            if (results.some(res => !res.ok)) console.error("Failed to save profit sharing rates to server");
         } catch (err) {
             console.error("Error saving profit sharing rates:", err);
         }
@@ -1881,7 +2042,8 @@ modalPackageType.value = defaults.pkg || "-";
         const query = state.filters.search;
         if (!query) return true;
         return String(agentName || "").toLowerCase().includes(query) ||
-               String(customerName || "").toLowerCase().includes(query);
+               String(customerName || "").toLowerCase().includes(query) ||
+               agentAliasMatches(agentName, query);
     }
 
     function getMonthRateKey() {
@@ -2053,6 +2215,17 @@ modalPackageType.value = defaults.pkg || "-";
     // full_payment_date (the 100% date), so an invoice that reached 75% but not
     // 100% reads "pending" there and would drop out of the balance run
     // entirely. Served by app.py's system_details, matched on customer name.
+    /** The payout rule a customer's invoice is paid under, as the Data page
+     *  states it, with the date each stage was reached. Null for payloads
+     *  built before the server sent it. */
+    function payoutPolicyFor(customerName) {
+        const map = state.rawData?.sections?.basic_nfp?.payout_policies;
+        const key = String(customerName || "").trim().toLowerCase();
+        if (!map || !key) return null;
+        const entries = map[key];
+        return entries && entries.length ? entries[0] : null;
+    }
+
     function realPct75Date(customerName) {
         const details = state.rawData?.sections?.basic_nfp?.system_details;
         const key = String(customerName || "").trim().toLowerCase();
@@ -2098,8 +2271,18 @@ modalPackageType.value = defaults.pkg || "-";
         // invoice settles at 100%, and so does NFP, which is never advanced.
         let milestoneDate = rawRow[idx.pct75];
         if (kind.includes("basic") && rm300v !== "invoice before july") {
-            const real = idx.customer === -1 ? "" : realPct75Date(rawRow[idx.customer]);
-            if (real) milestoneDate = real;
+            // The balance falls due at whatever payment % the Data page sets
+            // for this invoice's role -- 75% by default, 100% for a role moved
+            // to "pays at 100%". The server sends the date that milestone was
+            // reached; the fixed 75% date is only a fallback for an old payload.
+            const cust = idx.customer === -1 ? "" : rawRow[idx.customer];
+            const policy = payoutPolicyFor(cust);
+            if (policy) {
+                milestoneDate = policy.balance_date;
+            } else {
+                const real = realPct75Date(cust);
+                if (real) milestoneDate = real;
+            }
         }
         if (!milestoneLandsInActiveMonth(milestoneDate)) return false;
         const price = idx.price !== -1 ? String(rawRow[idx.price] || "").trim().toLowerCase() : "";
@@ -2939,9 +3122,15 @@ modalPackageType.value = defaults.pkg || "-";
         const cell = (i) => (i === -1 ? "" : String(row[i] || "").trim());
         const isPreJuly = cell(rm300Idx).toLowerCase() === "invoice before july";
 
+        // The stages and their percentages come from the Data page rule this
+        // invoice was paid under, so a role set to "pays at 100%" reads
+        // "Balance Payout (100% Payment)" rather than a fixed 75%.
+        const policy = isPreJuly ? null : payoutPolicyFor(custName);
         let payoutDate;
         if (isPreJuly) {
             payoutDate = cell(payDateIdx);
+        } else if (policy) {
+            payoutDate = policy.balance_date;
         } else {
             const details = state.rawData?.sections?.basic_nfp?.system_details;
             const entries = details ? details[String(custName || "").toLowerCase().trim()] : null;
@@ -2966,6 +3155,15 @@ modalPackageType.value = defaults.pkg || "-";
         const advanceDate = advDateIdx === -1 ? cell(firstPayIdx) : cell(advDateIdx);
 
         const out = [];
+        if (policy) {
+            if (policy.multi_stage) {
+                out.push(line(`Advance RM ${policy.advance_rm || "300"} (${policy.advance_pct}% Payment)`, advanceDate));
+                out.push(line(`Balance Payout (${policy.balance_pct}% Payment)`, payoutDate));
+            } else {
+                out.push(line(`Payout (${policy.balance_pct}% Payment)`, payoutDate));
+            }
+            return out.join("");
+        }
         if (!isPreJuly) out.push(line("Advance RM 300 (5% Payment)", advanceDate));
         out.push(line(isPreJuly ? "Payout (100% Payment)" : "Balance Payout (75% Payment)", payoutDate));
         return out.join("");
@@ -3092,11 +3290,15 @@ modalPackageType.value = defaults.pkg || "-";
             const advance = advIdx !== -1 ? parseNum(row[advIdx]) : 0;
             if (sales > 0 && assignedRate && assignedRate !== "-") {
                 const advanceStr = advance > 0 ? ` - ${fmtNum(advance)}` : "";
+                const hasEvAddon = /\+/.test(assignedRate) && /EV/i.test(assignedRate);
+                const formulaLine = hasEvAddon
+                    ? `Basic Commission = solar Basic + EV items × EV rate (${assignedRate})${advanceStr} = ${commValStr}`
+                    : `Basic Commission = Sales Price × Rate % = ${fmtNum(sales)} × ${assignedRate}${advanceStr} = ${commValStr}`;
                 return {
                     title: `Basic Commission — ${custName}`,
                     preformula: milestones,
                     formula: `Sales Price = Total Amount - EPP Effective`,
-                    subtext: `Basic Commission = Sales Price × Rate % = ${fmtNum(sales)} × ${assignedRate}${advanceStr} = ${commValStr}` + clickTip
+                    subtext: formulaLine + clickTip
                 };
             }
             // Cached payloads built before the rate column existed: fall back to
@@ -3906,9 +4108,14 @@ modalPackageType.value = defaults.pkg || "-";
 
             const N = rowsToRender.length;
             const agentSpans = new Array(N).fill(1), agentVisible = new Array(N).fill(true);
-            const fullAgentNames = [];
-            let cur = "";
-            rowsToRender.forEach(r => { const v = agentIdx !== -1 && r[agentIdx] ? String(r[agentIdx]).trim() : ""; if (v) cur = v; fullAgentNames.push(cur); });
+            // Each row's agent as the FULL table has it. The Agent cell is
+            // filled only on the first row of an agent's block, so carrying it
+            // forward over the visible rows alone loses the name whenever a
+            // filter hides that first row -- Balance Payout dropping Sunny
+            // Tan's first customer left his whole block reading "-" and his
+            // customers out of the Total Customers count. filteredProcessed
+            // already carries the name worked out before filtering.
+            const fullAgentNames = filteredProcessed.map(p => String(p.fullAgentName || "").trim());
 
             if (customerIdx !== -1) {
                 const visibleCustomerGroups = new Set();
@@ -3940,6 +4147,15 @@ modalPackageType.value = defaults.pkg || "-";
                     value: val === null || val === undefined || String(val).trim() === "" ? "-" : String(val),
                     rowspan: 1, visible: true
                 })));
+            }
+            // The row that opens an agent's block names them, even when it is
+            // not the row that carried the name in the unfiltered table.
+            if (agentIdx !== -1) {
+                for (let ri = 0; ri < N; ri++) {
+                    if (!agentVisible[ri] || !fullAgentNames[ri]) continue;
+                    const cell = cellGrid[ri][agentIdx];
+                    if (cell && cell.value === "-") cell.value = fullAgentNames[ri];
+                }
             }
 
             const effectiveCustomerNames = [];
@@ -4698,7 +4914,7 @@ modalPackageType.value = defaults.pkg || "-";
         const searchQuery = state.filters.search;
         const matchesAgentSearch = (agentVal) => {
             if (!searchQuery) return true;
-            return agentVal.includes(searchQuery) || matchingAgents.has(agentVal);
+            return matchesSearch(agentVal, "") || matchingAgents.has(agentVal);
         };
 
         // Filter summary tables by matching agents
@@ -4859,7 +5075,7 @@ modalPackageType.value = defaults.pkg || "-";
         const matchesAgentSearch = (agentVal) => {
             if (!searchQuery) return true;
             const cleanAgent = agentVal.replace(" *", "").trim().toLowerCase();
-            return cleanAgent.includes(searchQuery.toLowerCase().trim()) || matchingAgents.has(cleanAgent);
+            return matchesSearch(cleanAgent, "") || matchingAgents.has(cleanAgent);
         };
 
         // Table 1 is one row per team, so it is filtered by the teams the
@@ -5232,7 +5448,7 @@ modalPackageType.value = defaults.pkg || "-";
         const matchesAgentSearch = (agentVal) => {
             if (!searchQuery) return true;
             const cleanAgent = agentVal.trim().toLowerCase();
-            return cleanAgent.includes(searchQuery.toLowerCase().trim()) || matchingAgents.has(cleanAgent);
+            return matchesSearch(cleanAgent, "") || matchingAgents.has(cleanAgent);
         };
 
         // Filter Table 1 by matching agents
@@ -6657,11 +6873,10 @@ modalPackageType.value = defaults.pkg || "-";
     }
 
     function openFactoryRateModal(rowRef, headers, agentName, customerName, target) {
+        // Open in every view. The All Agents view used to be refused here
+        // because its save was filed under "all"; loadFactoryRates() and
+        // saveFactoryRates() now read and write each agent's own bucket.
         if (!factoryRateModal) return;
-        if (state.activeAgentType === "all") {
-            alert("Switch to Internal or Outsource Agents to set a Profit Sharing rate.");
-            return;
-        }
 
         const packageIdx = headers.findIndex(h => h.toLowerCase().trim() === "package type" || h.toLowerCase().trim() === "package");
         const systemIdx = headers.findIndex(h => h.toLowerCase().trim() === "system price");
@@ -6885,6 +7100,60 @@ modalPackageType.value = defaults.pkg || "-";
         icEl.dataset.saved = value || "";
     }
 
+    // The slip prints the canonical full name, but agent_roles.ic_no lives on
+    // the hierarchy row keyed by the eeAdmin name (and nicknames). Matching
+    // only r.agent == displayed name misses Carol Siow / Siow Sio Chui and
+    // anyone else whose Full Name differs. Hidden rows are skipped; a later
+    // period that actually has the IC wins over an earlier blank one.
+    function roleEffectiveStart(eff) {
+        const m = /^(\d{4}-\d{2})/.exec(String(eff || "").trim());
+        return m ? m[1] : "";
+    }
+
+    function roleAliasKeys(r) {
+        const keys = new Set();
+        const add = (v) => {
+            const k = normalizeAgentKey(v);
+            if (k) keys.add(k);
+            const canon = normalizeAgentKey(resolveAgentName(v));
+            if (canon) keys.add(canon);
+        };
+        add(r && r.agent);
+        add(r && r.full_name);
+        String((r && r.nick_name) || "").split(/[/,;]/).forEach(add);
+        return keys;
+    }
+
+    function findSlipRole(roles, ...names) {
+        if (!Array.isArray(roles)) return null;
+        const want = new Set();
+        names.forEach((n) => {
+            const k = normalizeAgentKey(n);
+            if (k) want.add(k);
+            const canon = normalizeAgentKey(resolveAgentName(n));
+            if (canon) want.add(canon);
+        });
+        if (!want.size) return null;
+        const matches = roles.filter((r) => {
+            if (!r || r.hidden === true || r.hidden === 1 || r.hidden === "1") return false;
+            const aliases = roleAliasKeys(r);
+            for (const k of want) {
+                if (aliases.has(k)) return true;
+            }
+            return false;
+        });
+        if (!matches.length) return null;
+        const ids = new Set(matches.map((r) => r.pg_bubble_id).filter(Boolean));
+        const related = ids.size
+            ? roles.filter((r) => r && !r.hidden && r.pg_bubble_id && ids.has(r.pg_bubble_id))
+            : matches;
+        const withIc = related.filter((r) => String(r.ic_no || "").trim());
+        const pool = withIc.length ? withIc : matches;
+        pool.sort((a, b) => roleEffectiveStart(b.effective_from)
+            .localeCompare(roleEffectiveStart(a.effective_from)));
+        return pool[0];
+    }
+
     function setupSlipIcEditing(resolvedName) {
         const icEl = document.getElementById("slipAgentNric");
         const statusEl = document.getElementById("slipIcStatus");
@@ -6938,6 +7207,7 @@ modalPackageType.value = defaults.pkg || "-";
                 const body = await res.json().catch(() => ({}));
                 if (!res.ok) throw new Error(body.error || "Save failed");
                 icEl.dataset.saved = value;
+                rememberAgentIc(value, agent, icEl.dataset.agent, document.getElementById("slipAgentName")?.textContent);
                 setStatus("Saved", "ok");
                 setTimeout(() => setStatus("", ""), 2500);
             } catch (err) {
@@ -6955,17 +7225,23 @@ modalPackageType.value = defaults.pkg || "-";
 
         const resolvedName = resolveAgentName(agentName) || agentName;
         document.getElementById("slipAgentName").textContent = resolvedName || "-";
-        document.getElementById("slipAgentNric").textContent = "-";
+        setSlipIcValue(lookupAgentIc(agentName, resolvedName));
         setupSlipIcEditing(resolvedName);
         fetch("/api/agent-roles")
             .then(res => res.json())
             .then(roles => {
                 // IC No comes from the Data page's roles table only — Postgres
                 // never carried it as text, and since 2026-09 supplies nothing
-                // but agent names.
-                const matched = Array.isArray(roles) && roles.find(r => r.agent && r.agent.toLowerCase().trim() === resolvedName.toLowerCase().trim());
-                if (matched && matched.ic_no) {
-                    setSlipIcValue(matched.ic_no);
+                // but agent names. Match any of the row's name aliases, not
+                // just the eeAdmin agent field, and prefer a row that has IC.
+                const matched = findSlipRole(roles, resolvedName, agentName);
+                if (matched) {
+                    if (matched.ic_no) {
+                        setSlipIcValue(matched.ic_no);
+                        rememberAgentIc(matched.ic_no, agentName, resolvedName, matched.agent, matched.full_name, matched.nick_name);
+                    }
+                    const icEl = document.getElementById("slipAgentNric");
+                    if (icEl && matched.agent) icEl.dataset.agent = matched.agent;
                 }
             })
             .catch(() => {});

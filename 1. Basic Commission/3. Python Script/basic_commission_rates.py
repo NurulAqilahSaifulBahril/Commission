@@ -282,6 +282,121 @@ def _row_property_list(r) -> list:
     return props
 
 
+# Job Type splits the business into the solar installs it was built on and
+# the EV charger jobs added in July 2026. A rate row names the job it prices;
+# a row that names none is a solar row, because every row written before the
+# column existed was written for solar.
+JOB_SOLAR = "Solar Services"
+JOB_EV = "EV Services"
+JOB_TYPES = (JOB_SOLAR, JOB_EV)
+
+
+def normalize_job_type(value) -> str:
+    """JOB_SOLAR or JOB_EV for anything that names one, else ''."""
+    v = str(value or "").strip().lower()
+    if not v:
+        return ""
+    if v.startswith("ev") or v == JOB_EV.lower():
+        return JOB_EV
+    if v.startswith("solar") or v == JOB_SOLAR.lower():
+        return JOB_SOLAR
+    return ""
+
+
+def _row_job_type(r) -> str:
+    return normalize_job_type(_cell(r, "job_type")) or JOB_SOLAR
+
+
+# EV Type further splits an EV Services row by which EV service it prices --
+# the charger unit, the installation labour, or both together. Blank means
+# "any EV subtype": the general EV rate a subtype-specific row can override.
+# Only meaningful when Job Type is EV Services; Solar rows ignore it.
+EV_CHARGER = "EV Charger"
+EV_INSTALLATION = "EV Installation"
+EV_CHARGER_INSTALLATION = "EV Charger + EV Installation"
+EV_TYPES = (EV_CHARGER, EV_INSTALLATION, EV_CHARGER_INSTALLATION)
+
+
+def normalize_ev_type(value) -> str:
+    """One of EV_TYPES for anything that names one, else ''."""
+    v = str(value or "").strip().lower()
+    if not v:
+        return ""
+    for t in EV_TYPES:
+        if v == t.lower():
+            return t
+    return ""
+
+
+def _row_ev_type(r) -> str:
+    return normalize_ev_type(_cell(r, "ev_type"))
+
+
+def _truthy_flag(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("t", "true", "1", "yes", "y")
+    if value is None:
+        return False
+    return bool(value)
+
+
+def classify_ev_invoice(row: dict):
+    """(is_ev_only, is_mixed, ev_item_amount) for one invoice row.
+
+    EV-only: the invoice is EV Services and has no JinkoSolar / Tiger Neo.
+    Mixed: JinkoSolar / Tiger Neo is on the invoice and EV line items have a
+    positive amount — solar Basic stays, EV commission is added on the same row.
+    """
+    try:
+        ev_amt = Decimal(str(row.get("ev_item_amount") or 0))
+    except Exception:
+        ev_amt = Decimal("0")
+    if ev_amt < 0:
+        ev_amt = Decimal("0")
+    has_jinko = _truthy_flag(row.get("has_jinko"))
+    job = normalize_job_type(row.get("job_type"))
+    is_ev_only = (job == JOB_EV) and not has_jinko
+    is_mixed = has_jinko and ev_amt > 0
+    return is_ev_only, is_mixed, ev_amt
+
+
+def format_basic_rate_display(solar_rate, ev_rate=None, *, is_mixed=False) -> str:
+    """Basic Rate % label. Mixed invoices show both pieces so 4.5% + 8% is
+    not mistaken for one combined rate."""
+    if is_mixed and solar_rate is not None and ev_rate is not None:
+        return f"{float(solar_rate) * 100:g}% + {float(ev_rate) * 100:g}% EV"
+    rate = ev_rate if solar_rate is None else solar_rate
+    if rate is None:
+        return ""
+    return f"{float(rate) * 100:g}%"
+
+
+def basic_commission_for_row(row: dict, sales_price, rate_fn):
+    """(commission, primary_rate, ev_rate, ev_commission, ev_item_amount, rate_display).
+
+    ``rate_fn(job_type, ev_type)`` returns the Data page rate as a Decimal.
+    EV-only uses the EV rate on sales. Mixed keeps today's solar Basic and
+    adds EV line-item amount × EV rate. Solar-only is unchanged.
+    """
+    sales_price = Decimal(str(sales_price or 0))
+    is_ev_only, is_mixed, ev_amt = classify_ev_invoice(row)
+    ev_type = row.get("ev_type")
+    if is_ev_only:
+        rate = rate_fn(JOB_EV, ev_type)
+        comm = sales_price * rate
+        return comm, rate, rate, Decimal("0"), ev_amt, format_basic_rate_display(rate)
+    if is_mixed:
+        solar_rate = rate_fn(JOB_SOLAR, None)
+        ev_rate = rate_fn(JOB_EV, ev_type)
+        ev_comm = ev_amt * ev_rate
+        comm = (sales_price * solar_rate) + ev_comm
+        return (comm, solar_rate, ev_rate, ev_comm, ev_amt,
+                format_basic_rate_display(solar_rate, ev_rate, is_mixed=True))
+    rate = rate_fn(row.get("job_type"), ev_type)
+    comm = sales_price * rate
+    return comm, rate, None, Decimal("0"), ev_amt, format_basic_rate_display(rate)
+
+
 def _row_agent_list(r) -> list:
     """A row's Agent Name cell, as a list. The Data page's Agent Name picker is
     multi-select and stores one row per rate holding every agent it applies to
@@ -299,32 +414,64 @@ def _is_rule_row(r) -> bool:
 
 
 def get_unified_basic_rate(agent_type: str, hierarchy: str, month: int, year: int = 2026,
-                           agent: str = None, property_type: str = None):
+                           agent: str = None, property_type: str = None,
+                           job_type: str = None, ev_type: str = None):
     """Effective-dated rate from the unified table, or None when no row covers
     the case."""
     hit = get_unified_basic_rate_row(agent_type, hierarchy, month, year=year,
-                                     agent=agent, property_type=property_type)
+                                     agent=agent, property_type=property_type,
+                                     job_type=job_type, ev_type=ev_type)
     return hit[0] if hit else None
 
 
 def get_unified_basic_rate_row(agent_type: str, hierarchy: str, month: int, year: int = 2026,
-                               agent: str = None, property_type: str = None):
+                               agent: str = None, property_type: str = None,
+                               job_type: str = None, ev_type: str = None):
     """(rate, effective_from) of the winning unified row, or None. Blank
     agent_type/role/property on a row means "applies to all"; a row naming a
     specific agent beats a role-level row."""
     best = _best_unified_row(agent_type, hierarchy, month, year=year, agent=agent,
-                             property_type=property_type)
+                             property_type=property_type, job_type=job_type,
+                             ev_type=ev_type)
     return (best[1], best[2]) if best else None
 
 
 def _best_unified_row(agent_type: str, hierarchy: str, month: int, year: int = 2026,
-                      agent: str = None, property_type: str = None):
+                      agent: str = None, property_type: str = None,
+                      job_type: str = None, ev_type: str = None):
     """(row, rate, effective_from) for the unified row that governs this case.
 
     The rate and the payout condition live on the SAME row, so both must be read
     off the one winner — resolving them independently would let an invoice take
     its rate from one row and its payout trigger from another.
+
+    Only rows for the invoice's Job Type are considered. An invoice whose job
+    is unknown is priced as solar, as every invoice was before the column
+    existed. An EV invoice falls back to the solar rows when no EV row covers
+    it, so EV jobs keep the rate they had until an EV rate is actually entered,
+    rather than dropping to the sheet default the moment the column appears.
+
+    An EV invoice further scoped to an EV Type (charger / installation / both)
+    first looks for a row scoped to that exact subtype, then falls back to a
+    row with no EV Type at all (a general EV rate), before falling back to
+    solar — so entering one subtype's rate does not zero out the others.
     """
+    want_job = normalize_job_type(job_type) or JOB_SOLAR
+    want_ev = normalize_ev_type(ev_type) if want_job == JOB_EV else ""
+    best = _scan_unified_rows(agent_type, hierarchy, month, year, agent,
+                              property_type, want_job, want_ev)
+    if best is None and want_ev:
+        best = _scan_unified_rows(agent_type, hierarchy, month, year, agent,
+                                  property_type, want_job, "")
+    if best is None and want_job != JOB_SOLAR:
+        best = _scan_unified_rows(agent_type, hierarchy, month, year, agent,
+                                  property_type, JOB_SOLAR, "")
+    return best
+
+
+def _scan_unified_rows(agent_type, hierarchy, month, year, agent, property_type,
+                       job_type, ev_type=""):
+    """_best_unified_row() for one Job Type (and, for EV Services, one EV Type)."""
     target = f"{year:04d}-{month:02d}"
     agent_key = _canon_agent_key(agent)
     prop_key = str(property_type or "").strip().lower()
@@ -336,6 +483,10 @@ def _best_unified_row(agent_type: str, hierarchy: str, month: int, year: int = 2
         if (_cell(r, "rate_type") or "Basic Commission") != "Basic Commission":
             continue
         if _is_rule_row(r):
+            continue
+        if _row_job_type(r) != job_type:
+            continue
+        if job_type == JOB_EV and _row_ev_type(r) != ev_type:
             continue
         row_atype = _cell(r, "agent_type").lower()
         if row_atype and row_atype != agent_type:
@@ -638,13 +789,14 @@ def policy_from_row(row) -> "PayoutPolicy | None":
 
 
 def get_payout_policy(agent_type: str, hierarchy: str, month: int, year: int = 2026,
-                      agent: str = None, property_type: str = None):
+                      agent: str = None, property_type: str = None,
+                      job_type: str = None):
     """The payout condition governing this agent/role/property in this month, or
     None when the Data page has nothing to say about it."""
     agent_type = str(agent_type or "").strip().lower()
     hierarchy = _normalize_hierarchy(hierarchy)
     best = _best_unified_row(agent_type, hierarchy, month, year=year, agent=agent,
-                             property_type=property_type)
+                             property_type=property_type, job_type=job_type)
     if not best:
         return None
     return policy_from_row(best[0])
@@ -783,15 +935,20 @@ def default_payout_policy(month: int, year: int = 2026) -> "PayoutPolicy":
 
 
 def invoice_milestones(row: dict, agent_type: str, hierarchy: str, month: int,
-                       year: int = 2026, agent: str = None, property_type: str = None):
+                       year: int = 2026, agent: str = None, property_type: str = None,
+                       job_type: str = None):
     """(policy, advance_date, balance_date, full_payment_date) for one invoice.
 
     The dates come back already chosen by the policy, so callers keep treating
     them as "the date the advance is due" and "the date the balance is due"
-    without knowing which percentages produced them.
+    without knowing which percentages produced them. The Job Type defaults to
+    the one the invoice query classified, so the payout condition comes off
+    the same row that priced the invoice.
     """
+    if job_type is None and isinstance(row, dict):
+        job_type = row.get("job_type")
     policy = get_payout_policy(agent_type, hierarchy, month, year=year, agent=agent,
-                              property_type=property_type)
+                              property_type=property_type, job_type=job_type)
     if policy is None:
         policy = default_payout_policy(month, year=year)
     advance = milestone_date(row, policy.advance_trigger) if policy.is_multi_stage else ""
@@ -1022,7 +1179,8 @@ def resolve_agent_type(agent_name: str, pg_agent_type: str, month: int = None,
 
 
 def get_db_basic_rate(agent_type: str, hierarchy: str, month: int, year: int = 2026,
-                      agent: str = None, property_type: str = None):
+                      agent: str = None, property_type: str = None,
+                      job_type: str = None, ev_type: str = None):
     """Effective-dated rate entered on the dashboard Data page, or None if no
     entry covers the given month. Rows store rate_pct as a percentage string
     and effective_from as 'YYYY-MM'; the row with the latest effective_from
@@ -1032,7 +1190,8 @@ def get_db_basic_rate(agent_type: str, hierarchy: str, month: int, year: int = 2
     The unified commission_rates table is consulted first; basic_rates is the
     fallback for anything it does not cover."""
     unified = get_unified_basic_rate(agent_type, hierarchy, month, year=year, agent=agent,
-                                     property_type=property_type)
+                                     property_type=property_type, job_type=job_type,
+                                     ev_type=ev_type)
     if unified is not None:
         return unified
 
@@ -1112,14 +1271,16 @@ def get_basic_rate_info(agent_type: str, hierarchy: str, month: int, agent: str 
 
 
 def get_basic_rate_detail(agent_type: str, hierarchy: str, month: int, agent: str = None,
-                          property_type: str = None, year: int = 2026):
+                          property_type: str = None, year: int = 2026,
+                          job_type: str = None, ev_type: str = None):
     """(rate, source, effective_from) — as get_basic_rate_info, plus the month
     the winning entry takes effect from ('' when a fallback answered, since
     fallbacks are not effective-dated)."""
     agent_type = agent_type.strip().lower()
     hierarchy = _normalize_hierarchy(hierarchy)
     hit = get_unified_basic_rate_row(agent_type, hierarchy, month, year=year, agent=agent,
-                                     property_type=property_type)
+                                     property_type=property_type, job_type=job_type,
+                                     ev_type=ev_type)
     if hit is not None:
         return hit[0], "unified", hit[1]
     legacy = get_db_basic_rate(agent_type, hierarchy, month, agent=agent,
@@ -1130,7 +1291,8 @@ def get_basic_rate_detail(agent_type: str, hierarchy: str, month: int, agent: st
 
 
 def get_basic_rate(agent_type: str, hierarchy: str, month: int, agent: str = None,
-                   property_type: str = None, year: int = 2026) -> Decimal:
+                   property_type: str = None, year: int = 2026,
+                   job_type: str = None, ev_type: str = None) -> Decimal:
     """Resolve basic commission rate: dashboard Data page entries first,
     then legacy cached sheet data, then hardcoded defaults."""
     # Normalize inputs
@@ -1139,7 +1301,8 @@ def get_basic_rate(agent_type: str, hierarchy: str, month: int, agent: str = Non
 
     # System-entered rates (dashboard Data page) take priority
     db_rate = get_db_basic_rate(agent_type, hierarchy, month, year=year, agent=agent,
-                                property_type=property_type)
+                                property_type=property_type, job_type=job_type,
+                                ev_type=ev_type)
     if db_rate is not None:
         return db_rate
 

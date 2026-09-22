@@ -149,7 +149,7 @@ def _post_json(body: Dict[str, Any], token: str) -> Dict[str, Any]:
         return _post_with_urllib(body, headers)
 
 
-def query_sql(sql: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
+def _query_sql_live(sql: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
     token = get_proxy_token()
     if not token:
         raise SystemExit(proxy_token_help())
@@ -205,6 +205,23 @@ def query_sql(sql: str, params: Optional[List[Any]] = None) -> List[Dict[str, An
             raise SystemExit(_network_help(e)) from e
 
     raise SystemExit(_network_help(last_error or RuntimeError("unknown")))
+
+
+def query_sql(sql: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
+    """_query_sql_live(), answered from the replay record while the dashboard
+    rebuilds after a Data page rule change (see query_replay.py)."""
+    try:
+        import query_replay as _replay
+    except ImportError:
+        _replay = None
+    if _replay is not None:
+        hit = _replay.lookup(DB_NAME, sql, params)
+        if hit is not None:
+            return hit
+    rows = _query_sql_live(sql, params)
+    if _replay is not None:
+        _replay.record(DB_NAME, sql, params, rows)
+    return rows
 
 
 def test_connection() -> List[Dict[str, Any]]:
