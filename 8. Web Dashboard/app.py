@@ -83,6 +83,7 @@ import build_commission_pack
 # Repo root on the path so we can import the shared agent-name resolver.
 sys.path.append(str(REPO_ROOT))
 import agent_names
+import query_replay
 import pickle
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -209,6 +210,9 @@ def load_disk_cache():
                 _data_cache = {}
                 return
             _data_cache = loaded
+            # The query record rides along so the first rule change after a
+            # restart rebuilds as fast as any other (see query_replay.py).
+            query_replay.restore(_data_cache.get("sql_replay"))
             _log(f"Loaded cache from disk: {[k for k in _data_cache if k != _CACHE_STAMP_KEY]}")
 
 def save_disk_cache():
@@ -278,20 +282,51 @@ def clear_cache():
     for m in dynamic_mods:
         sys.modules.pop(m, None)
 
+# Bumped whenever the figures the report shows may have changed, so an open
+# report page can tell it should reload (see /api/data-version).
+_data_version = {"n": 0}
+_data_version_lock = threading.Lock()
+
+
+def _bump_data_version() -> None:
+    with _data_version_lock:
+        _data_version["n"] += 1
+
+
 def clear_commission_cache():
-    """Clear only the computed commission cache, preserving raw proxy data.
-    This is faster than clear_cache() as it avoids re-fetching from the proxy."""
+    """A Data page setting changed: recalculate every commission figure, fast.
+
+    Every Data page save lands here -- rates and rules, roles, special cases,
+    profit sharing, referral overrides. None of them changes the invoices, so
+    the rebuild answers each query from the record of the last download
+    (query_replay.py) and only recalculates: a few seconds, where downloading
+    everything again took about a minute.
+
+    The bundles are no longer deleted first. They go on being served until the
+    rebuild swaps in the new ones, so the report never drops to "Commission
+    data is still being prepared" after a save. Response bodies ARE dropped at
+    once: special cases and referral overrides are applied as a response is
+    built, and have to show the moment they are saved.
+    """
     with _disk_cache_lock:
         keys_to_remove = [
             k for k in _data_cache
-            if isinstance(k, tuple) and (
-                len(k) == 2 or (len(k) == 4 and k[0] == "commission_response")
-            )
+            if isinstance(k, tuple) and len(k) == 4 and k[0] == "commission_response"
         ]
         for k in keys_to_remove:
             del _data_cache[k]
         save_disk_cache()
-    
+
+    # Rates, roles and names are read once and held; re-read them now.
+    try:
+        _rates_module().reset_cache()
+    except Exception:
+        pass
+    try:
+        agent_names.reset_cache()
+    except Exception:
+        pass
+
     dynamic_mods = [
         "int_basic_commission", "int_anp_commission", "int_nfp_commission", "int_ega_esa",
         "out_basic_commission", "out_anp_commission", "out_nfp_commission", "out_ega_esa"
@@ -300,9 +335,10 @@ def clear_commission_cache():
         sys.modules.pop(m, None)
 
     _clear_derived_caches()
+    _bump_data_version()
 
-    _log("Cleared commission cache (raw proxy data preserved). Triggering background re-build...")
-    start_prefetch(2026)
+    _log("Data page change: recalculating commissions from the last download...")
+    start_prefetch(2026, replay=True)
 
 
 def _clear_derived_caches():
@@ -781,6 +817,59 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
             pass
         return out
 
+    def _place_row(new_row: list, agent_name: str, customer_name: str, kind: str) -> None:
+        """Insert a restated row directly under the row it replaces.
+
+        Mirrors insertSpecialCaseRows() in app.js, which is where the Add
+        Special Case modal puts them: New Basic Commission under the original
+        Basic Commission, New Net Floor Price Commission under the original
+        NFP. Appending them to the end of the table instead split every case
+        from its invoice, so filtering to an agent showed the original in the
+        agent's block and the replacement at the bottom, and the report's
+        side-by-side rendering of old and new never engaged.
+
+        A second case for the same row stacks under the first. A customer with
+        no original row of that kind goes after their last row, then after the
+        agent's last row, and only then at the end.
+        """
+        want_a = agent_name.lower().strip()
+        want_c = customer_name.lower().strip()
+        cur_agent = ""
+        anchor = cust_last = agent_last = -1
+        for i, r in enumerate(rows):
+            cell = str(r[agent_i] or "").strip() if agent_i != -1 and len(r) > agent_i else ""
+            if cell and cell != "-":
+                cur_agent = cell
+            low = cur_agent.lower().strip()
+            if low != want_a or "total" in low or "summary" in low or "grand" in low:
+                continue
+            agent_last = i
+            cust = (str(r[customer_i] or "").strip().lower()
+                    if customer_i != -1 and len(r) > customer_i else "")
+            if cust != want_c:
+                continue
+            cust_last = i
+            if anchor != -1 or len(r) > len(headers):
+                continue          # already found, or a restated row itself
+            comm = str(r[comm_i] or "").lower() if comm_i != -1 else ""
+            is_nfp = "net floor" in comm or "netfloor" in comm
+            if (kind == "nfp") == is_nfp:
+                anchor = i
+        if anchor != -1:
+            # Step past replacements already stacked under this row.
+            while (anchor + 1 < len(rows) and len(rows[anchor + 1]) > len(headers)
+                   and str(rows[anchor + 1][customer_i] or "").strip().lower() == want_c
+                   and (("net floor" in str(rows[anchor + 1][comm_i] or "").lower()) == (kind == "nfp"))):
+                anchor += 1
+            pos = anchor + 1
+        elif cust_last != -1:
+            pos = cust_last + 1
+        elif agent_last != -1:
+            pos = agent_last + 1
+        else:
+            pos = len(rows)
+        rows.insert(pos, new_row)
+
     for case in cases:
         try:
             agent = str(case.get("agent") or "").strip()
@@ -945,26 +1034,60 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
             row_kind = "all"
 
         if row_kind in ("basic", "all"):
-            rows.append(build_row("New Basic Commission",
-                                  _special_case_money(basic_comm),
-                                  _special_case_money(sales_for_calc)))
+            _place_row(build_row("New Basic Commission",
+                                 _special_case_money(basic_comm),
+                                 _special_case_money(sales_for_calc)),
+                       agent, customer, "basic")
 
         if row_kind in ("nfp", "all"):
             nfp_row = build_row("New Net Floor Price Commission", nfp_comm_str, "-")
             if agent_i != -1:
                 nfp_row[agent_i] = ""  # matches the client: the NFP row's Agent cell is blanked
-            rows.append(nfp_row)
+            _place_row(nfp_row, agent, customer, "nfp")
 
 
 # â”€â”€ Background pre-fetching â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _prefetch_lock = threading.Lock()
 _is_prefetching = False
 
-def prefetch_data_worker(year=2026):
+# A rule change made while a rebuild is already running must not be dropped:
+# that rebuild started from the old rules. It is queued and run straight after.
+_prefetch_again = {"pending": False}
+
+
+def prefetch_data_worker(year=2026, replay=False):
+    """Rebuild the commission bundles. With `replay`, queries identical to the
+    last download are answered from its record rather than the database --
+    the Data page fast path. Without it (scheduled refresh, first start),
+    everything is downloaded fresh."""
+    import contextlib
+    import time as _time
+    while True:
+        started = _time.time()
+        with (query_replay.replaying() if replay else contextlib.nullcontext()):
+            outcome = _prefetch_run(year)
+        if outcome == "busy":
+            if replay:
+                with _prefetch_lock:
+                    _prefetch_again["pending"] = True
+            return
+        if replay:
+            _log(f"Recalculated after a Data page change in {_time.time() - started:.1f}s "
+                 f"(query record: {query_replay.stats()}).")
+        with _prefetch_lock:
+            again = _prefetch_again["pending"]
+            _prefetch_again["pending"] = False
+        if not again:
+            return
+        _log("Another Data page change arrived during that rebuild; recalculating again.")
+        replay = True
+
+
+def _prefetch_run(year=2026):
     global _is_prefetching
     with _prefetch_lock:
         if _is_prefetching:
-            return
+            return "busy"
         _is_prefetching = True
     
     _log("Starting background pre-fetch...")
@@ -1092,8 +1215,10 @@ def prefetch_data_worker(year=2026):
             for k in [k for k in _data_cache
                       if isinstance(k, tuple) and len(k) == 4 and k[0] == "commission_response"]:
                 del _data_cache[k]
+            _data_cache["sql_replay"] = query_replay.snapshot()
             save_disk_cache()
         _clear_derived_caches()
+        _bump_data_version()
         _log("Dropped results computed from the previous data.")
 
     except Exception as e:
@@ -1102,9 +1227,22 @@ def prefetch_data_worker(year=2026):
         with _prefetch_lock:
             _is_prefetching = False
 
-def start_prefetch(year=2026):
-    t = threading.Thread(target=prefetch_data_worker, args=(year,), daemon=True)
+def start_prefetch(year=2026, replay=False):
+    t = threading.Thread(target=prefetch_data_worker, args=(year, replay), daemon=True)
     t.start()
+
+
+@app.route("/api/data-version")
+@login_required
+def data_version_api():
+    """A counter that moves whenever the report's figures may have changed, so
+    an open report page can reload itself after a Data page save instead of
+    waiting for someone to press refresh."""
+    _sync_data_page_rules()
+    with _prefetch_lock:
+        rebuilding = bool(_is_prefetching) or bool(_prefetch_again["pending"])
+    with _data_version_lock:
+        return jsonify({"version": _data_version["n"], "rebuilding": rebuilding})
 
 
 def _fetch_commission_bundle(year: int, agent_type: str):
@@ -1382,6 +1520,7 @@ def agent_role_maps_api():
         return jsonify({
             "agent_roles": _agent_roles_for_month(year, month),
             "agent_role_history": _agent_role_history(),
+            "agent_ics": agent_names.get_ic_map(),
         })
     except Exception as e:
         _log("[AGENT ROLE MAPS ERROR]\n" + traceback.format_exc())
@@ -1429,15 +1568,20 @@ def api_update_status():
 
 
 @app.route("/api/agent-name-map")
+@login_required
 def agent_name_map():
     """Nickname -> canonical full-name lookup so the frontend can display full
-    agent names (Title Case) in every table. Sourced from the Agent Roles &
-    Hierarchy page (agent_roles table)."""
+    agent names (Title Case) in every table. Also the IC map the Monthly
+    Commission Slip prints. Both are sourced from Agent Roles & Hierarchy on
+    the Data page — the only place IC is stored."""
     try:
-        return jsonify({"map": agent_names.get_map()})
+        return jsonify({
+            "map": agent_names.get_map(),
+            "ic_map": agent_names.get_ic_map(),
+        })
     except Exception:
         _log("[AGENT NAME MAP ERROR]\n" + traceback.format_exc())
-        return jsonify({"map": {}}), 200
+        return jsonify({"map": {}, "ic_map": {}}), 200
 
 @app.route("/api/contest-months")
 def contest_months():
@@ -1866,6 +2010,63 @@ def _phase_label(phase_type) -> str:
     return ""
 
 
+def _as_at_date(value, as_at: str) -> str:
+    """A milestone date, or "" when it falls after the month being reported."""
+    text = str(value or "")[:10]
+    if not text:
+        return ""
+    return "" if build_commission_pack._is_after_month(text, as_at) else text
+
+
+def _pct_text(value) -> str:
+    """4.99 -> "4.99", 100 -> "100"."""
+    try:
+        text = f"{float(value):.2f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return ""
+    return text
+
+
+def _build_payout_policies(basic_lines, as_at: str = "") -> dict:
+    """customer (lower case) -> the payout rule each of their invoices is paid
+    under, as the Data page states it, with the date each stage is reached.
+
+    The report page used to assume every July-onward invoice settles its
+    balance at 75%: the Balance Payout filter tested the 75% milestone and the
+    hover said "Balance Payout (75% Payment)" whatever the Data page said. A
+    role moved to "pays at 100%" kept showing an 80%-paid invoice in the
+    balance run. These entries carry the rule the engine actually applied --
+    the same PayoutPolicy that priced the line -- so the page can follow it.
+    """
+    out: dict = {}
+    for ln in basic_lines or []:
+        customer = str(getattr(ln, "customer_name", "") or "").strip().lower()
+        policy = getattr(ln, "payout_policy", None)
+        if not customer or policy is None:
+            continue
+        multi = bool(getattr(policy, "is_multi_stage", False))
+        entry = {
+            "invoice": str(getattr(ln, "invoice_number", "") or ""),
+            "invoice_date": str(getattr(ln, "invoice_date", "") or "")[:10],
+            "multi_stage": multi,
+            "advance_pct": _pct_text(policy.advance_trigger) if multi else "",
+            "advance_rm": _pct_text(policy.advance_amount) if multi else "",
+            "balance_pct": _pct_text(policy.balance_trigger),
+            # pct75_date/pct5_date on a line are named for the 2026 defaults
+            # but hold whatever milestones this policy names.
+            "advance_date": _as_at_date(getattr(ln, "pct5_date", ""), as_at) if multi else "",
+            # A stage the invoice only reached after this month reads as
+            # pending here: the report is the month as it stood.
+            "balance_date": _as_at_date(getattr(ln, "pct75_date", ""), as_at),
+        }
+        bucket = out.setdefault(customer, [])
+        if entry not in bucket:
+            bucket.append(entry)
+    for entries in out.values():
+        entries.sort(key=lambda e: e.get("invoice_date") or "")
+    return out
+
+
 def _build_system_details(nfp_by_inv_all: dict) -> dict:
     """customer name (lowercased) -> list of system detail dicts, one per invoice.
 
@@ -1921,6 +2122,7 @@ def _agent_roles_for_month(year: int, month: int) -> dict[str, dict]:
             sys.path.append(rates_dir)
         from basic_commission_rates import split_effective_range
         target = f"{year}-{month:02d}"
+        ic_map = agent_names.get_ic_map()
 
         best: dict[str, tuple[str, dict]] = {}
         for r in db.list_agent_roles():
@@ -1936,10 +2138,16 @@ def _agent_roles_for_month(year: int, month: int) -> dict[str, dict]:
             key = agent_names.normalize_key(display)
             prev = best.get(key)
             if prev is None or start > prev[0]:
+                ic_no = (
+                    ic_map.get(key)
+                    or ic_map.get(agent_names.normalize_key(agent))
+                    or str(r.get("ic_no") or "").strip()
+                )
                 best[key] = (start, {
                     "agent": display,
                     "role": str(r.get("hierarchy") or "").strip(),
                     "agent_type": str(r.get("agent_type") or "").strip(),
+                    "ic_no": ic_no,
                 })
         return {k: v[1] for k, v in best.items()}
     except Exception:
@@ -3365,6 +3573,12 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         except ValueError:
             return (len(SALES_REPORT_BRANCH_ORDER), name)
 
+    # Every spelling of each agent's name, so the search box finds "Dong
+    # Leong Moi" from "Caryn Dong" as well. Sent rather than looked up in the
+    # browser so the page and the PDF export filter by the same list.
+    for a in out_agents:
+        a["aliases"] = agent_names.search_aliases(a.get("agent"))
+
     branches = sorted({a["branch"] for a in out_agents}, key=_branch_key)
     return {
         "ready": True,
@@ -3439,7 +3653,8 @@ def _sales_report_visible(payload: dict, search: str) -> list[dict]:
     if not q:
         return payload.get("agents") or []
     return [a for a in (payload.get("agents") or [])
-            if q in _normalize_search_text(a.get("agent") or "")]
+            if q in _normalize_search_text(a.get("agent") or "")
+            or any(q in k for k in (a.get("aliases") or []))]
 
 
 def _sales_report_pdf(payload: dict, search: str) -> bytes:
@@ -3901,9 +4116,68 @@ def get_sales_report_pdf():
         return jsonify({"error": "Failed to build the sales report PDF."}), 500
 
 
+# The rates and rules behind every commission figure are read once per process
+# and then held (basic_commission_rates caches the table; the commission
+# bundles and response bodies cache what was built from it). A save made
+# through THIS server clears all of that. A save made anywhere else -- the
+# installed app on another PC, a second copy of the dashboard, a direct edit
+# -- lands in the shared table and this server never hears of it, so the
+# report kept paying the old rule until someone restarted it. A cheap
+# fingerprint of the table, checked at most every _RULES_CHECK_SECONDS,
+# closes that gap.
+_RULES_CHECK_SECONDS = 20
+_rules_fingerprint = {"value": None, "checked": 0.0}
+_rules_fingerprint_lock = threading.Lock()
+
+
+def _data_page_rules_fingerprint():
+    with db._connect() as conn:
+        row = conn.execute(
+            """SELECT (SELECT COUNT(*) FROM commission_rates) AS n,
+                      (SELECT MAX(updated_at) FROM commission_rates) AS t,
+                      (SELECT COUNT(*) FROM agent_roles) AS rn,
+                      (SELECT MAX(updated_at) FROM agent_roles) AS rt""").fetchone()
+    return tuple(str(row[k]) for k in ("n", "t", "rn", "rt"))
+
+
+def _sync_data_page_rules() -> None:
+    """Rebuild the commission figures when the Data page rules have changed
+    since this server last looked, whoever changed them."""
+    now = time.time()
+    with _rules_fingerprint_lock:
+        if now - _rules_fingerprint["checked"] < _RULES_CHECK_SECONDS:
+            return
+        _rules_fingerprint["checked"] = now
+    try:
+        current = _data_page_rules_fingerprint()
+    except Exception:
+        return            # the table is unreachable; serve what we have
+    with _rules_fingerprint_lock:
+        previous = _rules_fingerprint["value"]
+        _rules_fingerprint["value"] = current
+    if previous is not None and previous != current:
+        _log("[RULES SYNC] Data page rates or roles changed since the last check; rebuilding commissions.")
+        _rates_module().reset_cache()
+        try:
+            agent_names.reset_cache()
+        except Exception:
+            pass
+        clear_commission_cache()
+
+
+def _note_rules_saved_here() -> None:
+    """A save through this server has already cleared everything; make the
+    next check take the new state as its baseline instead of rebuilding a
+    second time."""
+    with _rules_fingerprint_lock:
+        _rules_fingerprint["value"] = None
+        _rules_fingerprint["checked"] = 0.0
+
+
 @app.route("/api/commission")
 @login_required
 def get_commission():
+    _sync_data_page_rules()
     year = request.args.get("year", 2026, type=int)
     month = request.args.get("month", 5, type=int)
     agent_type = request.args.get("agent_type", "internal").lower()
@@ -3922,6 +4196,7 @@ def get_commission():
             if isinstance(cached_payload, dict):
                 cached_payload["agent_roles"] = _agent_roles_for_month(year, month)
                 cached_payload["agent_role_history"] = _agent_role_history()
+                cached_payload["agent_ics"] = agent_names.get_ic_map()
             return jsonify(cached_payload)
 
         cached = get_cached_data(year, agent_type)
@@ -4139,6 +4414,8 @@ def get_commission():
                     "rows": basic_nfp_rows,
                     # Customer-column hover: panel and phase per invoice.
                     "system_details": _build_system_details(int_nfp_by_inv_all),
+                    "payout_policies": _build_payout_policies(
+                        int_basic_lines, build_commission_pack.as_at_ym(year, month)),
                 },
                 "agent_summary": {"headers": agent_summary_headers, "rows": agent_summary_rows},
                 "anp": {"headers": anp_headers, "rows": anp_rows},
@@ -4376,6 +4653,8 @@ def get_commission():
                     "rows": basic_nfp_rows,
                     # Customer-column hover: panel and phase per invoice.
                     "system_details": _build_system_details(out_nfp_by_inv_all),
+                    "payout_policies": _build_payout_policies(
+                        out_basic_lines, build_commission_pack.as_at_ym(year, month)),
                 },
                 "agent_summary": {"headers": agent_summary_headers, "rows": agent_summary_rows},
                 "anp": {"headers": anp_headers, "rows": out_anp_rows},
@@ -4425,6 +4704,7 @@ def get_commission():
             # can be resolved against its own Invoice Date rather than the
             # report month it happens to be paid in.
             "agent_role_history": _agent_role_history(),
+            "agent_ics": agent_names.get_ic_map(),
         }
         set_cached_commission_response(year, month, agent_type, payload)
         return jsonify(payload)
@@ -4954,6 +5234,7 @@ def commission_rates_api():
         db.save_commission_rates(rows, user["username"])
         _rates_module().reset_cache()
         clear_commission_cache()
+        _note_rules_saved_here()
         return jsonify({"status": "success"})
     except Exception as e:
         _log("[COMMISSION RATES SAVE ERROR]\n" + traceback.format_exc())
@@ -5268,6 +5549,7 @@ def agent_roles_api():
     rows = (request.json or {}).get("entries", [])
     try:
         db.save_agent_roles(rows, user["username"])
+        agent_names.reset_cache()
         _rates_module().reset_cache()
         clear_commission_cache()
         return jsonify({"status": "success"})
@@ -5536,6 +5818,27 @@ def contest_rules_api():
         return jsonify({"error": str(e)}), 500
 
 
+def _role_matches_agent(row: dict, agent: str) -> bool:
+    """True when `agent` is this hierarchy row's eeAdmin name, full name, or
+    any nickname part — or resolves to the same canonical full name. The slip
+    displays the canonical full name, so a save keyed only on row['agent']
+    would miss Carol Siow / Siow Sio Chui and create a duplicate row."""
+    if row.get("hidden"):
+        return False
+    target = agent_names.normalize_key(agent)
+    if not target:
+        return False
+    want = {target, agent_names.normalize_key(agent_names.resolve(agent) or agent)}
+    want.discard("")
+    for alias in agent_names._role_aliases(row):
+        key = agent_names.normalize_key(alias)
+        if key in want:
+            return True
+        if agent_names.normalize_key(agent_names.resolve(alias) or alias) in want:
+            return True
+    return False
+
+
 @app.route("/api/agent-ic", methods=["POST"])
 @login_required
 def agent_ic_api():
@@ -5543,8 +5846,11 @@ def agent_ic_api():
     Commission Slip instead of only from the Data page's roles table.
 
     save_agent_roles() replaces the whole table, so this reads every row back,
-    edits the one that matches, and writes the full set again — anything else
-    would wipe the rest of the hierarchy.
+    edits the matching rows, and writes the full set again — anything else
+    would wipe the rest of the hierarchy. IC is an identity field, so every
+    non-hidden period for the same person is updated together; otherwise a
+    later row with the number would still leave an earlier blank row winning
+    an exact-name find().
     """
     user = auth.current_user()
     if user["role"] != "admin":
@@ -5558,14 +5864,10 @@ def agent_ic_api():
 
     try:
         rows = db.list_agent_roles()
-        target = next(
-            (r for r in rows
-             if str(r.get("agent") or "").strip().lower() == agent.lower()
-             and not r.get("hidden")),
-            None,
-        )
-        if target is not None:
-            target["ic_no"] = ic_no
+        matched = [r for r in rows if _role_matches_agent(r, agent)]
+        if matched:
+            for target in matched:
+                target["ic_no"] = ic_no
         else:
             # No hierarchy row for this agent yet (their name came straight from
             # Postgres); create the minimal row that carries the IC.
@@ -5575,6 +5877,7 @@ def agent_ic_api():
                 "effective_from": time.strftime("%Y-%m"),
             })
         db.save_agent_roles(rows, user["username"])
+        agent_names.reset_cache()
         _rates_module().reset_cache()
         clear_commission_cache()
         return jsonify({"status": "success", "ic_no": ic_no})
@@ -5618,6 +5921,7 @@ def agent_roles_seed_api():
             added += 1
 
         db.save_agent_roles(merged, user["username"])
+        agent_names.reset_cache()
         return jsonify({"status": "success", "added": added, "total": len(merged)})
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 400
@@ -5832,6 +6136,8 @@ def basic_rates_resolved_api():
                         "hierarchy": str(r.get("hierarchy") or "").strip(),
                         "agent": str(r.get("agent") or "").strip(),
                         "property_type": str(r.get("property_type") or "").strip(),
+                        "job_type": bcr.normalize_job_type(r.get("job_type")) or bcr.JOB_SOLAR,
+                        "ev_type": bcr.normalize_ev_type(r.get("ev_type")),
                         "rate_pct": rate_val,
                         "override_rate_pct": str(r.get("override_rate_pct") or "").strip(),
                         "override_from": str(r.get("override_from") or "").strip(),
@@ -5866,10 +6172,10 @@ def basic_rates_resolved_api():
             # Legacy pairs always shown; plus every role-level system entry covering
             # the month, and agent-specific exceptions (e.g. Sunny) shown as own rows.
             combos = [
-                ("Internal", "Executive", "", ""),
-                ("Internal", "Senior", "", ""),
-                ("Outsource", "OUM", "", ""),
-                ("Outsource", "OSA/OSA1", "", ""),
+                ("Internal", "Executive", "", "", bcr.JOB_SOLAR, ""),
+                ("Internal", "Senior", "", "", bcr.JOB_SOLAR, ""),
+                ("Outsource", "OUM", "", "", bcr.JOB_SOLAR, ""),
+                ("Outsource", "OSA/OSA1", "", "", bcr.JOB_SOLAR, ""),
             ]
             deleted_combos = set()
             system_combos = []
@@ -5882,19 +6188,22 @@ def basic_rates_resolved_api():
                 h = str(r.get("hierarchy") or "").strip()
                 ag = str(r.get("agent") or "").strip()
                 pt = str(r.get("property_type") or "").strip()
-                combo = (at, h, ag, pt)
+                jt = bcr.normalize_job_type(r.get("job_type")) or bcr.JOB_SOLAR
+                et = bcr.normalize_ev_type(r.get("ev_type")) if jt == bcr.JOB_EV else ""
+                combo = (at, h, ag, pt, jt, et)
                 rate_str = str(r.get("rate_pct") or "").strip()
                 remarks = str(r.get("remarks") or "").strip().lower()
                 if remarks == "deleted" or (not rate_str and not str(r.get("amount_rm") or "").strip() and not str(r.get("override_rate_pct") or "").strip()):
                     deleted_combos.add(combo)
-                    deleted_combos.add((at, h, ag, ""))
+                    deleted_combos.add((at, h, ag, "", jt, et))
                 else:
                     if combo not in system_combos:
                         system_combos.append(combo)
 
             if system_combos or deleted_combos:
-                base_roles_in_system = {(at, h, ag) for at, h, ag, pt in system_combos} | {(at, h, ag) for at, h, ag, pt in deleted_combos}
-                combos = [c for c in combos if (c[0], c[1], c[2]) not in base_roles_in_system]
+                base_roles_in_system = ({(at, h, ag, jt) for at, h, ag, pt, jt, et in system_combos}
+                                        | {(at, h, ag, jt) for at, h, ag, pt, jt, et in deleted_combos})
+                combos = [c for c in combos if (c[0], c[1], c[2], c[4]) not in base_roles_in_system]
                 for c in system_combos:
                     if c not in combos and c not in deleted_combos:
                         combos.append(c)
@@ -5906,10 +6215,13 @@ def basic_rates_resolved_api():
                 eff = str(r.get("effective_from") or "")
                 if not _eff_covers(eff, target):
                     continue
+                _jt = bcr.normalize_job_type(r.get("job_type")) or bcr.JOB_SOLAR
                 k = (str(r.get("agent_type") or "").strip(),
                      str(r.get("hierarchy") or "").strip(),
                      str(r.get("agent") or "").strip(),
-                     str(r.get("property_type") or "").strip())
+                     str(r.get("property_type") or "").strip(),
+                     _jt,
+                     bcr.normalize_ev_type(r.get("ev_type")) if _jt == bcr.JOB_EV else "")
                 cond_text = str(r.get("condition") or "").strip()
                 trig_text = str(r.get("trigger_pct") or "").strip()
                 prop_type = str(r.get("property_type") or "").strip()
@@ -5918,20 +6230,24 @@ def basic_rates_resolved_api():
                 own_cond[k] = (cond_text, trig_text, prop_type, ovr_pct, ovr_from)
 
             rates = []
-            for agent_type, hierarchy, agent, prop_type in combos:
+            for agent_type, hierarchy, agent, prop_type, job_type, ev_type in combos:
                 # A row's Agent Name cell can list several agents ("A, B") — they
                 # all share the one rate, so resolve with the first name. Passing
                 # the whole list matches nothing and the row would silently fall
                 # back to the role rate.
                 lookup_agent = agent.split(",")[0].strip() if agent else ""
                 rate, source, eff = bcr.get_basic_rate_detail(
-                    agent_type, hierarchy, month, agent=lookup_agent or None, property_type=prop_type or None, year=target_year)
-                c_val, t_val, p_val, ovr_p, ovr_f = own_cond.get((agent_type, hierarchy, agent, prop_type), ("", "", prop_type, "", ""))
+                    agent_type, hierarchy, month, agent=lookup_agent or None, property_type=prop_type or None,
+                    year=target_year, job_type=job_type, ev_type=ev_type)
+                c_val, t_val, p_val, ovr_p, ovr_f = own_cond.get(
+                    (agent_type, hierarchy, agent, prop_type, job_type, ev_type), ("", "", prop_type, "", ""))
                 rates.append({
                     "agent_type": agent_type,
                     "hierarchy": hierarchy,
                     "agent": agent,
                     "property_type": p_val or prop_type,
+                    "job_type": job_type,
+                    "ev_type": ev_type,
                     "rate_pct": float(rate * 100),
                     "override_rate_pct": ovr_p,
                     "override_from": ovr_f,

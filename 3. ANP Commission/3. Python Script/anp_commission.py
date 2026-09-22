@@ -212,6 +212,22 @@ class PostgresProxyClient:
         )
 
     def query(self, sql: str) -> list[dict[str, Any]]:
+        """_query_live(), answered from the replay record while the dashboard
+        rebuilds after a Data page rule change (see query_replay.py)."""
+        try:
+            import query_replay as _replay
+        except ImportError:
+            _replay = None
+        if _replay is not None:
+            hit = _replay.lookup(self.db_name, sql, [])
+            if hit is not None:
+                return hit
+        rows = self._query_live(sql)
+        if _replay is not None:
+            _replay.record(self.db_name, sql, [], rows)
+        return rows
+
+    def _query_live(self, sql: str) -> list[dict[str, Any]]:
         response = self.session.post(
             f"{self.base_url}/api/sql",
             json={"db_name": self.db_name, "sql": sql, "params": []},

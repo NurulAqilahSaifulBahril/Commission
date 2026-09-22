@@ -55,7 +55,12 @@
     function visibleAgents(data) {
         const q = normalizeName(state.search);
         if (!q) return data.agents;
-        return data.agents.filter(a => normalizeName(a.agent).includes(q));
+        // The aliases are every name the Data page holds for the agent, so
+        // "Caryn Dong" finds the row shown as Dong Leong Moi. They are stored
+        // without spaces, and so is the query they are compared with.
+        const qk = q.replace(/ /g, "");
+        return data.agents.filter(a => normalizeName(a.agent).includes(q)
+            || (a.aliases || []).some(k => k.includes(qk)));
     }
 
     /** "1 agent" / "3 agents" -- filtering to a single person makes the

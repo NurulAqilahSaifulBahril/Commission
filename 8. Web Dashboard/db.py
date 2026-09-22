@@ -194,6 +194,8 @@ def init_db() -> None:
                 profit_sharing_rate_pct TEXT,
                 profit_sharing_mode TEXT,
                 property_type TEXT,
+                job_type TEXT,
+                ev_type TEXT,
                 trigger_pct TEXT,
                 invoice_date_from TEXT,
                 rule_type TEXT,
@@ -496,6 +498,12 @@ def init_db() -> None:
 
             ALTER TABLE commission_rates ADD COLUMN IF NOT EXISTS override_from TEXT;
             ALTER TABLE commission_rates ADD COLUMN IF NOT EXISTS profit_sharing_mode TEXT;
+            -- Solar Services / EV Services. Blank reads as Solar Services: every
+            -- row written before the column existed was written for solar.
+            ALTER TABLE commission_rates ADD COLUMN IF NOT EXISTS job_type TEXT;
+            -- EV Charger / EV Installation / EV Charger + EV Installation. Only
+            -- meaningful when job_type is EV Services; blank means "any EV subtype".
+            ALTER TABLE commission_rates ADD COLUMN IF NOT EXISTS ev_type TEXT;
 
             ALTER TABLE nfp_prices ADD COLUMN IF NOT EXISTS package_price NUMERIC;
             ALTER TABLE nfp_prices ADD COLUMN IF NOT EXISTS tng_rebate NUMERIC;
@@ -941,7 +949,7 @@ RULE_SETTING_FIELDS = ["rule_key", "rule_type", "label", "value", "trigger_pct",
 COMMISSION_RATE_FIELDS = ["rate_type", "agent_type", "hierarchy", "agent", "label",
                           "rate_pct", "override_rate_pct", "override_from",
                           "profit_sharing_rate_pct", "profit_sharing_mode",
-                          "property_type", "trigger_pct", "invoice_date_from",
+                          "property_type", "job_type", "ev_type", "trigger_pct", "invoice_date_from",
                           "rule_type", "amount_rm", "condition",
                           "effective_from", "remarks"]
 

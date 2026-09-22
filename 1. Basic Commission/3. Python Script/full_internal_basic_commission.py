@@ -172,7 +172,8 @@ def _agent_type_override_sql() -> str:
 
 
 def _internal_hierarchy(agent_name: str, month: int, year: int, property_type: str,
-                        is_agent_senior: bool) -> str:
+                        is_agent_senior: bool, job_type: str = None,
+                        ev_type: str = None) -> str:
     """The role to price this invoice under. The Agent Roles & Hierarchy page is
     asked first, so Data page rows entered against an internal role like
     "Branch Sales Manager" can actually be reached — is_senior() only ever
@@ -193,7 +194,7 @@ def _internal_hierarchy(agent_name: str, month: int, year: int, property_type: s
         return fallback
     _rate, source, _eff = bcr.get_basic_rate_detail(
         "Internal", role, month, agent=agent_name, property_type=property_type,
-        year=year)
+        year=year, job_type=job_type, ev_type=ev_type)
     return role if source in ("unified", "legacy") else fallback
 
 
@@ -385,7 +386,7 @@ def _customer_filter_sql(tokens: list[str]) -> str:
     return " AND (" + " OR ".join(parts) + ")"
 
 
-def _proxy_sql(
+def _proxy_sql_live(
     *,
     proxy_url: str,
     db_name: str,
@@ -415,6 +416,32 @@ def _proxy_sql(
                 f"  {_SCRIPT_DIR / '.env'}"
             ) from e
         raise RuntimeError(f"HTTP {e.code} from proxy: {detail}") from e
+
+
+def _proxy_sql(
+    *,
+    proxy_url: str,
+    db_name: str,
+    token: str,
+    sql: str,
+    params: list[Any],
+) -> dict[str, Any]:
+    """_proxy_sql_live(), answered from the replay record while the dashboard
+    rebuilds after a Data page rule change (see query_replay.py). Outside such
+    a rebuild, and when run on its own, this is exactly _proxy_sql_live()."""
+    try:
+        import query_replay as _replay
+    except ImportError:
+        _replay = None
+    if _replay is not None:
+        hit = _replay.lookup(db_name, sql, params)
+        if hit is not None:
+            return hit
+    result = _proxy_sql_live(proxy_url=proxy_url, db_name=db_name, token=token,
+                             sql=sql, params=params)
+    if _replay is not None and isinstance(result, dict) and "error" not in result:
+        _replay.record(db_name, sql, params, result)
+    return result
 
 
 def _to_decimal(value: Any) -> Decimal:
@@ -504,6 +531,46 @@ candidates AS (
     i.package_type,
     i.package_name_snapshot,
     i.description,
+    CASE
+      WHEN pkg.bubble_id IS NULL THEN NULL
+      WHEN (COALESCE(pkg.invoice_desc, '') || ' ' || COALESCE(pkg.package_name, ''))
+           ILIKE '%%tiger neo%%'
+        THEN 'Solar Services'
+      WHEN (COALESCE(pkg.type, '') || ' ' || COALESCE(pkg.package_name, '') || ' '
+            || COALESCE(pkg.invoice_desc, '')) ~* '(^|[^a-z])ev([^a-z]|$)'
+        THEN 'EV Services'
+    END AS job_type,
+    -- Which EV service the package prices, when it is one at all. Every EV
+    -- Charger package on file names its subtype in the package_name itself:
+    -- "...with installation job" (both), "Installation Job for EV Charger..."
+    -- (installation only) or "...EV Charger Only" (charger only) -- checked
+    -- most-specific first since "with installation job" also contains "job".
+    CASE COALESCE(ev_items.ev_type_rank, 0)
+      WHEN 3 THEN 'EV Charger + EV Installation'
+      WHEN 2 THEN 'EV Installation'
+      WHEN 1 THEN 'EV Charger'
+      ELSE CASE
+        WHEN pkg.bubble_id IS NULL THEN NULL
+        WHEN (COALESCE(pkg.package_name, '') || ' ' || COALESCE(pkg.invoice_desc, ''))
+             ILIKE '%%with installation job%%'
+          THEN 'EV Charger + EV Installation'
+        WHEN (COALESCE(pkg.package_name, '') || ' ' || COALESCE(pkg.invoice_desc, ''))
+             ILIKE '%%installation job%%'
+          THEN 'EV Installation'
+        WHEN (COALESCE(pkg.package_name, '') || ' ' || COALESCE(pkg.invoice_desc, ''))
+             ILIKE '%%charger only%%'
+          THEN 'EV Charger'
+      END
+    END AS ev_type,
+    COALESCE(ev_items.ev_item_amount, 0) AS ev_item_amount,
+    (
+      (COALESCE(pkg.invoice_desc, '') || ' ' || COALESCE(pkg.package_name, ''))
+        ILIKE '%%tiger neo%%'
+      OR (COALESCE(pkg.invoice_desc, '') || ' ' || COALESCE(pkg.package_name, '')
+          || ' ' || COALESCE(pkg.type, ''))
+        ILIKE '%%jinko%%'
+      OR COALESCE(ev_items.has_jinko_item, FALSE)
+    ) AS has_jinko,
     COALESCE(sr_link.nem_type, sr_back.nem_type) AS seda_nem_type,
     ref.project_type AS referral_project_type,
     COALESCE(NULLIF(TRIM(c_referrer.name), ''), NULLIF(TRIM(i.referrer_name), '')) AS referral_name,
@@ -533,6 +600,9 @@ candidates AS (
     ORDER BY au.bubble_id, au.pri
   ) a ON a.bubble_id = i.linked_agent
   LEFT JOIN customer c ON c.customer_id = i.linked_customer
+  -- Job Type (Solar Services / EV Services) is read off the package sold.
+  LEFT JOIN package pkg
+    ON pkg.bubble_id = COALESCE(NULLIF(i.linked_package, ''), NULLIF(i.package_id, ''))
 {milestone_joins}
   LEFT JOIN SEDA_registration sr_link ON sr_link.bubble_id = i.linked_seda_registration
   LEFT JOIN SEDA_registration sr_back ON i.bubble_id = ANY(sr_back.linked_invoice)
@@ -594,6 +664,66 @@ candidates AS (
     ) ii_dedup
   ) epp_items ON TRUE
   LEFT JOIN LATERAL (
+    SELECT
+      COALESCE(SUM(
+        CASE
+          WHEN (
+            (COALESCE(ipkg.type, '') || ' ' || COALESCE(ipkg.package_name, '') || ' '
+             || COALESCE(ipkg.invoice_desc, '') || ' ' || COALESCE(ii.description, ''))
+            ~* '(^|[^a-z])ev([^a-z]|$)'
+          )
+          AND COALESCE(ii.description, '') NOT ILIKE '%%epp%%interest%%'
+          AND COALESCE(ii.description, '') NOT ILIKE '%%epp interest%%'
+          THEN COALESCE(ii.amount, ii.unit_price, 0)
+          ELSE 0
+        END
+      ), 0) AS ev_item_amount,
+      BOOL_OR(
+        (COALESCE(ipkg.invoice_desc, '') || ' ' || COALESCE(ipkg.package_name, '')
+         || ' ' || COALESCE(ii.description, '')) ILIKE '%%tiger neo%%'
+        OR (COALESCE(ipkg.invoice_desc, '') || ' ' || COALESCE(ipkg.package_name, '')
+            || ' ' || COALESCE(ii.description, '')) ILIKE '%%jinko%%'
+      ) AS has_jinko_item,
+      MAX(CASE
+        WHEN NOT (
+          (COALESCE(ipkg.type, '') || ' ' || COALESCE(ipkg.package_name, '') || ' '
+           || COALESCE(ipkg.invoice_desc, '') || ' ' || COALESCE(ii.description, ''))
+          ~* '(^|[^a-z])ev([^a-z]|$)'
+        ) THEN 0
+        WHEN (COALESCE(ipkg.package_name, '') || ' ' || COALESCE(ipkg.invoice_desc, '')
+              || ' ' || COALESCE(ii.description, ''))
+             ILIKE '%%with installation job%%' THEN 3
+        WHEN (COALESCE(ipkg.package_name, '') || ' ' || COALESCE(ipkg.invoice_desc, '')
+              || ' ' || COALESCE(ii.description, ''))
+             ~* 'wallbox|charger'
+         AND (COALESCE(ipkg.package_name, '') || ' ' || COALESCE(ipkg.invoice_desc, '')
+              || ' ' || COALESCE(ii.description, ''))
+             ~* 'install'
+         AND (COALESCE(ipkg.package_name, '') || ' ' || COALESCE(ipkg.invoice_desc, '')
+              || ' ' || COALESCE(ii.description, ''))
+             NOT ILIKE '%%only%%'
+          THEN 3
+        WHEN (COALESCE(ipkg.package_name, '') || ' ' || COALESCE(ipkg.invoice_desc, '')
+              || ' ' || COALESCE(ii.description, ''))
+             ILIKE '%%installation job%%' THEN 2
+        WHEN (COALESCE(ipkg.package_name, '') || ' ' || COALESCE(ipkg.invoice_desc, '')
+              || ' ' || COALESCE(ii.description, ''))
+             ~* 'install' THEN 2
+        WHEN (COALESCE(ipkg.package_name, '') || ' ' || COALESCE(ipkg.invoice_desc, '')
+              || ' ' || COALESCE(ii.description, ''))
+             ILIKE '%%charger only%%' THEN 1
+        WHEN (COALESCE(ipkg.package_name, '') || ' ' || COALESCE(ipkg.invoice_desc, '')
+              || ' ' || COALESCE(ii.description, ''))
+             ~* 'charger|wallbox' THEN 1
+        ELSE 0
+      END) AS ev_type_rank
+    FROM invoice_item ii
+    LEFT JOIN package ipkg
+      ON ipkg.bubble_id = NULLIF(ii.linked_package, '')
+    WHERE (ii.linked_invoice = i.bubble_id
+           OR ii.bubble_id = ANY(i.linked_invoice_item))
+  ) ev_items ON TRUE
+  LEFT JOIN LATERAL (
     SELECT SUM(COALESCE(p.epp_cost, 0)) AS epp_sum
     FROM payment p
     WHERE p.linked_invoice = i.bubble_id
@@ -637,6 +767,10 @@ SELECT
   package_type,
   package_name_snapshot,
   description,
+  job_type,
+  ev_type,
+  ev_item_amount,
+  has_jinko,
   seda_nem_type,
   referral_project_type,
   referral_name
@@ -671,6 +805,10 @@ class InvoiceLine:
     # The Data page payout condition this invoice was recognised under, so the
     # month-bucketing in build_commission_pack does not have to re-derive it.
     payout_policy: object = None
+    ev_item_amount: Decimal = Decimal("0")
+    ev_rate: Decimal | None = None
+    ev_commission: Decimal = Decimal("0")
+    rate_display: str = ""
 
     @property
     def net_base(self) -> Decimal:
@@ -811,12 +949,21 @@ def _process_invoices(
         _inv_parsed = _parse_invoice_date(inv_dt)
         _inv_month = _inv_parsed.month if _inv_parsed else 5
         _inv_year = _inv_parsed.year if _inv_parsed else 2026
+        from basic_commission_rates import (
+            classify_ev_invoice as _classify_ev,
+            JOB_SOLAR as _JOB_SOLAR,
+        )
+        _is_ev_only, _is_mixed, _ = _classify_ev(row)
+        _hier_job = _JOB_SOLAR if _is_mixed else row.get("job_type")
+        _hier_ev = None if _is_mixed else row.get("ev_type")
         _hierarchy = _internal_hierarchy(agent_name, _inv_month, _inv_year,
-                                         prop_type, is_agent_senior)
+                                         prop_type, is_agent_senior,
+                                         job_type=_hier_job,
+                                         ev_type=_hier_ev)
         from basic_commission_rates import invoice_milestones as _milestones
         policy, pct5_str, pct75_str, pct100_str = _milestones(
             row, "Internal", _hierarchy, _inv_month, year=_inv_year,
-            agent=agent_name, property_type=prop_type)
+            agent=agent_name, property_type=prop_type, job_type=_hier_job)
 
         NOT_FULLY_PAID_INVS = {'1008316', '1007905'}
         if invoice_num in NOT_FULLY_PAID_INVS:
@@ -831,6 +978,10 @@ def _process_invoices(
             pay_dt = _get_effective_payment_date(real_full_pay_str, pct75_str, pct100_str, pct5_str)
             first_pay_dt = str(row.get("first_payment_date") or "")[:10]
         
+        ev_rate = None
+        ev_comm = Decimal("0")
+        ev_amt = Decimal("0")
+        rate_display = ""
         if prop_type == "Factory":
             rate = Decimal("0.02")
             sharing_tuple = factory_rates.get(invoice_num, (Decimal("0"), Decimal("0")))
@@ -842,7 +993,9 @@ def _process_invoices(
                 safwan_sharing = sharing_tuple
             comm = sales_price * (rate + sharing)
         else:
-            from basic_commission_rates import get_basic_rate, get_rule_amount
+            from basic_commission_rates import (
+                get_basic_rate, get_rule_amount, basic_commission_for_row,
+            )
             # Rates and rules are based on Invoice Date (inv_month/inv_year), not
             # Payment Date. Pass the deal's property type so rows scoped on the
             # Data page can match, and the year so a range like "2025-01 to
@@ -850,9 +1003,14 @@ def _process_invoices(
             # hierarchy is the one the payout policy above already resolved, so
             # rate and payout condition can never come from different roles.
             inv_month, inv_year, hierarchy = _inv_month, _inv_year, _hierarchy
-            rate = get_basic_rate("Internal", hierarchy, inv_month, agent=agent_name,
-                                  property_type=prop_type, year=inv_year)
-            comm = sales_price * rate
+            comm, rate, ev_rate, ev_comm, ev_amt, rate_display = basic_commission_for_row(
+                row, sales_price,
+                lambda job, ev: get_basic_rate(
+                    "Internal", hierarchy, inv_month, agent=agent_name,
+                    property_type=prop_type, year=inv_year,
+                    job_type=job, ev_type=ev,
+                ),
+            )
 
             # Only the advance has been reached: cap the commission at the
             # advance amount. That amount comes from the Data page row's own
@@ -902,6 +1060,10 @@ def _process_invoices(
                 pct75_date=pct75_str,
                 pct5_date=pct5_str,
                 payout_policy=policy,
+                ev_item_amount=ev_amt,
+                ev_rate=ev_rate,
+                ev_commission=ev_comm,
+                rate_display=rate_display,
             )
         )
         
