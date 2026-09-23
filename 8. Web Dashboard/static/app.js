@@ -3087,6 +3087,12 @@ modalPackageType.value = defaults.pkg || "-";
         const entries = map[name.toLowerCase()];
         if (!entries || !entries.length) return null;
         const lines = entries.map(e => {
+            // An EV charger job is named, not counted in panels.
+            if (e.package) {
+                return `<div style="margin-bottom:8px;">
+                    <div><strong>Package</strong> ${escapeHtml(e.package)}</div>
+                </div>`;
+            }
             const panel = e.panel_qty && e.panel_rating
                 ? `${e.panel_qty}x ${e.panel_rating}W${e.brand ? ` ${e.brand}` : ""}`
                 : "-";
@@ -4563,6 +4569,23 @@ modalPackageType.value = defaults.pkg || "-";
                         });
                     }
 
+                    // "EV package" stands where a net floor price would be, and
+                    // opens the same Special Case editor the commission cells
+                    // do -- that is where an EV job's floor price is entered.
+                    if (state.activeSection === "basic_nfp" && !isTotalRow
+                        && String(displayVal).trim() === "EV package"
+                        && userObj && !userObj.readOnly) {
+                        td.style.cursor = "pointer";
+                        td.title = "Click to set a net floor price for this EV job";
+                        td.classList.add("clickable-special-case");
+                        td.addEventListener("click", () => {
+                            hideCommCalcTooltip();
+                            if (isSpecialRow) openEditSpecialCaseModal(row);
+                            else openAddSpecialCaseModal(agentName, custName,
+                                                         nfpRowForSpecialCase(row, rowsToRender));
+                        });
+                    }
+
                     // Add hover breakdown & click handlers for Basic/NFP commission cells
                     if (state.activeSection === "basic_nfp" && !isTotalRow) {
                         if (ci === commissionIdx || ci === commissionPriceIdx) {
@@ -4625,6 +4648,21 @@ modalPackageType.value = defaults.pkg || "-";
                     if (isAgentHeader(colHeader) && cellVal != null && String(cellVal).trim()) {
                         td.textContent = resolveAgentName(cellVal);
                         attachAgentRoleHover(td, agentName, invoiceDateCellOf(row, headers));
+                    }
+
+                    // "EV package" stands where a net floor price would be, and
+                    // opens the same Special Case editor the commission cells
+                    // do -- that is where an EV job's floor price is entered.
+                    if (state.activeSection === "basic_nfp" && !isTotalRow
+                        && String(cellVal).trim() === "EV package"
+                        && userObj && !userObj.readOnly) {
+                        td.style.cursor = "pointer";
+                        td.title = "Click to set a net floor price for this EV job";
+                        td.classList.add("clickable-special-case");
+                        td.addEventListener("click", () => {
+                            hideCommCalcTooltip();
+                            openAddSpecialCaseModal(agentName, custName, nfpRowForSpecialCase(row, rows));
+                        });
                     }
 
                     // Add hover breakdown & click handlers for Basic/NFP commission cells
@@ -6210,6 +6248,59 @@ modalPackageType.value = defaults.pkg || "-";
         all: ["adjusted_nfp", "fee_waiver", "adjusted_rate", "profit_sharing", "adjusted_sales_price"]
     };
 
+    /** The Net Floor Price row of the invoice a row belongs to.
+     *
+     *  The editor offers "Adjusted Net Floor Price" only on an NFP row (see
+     *  getSpecialCaseRowKind). An "EV package" cell sits on the Basic row too,
+     *  and opening the editor from there offered every type EXCEPT the one
+     *  that sets a floor price. Falls back to the row itself. */
+    function nfpRowForSpecialCase(rowRef, list) {
+        const headers = state.rawData?.sections?.basic_nfp?.headers || [];
+        const commIdx = headers.findIndex(h => {
+            const n = String(h).toLowerCase().trim();
+            return n === "commission" || n === "commission type";
+        });
+        if (commIdx === -1 || !rowRef || !Array.isArray(list)) return rowRef;
+        const isNfp = (r) => String((r || [])[commIdx] || "").toLowerCase().includes("net floor");
+        if (isNfp(rowRef)) return rowRef;
+        const i = list.indexOf(rowRef);
+        if (i === -1) return rowRef;
+        for (let k = i + 1; k < list.length && k <= i + 3; k++) {
+            if (isNfp(list[k])) return list[k];
+            // The next invoice has started; this one has no NFP row.
+            if (String(list[k][commIdx] || "").toLowerCase().includes("basic")) break;
+        }
+        return rowRef;
+    }
+
+    /** The Basic Commission row of the invoice a row belongs to.
+     *
+     *  An invoice's Sales Price, System Price and Package Type are written on
+     *  its Basic row only -- the paired Net Floor Price row leaves them "-",
+     *  since repeating them would read as a second sale. Opening the Special
+     *  Case editor from the NFP row therefore showed Sales Price 0, and every
+     *  figure derived from it. Falls back to the row itself. */
+    function basicRowForSpecialCase(rowRef) {
+        const sec = state.rawData?.sections?.basic_nfp;
+        const rows = sec?.rows || [];
+        const headers = sec?.headers || [];
+        const commIdx = headers.findIndex(h => {
+            const n = String(h).toLowerCase().trim();
+            return n === "commission" || n === "commission type";
+        });
+        if (commIdx === -1 || !rowRef) return rowRef;
+        const kindOf = (r) => String((r || [])[commIdx] || "").toLowerCase();
+        if (kindOf(rowRef).includes("basic")) return rowRef;
+        const i = rows.indexOf(rowRef);
+        if (i === -1) return rowRef;
+        for (let k = i - 1; k >= 0 && k >= i - 3; k--) {
+            const v = kindOf(rows[k]);
+            if (v.includes("basic")) return rows[k];
+            if (!v.includes("net floor")) break;
+        }
+        return rowRef;
+    }
+
     function getSpecialCaseRowKind(rowRef) {
         const headers = state.rawData?.sections?.basic_nfp?.headers || [];
         const commIdx = headers.findIndex(h => {
@@ -6259,10 +6350,19 @@ modalPackageType.value = defaults.pkg || "-";
             return parseFloat(String(val).replace(/[^0-9.-]/g, "")) || 0;
         };
 
-        const pkg = packageIdx !== -1 ? String(rowRef[packageIdx] || "").trim() : "";
-        const sales = salesIdx !== -1 ? parseMoney(rowRef[salesIdx]) : 0;
-        const system = systemIdx !== -1 ? parseMoney(rowRef[systemIdx]) : 0;
-        const origNfp = nfpIdx !== -1 ? parseMoney(rowRef[nfpIdx]) : 0;
+        // Shared figures live on the invoice's Basic row; an NFP row leaves
+        // them blank (see basicRowForSpecialCase).
+        const figureRow = basicRowForSpecialCase(rowRef);
+        const cellOf = (idx) => {
+            if (idx === -1) return "";
+            const own = String(rowRef[idx] || "").trim();
+            if (own && own !== "-") return own;
+            return String((figureRow || [])[idx] || "").trim();
+        };
+        const pkg = packageIdx !== -1 ? cellOf(packageIdx) : "";
+        const sales = salesIdx !== -1 ? parseMoney(cellOf(salesIdx)) : 0;
+        const system = systemIdx !== -1 ? parseMoney(cellOf(systemIdx)) : 0;
+        const origNfp = nfpIdx !== -1 ? parseMoney(cellOf(nfpIdx)) : 0;
         // Read the rate the report ALREADY computed for this exact invoice
         // (basic commission ÷ sales price) instead of recalculating it from
         // scratch — getDefaultBasicRateForPackage() is a simplified client-side

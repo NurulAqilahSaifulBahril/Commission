@@ -1158,7 +1158,18 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
         else:
             ogm_comm = Decimal("0")
 
-        if prop_type == "Factory":
+        is_ev_job = False
+        try:
+            import basic_commission_rates as _bcr
+            is_ev_job = _bcr.normalize_job_type(r.get("job_type")) == _bcr.JOB_EV
+        except Exception:
+            pass
+        # An EV charger job is priced by its Job Type, from the Data page, even
+        # when the site is a factory. The Factory formula below is the solar
+        # one -- a 2% base plus the profit sharing negotiated on the panels --
+        # and it bypasses the Data page rate entirely. Towa Hardware's 11kW EV
+        # charger was being paid by it.
+        if prop_type == "Factory" and not is_ev_job:
             base_rate = Decimal("0.02")
 
             # The dashboard saves a Factory rate under whatever month the
@@ -1655,6 +1666,105 @@ def _is_after_month(date_str, as_at: str) -> bool:
     """
     text = str(date_str or "").strip()
     return bool(as_at) and len(text) >= 7 and text[:7] > as_at
+
+
+NFP_PRICE_TBC = "TBC with Finance"
+EV_PACKAGE_LABEL = "EV package"
+
+
+def _is_ev_package(text) -> bool:
+    """True for an EV charger job, by the same reading as the invoice query:
+    a package naming Jinko panels is solar, otherwise one naming EV is an EV
+    job. Net floor price is a solar idea -- panels against a price list -- so
+    an EV job has none until someone enters one."""
+    s = str(text or "").lower()
+    if not s or "tiger neo" in s or "jinko" in s:
+        return False
+    return re.search(r"(^|[^a-z])ev([^a-z]|$)", s) is not None
+
+
+def ev_package_label(text) -> str:
+    """The EV job in a few words, e.g. "11kW three-phase EV charger".
+
+    Read off the package's own description rather than a fixed phrase, so the
+    customer hover names what was actually sold: a 7kW single-phase charger
+    and a 22kW three-phase one should not read alike. Falls back to the plain
+    "EV Charger" when the description says no more than that.
+    """
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not s:
+        return "EV Charger"
+    phase = ""
+    if re.search(r"three[- ]phase|3\s*phase|\[\s*3p\s*\]", s, re.I):
+        phase = "three-phase"
+    elif re.search(r"single[- ]phase|1\s*phase|\[\s*1p\s*\]", s, re.I):
+        phase = "single-phase"
+    kw = re.search(r"(\d+(?:\.\d+)?)\s*kw", s, re.I)
+    if kw:
+        return " ".join(x for x in (f"{kw.group(1)}kW", phase, "EV charger") if x)
+    if re.search(r"install", s, re.I):
+        return " ".join(x for x in (phase, "EV charger installation") if x)
+    return "EV Charger"
+
+
+def _customer_is_ev_job(cust_basic_lines, nfp_by_inv_all, pkg_text: str = "") -> bool:
+    for r in _nfp_records_for(cust_basic_lines, nfp_by_inv_all):
+        if _is_ev_package(getattr(r, "package_description", "")):
+            return True
+    return _is_ev_package(pkg_text)
+
+
+def _nfp_records_for(cust_basic_lines, nfp_by_inv_all) -> list:
+    """The Net Floor Price engine's record of each of this customer's invoices,
+    whatever month it belongs to.
+
+    What the package WAS is a property of the invoice, not of the month being
+    reported. Reading it only from the rows inside the month left an invoice
+    with no NFP row that month looking like it had no panels at all: Wong Siew
+    Yong's top-up case, 14 x 650W JinkoSolar, was labelled "JinkoSolar package
+    not included" because its NFP row is absent until the package is priced.
+    """
+    out = []
+    for ln in cust_basic_lines or []:
+        inv = str(getattr(ln, "invoice_number", "") or "").strip()
+        r = (nfp_by_inv_all or {}).get(inv)
+        if r is not None:
+            out.append(r)
+    return out
+
+
+def _nfp_price_missing(cust_basic_lines, nfp_by_inv_all) -> bool:
+    """True when this customer's JinkoSolar package has no net floor price on
+    file, because its panel count is not in the price list.
+
+    The list is entered per panel count -- 620W panels run 8 to 48 -- and the
+    lookup needs an exact match. Diesel Truck Sdn Bhd's 50 x 620W package has
+    a floor price in principle and none in the table, so both its Net Floor
+    Price and its commission came out blank, reading as though none were due.
+    Say it is outstanding instead, and it clears itself the moment Finance
+    adds that size on the Data page.
+    """
+    for ln in cust_basic_lines or []:
+        inv = str(getattr(ln, "invoice_number", "") or "").strip()
+        r = (nfp_by_inv_all or {}).get(inv)
+        if r is None or _is_cleaning_inspection_service(r):
+            continue
+        if not getattr(r, "panel_qty", None) or not getattr(r, "panel_rating", None):
+            continue          # no panel data: a different gap, reported elsewhere
+        # Only an actual solar panel package has a floor price to be missing.
+        # An EV charger, a battery, a cap bank or a cable add-on carries a
+        # model number where the panel rating goes ("107" for an ARMORVOLT
+        # 7kW), which would otherwise read as an unlisted panel size.
+        desc = str(getattr(r, "package_description", "") or "")
+        if "jinko" not in desc.lower() and not _has_jinko_power_output(desc):
+            continue
+        try:
+            if float(getattr(r, "net_floor_price", 0) or 0) != 0:
+                continue      # priced
+        except (TypeError, ValueError):
+            pass
+        return True
+    return False
 
 
 def _nfp_awaiting_full_payment(cust_basic_lines, nfp_by_inv_all, as_at: str = "") -> bool:
@@ -2370,6 +2480,9 @@ def build_internal_summary_tables(
                     row_other_commission = format_other_commission_for_customer(basic_override_by_customer[agent].get(customer, {}))
 
                     is_before_oct_25 = is_before_october_2025(basic_dates[0]) or is_before_october_2025(nfp_dates[0])
+                    # The invoice's own package too, for a month that carries
+                    # no Net Floor Price row for it.
+                    cust_nfp_records = _nfp_records_for(cust_basic_lines, nfp_by_inv_all)
                     cust_all_pkg_text = " ".join(filter(None, [
                         cust_basic_pkg_str,
                         cust_nfp_pkg_str,
@@ -2377,10 +2490,12 @@ def build_internal_summary_tables(
                         *[getattr(ln, 'all_item_text', '') for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer],
                         *[getattr(r, 'package_description', '') for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer],
                         *[getattr(r, 'all_item_text', '') for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer],
+                        *[str(getattr(r, 'package_description', '') or '') for r in cust_nfp_records],
                     ]))
                     cust_panel_ratings = [
                         *[getattr(ln, 'panel_rating', None) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer],
                         *[getattr(r, 'panel_rating', None) for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer],
+                        *[getattr(r, 'panel_rating', None) for r in cust_nfp_records],
                     ]
                     has_power_out = (
                         nfp_info['net_floor_price'] != 0 or nfp_info['comm'] != 0 or nfp_info['sales'] != 0 or
@@ -2388,7 +2503,13 @@ def build_internal_summary_tables(
                         _has_jinko_power_output(cust_all_pkg_text, cust_panel_ratings)
                     )
 
-                    if is_before_oct_25:
+                    if _customer_is_ev_job(cust_basic_lines, nfp_by_inv_all, cust_all_pkg_text):
+                        # An EV charger job: no panels, so no net floor price
+                        # until one is entered on the row's Special Case editor.
+                        basic_nfp_cell = EV_PACKAGE_LABEL
+                        nfp_nfp_cell = EV_PACKAGE_LABEL
+                        nfp_comm_val = EV_PACKAGE_LABEL
+                    elif is_before_oct_25:
                         basic_nfp_cell = "invoice before Oct 25"
                         nfp_nfp_cell = "invoice before Oct 25"
                         nfp_comm_val = "invoice before Oct 25"
@@ -2396,6 +2517,12 @@ def build_internal_summary_tables(
                         basic_nfp_cell = "JinkoSolar package not included"
                         nfp_nfp_cell = "JinkoSolar package not included"
                         nfp_comm_val = "JinkoSolar package not included"
+                    elif _nfp_price_missing(cust_basic_lines, nfp_by_inv_all):
+                        # A JinkoSolar package whose panel count is not in the
+                        # price list: the floor price is owed, not absent.
+                        basic_nfp_cell = NFP_PRICE_TBC
+                        nfp_nfp_cell = NFP_PRICE_TBC
+                        nfp_comm_val = NFP_PRICE_TBC
                     else:
                         basic_nfp_cell = (
                             "cleaning and inspection service" if basic_info['net_floor_price'] == 0 and basic_info.get('is_cleaning_service')
@@ -2858,6 +2985,9 @@ def build_outsource_summary_tables(
                         basic_display_is_cleaning = basic_info.get("is_cleaning_service", False)
 
                     is_before_oct_25 = is_before_october_2025(basic_dates[0]) or is_before_october_2025(nfp_dates[0])
+                    # The invoice's own package too, for a month that carries
+                    # no Net Floor Price row for it.
+                    cust_nfp_records = _nfp_records_for(cust_basic_lines, nfp_by_inv_all)
                     cust_all_pkg_text = " ".join(filter(None, [
                         cust_basic_pkg_str,
                         cust_nfp_pkg_str,
@@ -2865,10 +2995,12 @@ def build_outsource_summary_tables(
                         *[getattr(ln, 'all_item_text', '') for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer],
                         *[getattr(r, 'package_description', '') for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer],
                         *[getattr(r, 'all_item_text', '') for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer],
+                        *[str(getattr(r, 'package_description', '') or '') for r in cust_nfp_records],
                     ]))
                     cust_panel_ratings = [
                         *[getattr(ln, 'panel_rating', None) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.customer_name.strip() == customer],
                         *[getattr(r, 'panel_rating', None) for r in month_nfp_rows if r.agent_name.strip() == agent and r.customer_name.strip() == customer],
+                        *[getattr(r, 'panel_rating', None) for r in cust_nfp_records],
                     ]
                     has_power_out = (
                         nfp_info['net_floor_price'] != 0 or nfp_info['comm'] != 0 or nfp_info['sales'] != 0 or
@@ -2876,7 +3008,13 @@ def build_outsource_summary_tables(
                         _has_jinko_power_output(cust_all_pkg_text, cust_panel_ratings)
                     )
 
-                    if is_before_oct_25:
+                    if _customer_is_ev_job(cust_basic_lines, nfp_by_inv_all, cust_all_pkg_text):
+                        # An EV charger job: no panels, so no net floor price
+                        # until one is entered on the row's Special Case editor.
+                        basic_nfp_cell = EV_PACKAGE_LABEL
+                        nfp_nfp_cell = EV_PACKAGE_LABEL
+                        nfp_comm_val = EV_PACKAGE_LABEL
+                    elif is_before_oct_25:
                         basic_nfp_cell = "invoice before Oct 25"
                         nfp_nfp_cell = "invoice before Oct 25"
                         nfp_comm_val = "invoice before Oct 25"
@@ -2884,6 +3022,12 @@ def build_outsource_summary_tables(
                         basic_nfp_cell = "JinkoSolar package not included"
                         nfp_nfp_cell = "JinkoSolar package not included"
                         nfp_comm_val = "JinkoSolar package not included"
+                    elif _nfp_price_missing(cust_basic_lines, nfp_by_inv_all):
+                        # A JinkoSolar package whose panel count is not in the
+                        # price list: the floor price is owed, not absent.
+                        basic_nfp_cell = NFP_PRICE_TBC
+                        nfp_nfp_cell = NFP_PRICE_TBC
+                        nfp_comm_val = NFP_PRICE_TBC
                     else:
                         basic_nfp_cell = (
                             "cleaning and inspection service" if basic_display_nfp == 0 and basic_display_is_cleaning

@@ -2090,13 +2090,20 @@ def _build_system_details(nfp_by_inv_all: dict) -> dict:
             continue
         qty = getattr(inv, "panel_qty", None)
         rating = getattr(inv, "panel_rating", None)
+        # An EV charger job has no panels. Its model number sits where the
+        # panel rating goes ("111" for an ARMORVOLT 11kW), so reporting it as
+        # panels read as "5x 111W" on the customer hover. Name the package
+        # instead, and leave the panel fields empty.
+        is_ev = build_commission_pack._is_ev_package(getattr(inv, "package_description", ""))
         entry = {
             "invoice": str(getattr(inv, "invoice_number", "") or ""),
             "invoice_date": str(getattr(inv, "invoice_date", "") or ""),
-            "panel_qty": int(qty) if qty is not None else None,
-            "panel_rating": int(rating) if rating is not None else None,
-            "brand": _panel_brand(getattr(inv, "package_description", "")),
-            "phase": _phase_label(getattr(inv, "phase_type", None)),
+            "package": (build_commission_pack.ev_package_label(
+                getattr(inv, "package_description", "")) if is_ev else ""),
+            "panel_qty": None if is_ev else (int(qty) if qty is not None else None),
+            "panel_rating": None if is_ev else (int(rating) if rating is not None else None),
+            "brand": "" if is_ev else _panel_brand(getattr(inv, "package_description", "")),
+            "phase": "" if is_ev else _phase_label(getattr(inv, "phase_type", None)),
             # The 75% milestone is NOT on the table row: the column headed
             # "75% Payment Date" is filled from the invoice's full_payment_date
             # (the 100% date), so a post-July invoice that reached 75% but not
@@ -2105,7 +2112,7 @@ def _build_system_details(nfp_by_inv_all: dict) -> dict:
             "pct75_date": str(getattr(inv, "pct75_date", "") or ""),
             "full_payment_date": str(getattr(inv, "full_payment_date", "") or ""),
         }
-        if (entry["panel_qty"] is None and entry["panel_rating"] is None
+        if (not entry["package"] and entry["panel_qty"] is None and entry["panel_rating"] is None
                 and not entry["phase"] and not entry["pct75_date"]
                 and not entry["full_payment_date"]):
             continue

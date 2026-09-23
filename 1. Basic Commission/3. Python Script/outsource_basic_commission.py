@@ -1280,7 +1280,14 @@ def main(argv: list[str]) -> int:
         import agent_names as _names
         ref_name = _names.clean_referral_name(r.get("referral_name"))
 
-        if prop_type == "Factory":
+        from basic_commission_rates import normalize_job_type as _norm_job, JOB_EV as _JOB_EV
+        is_ev_job = _norm_job(r.get("job_type")) == _JOB_EV
+        # An EV charger job is priced by its Job Type, from the Data page, even
+        # when the site is a factory. The Factory formula below is the solar
+        # one -- a 2% base plus the profit sharing negotiated on the panels --
+        # and it bypasses the Data page rate entirely. Towa Hardware's 11kW EV
+        # charger was being paid by it.
+        if prop_type == "Factory" and not is_ev_job:
             rate = Decimal("0.02")
             agent_sharing = factory_rates.get(invoice_num, Decimal("0"))
             safwan_sharing = factory_safwan_rates.get(invoice_num, Decimal("0"))
