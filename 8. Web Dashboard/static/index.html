@@ -302,18 +302,19 @@
                         <option value="fee_waiver">Net Floor Price Commission Fee Waiver</option>
                         <option value="adjusted_rate">Adjusted Basic Commission Rate %</option>
                         <option value="profit_sharing">Profit Sharing</option>
-                        <option value="adjusted_sales_price">Adjusted Sales Price</option>
+                        <option value="adjusted_sales_price">New Sales Price</option>
                     </select>
                 </div>
 
-                <!-- Dynamic Input Rows -->
+                <!-- Default: below Type on the Basic form. JS moves this above
+                     Type when the form is opened from the NFP cell. -->
                 <div class="form-row hidden" id="rowAdjustedSalesPrice">
-                    <label>Adjusted Sales Price (RM) <span style="font-size: 11px; color: #64748b; font-weight: normal;">(Management-adjusted amount to use instead of the auto-calculated sales price for this invoice)</span></label>
+                    <label>New Sales Price (RM) <span style="font-size: 11px; color: #64748b; font-weight: normal;">(used instead of the invoice sales price for commission)</span></label>
                     <input type="number" id="modalAdjustedSalesPrice" placeholder="e.g. 25000.00" step="100">
                 </div>
 
                 <div class="form-row" id="rowAdjustedNfp">
-                    <label>New Net Floor Price (RM)</label>
+                    <label>New Net Floor Price (RM) <span style="font-size: 11px; color: #64748b; font-weight: normal;">(NFP commission uses the New Sales Price when one is entered)</span></label>
                     <input type="number" id="modalNetFloorPrice" placeholder="0.00" value="0.00" step="100">
                 </div>
 
@@ -612,7 +613,7 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=20260923-scsales"></script>
-    <script src="/static/updater.js?v=20260731-ota-v1"></script>
+    <script src="/static/app.js?v=20260924-nfp-cell-case"></script>
+    <script src="/static/updater.js?v=20260923-adminonly"></script>
 </body>
 </html>

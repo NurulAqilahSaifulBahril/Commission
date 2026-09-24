@@ -226,7 +226,7 @@
     // resolves on its own within seconds, so poll rather than stranding the
     // user on a dead page they have to reload by hand.
     let retryTimer = null;
-    const RETRY_MS = 5000;
+    const RETRY_MS = 1000;
     const MAX_RETRIES = 24;   // ~2 minutes, which covers a full prefetch
     let retries = 0;
 

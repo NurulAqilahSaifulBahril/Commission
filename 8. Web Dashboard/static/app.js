@@ -725,7 +725,7 @@ document.addEventListener("DOMContentLoaded", () => {
         // would fall back to the report-month role on every agent hover for up
         // to six hours -- silently wrong for invoices that predate a role
         // change. (v4 did the same for "agent_roles", v3 for "system_details".)
-        return `commission_api_cache_v5:${state.activeYear}:${state.activeMonth}:${state.activeAgentType}`;
+        return `commission_api_cache_v7:${state.activeYear}:${state.activeMonth}:${state.activeAgentType}`;
     }
 
     function loadCachedCommissionPayload() {
@@ -891,7 +891,23 @@ document.addEventListener("DOMContentLoaded", () => {
     // Fetches and parses one agent-type's commission payload. Throws a
     // normalized Error on any HTTP/JSON failure.
     async function fetchCommissionJson(agentType) {
-        const res = await fetch(`/api/commission?year=${state.activeYear}&month=${state.activeMonth}&agent_type=${agentType}`);
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 5000);
+        let res;
+        try {
+            res = await fetch(`/api/commission?year=${state.activeYear}&month=${state.activeMonth}&agent_type=${agentType}`, {
+                signal: ctrl.signal,
+            });
+        } catch (err) {
+            if (err && err.name === "AbortError") {
+                const readyErr = new Error("Commission data is still being prepared.");
+                readyErr.code = "NOT_READY";
+                throw readyErr;
+            }
+            throw err;
+        } finally {
+            clearTimeout(timer);
+        }
         const text = await res.text();
         if (!res.ok) {
             let errMsg = `Server error (HTTP ${res.status})`;
@@ -905,8 +921,15 @@ document.addEventListener("DOMContentLoaded", () => {
             throw new Error(normalizeApiErrorMessage(errMsg));
         }
         try {
-            return JSON.parse(text);
+            const data = JSON.parse(text);
+            if (data && data.ready === false) {
+                const err = new Error(data.message || "Commission data is still being prepared.");
+                err.code = "NOT_READY";
+                throw err;
+            }
+            return data;
         } catch (jsonErr) {
+            if (jsonErr && jsonErr.code === "NOT_READY") throw jsonErr;
             console.error("JSON parsing failed. Raw response text was:", text);
             console.error("Parse error was:", jsonErr);
             throw new Error("Server returned invalid JSON. Check the server console for errors.");
@@ -1137,11 +1160,36 @@ document.addEventListener("DOMContentLoaded", () => {
         return fetchCommissionJson(state.activeAgentType);
     }
 
+    async function fetchCommissionDataUntilReady({ retries = 60, pauseMs = 1000, onWaiting } = {}) {
+        let lastErr;
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+                return await fetchCommissionDataForSelection();
+            } catch (err) {
+                lastErr = err;
+                if (err.code !== "NOT_READY" || attempt === retries) throw err;
+                if (typeof onWaiting === "function") onWaiting(err.message);
+                await new Promise(resolve => setTimeout(resolve, pauseMs));
+            }
+        }
+        throw lastErr;
+    }
+
     async function fetchCommissionPayload({ showErrors = true, persistCache = true } = {}) {
         const requestToken = ++commissionFetchToken;
         try {
-            const data = await fetchCommissionDataForSelection();
+            const data = await fetchCommissionDataUntilReady({
+                onWaiting: showErrors ? (msg) => {
+                    showLoader(false);
+                    noDataView.classList.remove("hidden");
+                    const heading = noDataView.querySelector("h4");
+                    const detail = noDataView.querySelector("p");
+                    if (heading) heading.textContent = "Preparing commission data";
+                    if (detail) detail.textContent = msg || "Commission data is still being prepared. Retrying…";
+                } : undefined,
+            });
             if (requestToken !== commissionFetchToken) return;
+            noDataView.classList.add("hidden");
             await applyCommissionPayload(data, { persistCache });
         } catch (err) {
             if (requestToken !== commissionFetchToken) return;
@@ -1220,7 +1268,17 @@ document.addEventListener("DOMContentLoaded", () => {
         noDataView.classList.add("hidden");
         
         try {
-            const data = await fetchCommissionDataForSelection();
+            const data = await fetchCommissionDataUntilReady({
+                onWaiting: (msg) => {
+                    showLoader(false);
+                    noDataView.classList.remove("hidden");
+                    const heading = noDataView.querySelector("h4");
+                    const detail = noDataView.querySelector("p");
+                    if (heading) heading.textContent = "Preparing commission data";
+                    if (detail) detail.textContent = msg || "Commission data is still being prepared. Retrying…";
+                },
+            });
+            noDataView.classList.add("hidden");
             state.rawData = data;
             await loadFactoryRates();
             
@@ -1487,13 +1545,36 @@ document.addEventListener("DOMContentLoaded", () => {
         customerSearchResults.classList.remove("hidden");
     }
 
+    function placeSpecialCaseSalesPriceRow() {
+        if (!rowAdjustedSalesPrice || !rowCaseType || !rowCaseType.parentNode) return;
+        // NFP form: New Sales Price above Type. Basic form: below Type.
+        if (state.specialCaseRowKind === "nfp") {
+            rowCaseType.parentNode.insertBefore(rowAdjustedSalesPrice, rowCaseType);
+        } else {
+            rowCaseType.insertAdjacentElement("afterend", rowAdjustedSalesPrice);
+        }
+    }
+
     function onSpecialCaseTypeChange() {
         const type = modalCaseType ? modalCaseType.value : "adjusted_nfp";
-        if (rowAdjustedNfp) rowAdjustedNfp.classList.toggle("hidden", type !== "adjusted_nfp");
+        const openedFromNfp = state.specialCaseRowKind === "nfp";
+        const openedFromBasic = state.specialCaseRowKind === "basic";
+        // Basic cell: New Sales Price only, never New Net Floor Price.
+        // NFP cell: both, and New Sales Price sits above Type.
+        const showNewSales = openedFromNfp || type === "adjusted_sales_price";
+        const showNewNfp = !openedFromBasic && (openedFromNfp || type === "adjusted_nfp" || type === "adjusted_sales_price");
+        placeSpecialCaseSalesPriceRow();
+        if (rowAdjustedNfp) rowAdjustedNfp.classList.toggle("hidden", !showNewNfp);
         if (rowFeeWaiver) rowFeeWaiver.classList.toggle("hidden", type !== "fee_waiver");
         if (rowAdjustedRate) rowAdjustedRate.classList.toggle("hidden", type !== "adjusted_rate");
-        if (rowAdjustedSalesPrice) rowAdjustedSalesPrice.classList.toggle("hidden", type !== "adjusted_sales_price");
-        if (rowRevisedSalesPrice) rowRevisedSalesPrice.classList.toggle("hidden", type !== "adjusted_sales_price");
+        if (rowAdjustedSalesPrice) rowAdjustedSalesPrice.classList.toggle("hidden", !showNewSales);
+        if (rowRevisedSalesPrice) rowRevisedSalesPrice.classList.toggle("hidden", !showNewSales);
+        const salesHint = rowAdjustedSalesPrice?.querySelector("label span");
+        if (salesHint) {
+            salesHint.textContent = openedFromNfp
+                ? "(from the Basic Commission special case — NFP commission uses this figure)"
+                : "(used instead of the invoice sales price for commission)";
+        }
         
         const pkgName = String(modalPackageType?.value || "").toLowerCase();
         const isSpecialPkg = pkgName.includes("factory") || pkgName.includes("ngo") || pkgName.includes("goverment") || pkgName.includes("government");
@@ -1512,6 +1593,23 @@ document.addEventListener("DOMContentLoaded", () => {
     // on his own. The rate is negotiated per agent, so a case may carry its
     // own; blank falls back to the standard 0.75%.
     const DEFAULT_GAN_OVERRIDE_PCT = 0.75;
+
+    // The sales figure a special case actually uses. Adjusted Sales Price wins
+    // when it was entered; otherwise the case's own sales field. Used so a
+    // Basic-row edit of the sales price is also what the paired NFP row
+    // calculates from and what the merged Sales Price column stacks.
+    function specialCaseRevisedSalesAmount(sc) {
+        if (!sc) return null;
+        const adj = Number(sc.adjustedSalesPrice);
+        if (Number.isFinite(adj) && adj !== 0) return adj;
+        const sales = Number(sc.sales);
+        if (Number.isFinite(sales) && sales !== 0) return sales;
+        return null;
+    }
+
+    function formatSpecialCaseRm(amount) {
+        return `RM ${Number(amount).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+    }
 
     // Where the modal's agent actually lives, matching how confirmModalBtn
     // resolves it at save time. In standard mode it is only ever in the
@@ -1570,13 +1668,13 @@ document.addEventListener("DOMContentLoaded", () => {
         const baselineRate = parseFloat(modalBaselineRate?.value) || parseFloat(modalRatePct?.value) || 3.0;
         const type = modalCaseType ? modalCaseType.value : "adjusted_nfp";
 
-        // Management's manually adjusted sales price replaces the auto-calculated
-        // one for every downstream calc (basic commission AND the NFP bonus/
-        // clawback, since that also compares sales price against the floor).
+        // A typed Adjusted Sales Price replaces the invoice sales for every
+        // downstream calc, including New Net Floor Price, even when the
+        // selected type is Adjusted NFP.
         let salesForCalc = sales;
-        if (type === "adjusted_sales_price") {
-            const adj = parseFloat(modalAdjustedSalesPrice?.value);
-            if (!isNaN(adj)) salesForCalc = adj;
+        const adj = parseFloat(modalAdjustedSalesPrice?.value);
+        if (String(modalAdjustedSalesPrice?.value || "").trim() !== "" && !isNaN(adj)) {
+            salesForCalc = adj;
         }
 
         let rate = baselineRate;
@@ -3329,10 +3427,15 @@ modalPackageType.value = defaults.pkg || "-";
         // 2. Net Floor Price Commission
         if (commTypeLower.includes("net floor price")) {
             if (row.specialCaseData) {
+                const sc = row.specialCaseData;
+                const scSales = specialCaseRevisedSalesAmount(sc);
+                const scNfp = Number(sc.nfp);
+                const usedSales = scSales != null ? scSales : sales;
+                const usedNfp = Number.isFinite(scNfp) ? scNfp : nfp;
                 return {
                     title: `Net Floor Price Commission — ${custName || "Special Case"}`,
                     formula: `Net Floor Price Commission = (Sales Price - Net Floor Price) × Rate%`,
-                    subtext: `Special Case Override = ${commValStr}` + clickTip
+                    subtext: `Special Case = (${fmtNum(usedSales)} − ${fmtNum(usedNfp)}) × Rate% = ${commValStr}` + clickTip
                 };
             }
 
@@ -4295,6 +4398,7 @@ modalPackageType.value = defaults.pkg || "-";
             const specialCaseGroupAnchorByRowIndex = new Array(N).fill(-1);
             const specialCaseGroupSpanByAnchor = new Map();
             const specialCaseGroupNfpByAnchor = new Map();
+            const specialCaseGroupSalesByAnchor = new Map();
             let groupStart = 0;
             while (groupStart < N) {
                 const groupCustomer = effectiveCustomerNames[groupStart];
@@ -4331,6 +4435,15 @@ modalPackageType.value = defaults.pkg || "-";
                         ? `RM ${parsedNfp.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`
                         : String(rawNfp);
                     specialCaseGroupNfpByAnchor.set(groupStart, newNfpVal);
+                    break;
+                }
+
+                for (let idx = groupStart; idx < groupEnd; idx++) {
+                    const row = rowsToRender[idx];
+                    if (!row || !row.specialCaseData || salesPriceIdx === -1) continue;
+                    const revisedSales = specialCaseRevisedSalesAmount(row.specialCaseData);
+                    if (revisedSales == null) continue;
+                    specialCaseGroupSalesByAnchor.set(groupStart, formatSpecialCaseRm(revisedSales));
                     break;
                 }
 
@@ -4454,6 +4567,22 @@ modalPackageType.value = defaults.pkg || "-";
                             td.classList.add("special-case-merge-cell");
                         } else {
                             td.innerHTML = displayVal;
+                        }
+                    }
+
+                    if (isGroupAnchor && ci === salesPriceIdx) {
+                        const secondarySales = specialCaseGroupSalesByAnchor.get(ri);
+                        const originalSalesAmt = parseMoneyValue(displayVal);
+                        const secondarySalesAmt = parseMoneyValue(secondarySales || "");
+                        if (secondarySales && secondarySales !== "-"
+                            && secondarySalesAmt !== originalSalesAmt) {
+                            td.innerHTML = `
+                                <div class="special-case-merge-stack">
+                                    <span class="special-case-primary-value">${displayVal}</span>
+                                    <span class="special-case-secondary-value">${secondarySales}</span>
+                                </div>
+                            `;
+                            td.classList.add("special-case-merge-cell");
                         }
                     }
 
@@ -6239,7 +6368,7 @@ modalPackageType.value = defaults.pkg || "-";
         fee_waiver: "Net Floor Price Commission Fee Waiver",
         adjusted_rate: "Adjusted Basic Commission Rate %",
         profit_sharing: "Profit Sharing",
-        adjusted_sales_price: "Adjusted Sales Price"
+        adjusted_sales_price: "New Sales Price"
     };
 
     const SPECIAL_CASE_TYPES_BY_ROW = {
@@ -6311,6 +6440,63 @@ modalPackageType.value = defaults.pkg || "-";
         if (val.includes("net floor") || val.includes("netfloor")) return "nfp";
         if (val.includes("basic")) return "basic";
         return "all";
+    }
+
+    function findNewSalesPriceForCustomer(agentName, customerName) {
+        const wantAgent = String(agentName || "").toLowerCase().trim();
+        const wantCustomer = String(customerName || "").toLowerCase().trim();
+        if (!wantAgent || !wantCustomer) return "";
+        const priceOf = (data) => {
+            if (!data) return "";
+            const adj = data.adjustedSalesPrice;
+            if (adj == null || String(adj).trim() === "") return "";
+            return adj;
+        };
+        const matches = (data) => data
+            && String(data.agent || "").toLowerCase().trim() === wantAgent
+            && String(data.customer || "").toLowerCase().trim() === wantCustomer;
+        let fallback = "";
+        const take = (data) => {
+            if (!matches(data)) return "";
+            const price = priceOf(data);
+            if (!price) return "";
+            if (String(data.rowKind || "").toLowerCase() === "basic") return price;
+            fallback = fallback || price;
+            return "";
+        };
+        for (const pair of state.specialCasePairs || []) {
+            const hit = take((pair.find(Boolean) || {}).specialCaseData);
+            if (hit) return hit;
+        }
+        for (const row of state.rawData?.sections?.basic_nfp?.rows || []) {
+            const hit = take(row && row.specialCaseData);
+            if (hit) return hit;
+        }
+        return fallback;
+    }
+
+    function findSpecialCasePairByKind(agentName, customerName, kind) {
+        const wantAgent = String(agentName || "").toLowerCase().trim();
+        const wantCustomer = String(customerName || "").toLowerCase().trim();
+        const wantKind = String(kind || "").toLowerCase().trim();
+        if (!wantAgent || !wantCustomer || !wantKind) return null;
+        for (const pair of state.specialCasePairs || []) {
+            const data = (pair.find(Boolean) || {}).specialCaseData;
+            if (!data) continue;
+            if (String(data.agent || "").toLowerCase().trim() === wantAgent
+                && String(data.customer || "").toLowerCase().trim() === wantCustomer
+                && String(data.rowKind || "").toLowerCase() === wantKind) {
+                return pair;
+            }
+        }
+        return null;
+    }
+
+    function nfpCaseDataFromSales(baseData) {
+        return Object.assign({}, baseData, {
+            rowKind: "nfp",
+            specialCaseType: "adjusted_nfp",
+        });
     }
 
     /** Rebuild the Type of Special Case list for a row kind. `preferred` (an
@@ -6396,6 +6582,15 @@ modalPackageType.value = defaults.pkg || "-";
         // deliberately overrides it.
         if (modalGanOverridePct) modalGanOverridePct.value = "";
         modalRemarks.value = "";
+
+        // Opening from the NFP cell after a Basic "New Sales Price" case:
+        // show that figure above Type of Special Case so New NFP is based
+        // on the restated sales, not the original invoice amount. The two
+        // cases stay separate — this only copies the sales figure across.
+        if (state.specialCaseRowKind === "nfp" && modalAdjustedSalesPrice) {
+            const price = findNewSalesPriceForCustomer(agentName, customerName);
+            if (price !== "") modalAdjustedSalesPrice.value = price;
+        }
 
         onSpecialCaseTypeChange();
         confirmModalBtn.textContent = "Confirm & Add";
@@ -6493,16 +6688,41 @@ modalPackageType.value = defaults.pkg || "-";
         // the saved type preselected (and kept available even if it predates
         // this filtering). Cases saved before rowKind existed fall back to the
         // clicked row so they keep behaving as they always did.
+        const clickedKind = getSpecialCaseRowKind(rowRef);
+        // The auto New NFP row from a Basic New Sales Price must open as
+        // an NFP special case, even if it was still stored on the Basic pair.
+        if (!isCustomerMode && (clickedKind === "nfp" || clickedKind === "basic")
+            && state.editingPair && state.editingPair.length > 1) {
+            const keep = state.editingPair.filter(r => getSpecialCaseRowKind(r) === clickedKind);
+            const rest = state.editingPair.filter(r => !keep.includes(r));
+            const pairIdxSplit = state.specialCasePairs.indexOf(state.editingPair);
+            if (pairIdxSplit !== -1) {
+                state.specialCasePairs[pairIdxSplit] = keep.length ? keep : [rowRef];
+                if (rest.length) state.specialCasePairs.push(rest);
+                state.editingPair = state.specialCasePairs[pairIdxSplit];
+            }
+        }
         state.specialCaseRowKind = isCustomerMode
             ? "all"
-            : (data.rowKind || getSpecialCaseRowKind(rowRef));
+            : (clickedKind === "nfp" || clickedKind === "basic"
+                ? clickedKind
+                : (data.rowKind || clickedKind));
         setSpecialCaseTypeOptions(
             state.specialCaseRowKind,
-            data.specialCaseType || "adjusted_nfp"
+            (clickedKind === "nfp" && data.rowKind === "basic")
+                ? "adjusted_nfp"
+                : (data.specialCaseType || "adjusted_nfp")
         );
         if (modalFeeWaiver) modalFeeWaiver.value = data.feeWaiver ?? 0;
         if (modalProfitSharingPct) modalProfitSharingPct.value = data.profitSharingPct ?? 0;
-        if (modalAdjustedSalesPrice) modalAdjustedSalesPrice.value = data.adjustedSalesPrice ?? "";
+        if (modalAdjustedSalesPrice) {
+            modalAdjustedSalesPrice.value = data.adjustedSalesPrice ?? "";
+            if (state.specialCaseRowKind === "nfp"
+                && String(modalAdjustedSalesPrice.value || "").trim() === "") {
+                const price = findNewSalesPriceForCustomer(data.agent, data.customer);
+                if (price !== "") modalAdjustedSalesPrice.value = price;
+            }
+        }
         // Blank for cases saved before this field existed, which is exactly the
         // "use the standard rate" state they have always had.
         if (modalGanOverridePct) modalGanOverridePct.value = data.ganOverridePct ?? "";
@@ -6634,12 +6854,11 @@ modalPackageType.value = defaults.pkg || "-";
             const feeWaiver = specialCaseType === "fee_waiver" ? (parseFloat(modalFeeWaiver.value) || 0) : 0;
             const remarks = modalRemarks.value.trim();
             const profitSharingPct = parseFloat(modalProfitSharingPct?.value) || 0;
-            const adjustedSalesPrice = specialCaseType === "adjusted_sales_price"
-                ? (parseFloat(modalAdjustedSalesPrice?.value) || 0) : null;
-            // Management's manually adjusted sales price replaces the auto-
-            // calculated one for every downstream calc — same as the live preview.
-            const salesForCalc = (specialCaseType === "adjusted_sales_price" && adjustedSalesPrice)
-                ? adjustedSalesPrice : sales;
+            const adjSalesRaw = String(modalAdjustedSalesPrice?.value ?? "").trim();
+            const adjustedSalesPrice = adjSalesRaw !== "" ? (parseFloat(adjSalesRaw) || 0) : null;
+            // New NFP is always compared to this figure, not the original
+            // invoice sales, when a new sales price was entered.
+            const salesForCalc = (adjustedSalesPrice != null) ? adjustedSalesPrice : sales;
 
             if (state.specialCaseMode === "customer" && (!agent || !customer || customer === "(Unknown)")) {
                 alert("Please select both an agent and a customer from the database list first.");
@@ -6729,7 +6948,11 @@ modalPackageType.value = defaults.pkg || "-";
                 setVal("Package", pkg);
                 setVal("System Price", sysStr);
                 setVal("Net Floor Price", nfpStr);
-                setVal("Sales Price", commType.toLowerCase().includes("net floor price") ? "-" : salesStr);
+                // The restated row shows the figure this case actually used.
+                // A Basic New Sales Price also restates NFP commission
+                // (first change). A later NFP-cell case can change the
+                // floor and restate it again (second change).
+                setVal("Sales Price", salesStr);
                 setVal("Commission", commType);
                 setVal("Commission Price", commPriceVal);
                 // The override rides on the basic commission only, never on the
@@ -6742,9 +6965,7 @@ modalPackageType.value = defaults.pkg || "-";
             // Commission, and vice versa — only the clicked row is replaced.
             // "all" (Add Special Case Customer) still creates both.
             // Raised from Gan Lai Soon's column: his override is the only thing
-            // being changed, so neither commission is restated. Kept ahead of the
-            // Adjusted Sales Price rule below, which would otherwise drag both
-            // rows back in.
+            // being changed, so neither commission is restated.
             const ganOnly = !!state.specialCaseGanMode;
             // "gan" is only for a case BORN from the Gan column, where there is
             // nothing else to keep. Gan-editing an existing case must preserve
@@ -6759,14 +6980,14 @@ modalPackageType.value = defaults.pkg || "-";
                 ? (editingStored ? editingStored.rowKind : "gan")
                 : (state.specialCaseMode === "customer"
                     ? "all" : (state.specialCaseRowKind || "all"));
-            // Exception: Adjusted Sales Price changes the figure BOTH
-            // commissions are derived from (basic = sales × rate, NFP =
-            // (sales − net floor price) × rate), so it always restates both —
-            // whichever row it was raised from. Every other type touches only
-            // one side of the calculation.
-            const affectsBothCommissions = !ganOnly && specialCaseType === "adjusted_sales_price";
-            const wantsBasic = !ganOnly && (affectsBothCommissions || rowKind === "basic" || rowKind === "all");
-            const wantsNfp = !ganOnly && (affectsBothCommissions || rowKind === "nfp" || rowKind === "all");
+            // Two-step NFP commission: a New Sales Price on the Basic cell
+            // auto-restates NFP from (new sales − current floor). A later
+            // NFP-cell case can change the floor and restate it again.
+            // Other Basic types (rate, profit sharing) stay Basic-only.
+            const salesRestatesNfp = !ganOnly && rowKind === "basic"
+                && adjustedSalesPrice != null;
+            const wantsBasic = !ganOnly && (rowKind === "basic" || rowKind === "all");
+            const wantsNfp = !ganOnly && (rowKind === "nfp" || rowKind === "all");
 
             // Stored as typed, so a blank stays blank and keeps tracking the
             // standard rate rather than freezing today's 0.75% into the case.
@@ -6839,6 +7060,68 @@ modalPackageType.value = defaults.pkg || "-";
                         rowRef[rowRef.length - 1] = JSON.stringify(dataObject);
                     }
                 });
+                // If this edit now covers a side the pair did not have,
+                // add that restated row. Basic and NFP stay separate
+                // assignments, so this only runs for "all" (new customer).
+                const pairIsNfp = (rowRef) => {
+                    if (!rowRef || commIdxEdit === -1) return false;
+                    const existing = String(rowRef[commIdxEdit] || "").toLowerCase();
+                    return existing.includes("net floor") || existing.includes("netfloor");
+                };
+                const originalRows = state.rawData.sections.basic_nfp.rows;
+                const clonePairRow = () => {
+                    const template = state.editingPair.find(Boolean);
+                    const r = template ? [...template] : new Array(headers.length).fill("-");
+                    delete r.specialCaseData;
+                    while (r.length > headers.length) r.pop();
+                    return r;
+                };
+                if (wantsNfp && !state.editingPair.some(pairIsNfp)) {
+                    const nfpRow = clonePairRow();
+                    setRowValues(nfpRow, "New Net Floor Price Commission", nfpCommStr);
+                    if (agentIdx !== -1) nfpRow[agentIdx] = "";
+                    nfpRow.specialCaseData = dataObject;
+                    nfpRow.push(JSON.stringify(dataObject));
+                    insertSpecialCaseRows(originalRows, null, nfpRow, headers, agent, customer);
+                    state.specialCaseRowRefs.add(nfpRow);
+                    state.editingPair.push(nfpRow);
+                }
+                if (wantsBasic && !state.editingPair.some(r => r && !pairIsNfp(r))) {
+                    const basicRow = clonePairRow();
+                    setRowValues(basicRow, "New Basic Commission", basicCommStr);
+                    basicRow.specialCaseData = dataObject;
+                    basicRow.push(JSON.stringify(dataObject));
+                    insertSpecialCaseRows(originalRows, basicRow, null, headers, agent, customer);
+                    state.specialCaseRowRefs.add(basicRow);
+                    state.editingPair.unshift(basicRow);
+                }
+                if (salesRestatesNfp) {
+                    const nfpData = nfpCaseDataFromSales(dataObject);
+                    const existingNfpPair = findSpecialCasePairByKind(agent, customer, "nfp");
+                    if (existingNfpPair) {
+                        existingNfpPair.forEach(rowRef => {
+                            if (!rowRef) return;
+                            setRowValues(rowRef, "New Net Floor Price Commission", nfpCommStr);
+                            if (agentIdx !== -1) rowRef[agentIdx] = "";
+                            rowRef.specialCaseData = Object.assign({}, rowRef.specialCaseData || {}, nfpData, {
+                                nfp: (rowRef.specialCaseData || {}).nfp ?? nfpData.nfp,
+                                specialCaseType: (rowRef.specialCaseData || {}).specialCaseType || "adjusted_nfp",
+                            });
+                            if (rowRef.length > headers.length) {
+                                rowRef[rowRef.length - 1] = JSON.stringify(rowRef.specialCaseData);
+                            }
+                        });
+                    } else {
+                        const nfpRow = clonePairRow();
+                        setRowValues(nfpRow, "New Net Floor Price Commission", nfpCommStr);
+                        if (agentIdx !== -1) nfpRow[agentIdx] = "";
+                        nfpRow.specialCaseData = nfpData;
+                        nfpRow.push(JSON.stringify(nfpData));
+                        insertSpecialCaseRows(originalRows, null, nfpRow, headers, agent, customer);
+                        state.specialCaseRowRefs.add(nfpRow);
+                        state.specialCasePairs.push([nfpRow]);
+                    }
+                }
             } else {
                 const originalRows = state.rawData.sections.basic_nfp.rows;
                 const agentIdx = headers.findIndex(h => h.toLowerCase().trim() === "agent");
@@ -6888,12 +7171,28 @@ modalPackageType.value = defaults.pkg || "-";
                     nfpRow.specialCaseData = dataObject;
                     nfpRow.push(JSON.stringify(dataObject));
                 }
+                if (salesRestatesNfp && !nfpRow) {
+                    const nfpData = nfpCaseDataFromSales(dataObject);
+                    nfpRow = makeRow();
+                    setRowValues(nfpRow, "New Net Floor Price Commission", nfpCommStr);
+                    if (agentIdx !== -1) nfpRow[agentIdx] = "";
+                    nfpRow.specialCaseData = nfpData;
+                    nfpRow.push(JSON.stringify(nfpData));
+                }
 
                 insertSpecialCaseRows(originalRows, basicRow, nfpRow, headers, agent, customer);
 
                 const created = [basicRow, nfpRow].filter(Boolean);
                 created.forEach(r => state.specialCaseRowRefs.add(r));
-                state.specialCasePairs.push(created);
+                // A New Sales Price on Basic files two cases: Basic on the
+                // Basic cell, NFP on the auto New NFP cell, so clicking that
+                // NFP cell opens the NFP special-case form.
+                if (salesRestatesNfp && basicRow && nfpRow) {
+                    state.specialCasePairs.push([basicRow]);
+                    state.specialCasePairs.push([nfpRow]);
+                } else {
+                    state.specialCasePairs.push(created);
+                }
             }
 
 
@@ -6917,7 +7216,11 @@ modalPackageType.value = defaults.pkg || "-";
         // removes it.
         const scData = (pair.find(Boolean) || {}).specialCaseData;
         if (scData && scData.agent && scData.customer) {
-            pendingSpecialCaseDeletes.push({ agent: scData.agent, customer: scData.customer });
+            pendingSpecialCaseDeletes.push({
+                agent: scData.agent,
+                customer: scData.customer,
+                rowKind: scData.rowKind || "all",
+            });
         }
 
         pair.forEach(r => {

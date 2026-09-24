@@ -94,7 +94,7 @@ import agent_names
 import query_replay
 import pickle
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 import time
 
 # Load all commission modules at startup so classes are defined for pickle/running
@@ -210,13 +210,19 @@ def load_disk_cache():
                 _log(f"Failed to load cache from disk: {e}\n" + traceback.format_exc())
                 _data_cache = {}
                 return
-            if not isinstance(loaded, dict) or loaded.get(_CACHE_STAMP_KEY) != _CACHE_STAMP:
-                # Built by different code. Serving it could show figures shaped
-                # by rules that no longer exist, which is what deleting the file
-                # on launch used to guard against -- now only when it applies.
-                _log("Discarding disk cache: it was built by a different version of the code.")
+            if not isinstance(loaded, dict):
                 _data_cache = {}
                 return
+            if loaded.get(_CACHE_STAMP_KEY) != _CACHE_STAMP:
+                # Keep last month's yearly bundles so sign-in stays fast, but
+                # drop assembled month pages. Those embed special-case rows
+                # and hover labels; serving them after an inject/label change
+                # is why the screen looked "not updated yet".
+                _log("Disk cache was built by a different version; serving yearly bundles while month pages rebuild.")
+                stale_pages = [k for k in loaded
+                               if isinstance(k, tuple) and len(k) == 4 and k[0] == "commission_response"]
+                for k in stale_pages:
+                    loaded.pop(k, None)
             _data_cache = loaded
             # The query record rides along so the first rule change after a
             # restart rebuilds as fast as any other (see query_replay.py).
@@ -386,6 +392,12 @@ def set_cached_commission_response(year: int, month: int, agent_type: str, paylo
 
 
 def _trigger_background_refresh(year: int, agent_type: str) -> None:
+    # A month payload can be rebuilt from bundles already on disk. Only hit
+    # the database when those bundles are missing — a full prefetch takes
+    # minutes and used to wipe the month cache mid-page-load.
+    existing = get_cached_data(year, agent_type)
+    if existing and existing.get("invoice_dates"):
+        return
     key = (int(year), str(agent_type).lower())
     with _response_refresh_lock:
         if key in _refreshing_response_keys:
@@ -394,13 +406,55 @@ def _trigger_background_refresh(year: int, agent_type: str) -> None:
 
     def _worker() -> None:
         try:
-            # Refresh the shared yearly commission bundles in the background.
             start_prefetch(year)
         finally:
             with _response_refresh_lock:
                 _refreshing_response_keys.discard(key)
 
     threading.Thread(target=_worker, daemon=True).start()
+
+
+# First paint after sign-in must return within this many seconds. The year
+# rebuild keeps running in the background; the next poll picks it up.
+_COMMISSION_REQUEST_SECONDS = 5
+_commission_build_lock = threading.Lock()
+_commission_build_futs: dict[tuple, object] = {}
+_commission_build_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="comm-build")
+
+
+def _decorate_commission_payload(payload: dict, year: int, month: int) -> dict:
+    if isinstance(payload, dict):
+        payload["agent_roles"] = _agent_roles_for_month(year, month)
+        payload["agent_role_history"] = _agent_role_history()
+        payload["agent_ics"] = agent_names.get_ic_map()
+    return payload
+
+
+def _commission_payload_within_seconds(year: int, month: int, agent_type: str,
+                                       seconds: float = _COMMISSION_REQUEST_SECONDS):
+    """Return a month payload in `seconds` or None so the page can retry.
+
+    Concurrent requests for the same month share one build. The first one
+    that finishes writes the response cache; later hits are instant."""
+    cached_response = get_cached_commission_response(year, month, agent_type)
+    if cached_response and isinstance(cached_response, dict) and cached_response.get("payload"):
+        return cached_response["payload"]
+
+    key = (int(year), int(month), str(agent_type).lower())
+    with _commission_build_lock:
+        fut = _commission_build_futs.get(key)
+        if fut is None or fut.done():
+            if fut is not None and fut.done() and fut.exception() is None:
+                result = fut.result()
+                if result is not None:
+                    return result
+            fut = _commission_build_pool.submit(
+                _build_commission_payload, int(year), int(month), str(agent_type).lower())
+            _commission_build_futs[key] = fut
+    try:
+        return fut.result(timeout=seconds)
+    except FuturesTimeout:
+        return None
 
 
 def _empty_commission_payload(agent_type: str) -> dict:
@@ -878,7 +932,19 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
             pos = len(rows)
         rows.insert(pos, new_row)
 
-    for case in cases:
+    def _inject_order(c):
+        kind = str((c or {}).get("rowKind") or "all").strip().lower()
+        # Basic first so its auto NFP restatement (new sales, same floor)
+        # lands above a later NFP-cell assignment (new floor).
+        if kind == "basic":
+            return 0
+        if kind == "nfp":
+            return 1
+        if kind == "gan":
+            return 2
+        return 3
+
+    for case in sorted(cases, key=_inject_order):
         try:
             agent = str(case.get("agent") or "").strip()
             customer = str(case.get("customer") or "").strip()
@@ -913,10 +979,32 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
             continue
 
         # Same formulas as updateSpecialCasePreview()/confirmModalBtn in
-        # app.js â€” kept in lockstep so the saved value can never drift from
+        # app.js — kept in lockstep so the saved value can never drift from
         # what the modal previewed. A management-adjusted sales price replaces
         # the auto-calculated one for every downstream calc here too.
-        sales_for_calc = adjusted_sales_price if (special_case_type == "adjusted_sales_price" and adjusted_sales_price) else sales
+        # An NFP-only case copies the Basic cell's New Sales Price when it
+        # did not store one of its own.
+        row_kind_early = str(case.get("rowKind") or "all").strip().lower()
+        if not adjusted_sales_price and row_kind_early == "nfp":
+            want_a, want_c = agent.lower(), customer.lower()
+            for other in cases:
+                if other is case:
+                    continue
+                if str(other.get("rowKind") or "").strip().lower() != "basic":
+                    continue
+                if str(other.get("agent") or "").strip().lower() != want_a:
+                    continue
+                if str(other.get("customer") or "").strip().lower() != want_c:
+                    continue
+                other_adj = other.get("adjustedSalesPrice")
+                try:
+                    other_adj = float(other_adj) if other_adj else 0.0
+                except (TypeError, ValueError):
+                    other_adj = 0.0
+                if other_adj:
+                    adjusted_sales_price = other_adj
+                break
+        sales_for_calc = adjusted_sales_price if adjusted_sales_price else sales
         basic_comm = sales_for_calc * ((rate + profit_sharing_pct) / 100)
 
         if special_case_type == "fee_waiver":
@@ -1036,19 +1124,27 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
                 _annotate_gan_override(rows, headers, agent_i, customer_i, comm_i,
                                        gan_i, agent, customer, gan_comm, data_json)
             continue
-        # Exception, mirroring app.js: Adjusted Sales Price changes the figure
-        # BOTH commissions are derived from, so it always restates both.
-        if special_case_type == "adjusted_sales_price":
-            row_kind = "all"
-
         if row_kind in ("basic", "all"):
             _place_row(build_row("New Basic Commission",
                                  _special_case_money(basic_comm),
                                  _special_case_money(sales_for_calc)),
                        agent, customer, "basic")
 
-        if row_kind in ("nfp", "all"):
-            nfp_row = build_row("New Net Floor Price Commission", nfp_comm_str, "-")
+        # First NFP change lives on its own NFP case (filed from Basic New
+        # Sales Price). Only auto-inject from the Basic case when that NFP
+        # case has not been saved yet, so the two never stack as duplicates.
+        has_nfp_case = any(
+            str((other or {}).get("rowKind") or "").strip().lower() == "nfp"
+            and str((other or {}).get("agent") or "").strip().lower() == agent.lower()
+            and str((other or {}).get("customer") or "").strip().lower() == customer.lower()
+            for other in cases
+        )
+        sales_restates_nfp = (row_kind == "basic" and bool(adjusted_sales_price)
+                              and not has_nfp_case)
+        if row_kind in ("nfp", "all") or sales_restates_nfp:
+            nfp_sales = (_special_case_money(sales_for_calc)
+                         if sales_for_calc else "-")
+            nfp_row = build_row("New Net Floor Price Commission", nfp_comm_str, nfp_sales)
             if agent_i != -1:
                 nfp_row[agent_i] = ""  # matches the client: the NFP row's Agent cell is blanked
             _place_row(nfp_row, agent, customer, "nfp")
@@ -1228,6 +1324,19 @@ def _prefetch_run(year=2026):
         _clear_derived_caches()
         _bump_data_version()
         _log("Dropped results computed from the previous data.")
+        # Sign-in opens on a month view. Assemble those payloads now so the
+        # first /api/commission is a cache hit instead of a 15-second wait.
+        try:
+            from datetime import date as _date
+            warm_months = {5, _date.today().month}
+            for warm_month in sorted(warm_months):
+                for warm_type in ("internal", "outsource"):
+                    try:
+                        _build_commission_payload(year, warm_month, warm_type)
+                    except Exception as warm_err:
+                        _log(f"Warm {warm_type} {year}-{warm_month:02d} failed: {warm_err}")
+        except Exception:
+            pass
 
     except Exception as e:
         _log("[PREFETCH ERROR]\n" + traceback.format_exc())
@@ -1333,11 +1442,12 @@ build_commission_pack._load_env_files()
 app.secret_key = os.environ.get("FLASK_SECRET_KEY")
 # Keep people signed in. The login cookie used to last only while the window
 # was open, so every launch of the dashboard began at the sign-in page. It now
-# lasts 30 days and each visit pushes that out again, so anyone who uses the
-# dashboard at least monthly stays signed in. auth.current_user() re-checks the
-# account, so deactivating a user or resetting a password still signs them out.
+# lasts 14 days and each visit pushes that out again, so anyone who uses the
+# dashboard at least every two weeks stays signed in. auth.current_user()
+# re-checks the account, so deactivating a user or resetting a password still
+# signs them out.
 from datetime import timedelta as _timedelta
-app.config["PERMANENT_SESSION_LIFETIME"] = _timedelta(days=30)
+app.config["PERMANENT_SESSION_LIFETIME"] = _timedelta(days=14)
 app.config["SESSION_REFRESH_EACH_REQUEST"] = True
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
@@ -2120,6 +2230,25 @@ def _build_system_details(nfp_by_inv_all: dict) -> dict:
     for rows in details.values():
         rows.sort(key=lambda e: e.get("invoice_date") or "")
     return details
+
+
+def _refresh_system_details(payload: dict, year: int, agent_type: str) -> None:
+    """Rebuild the customer-hover map on a cached month payload.
+
+    EV package wording lives in this map. Serving last month's cached body
+    after a label change would otherwise keep the old short phrase
+    (e.g. dropping "with standard installation") until a full rebuild.
+    """
+    if not isinstance(payload, dict):
+        return
+    cached = get_cached_data(year, agent_type)
+    if not cached or "nfp" not in cached:
+        return
+    nfp_tuple = cached.get("nfp") or ()
+    nfp_by_inv_all = nfp_tuple[-1] if nfp_tuple else {}
+    basic = (payload.get("sections") or {}).get("basic_nfp")
+    if isinstance(basic, dict):
+        basic["system_details"] = _build_system_details(nfp_by_inv_all)
 
 
 def _agent_roles_for_month(year: int, month: int) -> dict[str, dict]:
@@ -4189,6 +4318,497 @@ def _note_rules_saved_here() -> None:
         _rules_fingerprint["checked"] = 0.0
 
 
+def _build_commission_payload(year: int, month: int, agent_type: str):
+    """Assemble one month from cached yearly bundles. Returns None when
+    those bundles are not ready yet so the request can return in time."""
+    cached = get_cached_data(year, agent_type)
+    if not cached or not cached.get("invoice_dates"):
+        _trigger_background_refresh(year, agent_type)
+        return None
+    invoice_dates_map = cached.get("invoice_dates")
+
+    # Response payload structure
+    sections = {}
+    agents_set = set()
+    customers_set = set()
+
+    if agent_type == "internal":
+        # 1. Fetch data (use cache if available)
+        if cached and 'basic' in cached and 'anp' in cached and 'nfp' in cached and 'ega' in cached:
+            int_basic_t1, int_basic_t2, int_basic_t3, int_basic_t4, int_basic_meta, int_basic_lines = cached['basic']
+            int_anp_summary, int_anp_detail, int_anp_meta = cached['anp']
+            int_nfp_agent, int_nfp_detail, int_nfp_meta, int_nfp_rows, int_nfp_by_inv_all = cached['nfp']
+            int_ega_t1, int_ega_t2, int_ega_t3, int_ega_h1, int_ega_h2, int_ega_h3 = cached['ega']
+        else:
+            int_bundle = _fetch_commission_bundle(year, "internal")
+            int_basic_t1, int_basic_t2, int_basic_t3, int_basic_t4, int_basic_meta, int_basic_lines = int_bundle["basic"]
+            int_anp_summary, int_anp_detail, int_anp_meta = int_bundle["anp"]
+            int_nfp_agent, int_nfp_detail, int_nfp_meta, int_nfp_rows, int_nfp_by_inv_all = int_bundle["nfp"]
+            int_ega_t1, int_ega_t2, int_ega_t3, int_ega_h1, int_ega_h2, int_ega_h3 = int_bundle["ega"]
+            int_ega_raw = int_bundle["ega_raw"]
+            # Cache the fetched data
+            set_cached_data(year, agent_type, {
+                'basic': (int_basic_t1, int_basic_t2, int_basic_t3, int_basic_t4, int_basic_meta, int_basic_lines),
+                'anp': (int_anp_summary, int_anp_detail, int_anp_meta),
+                'nfp': (int_nfp_agent, int_nfp_detail, int_nfp_meta, int_nfp_rows, int_nfp_by_inv_all),
+                'ega': (int_ega_t1, int_ega_t2, int_ega_t3, int_ega_h1, int_ega_h2, int_ega_h3),
+                'ega_raw': int_ega_raw,
+                'invoice_dates': invoice_dates_map
+            })
+
+        # Filter ANP by month
+        int_anp_detail_filtered = [r for r in int_anp_detail if build_commission_pack._parse_month(r.get("invoice_date")) == month]
+
+        # Run build internal summary tables to get customer layout rows
+        int_agent_summary, int_customer_summary, int_agent_anp, int_customer_anp, _int_agent_totals = build_commission_pack.build_internal_summary_tables(
+            basic_t1=int_basic_t1,
+            basic_lines=int_basic_lines,
+            basic_t4=int_basic_t4,
+            nfp_agent_rows=int_nfp_agent,
+            nfp_rows=int_nfp_rows,
+            nfp_by_inv_all=int_nfp_by_inv_all,
+            anp_summary_rows=int_anp_summary,
+            anp_detail=int_anp_detail_filtered,
+            year=year,
+            invoice_dates_map=invoice_dates_map,
+            month=month
+        )
+
+        # Determine headers. The Safwan column is popped further below, AFTER
+        # special-case rows are injected -- a hand-added factory customer
+        # (e.g. a Durapower-style restatement) only exists in those injected
+        # rows, so checking has_factory before injection always missed it.
+        if month >= 7:
+            basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
+        else:
+            basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
+
+        # Extract ANP rows before column removal
+        anp_rows = _apply_anp_agent_display_names(int_customer_anp.get(month, []))
+        anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Accumulated Total Amount", "Commission Price", "Clawback"]
+
+        basic_nfp_rows = remove_agent_block(int_customer_summary.get(month, []), "Safwan")
+        for r in basic_nfp_rows:
+            while len(r) < len(basic_nfp_headers):
+                r.append("-")
+        for r in anp_rows:
+            while len(r) < len(basic_nfp_headers):
+                r.append("-")
+        if "Remarks" not in basic_nfp_headers:
+            basic_nfp_headers.append("Remarks")
+        for r in basic_nfp_rows:
+            while len(r) < len(basic_nfp_headers):
+                r.append("-")
+        for r in anp_rows:
+            while len(r) < len(basic_nfp_headers):
+                r.append("-")
+
+        _inject_special_case_rows(basic_nfp_headers, basic_nfp_rows, year, month, "internal")
+
+        pkg_i = basic_nfp_headers.index("Package Type") if "Package Type" in basic_nfp_headers else -1
+        has_factory = pkg_i != -1 and any(
+            "factory" in str(r[pkg_i]).lower() for r in basic_nfp_rows if len(r) > pkg_i
+        )
+        if not has_factory and "Safwan (RM)" in basic_nfp_headers:
+            safwan_idx = basic_nfp_headers.index("Safwan (RM)")
+            basic_nfp_headers.pop(safwan_idx)
+            for r in reversed(basic_nfp_rows):
+                if len(r) > safwan_idx:
+                    r.pop(safwan_idx)
+            for r in reversed(anp_rows):
+                if len(r) > safwan_idx:
+                    r.pop(safwan_idx)
+
+        agent_summary_rows = remove_agent_block(int_agent_summary.get(month, []), "Safwan")
+        agent_summary_headers = ["Agent", "Count of Customer", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission Price", "Other Commission"]
+
+        from decimal import Decimal
+        # Get raw internal EGA ESA invoices
+        int_ega_raw = cached.get('ega_raw') if (cached and 'ega_raw' in cached) else None
+        if not int_ega_raw:
+            int_ega_raw = build_commission_pack.fetch_internal_ega_raw(year)
+            if cached:
+                cached['ega_raw'] = int_ega_raw
+                save_disk_cache()
+
+        # Filter invoices: January up to selected month M
+        from collections import defaultdict
+        filtered_ega_raw = []
+        for r in (int_ega_raw or []):
+            inv_date = r.get("invoice_date")
+            if inv_date:
+                m = build_commission_pack._parse_month(inv_date)
+                if m is not None and m <= month:
+                    filtered_ega_raw.append(r)
+
+        # Build reports using filtered rows
+        int_ega_mod = sys.modules.get("int_ega_esa")
+        if int_ega_mod is None:
+            ega_dir = REPO_ROOT / "4. EGA ESA Awards" / "3. Python script"
+            int_ega_mod = build_commission_pack._load_module("int_ega_esa", ega_dir / "full_internal_EGA_ESA_Awards.py")
+
+        # These rows come from cache, so no fetch necessarily ran this
+        # process to apply the Data page's thresholds. Without this the
+        # award grades against the constants hardcoded in the script.
+        int_ega_mod.ensure_rules_applied(year)
+        # Company-wide rows so an agent who transferred mid-year is judged
+        # on their whole year here, exactly as the Sales Report shows them.
+        # Falls back to this section's own rows when that bundle is cold.
+        _ega_rows = _company_ega_rows(year) or filtered_ega_raw
+        lines, agent_ep, agent_sales, agent_eligibility = _ega_award_report(
+            int_ega_mod, sys.modules.get("out_ega_esa") or int_ega_mod,
+            _ega_rows, year, month, "Internal",
+            _sales_report_carryover(year), _sales_report_role_index(),
+            _sales_report_case_dates(year))
+
+        # Build Table 1: Agent Name, Customer Count, Accumulated Sales Price, Accumulated EP Point, Eligibility
+        t1_rows = []
+        agent_customers = defaultdict(set)
+        for ln in lines:
+            agent_customers[ln.agent_name].add(ln.customer_name)
+
+        for agent in sorted(agent_ep):
+            cust_count = len(agent_customers[agent])
+            sales = agent_sales.get(agent, Decimal("0"))
+            ep = agent_ep.get(agent, Decimal("0"))
+            eligibility = agent_eligibility.get(agent, "-")
+            t1_rows.append([
+                build_commission_pack.to_title_case(agent),
+                str(cust_count),
+                f"RM {sales:,.2f}" if sales != 0 else "-",
+                f"{ep:,.2f}" if ep != 0 else "-",
+                eligibility
+            ])
+
+        # Build Table 2: Agent Name, Customer Name, Invoice Date, 1st Payment Date, Sales Price, Accumulated EP Point, Eligibility
+        t2_rows = []
+        sorted_lines = sorted(lines, key=lambda x: (x.agent_name.lower(), x.invoice_date, x.invoice_number))
+        for ln in sorted_lines:
+            inv_key = str(ln.invoice_number).strip()
+            dates = invoice_dates_map.get(inv_key) if invoice_dates_map else None
+            inv_date = dates[0] if dates else ln.invoice_date
+            first_pay_date = dates[1] if dates else ""
+            t2_rows.append([
+                build_commission_pack.to_title_case(ln.agent_name),
+                build_commission_pack.to_title_case(ln.customer_name),
+                inv_date,
+                first_pay_date,
+                f"RM {ln.sales_price:,.2f}" if ln.sales_price != 0 else "-",
+                f"{ln.accum_ep:,.2f}" if ln.accum_ep != 0 else "-",
+                agent_eligibility.get(ln.agent_name, "-")
+            ])
+
+        for r in basic_nfp_rows:
+            if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
+            if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
+        for r in anp_rows:
+            if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
+        for r in t2_rows:
+            if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
+            if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
+
+        sections = {
+            "basic_nfp": {
+                "headers": basic_nfp_headers,
+                "rows": basic_nfp_rows,
+                # Customer-column hover: panel and phase per invoice.
+                "system_details": _build_system_details(int_nfp_by_inv_all),
+                "payout_policies": _build_payout_policies(
+                    int_basic_lines, build_commission_pack.as_at_ym(year, month)),
+            },
+            "agent_summary": {"headers": agent_summary_headers, "rows": agent_summary_rows},
+            "anp": {"headers": anp_headers, "rows": anp_rows},
+            "ega_esa": {
+                "headers_t1": ["Agent Name", "Customer Count", "Accumulated Sales Price", "Accumulated EP Point", "Eligibility"],
+                "rows_t1": t1_rows,
+                "headers_t2": ["Agent Name", "Customer Name", "Invoice Date", "1st Payment Date", "Sales Price", "Accumulated EP Point", "Eligibility"],
+                "rows_t2": t2_rows
+            },
+            "production_bonus": {
+                "headers_oum": ["Agent", "Total Sales", "Status", "Bonus Amount"],
+                "rows_oum": [],
+                "headers_ogm": ["Agent", "Total Sales", "Status", "Bonus Amount"],
+                "rows_ogm": [],
+                "headers_detail": ["Agent", "Customer", "Sales Price"],
+                "rows_detail": []
+            }
+        }
+
+        if True:
+            try:
+                contest_path = REPO_ROOT / "6. Monthly Contest" / "3. Python Script" / "monthly_contest.py"
+                contest_mod = build_commission_pack._load_module("monthly_contest", contest_path)
+                token, _, _ = build_commission_pack._resolve_proxy_credentials()
+                df_t1, _, df_t3, _, _, _, _, _, _, _, _ = contest_mod.calculate_monthly_contest(token=token, base_path=REPO_ROOT / "6. Monthly Contest", month=month, year=year)
+                df_t1 = df_t1.fillna("-")
+                df_t3 = df_t3.fillna("-")
+                t1_rows = [list(r) for r in df_t1.values]
+                t3_rows = [list(r) for r in df_t3.values]
+                sections["monthly_contest"] = {
+                    "headers_t1": list(df_t1.columns),
+                    "rows_t1": t1_rows,
+                    "headers_t3": list(df_t3.columns),
+                    "rows_t3": t3_rows
+                }
+                for r in t3_rows:
+                    if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
+                    if len(r) > 2 and r[2]: customers_set.add(str(r[2]).strip())
+            except Exception as exc:
+                _log("[CONTEST ROUTE ERROR]\n" + traceback.format_exc())
+                # Surface the reason; otherwise the UI shows a bare "no records" state.
+                sections["monthly_contest"] = {"error": str(exc)}
+
+    else:
+        if cached and 'basic' in cached and 'anp' in cached and 'nfp' in cached and 'ega' in cached:
+            out_basic_t1, out_basic_invoices, out_basic_factory, out_basic_meta, out_basic_lines = cached['basic']
+            out_anp_summary, out_anp_detail, out_anp_meta = cached['anp']
+            out_nfp_agent, out_nfp_detail, out_nfp_meta, out_nfp_rows, out_nfp_by_inv_all = cached['nfp']
+            out_ega_t1, out_ega_t2, out_ega_t3, out_ega_h1, out_ega_h2, out_ega_h3 = cached['ega']
+        else:
+            out_bundle = _fetch_commission_bundle(year, "outsource")
+            out_basic_t1, out_basic_invoices, out_basic_factory, out_basic_meta, out_basic_lines = out_bundle["basic"]
+            out_anp_summary, out_anp_detail, out_anp_meta = out_bundle["anp"]
+            out_nfp_agent, out_nfp_detail, out_nfp_meta, out_nfp_rows, out_nfp_by_inv_all = out_bundle["nfp"]
+            out_ega_t1, out_ega_t2, out_ega_t3, out_ega_h1, out_ega_h2, out_ega_h3 = out_bundle["ega"]
+            out_ega_raw = out_bundle["ega_raw"]
+            set_cached_data(year, agent_type, {
+                'basic': (out_basic_t1, out_basic_invoices, out_basic_factory, out_basic_meta, out_basic_lines),
+                'anp': (out_anp_summary, out_anp_detail, out_anp_meta),
+                'nfp': (out_nfp_agent, out_nfp_detail, out_nfp_meta, out_nfp_rows, out_nfp_by_inv_all),
+                'ega': (out_ega_t1, out_ega_t2, out_ega_t3, out_ega_h1, out_ega_h2, out_ega_h3),
+                'ega_raw': out_ega_raw,
+                'invoice_dates': invoice_dates_map
+            })
+
+        out_anp_detail_filtered = [r for r in out_anp_detail if build_commission_pack._parse_month(r.get("invoice_date")) == month]
+        out_agent_summary, out_customer_summary, out_customer_anp_summary, _out_agent_totals = build_commission_pack.build_outsource_summary_tables(
+            basic_t1=out_basic_t1,
+            basic_lines=out_basic_lines,
+            basic_meta=out_basic_meta,
+            nfp_agent_rows=out_nfp_agent,
+            nfp_rows=out_nfp_rows,
+            nfp_by_inv_all=out_nfp_by_inv_all,
+            anp_summary_rows=[],
+            anp_detail=out_anp_detail_filtered,
+            year=year,
+            invoice_dates_map=invoice_dates_map,
+            month=month
+        )
+
+        if month >= 7:
+            basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
+        else:
+            basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
+
+        out_anp_rows = _apply_anp_agent_display_names(build_anp_customer_rows_custom(
+            anp_summary=out_anp_summary,
+            anp_detail=out_anp_detail_filtered,
+            invoice_dates_map=invoice_dates_map,
+            month=month,
+            is_internal=False
+        ))
+
+        basic_nfp_rows = remove_agent_block(out_customer_summary.get(month, []), "Safwan")
+        for r in basic_nfp_rows:
+            while len(r) < len(basic_nfp_headers):
+                r.append("-")
+        for r in out_anp_rows:
+            while len(r) < len(basic_nfp_headers):
+                r.append("-")
+        if "Remarks" not in basic_nfp_headers:
+            basic_nfp_headers.append("Remarks")
+        for r in basic_nfp_rows:
+            while len(r) < len(basic_nfp_headers):
+                r.append("-")
+        for r in out_anp_rows:
+            while len(r) < len(basic_nfp_headers):
+                r.append("-")
+
+        _inject_special_case_rows(basic_nfp_headers, basic_nfp_rows, year, month, "outsource")
+
+        pkg_i = basic_nfp_headers.index("Package Type") if "Package Type" in basic_nfp_headers else -1
+        has_factory = pkg_i != -1 and any(
+            "factory" in str(r[pkg_i]).lower() for r in basic_nfp_rows if len(r) > pkg_i
+        )
+        if not has_factory and "Safwan (RM)" in basic_nfp_headers:
+            safwan_idx = basic_nfp_headers.index("Safwan (RM)")
+            basic_nfp_headers.pop(safwan_idx)
+            for r in reversed(basic_nfp_rows):
+                if len(r) > safwan_idx:
+                    r.pop(safwan_idx)
+            for r in reversed(out_anp_rows):
+                if len(r) > safwan_idx:
+                    r.pop(safwan_idx)
+
+        anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Accumulated Total Amount", "Commission Price", "Clawback"]
+
+        from decimal import Decimal
+        # Get raw outsource EGA ESA invoices
+        out_ega_raw = cached.get('ega_raw') if (cached and 'ega_raw' in cached) else None
+        if not out_ega_raw:
+            out_ega_raw = build_commission_pack.fetch_outsource_ega_raw(year)
+            if cached:
+                cached['ega_raw'] = out_ega_raw
+                save_disk_cache()
+
+        # Filter invoices: January up to selected month M
+        from collections import defaultdict
+        filtered_ega_raw = []
+        for r in (out_ega_raw or []):
+            inv_date = r.get("invoice_date")
+            if inv_date:
+                m = build_commission_pack._parse_month(inv_date)
+                if m is not None and m <= month:
+                    filtered_ega_raw.append(r)
+
+        # Build reports using filtered rows
+        out_ega_mod = sys.modules.get("out_ega_esa")
+        if out_ega_mod is None:
+            ega_dir = REPO_ROOT / "4. EGA ESA Awards" / "3. Python script"
+            out_ega_mod = build_commission_pack._load_module("out_ega_esa", ega_dir / "outsource_EGA_ESA_Awards.py")
+
+        # These rows come from cache, so no fetch necessarily ran this
+        # process to apply the Data page's thresholds. Without this the
+        # award grades against the constants hardcoded in the script.
+        out_ega_mod.ensure_rules_applied(year)
+        _ega_rows = _company_ega_rows(year) or filtered_ega_raw
+        lines, agent_ep, agent_sales, agent_eligibility = _ega_award_report(
+            out_ega_mod, out_ega_mod, _ega_rows, year, month, "Outsource",
+            _sales_report_carryover(year), _sales_report_role_index(),
+            _sales_report_case_dates(year))
+
+        # Build Table 1: Agent Name, Customer Count, Accumulated Sales Price, Accumulated EP Point, Eligibility
+        t1_rows = []
+        agent_customers = defaultdict(set)
+        for ln in lines:
+            agent_customers[ln.agent_name].add(ln.customer_name)
+
+        for agent in sorted(agent_ep):
+            cust_count = len(agent_customers[agent])
+            sales = agent_sales.get(agent, Decimal("0"))
+            ep = agent_ep.get(agent, Decimal("0"))
+            eligibility = agent_eligibility.get(agent, "-")
+            t1_rows.append([
+                build_commission_pack.to_title_case(agent),
+                str(cust_count),
+                f"RM {sales:,.2f}" if sales != 0 else "-",
+                f"{ep:,.2f}" if ep != 0 else "-",
+                eligibility
+            ])
+
+        # Build Table 2: Agent Name, Customer Name, Invoice Date, 1st Payment Date, Sales Price, Accumulated EP Point, Eligibility
+        t2_rows = []
+        sorted_lines = sorted(lines, key=lambda x: (x.agent_name.lower(), x.invoice_date, x.invoice_number))
+        for ln in sorted_lines:
+            inv_key = str(ln.invoice_number).strip()
+            dates = invoice_dates_map.get(inv_key) if invoice_dates_map else None
+            inv_date = dates[0] if dates else ln.invoice_date
+            first_pay_date = dates[1] if dates else ""
+            t2_rows.append([
+                build_commission_pack.to_title_case(ln.agent_name),
+                build_commission_pack.to_title_case(ln.customer_name),
+                inv_date,
+                first_pay_date,
+                f"RM {ln.sales_price:,.2f}" if ln.sales_price != 0 else "-",
+                f"{ln.accum_ep:,.2f}" if ln.accum_ep != 0 else "-",
+                agent_eligibility.get(ln.agent_name, "-")
+            ])
+
+        # Production Bonus is always "Jan 1 through today" — not scoped to
+        # whichever month tab is selected — so it isn't cached per month.
+        out_prod_data = build_commission_pack.fetch_production_bonus(year)
+        prod_bonus = {"headers_oum": [], "rows_oum": [], "headers_ogm": [], "rows_ogm": [], "headers_detail": [], "rows_detail": []}
+        if out_prod_data:
+            pb_headers = out_prod_data.get("headers", {})
+            prod_bonus = {
+                "headers_oum": pb_headers.get("oum", ["Agent", "Total Sales", "Status", "Bonus Amount"]),
+                "rows_oum": out_prod_data.get("oum_summary", []),
+                "headers_ogm": pb_headers.get("ogm", ["Agent", "Total Sales", "Status", "Bonus Amount"]),
+                "rows_ogm": out_prod_data.get("ogm_summary", []),
+                "headers_detail": pb_headers.get("detail", ["Agent", "Customer", "Sales Price"]),
+                "rows_detail": out_prod_data.get("team_detail", [])
+            }
+
+        agent_summary_rows = remove_agent_block(out_agent_summary.get(month, []), "Safwan")
+        agent_summary_headers = ["Agent", "Total Invoice", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission Price", "Other Commission"]
+
+        for r in basic_nfp_rows:
+            if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
+            if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
+        for r in out_anp_rows:
+            if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
+            if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
+        for r in t2_rows:
+            if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
+            if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
+        if out_prod_data:
+            for r in out_prod_data.get("team_detail", []):
+                if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
+                if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
+
+        sections = {
+            "basic_nfp": {
+                "headers": basic_nfp_headers,
+                "rows": basic_nfp_rows,
+                # Customer-column hover: panel and phase per invoice.
+                "system_details": _build_system_details(out_nfp_by_inv_all),
+                "payout_policies": _build_payout_policies(
+                    out_basic_lines, build_commission_pack.as_at_ym(year, month)),
+            },
+            "agent_summary": {"headers": agent_summary_headers, "rows": agent_summary_rows},
+            "anp": {"headers": anp_headers, "rows": out_anp_rows},
+            "ega_esa": {
+                "headers_t1": ["Agent Name", "Customer Count", "Accumulated Sales Price", "Accumulated EP Point", "Eligibility"],
+                "rows_t1": t1_rows,
+                "headers_t2": ["Agent Name", "Customer Name", "Invoice Date", "1st Payment Date", "Sales Price", "Accumulated EP Point", "Eligibility"],
+                "rows_t2": t2_rows
+            },
+            "production_bonus": prod_bonus
+        }
+
+        if True:
+            try:
+                contest_path = REPO_ROOT / "6. Monthly Contest" / "3. Python Script" / "monthly_contest.py"
+                contest_mod = build_commission_pack._load_module("monthly_contest", contest_path)
+                token, _, _ = build_commission_pack._resolve_proxy_credentials()
+                df_t1, _, df_t3, _, _, _, _, _, _, _, _ = contest_mod.calculate_monthly_contest(token=token, base_path=REPO_ROOT / "6. Monthly Contest", month=month, year=year)
+                df_t1 = df_t1.fillna("-")
+                df_t3 = df_t3.fillna("-")
+                t1_rows = [list(r) for r in df_t1.values]
+                t3_rows = [list(r) for r in df_t3.values]
+                sections["monthly_contest"] = {
+                    "headers_t1": list(df_t1.columns),
+                    "rows_t1": t1_rows,
+                    "headers_t3": list(df_t3.columns),
+                    "rows_t3": t3_rows
+                }
+                for r in t3_rows:
+                    if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
+                    if len(r) > 2 and r[2]: customers_set.add(str(r[2]).strip())
+            except Exception as exc:
+                _log("[CONTEST ROUTE ERROR (outsource)]\n" + traceback.format_exc())
+                # Surface the reason; otherwise the UI shows a bare "no records" state.
+                sections["monthly_contest"] = {"error": str(exc)}
+
+    payload = {
+        "summary": {
+            "total_agents": len(agents_set),
+            "total_customers": len(customers_set)
+        },
+        "sections": sections,
+        # Each agent's role as at this month -- the fallback the agent-name
+        # hover uses on tables that carry no invoice date of their own.
+        "agent_roles": _agent_roles_for_month(year, month),
+        # Full role history, so a row whose invoice predates a role change
+        # can be resolved against its own Invoice Date rather than the
+        # report month it happens to be paid in.
+        "agent_role_history": _agent_role_history(),
+        "agent_ics": agent_names.get_ic_map(),
+    }
+    set_cached_commission_response(year, month, agent_type, payload)
+    return payload
+
+
 @app.route("/api/commission")
 @login_required
 def get_commission():
@@ -4208,521 +4828,17 @@ def get_commission():
             # they are cheap, they are edited on the Data page without
             # rebuilding commissions, and a response cached before this field
             # existed carries none at all.
-            if isinstance(cached_payload, dict):
-                cached_payload["agent_roles"] = _agent_roles_for_month(year, month)
-                cached_payload["agent_role_history"] = _agent_role_history()
-                cached_payload["agent_ics"] = agent_names.get_ic_map()
-            return jsonify(cached_payload)
+            _refresh_system_details(cached_payload, year, agent_type)
+            return jsonify(_decorate_commission_payload(cached_payload, year, month))
 
-        cached = get_cached_data(year, agent_type)
-        if not cached or not cached.get("invoice_dates"):
-            _trigger_background_refresh(year, agent_type)
+        payload = _commission_payload_within_seconds(year, month, agent_type)
+        if payload is None:
+            return jsonify({
+                "ready": False,
+                "message": "Commission data is still being prepared. Refresh shortly.",
+            })
+        return jsonify(_decorate_commission_payload(payload, year, month))
 
-            # Wait a little for the background build to populate the cache so
-            # the UI gets real commission rows instead of an empty shell.
-            deadline = time.time() + 90
-            while time.time() < deadline:
-                time.sleep(2)
-                cached = get_cached_data(year, agent_type)
-                if cached and cached.get("invoice_dates"):
-                    break
-
-            if cached and cached.get("invoice_dates"):
-                invoice_dates_map = cached.get("invoice_dates")
-            else:
-                # Fall back to the direct path if the background build still
-                # has not produced the cached bundle.
-                token, proxy_url, db_name = build_commission_pack._resolve_proxy_credentials()
-                if not token:
-                    return jsonify({"error": "Postgres proxy token not found. Set PG_PROXY_TOKEN in .env"}), 500
-
-                basic_path = REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "full_internal_basic_commission.py"
-                basic_mod = build_commission_pack._load_module("int_basic_commission", basic_path)
-                invoice_dates_map = build_commission_pack.fetch_invoice_dates(year, basic_mod)
-                cached = None
-        else:
-            invoice_dates_map = cached.get("invoice_dates")
-
-        # Response payload structure
-        sections = {}
-        agents_set = set()
-        customers_set = set()
-
-        if agent_type == "internal":
-            # 1. Fetch data (use cache if available)
-            if cached and 'basic' in cached and 'anp' in cached and 'nfp' in cached and 'ega' in cached:
-                int_basic_t1, int_basic_t2, int_basic_t3, int_basic_t4, int_basic_meta, int_basic_lines = cached['basic']
-                int_anp_summary, int_anp_detail, int_anp_meta = cached['anp']
-                int_nfp_agent, int_nfp_detail, int_nfp_meta, int_nfp_rows, int_nfp_by_inv_all = cached['nfp']
-                int_ega_t1, int_ega_t2, int_ega_t3, int_ega_h1, int_ega_h2, int_ega_h3 = cached['ega']
-            else:
-                int_bundle = _fetch_commission_bundle(year, "internal")
-                int_basic_t1, int_basic_t2, int_basic_t3, int_basic_t4, int_basic_meta, int_basic_lines = int_bundle["basic"]
-                int_anp_summary, int_anp_detail, int_anp_meta = int_bundle["anp"]
-                int_nfp_agent, int_nfp_detail, int_nfp_meta, int_nfp_rows, int_nfp_by_inv_all = int_bundle["nfp"]
-                int_ega_t1, int_ega_t2, int_ega_t3, int_ega_h1, int_ega_h2, int_ega_h3 = int_bundle["ega"]
-                int_ega_raw = int_bundle["ega_raw"]
-                # Cache the fetched data
-                set_cached_data(year, agent_type, {
-                    'basic': (int_basic_t1, int_basic_t2, int_basic_t3, int_basic_t4, int_basic_meta, int_basic_lines),
-                    'anp': (int_anp_summary, int_anp_detail, int_anp_meta),
-                    'nfp': (int_nfp_agent, int_nfp_detail, int_nfp_meta, int_nfp_rows, int_nfp_by_inv_all),
-                    'ega': (int_ega_t1, int_ega_t2, int_ega_t3, int_ega_h1, int_ega_h2, int_ega_h3),
-                    'ega_raw': int_ega_raw,
-                    'invoice_dates': invoice_dates_map
-                })
-
-            # Filter ANP by month
-            int_anp_detail_filtered = [r for r in int_anp_detail if build_commission_pack._parse_month(r.get("invoice_date")) == month]
-
-            # Run build internal summary tables to get customer layout rows
-            int_agent_summary, int_customer_summary, int_agent_anp, int_customer_anp, _int_agent_totals = build_commission_pack.build_internal_summary_tables(
-                basic_t1=int_basic_t1,
-                basic_lines=int_basic_lines,
-                basic_t4=int_basic_t4,
-                nfp_agent_rows=int_nfp_agent,
-                nfp_rows=int_nfp_rows,
-                nfp_by_inv_all=int_nfp_by_inv_all,
-                anp_summary_rows=int_anp_summary,
-                anp_detail=int_anp_detail_filtered,
-                year=year,
-                invoice_dates_map=invoice_dates_map,
-                month=month
-            )
-
-            # Determine headers. The Safwan column is popped further below, AFTER
-            # special-case rows are injected -- a hand-added factory customer
-            # (e.g. a Durapower-style restatement) only exists in those injected
-            # rows, so checking has_factory before injection always missed it.
-            if month >= 7:
-                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
-            else:
-                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
-
-            # Extract ANP rows before column removal
-            anp_rows = _apply_anp_agent_display_names(int_customer_anp.get(month, []))
-            anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Accumulated Total Amount", "Commission Price", "Clawback"]
-
-            basic_nfp_rows = remove_agent_block(int_customer_summary.get(month, []), "Safwan")
-            for r in basic_nfp_rows:
-                while len(r) < len(basic_nfp_headers):
-                    r.append("-")
-            for r in anp_rows:
-                while len(r) < len(basic_nfp_headers):
-                    r.append("-")
-            if "Remarks" not in basic_nfp_headers:
-                basic_nfp_headers.append("Remarks")
-            for r in basic_nfp_rows:
-                while len(r) < len(basic_nfp_headers):
-                    r.append("-")
-            for r in anp_rows:
-                while len(r) < len(basic_nfp_headers):
-                    r.append("-")
-
-            _inject_special_case_rows(basic_nfp_headers, basic_nfp_rows, year, month, "internal")
-
-            pkg_i = basic_nfp_headers.index("Package Type") if "Package Type" in basic_nfp_headers else -1
-            has_factory = pkg_i != -1 and any(
-                "factory" in str(r[pkg_i]).lower() for r in basic_nfp_rows if len(r) > pkg_i
-            )
-            if not has_factory and "Safwan (RM)" in basic_nfp_headers:
-                safwan_idx = basic_nfp_headers.index("Safwan (RM)")
-                basic_nfp_headers.pop(safwan_idx)
-                for r in reversed(basic_nfp_rows):
-                    if len(r) > safwan_idx:
-                        r.pop(safwan_idx)
-                for r in reversed(anp_rows):
-                    if len(r) > safwan_idx:
-                        r.pop(safwan_idx)
-
-            agent_summary_rows = remove_agent_block(int_agent_summary.get(month, []), "Safwan")
-            agent_summary_headers = ["Agent", "Count of Customer", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission Price", "Other Commission"]
-
-            from decimal import Decimal
-            # Get raw internal EGA ESA invoices
-            int_ega_raw = cached.get('ega_raw') if (cached and 'ega_raw' in cached) else None
-            if not int_ega_raw:
-                int_ega_raw = build_commission_pack.fetch_internal_ega_raw(year)
-                if cached:
-                    cached['ega_raw'] = int_ega_raw
-                    save_disk_cache()
-
-            # Filter invoices: January up to selected month M
-            from collections import defaultdict
-            filtered_ega_raw = []
-            for r in (int_ega_raw or []):
-                inv_date = r.get("invoice_date")
-                if inv_date:
-                    m = build_commission_pack._parse_month(inv_date)
-                    if m is not None and m <= month:
-                        filtered_ega_raw.append(r)
-
-            # Build reports using filtered rows
-            int_ega_mod = sys.modules.get("int_ega_esa")
-            if int_ega_mod is None:
-                ega_dir = REPO_ROOT / "4. EGA ESA Awards" / "3. Python script"
-                int_ega_mod = build_commission_pack._load_module("int_ega_esa", ega_dir / "full_internal_EGA_ESA_Awards.py")
-
-            # These rows come from cache, so no fetch necessarily ran this
-            # process to apply the Data page's thresholds. Without this the
-            # award grades against the constants hardcoded in the script.
-            int_ega_mod.ensure_rules_applied(year)
-            # Company-wide rows so an agent who transferred mid-year is judged
-            # on their whole year here, exactly as the Sales Report shows them.
-            # Falls back to this section's own rows when that bundle is cold.
-            _ega_rows = _company_ega_rows(year) or filtered_ega_raw
-            lines, agent_ep, agent_sales, agent_eligibility = _ega_award_report(
-                int_ega_mod, sys.modules.get("out_ega_esa") or int_ega_mod,
-                _ega_rows, year, month, "Internal",
-                _sales_report_carryover(year), _sales_report_role_index(),
-                _sales_report_case_dates(year))
-
-            # Build Table 1: Agent Name, Customer Count, Accumulated Sales Price, Accumulated EP Point, Eligibility
-            t1_rows = []
-            agent_customers = defaultdict(set)
-            for ln in lines:
-                agent_customers[ln.agent_name].add(ln.customer_name)
-
-            for agent in sorted(agent_ep):
-                cust_count = len(agent_customers[agent])
-                sales = agent_sales.get(agent, Decimal("0"))
-                ep = agent_ep.get(agent, Decimal("0"))
-                eligibility = agent_eligibility.get(agent, "-")
-                t1_rows.append([
-                    build_commission_pack.to_title_case(agent),
-                    str(cust_count),
-                    f"RM {sales:,.2f}" if sales != 0 else "-",
-                    f"{ep:,.2f}" if ep != 0 else "-",
-                    eligibility
-                ])
-
-            # Build Table 2: Agent Name, Customer Name, Invoice Date, 1st Payment Date, Sales Price, Accumulated EP Point, Eligibility
-            t2_rows = []
-            sorted_lines = sorted(lines, key=lambda x: (x.agent_name.lower(), x.invoice_date, x.invoice_number))
-            for ln in sorted_lines:
-                inv_key = str(ln.invoice_number).strip()
-                dates = invoice_dates_map.get(inv_key) if invoice_dates_map else None
-                inv_date = dates[0] if dates else ln.invoice_date
-                first_pay_date = dates[1] if dates else ""
-                t2_rows.append([
-                    build_commission_pack.to_title_case(ln.agent_name),
-                    build_commission_pack.to_title_case(ln.customer_name),
-                    inv_date,
-                    first_pay_date,
-                    f"RM {ln.sales_price:,.2f}" if ln.sales_price != 0 else "-",
-                    f"{ln.accum_ep:,.2f}" if ln.accum_ep != 0 else "-",
-                    agent_eligibility.get(ln.agent_name, "-")
-                ])
-
-            for r in basic_nfp_rows:
-                if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
-                if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
-            for r in anp_rows:
-                if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
-            for r in t2_rows:
-                if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
-                if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
-
-            sections = {
-                "basic_nfp": {
-                    "headers": basic_nfp_headers,
-                    "rows": basic_nfp_rows,
-                    # Customer-column hover: panel and phase per invoice.
-                    "system_details": _build_system_details(int_nfp_by_inv_all),
-                    "payout_policies": _build_payout_policies(
-                        int_basic_lines, build_commission_pack.as_at_ym(year, month)),
-                },
-                "agent_summary": {"headers": agent_summary_headers, "rows": agent_summary_rows},
-                "anp": {"headers": anp_headers, "rows": anp_rows},
-                "ega_esa": {
-                    "headers_t1": ["Agent Name", "Customer Count", "Accumulated Sales Price", "Accumulated EP Point", "Eligibility"],
-                    "rows_t1": t1_rows,
-                    "headers_t2": ["Agent Name", "Customer Name", "Invoice Date", "1st Payment Date", "Sales Price", "Accumulated EP Point", "Eligibility"],
-                    "rows_t2": t2_rows
-                },
-                "production_bonus": {
-                    "headers_oum": ["Agent", "Total Sales", "Status", "Bonus Amount"],
-                    "rows_oum": [],
-                    "headers_ogm": ["Agent", "Total Sales", "Status", "Bonus Amount"],
-                    "rows_ogm": [],
-                    "headers_detail": ["Agent", "Customer", "Sales Price"],
-                    "rows_detail": []
-                }
-            }
-
-            if True:
-                try:
-                    contest_path = REPO_ROOT / "6. Monthly Contest" / "3. Python Script" / "monthly_contest.py"
-                    contest_mod = build_commission_pack._load_module("monthly_contest", contest_path)
-                    token, _, _ = build_commission_pack._resolve_proxy_credentials()
-                    df_t1, _, df_t3, _, _, _, _, _, _, _, _ = contest_mod.calculate_monthly_contest(token=token, base_path=REPO_ROOT / "6. Monthly Contest", month=month, year=year)
-                    df_t1 = df_t1.fillna("-")
-                    df_t3 = df_t3.fillna("-")
-                    t1_rows = [list(r) for r in df_t1.values]
-                    t3_rows = [list(r) for r in df_t3.values]
-                    sections["monthly_contest"] = {
-                        "headers_t1": list(df_t1.columns),
-                        "rows_t1": t1_rows,
-                        "headers_t3": list(df_t3.columns),
-                        "rows_t3": t3_rows
-                    }
-                    for r in t3_rows:
-                        if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
-                        if len(r) > 2 and r[2]: customers_set.add(str(r[2]).strip())
-                except Exception as exc:
-                    _log("[CONTEST ROUTE ERROR]\n" + traceback.format_exc())
-                    # Surface the reason; otherwise the UI shows a bare "no records" state.
-                    sections["monthly_contest"] = {"error": str(exc)}
-
-        else:
-            if cached and 'basic' in cached and 'anp' in cached and 'nfp' in cached and 'ega' in cached:
-                out_basic_t1, out_basic_invoices, out_basic_factory, out_basic_meta, out_basic_lines = cached['basic']
-                out_anp_summary, out_anp_detail, out_anp_meta = cached['anp']
-                out_nfp_agent, out_nfp_detail, out_nfp_meta, out_nfp_rows, out_nfp_by_inv_all = cached['nfp']
-                out_ega_t1, out_ega_t2, out_ega_t3, out_ega_h1, out_ega_h2, out_ega_h3 = cached['ega']
-            else:
-                out_bundle = _fetch_commission_bundle(year, "outsource")
-                out_basic_t1, out_basic_invoices, out_basic_factory, out_basic_meta, out_basic_lines = out_bundle["basic"]
-                out_anp_summary, out_anp_detail, out_anp_meta = out_bundle["anp"]
-                out_nfp_agent, out_nfp_detail, out_nfp_meta, out_nfp_rows, out_nfp_by_inv_all = out_bundle["nfp"]
-                out_ega_t1, out_ega_t2, out_ega_t3, out_ega_h1, out_ega_h2, out_ega_h3 = out_bundle["ega"]
-                out_ega_raw = out_bundle["ega_raw"]
-                set_cached_data(year, agent_type, {
-                    'basic': (out_basic_t1, out_basic_invoices, out_basic_factory, out_basic_meta, out_basic_lines),
-                    'anp': (out_anp_summary, out_anp_detail, out_anp_meta),
-                    'nfp': (out_nfp_agent, out_nfp_detail, out_nfp_meta, out_nfp_rows, out_nfp_by_inv_all),
-                    'ega': (out_ega_t1, out_ega_t2, out_ega_t3, out_ega_h1, out_ega_h2, out_ega_h3),
-                    'ega_raw': out_ega_raw,
-                    'invoice_dates': invoice_dates_map
-                })
-
-            out_anp_detail_filtered = [r for r in out_anp_detail if build_commission_pack._parse_month(r.get("invoice_date")) == month]
-            out_agent_summary, out_customer_summary, out_customer_anp_summary, _out_agent_totals = build_commission_pack.build_outsource_summary_tables(
-                basic_t1=out_basic_t1,
-                basic_lines=out_basic_lines,
-                basic_meta=out_basic_meta,
-                nfp_agent_rows=out_nfp_agent,
-                nfp_rows=out_nfp_rows,
-                nfp_by_inv_all=out_nfp_by_inv_all,
-                anp_summary_rows=[],
-                anp_detail=out_anp_detail_filtered,
-                year=year,
-                invoice_dates_map=invoice_dates_map,
-                month=month
-            )
-
-            if month >= 7:
-                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
-            else:
-                basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
-
-            out_anp_rows = _apply_anp_agent_display_names(build_anp_customer_rows_custom(
-                anp_summary=out_anp_summary,
-                anp_detail=out_anp_detail_filtered,
-                invoice_dates_map=invoice_dates_map,
-                month=month,
-                is_internal=False
-            ))
-
-            basic_nfp_rows = remove_agent_block(out_customer_summary.get(month, []), "Safwan")
-            for r in basic_nfp_rows:
-                while len(r) < len(basic_nfp_headers):
-                    r.append("-")
-            for r in out_anp_rows:
-                while len(r) < len(basic_nfp_headers):
-                    r.append("-")
-            if "Remarks" not in basic_nfp_headers:
-                basic_nfp_headers.append("Remarks")
-            for r in basic_nfp_rows:
-                while len(r) < len(basic_nfp_headers):
-                    r.append("-")
-            for r in out_anp_rows:
-                while len(r) < len(basic_nfp_headers):
-                    r.append("-")
-
-            _inject_special_case_rows(basic_nfp_headers, basic_nfp_rows, year, month, "outsource")
-
-            pkg_i = basic_nfp_headers.index("Package Type") if "Package Type" in basic_nfp_headers else -1
-            has_factory = pkg_i != -1 and any(
-                "factory" in str(r[pkg_i]).lower() for r in basic_nfp_rows if len(r) > pkg_i
-            )
-            if not has_factory and "Safwan (RM)" in basic_nfp_headers:
-                safwan_idx = basic_nfp_headers.index("Safwan (RM)")
-                basic_nfp_headers.pop(safwan_idx)
-                for r in reversed(basic_nfp_rows):
-                    if len(r) > safwan_idx:
-                        r.pop(safwan_idx)
-                for r in reversed(out_anp_rows):
-                    if len(r) > safwan_idx:
-                        r.pop(safwan_idx)
-
-            anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Accumulated Total Amount", "Commission Price", "Clawback"]
-
-            from decimal import Decimal
-            # Get raw outsource EGA ESA invoices
-            out_ega_raw = cached.get('ega_raw') if (cached and 'ega_raw' in cached) else None
-            if not out_ega_raw:
-                out_ega_raw = build_commission_pack.fetch_outsource_ega_raw(year)
-                if cached:
-                    cached['ega_raw'] = out_ega_raw
-                    save_disk_cache()
-
-            # Filter invoices: January up to selected month M
-            from collections import defaultdict
-            filtered_ega_raw = []
-            for r in (out_ega_raw or []):
-                inv_date = r.get("invoice_date")
-                if inv_date:
-                    m = build_commission_pack._parse_month(inv_date)
-                    if m is not None and m <= month:
-                        filtered_ega_raw.append(r)
-
-            # Build reports using filtered rows
-            out_ega_mod = sys.modules.get("out_ega_esa")
-            if out_ega_mod is None:
-                ega_dir = REPO_ROOT / "4. EGA ESA Awards" / "3. Python script"
-                out_ega_mod = build_commission_pack._load_module("out_ega_esa", ega_dir / "outsource_EGA_ESA_Awards.py")
-
-            # These rows come from cache, so no fetch necessarily ran this
-            # process to apply the Data page's thresholds. Without this the
-            # award grades against the constants hardcoded in the script.
-            out_ega_mod.ensure_rules_applied(year)
-            _ega_rows = _company_ega_rows(year) or filtered_ega_raw
-            lines, agent_ep, agent_sales, agent_eligibility = _ega_award_report(
-                out_ega_mod, out_ega_mod, _ega_rows, year, month, "Outsource",
-                _sales_report_carryover(year), _sales_report_role_index(),
-                _sales_report_case_dates(year))
-
-            # Build Table 1: Agent Name, Customer Count, Accumulated Sales Price, Accumulated EP Point, Eligibility
-            t1_rows = []
-            agent_customers = defaultdict(set)
-            for ln in lines:
-                agent_customers[ln.agent_name].add(ln.customer_name)
-
-            for agent in sorted(agent_ep):
-                cust_count = len(agent_customers[agent])
-                sales = agent_sales.get(agent, Decimal("0"))
-                ep = agent_ep.get(agent, Decimal("0"))
-                eligibility = agent_eligibility.get(agent, "-")
-                t1_rows.append([
-                    build_commission_pack.to_title_case(agent),
-                    str(cust_count),
-                    f"RM {sales:,.2f}" if sales != 0 else "-",
-                    f"{ep:,.2f}" if ep != 0 else "-",
-                    eligibility
-                ])
-
-            # Build Table 2: Agent Name, Customer Name, Invoice Date, 1st Payment Date, Sales Price, Accumulated EP Point, Eligibility
-            t2_rows = []
-            sorted_lines = sorted(lines, key=lambda x: (x.agent_name.lower(), x.invoice_date, x.invoice_number))
-            for ln in sorted_lines:
-                inv_key = str(ln.invoice_number).strip()
-                dates = invoice_dates_map.get(inv_key) if invoice_dates_map else None
-                inv_date = dates[0] if dates else ln.invoice_date
-                first_pay_date = dates[1] if dates else ""
-                t2_rows.append([
-                    build_commission_pack.to_title_case(ln.agent_name),
-                    build_commission_pack.to_title_case(ln.customer_name),
-                    inv_date,
-                    first_pay_date,
-                    f"RM {ln.sales_price:,.2f}" if ln.sales_price != 0 else "-",
-                    f"{ln.accum_ep:,.2f}" if ln.accum_ep != 0 else "-",
-                    agent_eligibility.get(ln.agent_name, "-")
-                ])
-
-            # Production Bonus is always "Jan 1 through today" — not scoped to
-            # whichever month tab is selected — so it isn't cached per month.
-            out_prod_data = build_commission_pack.fetch_production_bonus(year)
-            prod_bonus = {"headers_oum": [], "rows_oum": [], "headers_ogm": [], "rows_ogm": [], "headers_detail": [], "rows_detail": []}
-            if out_prod_data:
-                pb_headers = out_prod_data.get("headers", {})
-                prod_bonus = {
-                    "headers_oum": pb_headers.get("oum", ["Agent", "Total Sales", "Status", "Bonus Amount"]),
-                    "rows_oum": out_prod_data.get("oum_summary", []),
-                    "headers_ogm": pb_headers.get("ogm", ["Agent", "Total Sales", "Status", "Bonus Amount"]),
-                    "rows_ogm": out_prod_data.get("ogm_summary", []),
-                    "headers_detail": pb_headers.get("detail", ["Agent", "Customer", "Sales Price"]),
-                    "rows_detail": out_prod_data.get("team_detail", [])
-                }
-
-            agent_summary_rows = remove_agent_block(out_agent_summary.get(month, []), "Safwan")
-            agent_summary_headers = ["Agent", "Total Invoice", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission Price", "Other Commission"]
-
-            for r in basic_nfp_rows:
-                if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
-                if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
-            for r in out_anp_rows:
-                if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
-                if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
-            for r in t2_rows:
-                if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
-                if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
-            if out_prod_data:
-                for r in out_prod_data.get("team_detail", []):
-                    if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
-                    if len(r) > 1 and r[1]: customers_set.add(str(r[1]).strip())
-
-            sections = {
-                "basic_nfp": {
-                    "headers": basic_nfp_headers,
-                    "rows": basic_nfp_rows,
-                    # Customer-column hover: panel and phase per invoice.
-                    "system_details": _build_system_details(out_nfp_by_inv_all),
-                    "payout_policies": _build_payout_policies(
-                        out_basic_lines, build_commission_pack.as_at_ym(year, month)),
-                },
-                "agent_summary": {"headers": agent_summary_headers, "rows": agent_summary_rows},
-                "anp": {"headers": anp_headers, "rows": out_anp_rows},
-                "ega_esa": {
-                    "headers_t1": ["Agent Name", "Customer Count", "Accumulated Sales Price", "Accumulated EP Point", "Eligibility"],
-                    "rows_t1": t1_rows,
-                    "headers_t2": ["Agent Name", "Customer Name", "Invoice Date", "1st Payment Date", "Sales Price", "Accumulated EP Point", "Eligibility"],
-                    "rows_t2": t2_rows
-                },
-                "production_bonus": prod_bonus
-            }
-
-            if True:
-                try:
-                    contest_path = REPO_ROOT / "6. Monthly Contest" / "3. Python Script" / "monthly_contest.py"
-                    contest_mod = build_commission_pack._load_module("monthly_contest", contest_path)
-                    token, _, _ = build_commission_pack._resolve_proxy_credentials()
-                    df_t1, _, df_t3, _, _, _, _, _, _, _, _ = contest_mod.calculate_monthly_contest(token=token, base_path=REPO_ROOT / "6. Monthly Contest", month=month, year=year)
-                    df_t1 = df_t1.fillna("-")
-                    df_t3 = df_t3.fillna("-")
-                    t1_rows = [list(r) for r in df_t1.values]
-                    t3_rows = [list(r) for r in df_t3.values]
-                    sections["monthly_contest"] = {
-                        "headers_t1": list(df_t1.columns),
-                        "rows_t1": t1_rows,
-                        "headers_t3": list(df_t3.columns),
-                        "rows_t3": t3_rows
-                    }
-                    for r in t3_rows:
-                        if len(r) > 0 and r[0]: agents_set.add(str(r[0]).strip())
-                        if len(r) > 2 and r[2]: customers_set.add(str(r[2]).strip())
-                except Exception as exc:
-                    _log("[CONTEST ROUTE ERROR (outsource)]\n" + traceback.format_exc())
-                    # Surface the reason; otherwise the UI shows a bare "no records" state.
-                    sections["monthly_contest"] = {"error": str(exc)}
-
-        payload = {
-            "summary": {
-                "total_agents": len(agents_set),
-                "total_customers": len(customers_set)
-            },
-            "sections": sections,
-            # Each agent's role as at this month -- the fallback the agent-name
-            # hover uses on tables that carry no invoice date of their own.
-            "agent_roles": _agent_roles_for_month(year, month),
-            # Full role history, so a row whose invoice predates a role change
-            # can be resolved against its own Invoice Date rather than the
-            # report month it happens to be paid in.
-            "agent_role_history": _agent_role_history(),
-            "agent_ics": agent_names.get_ic_map(),
-        }
-        set_cached_commission_response(year, month, agent_type, payload)
-        return jsonify(payload)
 
     except Exception as e:
         tb_str = ""
@@ -4827,8 +4943,12 @@ def special_cases_api():
     # user explicitly deleted. "replace" is still available for a deliberate
     # full overwrite.
     def _case_key(c):
+        # rowKind keeps a Basic assignment and an NFP assignment for the
+        # same customer as two records. Keying only on agent+customer used
+        # to overwrite the first when the second was saved.
         return (str(c.get("agent") or "").strip().lower(),
-                str(c.get("customer") or "").strip().lower())
+                str(c.get("customer") or "").strip().lower(),
+                str(c.get("rowKind") or "all").strip().lower())
 
     # A restated-customer case (caseType "customer" with a restatedTotal +
     # linkedInvoiceNumber) never trusts the (year, month) the browser posted

@@ -30,10 +30,10 @@ def verify_login(username: str, password: str) -> dict | None:
             "mark": _password_mark(user["password_hash"])}
 
 
-# A sign-in is remembered for 30 days (PERMANENT_SESSION_LIFETIME in app.py),
+# A sign-in is remembered for 14 days (PERMANENT_SESSION_LIFETIME in app.py),
 # so the cookie alone can no longer be trusted for that long: an admin who
 # deactivates someone or resets their password expects it to take effect, not
-# to wait out the month. Every signed-in visit is therefore checked against the
+# to wait out the fortnight. Every signed-in visit is therefore checked against the
 # users table -- that the account still exists, is active, and has the password
 # it had at sign-in.
 #
@@ -112,7 +112,7 @@ def current_user() -> dict | None:
 
 def login_user(user: dict) -> None:
     session.clear()
-    session.permanent = True        # survives closing the app, for 30 days
+    session.permanent = True        # survives closing the app, for 14 days
     session["user_id"] = user["id"]
     session["username"] = user["username"]
     session["role"] = user["role"]

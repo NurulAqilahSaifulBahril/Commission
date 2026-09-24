@@ -711,8 +711,18 @@
                 return true;
             });
 
-            // Sort by month descending: latest at the top
+            // Sort by Job Type (Solar, then EV), then EV Type, then month
+            // descending so the latest row still floats within each group.
             filteredRates.sort((a, b) => {
+                const jobA = normJob(a.job_type);
+                const jobB = normJob(b.job_type);
+                if (jobA !== jobB) {
+                    // Solar Services first, EV Services after.
+                    return jobA === "Solar Services" ? -1 : 1;
+                }
+                const evA = normEvType(a.ev_type);
+                const evB = normEvType(b.ev_type);
+                if (evA !== evB) return evA.localeCompare(evB);
                 const effA = String(a.effective_from || "");
                 const effB = String(b.effective_from || "");
                 return effB.localeCompare(effA);

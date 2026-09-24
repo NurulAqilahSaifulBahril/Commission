@@ -31,6 +31,13 @@
     async function getJSON(url, options) {
         const resp = await fetch(url, options || {});
         if (!resp.ok && resp.status !== 202 && resp.status !== 409) {
+            if (resp.status === 403) {
+                throw new Error("this account cannot install updates. "
+                    + "Sign in as an admin and try again.");
+            }
+            if (resp.status === 401) {
+                throw new Error("your session has expired. Sign in again.");
+            }
             throw new Error("HTTP " + resp.status);
         }
         return resp.json();
@@ -77,9 +84,13 @@
 
         show("available");
         headline.textContent = "Version " + info.latest_version + " is available";
-        sub.textContent = "You are on v" + info.current_version + ".";
-        installBtn.style.display = "";
-        installBtn.disabled = false;
+        sub.textContent = "You are on v" + info.current_version + "."
+            + (isAdmin ? "" : " Ask an admin to install it.");
+        // Installing replaces the code on this machine, which the server only
+        // allows an admin to do. Offering the button to everyone meant a staff
+        // account could start an update and be told "HTTP 403".
+        installBtn.style.display = isAdmin ? "" : "none";
+        installBtn.disabled = !isAdmin;
         progress.style.display = "none";
 
         if (info.release_url) {

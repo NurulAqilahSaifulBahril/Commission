@@ -1684,24 +1684,31 @@ def _is_ev_package(text) -> bool:
 
 
 def ev_package_label(text) -> str:
-    """The EV job in a few words, e.g. "11kW three-phase EV charger".
+    """The EV job in a few words, e.g. "22kW three-phase EV charger with
+    standard installation".
 
     Read off the package's own description rather than a fixed phrase, so the
     customer hover names what was actually sold: a 7kW single-phase charger
-    and a 22kW three-phase one should not read alike. Falls back to the plain
-    "EV Charger" when the description says no more than that.
+    and a 22kW three-phase one should not read alike. The lead phrase before
+    "Includes" / the first sentence is the sold name; kW + phase is the
+    fallback. Falls back to the plain "EV Charger" when the description says
+    no more than that.
     """
     s = re.sub(r"\s+", " ", str(text or "")).strip()
     if not s:
         return "EV Charger"
+    lead = re.split(r"\.\s+|Includes\b", s, maxsplit=1, flags=re.I)[0].strip(" .")
+    if re.search(r"(^|[^a-z])ev([^a-z]|$)", lead, re.I) and 8 <= len(lead) <= 90:
+        return lead
     phase = ""
     if re.search(r"three[- ]phase|3\s*phase|\[\s*3p\s*\]", s, re.I):
         phase = "three-phase"
     elif re.search(r"single[- ]phase|1\s*phase|\[\s*1p\s*\]", s, re.I):
         phase = "single-phase"
     kw = re.search(r"(\d+(?:\.\d+)?)\s*kw", s, re.I)
+    extra = "with standard installation" if re.search(r"standard\s+install", s, re.I) else ""
     if kw:
-        return " ".join(x for x in (f"{kw.group(1)}kW", phase, "EV charger") if x)
+        return " ".join(x for x in (f"{kw.group(1)}kW", phase, "EV charger", extra) if x)
     if re.search(r"install", s, re.I):
         return " ".join(x for x in (phase, "EV charger installation") if x)
     return "EV Charger"
