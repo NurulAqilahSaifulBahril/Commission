@@ -4399,6 +4399,7 @@ modalPackageType.value = defaults.pkg || "-";
             const specialCaseGroupSpanByAnchor = new Map();
             const specialCaseGroupNfpByAnchor = new Map();
             const specialCaseGroupSalesByAnchor = new Map();
+            const specialCaseGroupNewNfpRowByAnchor = new Map();
             let groupStart = 0;
             while (groupStart < N) {
                 const groupCustomer = effectiveCustomerNames[groupStart];
@@ -4438,6 +4439,19 @@ modalPackageType.value = defaults.pkg || "-";
                     break;
                 }
 
+                // Once a special case has put a New Net Floor Price Commission
+                // row in this group, that row owns the NFP special case: the
+                // original NFP row stops opening the pop-up, so there is one
+                // place to edit it rather than a second "Add" beside it.
+                for (let idx = groupStart; idx < groupEnd; idx++) {
+                    const row = rowsToRender[idx];
+                    if (!row || !state.specialCaseRowRefs.has(row) || commissionIdx === -1) continue;
+                    const t = String(row[commissionIdx] || "").toLowerCase();
+                    if (!t.includes("new") || !(t.includes("net floor") || t.includes("netfloor"))) continue;
+                    specialCaseGroupNewNfpRowByAnchor.set(groupStart, row);
+                    break;
+                }
+
                 for (let idx = groupStart; idx < groupEnd; idx++) {
                     const row = rowsToRender[idx];
                     if (!row || !row.specialCaseData || salesPriceIdx === -1) continue;
@@ -4465,6 +4479,11 @@ modalPackageType.value = defaults.pkg || "-";
                 const isGanOnlyCase = !!row.specialCaseData
                     && String(row.specialCaseData.rowKind || "").toLowerCase() === "gan";
                 const isSpecialRow = state.specialCaseRowRefs.has(row) && !isGanOnlyCase;
+                const groupNewNfpRow = specialCaseGroupNewNfpRowByAnchor.get(specialCaseGroupAnchorByRowIndex[ri]) || null;
+                const rowCommLower = rowCommType.toLowerCase();
+                const isOriginalNfpRow = !isSpecialRow && !rowCommLower.includes("new")
+                    && (rowCommLower.includes("net floor") || rowCommLower.includes("netfloor"));
+                const nfpHandedToNewRow = isOriginalNfpRow && !!groupNewNfpRow;
                 const tr = document.createElement("tr");
                 if (rowClass) tr.className = rowClass;
                 if (isSpecialRow) tr.classList.add("special-case-row");
@@ -4710,6 +4729,8 @@ modalPackageType.value = defaults.pkg || "-";
                         td.addEventListener("click", () => {
                             hideCommCalcTooltip();
                             if (isSpecialRow) openEditSpecialCaseModal(row);
+                            // The NFP case already lives on the New NFP row.
+                            else if (groupNewNfpRow) openEditSpecialCaseModal(groupNewNfpRow);
                             else openAddSpecialCaseModal(agentName, custName,
                                                          nfpRowForSpecialCase(row, rowsToRender));
                         });
@@ -4726,7 +4747,8 @@ modalPackageType.value = defaults.pkg || "-";
                                 td.addEventListener("mouseleave", hideCommCalcTooltip);
                             }
 
-                            if (!isFactoryCell && userObj && !userObj.readOnly) {
+                            // nfpHandedToNewRow: edit it from the New NFP row instead.
+                            if (!isFactoryCell && !nfpHandedToNewRow && userObj && !userObj.readOnly) {
                                 td.style.cursor = "pointer";
                                 td.classList.add("clickable-special-case");
                                 td.addEventListener("click", () => {
