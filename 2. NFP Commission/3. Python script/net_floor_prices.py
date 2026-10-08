@@ -58,7 +58,8 @@ def _load_db_prices():
     _NFP_SQL = (
         # String-inverter rows only: hybrid rows are display data for the
         # dashboard and must never feed commission calculations.
-        "SELECT month, panel_rating, table_no, panels, final_price, final_with_tng"
+        "SELECT month, panel_rating, table_no, panels, final_price, final_with_tng,"
+        " promo_price, promo_from, promo_to"
         " FROM nfp_prices"
         " WHERE inverter_type IS NULL OR inverter_type = '' OR LOWER(inverter_type) = 'string'"
         " ORDER BY month, panel_rating, table_no, panels"
@@ -96,14 +97,27 @@ def _load_db_prices():
         rating = int(r["panel_rating"])
         table_no = int(r["table_no"])
         tables = _DB_PRICES.setdefault(month, {}).setdefault(rating, {})
+        promo_price = r["promo_price"] if "promo_price" in r.keys() else None
         tables.setdefault(table_no, {})[int(r["panels"])] = PriceRow(
             int(r["panels"]), float(r["final_price"]),
             float(r["final_with_tng"]) if r["final_with_tng"] is not None else None,
+            float(promo_price) if promo_price is not None else None,
+            _parse_iso_date(r["promo_from"]) if promo_price is not None else None,
+            _parse_iso_date(r["promo_to"]) if promo_price is not None else None,
         )
     for month, ratings in _DB_PRICES.items():
         for rating in list(ratings.keys()):
             ratings[rating] = [ratings[rating][k] for k in sorted(ratings[rating].keys())]
     return _DB_PRICES
+
+
+def _parse_iso_date(value) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
 
 
 def _db_lookup_net_floor_price(
@@ -139,11 +153,18 @@ def _db_lookup_net_floor_price(
         if m not in ordered:
             ordered.append(m)
 
+    # A month that lists the panel's own wattage (e.g. 625W from Sep 2026)
+    # prices it from that list; otherwise the 590/620/650 bucket as before.
+    exact_rating = int(panel_rating) if panel_rating else None
     for m in ordered:
-        tables = data.get(m, {}).get(target_rating, [])
+        month_data = data.get(m, {})
+        rating_used = target_rating
+        if exact_rating and exact_rating != target_rating and month_data.get(exact_rating):
+            rating_used = exact_rating
+        tables = month_data.get(rating_used, [])
         if not tables:
             continue
-        if target_rating == 650 and len(tables) > 1:
+        if len(tables) > 1 and (target_rating == 650 or rating_used != target_rating):
             table = pick_table_for_panels(tables, panel_qty, three_phase=three_phase)
         else:
             table = None
@@ -162,6 +183,12 @@ def _db_lookup_net_floor_price(
             else row.final_price
         )
         suffix = "_with_tng" if has_tng_rebate and row.final_with_tng is not None else ""
+        if (m == inv_ym and row.promo_price is not None and row.promo_from and row.promo_to
+                and row.promo_from <= invoice_date <= row.promo_to):
+            price = row.promo_price
+            suffix = f"_promo_{row.promo_from:%d%b}-{row.promo_to:%d%b}".lower()
+        if rating_used != target_rating:
+            suffix += f"_{rating_used}w"
         if m == inv_ym:
             source = f"db_{m}{suffix}"
         else:
@@ -175,6 +202,11 @@ class PriceRow:
     panels: int
     final_price: float
     final_with_tng: Optional[float]
+    # Dated promo inside the month: invoices dated promo_from..promo_to
+    # (inclusive) use promo_price instead of final_price.
+    promo_price: Optional[float] = None
+    promo_from: Optional[date] = None
+    promo_to: Optional[date] = None
 
 
 def round_rm(value: float | int | str | Decimal, places: int = 2) -> float:

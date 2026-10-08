@@ -1139,6 +1139,11 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
             property_type=prop_type,
         )
         first_pay_str = str(r.get("first_payment_date") or r.get("1st_payment_date") or "")[:10]
+        # Created at of the payments that reached each stage (Basic hover).
+        import basic_commission_rates as _bcr_c
+        pct5_created, pct75_created = _bcr_c.invoice_milestone_created(r, policy)
+        pct5_created = pct5_created if pct5_str else ""
+        pct75_created = pct75_created if pct75_str else ""
 
         if h1_only:
             m = _parse_month(pay_dt)
@@ -1243,6 +1248,8 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
                 pct5_date=pct5_str,
                 pct75_date=pct75_str,
                 pct100_date=pct100_str,
+                pct5_created=pct5_created,
+                pct75_created=pct75_created,
                 first_payment_date=first_pay_str,
                 payout_policy=policy,
             )
@@ -1296,6 +1303,8 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
                 pct5_date=pct5_str,
                 pct75_date=pct75_str,
                 pct100_date=pct100_str,
+                pct5_created=pct5_created,
+                pct75_created=pct75_created,
                 first_payment_date=first_pay_str,
                 payout_policy=policy,
                 ev_item_amount=float(ev_amt or 0),

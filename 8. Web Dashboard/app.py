@@ -166,6 +166,7 @@ _disk_cache_lock = threading.RLock()
 _response_refresh_lock = threading.Lock()
 _refreshing_response_keys: set[tuple[int, int, str]] = set()
 _RESPONSE_CACHE_TTL_SECONDS = 300
+_SALES_REPORT_PAYLOAD_CACHE: dict[tuple, tuple[float, dict]] = {}
 
 def _cache_stamp() -> str:
     """Fingerprint of everything that shapes what the cache holds.
@@ -224,9 +225,8 @@ def load_disk_cache():
                 for k in stale_pages:
                     loaded.pop(k, None)
             _data_cache = loaded
-            # The query record rides along so the first rule change after a
-            # restart rebuilds as fast as any other (see query_replay.py).
             query_replay.restore(_data_cache.get("sql_replay"))
+            _SALES_REPORT_PAYLOAD_CACHE.clear()
             _log(f"Loaded cache from disk: {[k for k in _data_cache if k != _CACHE_STAMP_KEY]}")
 
 def save_disk_cache():
@@ -1203,37 +1203,38 @@ def _prefetch_run(year=2026):
             return
 
         # Pre-fetch all agents and customers list
-        _log("Pre-fetching all agents and customers list...")
-        anp_mod = sys.modules.get("int_anp_commission")
-        if anp_mod is None:
-            anp_path = build_commission_pack._anp_script_path()
-            anp_mod = build_commission_pack._load_module("int_anp_commission", anp_path)
-        client = anp_mod.PostgresProxyClient(url.rstrip("/").replace("/api/sql", ""), token, db_name)
-        try:
-            agents_list = client.query(
-                """
-                SELECT DISTINCT ON (au.bubble_id) au.bubble_id, au.name, au.agent_type
-                FROM (
-                  SELECT u.bubble_id, u.name, u.agent_type, 1 AS pri FROM "user" u
-                   WHERE u.bubble_id IS NOT NULL AND COALESCE(BTRIM(u.agent_type), '') <> ''
-                  UNION ALL
-                  SELECT ag.bubble_id, ag.name, ag.agent_type, 2 FROM agent ag
-                   WHERE ag.bubble_id IS NOT NULL
-                  UNION ALL
-                  SELECT u2.bubble_id, u2.name, u2.agent_type, 3 FROM "user" u2
-                   WHERE u2.bubble_id IS NOT NULL
-                ) au
-                ORDER BY au.bubble_id, au.pri
-                """
-            )
-            customers_list = client.query("SELECT customer_id, name FROM customer ORDER BY name")
-            with _disk_cache_lock:
-                _data_cache['all_agents'] = agents_list
-                _data_cache['all_customers'] = customers_list
-                save_disk_cache()
-            _log("Agents and customers list pre-fetched and saved to disk.")
-        except Exception as e_ac:
-            _log(f"Failed to pre-fetch agents/customers: {e_ac}")
+        if not query_replay.is_replaying():
+            _log("Pre-fetching all agents and customers list...")
+            anp_mod = sys.modules.get("int_anp_commission")
+            if anp_mod is None:
+                anp_path = build_commission_pack._anp_script_path()
+                anp_mod = build_commission_pack._load_module("int_anp_commission", anp_path)
+            client = anp_mod.PostgresProxyClient(url.rstrip("/").replace("/api/sql", ""), token, db_name)
+            try:
+                agents_list = client.query(
+                    """
+                    SELECT DISTINCT ON (au.bubble_id) au.bubble_id, au.name, au.agent_type
+                    FROM (
+                      SELECT u.bubble_id, u.name, u.agent_type, 1 AS pri FROM "user" u
+                       WHERE u.bubble_id IS NOT NULL AND COALESCE(BTRIM(u.agent_type), '') <> ''
+                      UNION ALL
+                      SELECT ag.bubble_id, ag.name, ag.agent_type, 2 FROM agent ag
+                       WHERE ag.bubble_id IS NOT NULL
+                      UNION ALL
+                      SELECT u2.bubble_id, u2.name, u2.agent_type, 3 FROM "user" u2
+                       WHERE u2.bubble_id IS NOT NULL
+                    ) au
+                    ORDER BY au.bubble_id, au.pri
+                    """
+                )
+                customers_list = client.query("SELECT customer_id, name FROM customer ORDER BY name")
+                with _disk_cache_lock:
+                    _data_cache['all_agents'] = agents_list
+                    _data_cache['all_customers'] = customers_list
+                    save_disk_cache()
+                _log("Agents and customers list pre-fetched and saved to disk.")
+            except Exception as e_ac:
+                _log(f"Failed to pre-fetch agents/customers: {e_ac}")
 
         # Load invoice dates first
         basic_mod = sys.modules.get("int_basic_commission")
@@ -1572,14 +1573,14 @@ if SETUP_ERROR is not None:
     has_main_keys = True
 if not has_main_keys:
     _log("Cache is missing internal or outsource data on startup. Triggering background pre-fetch...")
-    start_prefetch(2026)
+    start_prefetch(2026, replay=True)
 elif SETUP_ERROR is None:
     # Pages open straight away on the data saved last time, and the rebuild
     # runs behind them. Each piece replaces its old copy only once the new one
     # is complete, so nobody ever sees a half-built figure -- just figures that
     # catch up to the database a minute or two after launch.
     _log("Serving cached data from the last session; refreshing it in the background...")
-    start_prefetch(2026)
+    start_prefetch(2026, replay=True)
 
 def _no_store(resp):
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -2111,6 +2112,27 @@ def _panel_brand(package_description: str) -> str:
     return "JinkoSolar" if _PANEL_BRAND_RE.search(first_line) else ""
 
 
+def _inverter_label(package_name, package_description) -> str:
+    """"Hybrid" / "String" / "Microinverter", or "" when the invoice does not say.
+
+    The package name is read first: a hybrid invoice's item text only lists the
+    parts ("SAJ H2 ..."), and only its package, e.g. "[1P] HYBRID SAJ JINKO 15
+    PCS", says hybrid. Invoices with no linked package fall back to the item
+    text, where string packages name a "String Inverter" and micro-inverter
+    jobs list NEP BDM units.
+    """
+    for text in (package_name, package_description):
+        low = str(text or "").lower()
+        if "hybrid" in low:
+            return "Hybrid"
+        if "string" in low:
+            return "String"
+    low = str(package_description or "").lower()
+    if "bdm" in low or "micro" in low:
+        return "Microinverter"
+    return ""
+
+
 def _phase_label(phase_type) -> str:
     """"1P (Single Phase)" / "3P (Three Phase)", or "" when SEDA has no record.
 
@@ -2177,6 +2199,12 @@ def _build_payout_policies(basic_lines, as_at: str = "") -> dict:
             # pending here: the report is the month as it stood.
             "balance_date": _as_at_date(getattr(ln, "pct75_date", ""), as_at),
         }
+        # Created at of the payment that reached each stage -- when Finance
+        # entered it. Blank whenever the stage itself reads as pending.
+        entry["advance_created"] = (str(getattr(ln, "pct5_created", "") or "")[:10]
+                                    if entry["advance_date"] else "")
+        entry["balance_created"] = (str(getattr(ln, "pct75_created", "") or "")[:10]
+                                    if entry["balance_date"] else "")
         bucket = out.setdefault(customer, [])
         if entry not in bucket:
             bucket.append(entry)
@@ -2214,6 +2242,8 @@ def _build_system_details(nfp_by_inv_all: dict) -> dict:
             "panel_rating": None if is_ev else (int(rating) if rating is not None else None),
             "brand": "" if is_ev else _panel_brand(getattr(inv, "package_description", "")),
             "phase": "" if is_ev else _phase_label(getattr(inv, "phase_type", None)),
+            "inverter": "" if is_ev else _inverter_label(getattr(inv, "package_name", None),
+                                                         getattr(inv, "package_description", "")),
             # The 75% milestone is NOT on the table row: the column headed
             # "75% Payment Date" is filled from the invoice's full_payment_date
             # (the 100% date), so a post-July invoice that reached 75% but not
@@ -2223,7 +2253,7 @@ def _build_system_details(nfp_by_inv_all: dict) -> dict:
             "full_payment_date": str(getattr(inv, "full_payment_date", "") or ""),
         }
         if (not entry["package"] and entry["panel_qty"] is None and entry["panel_rating"] is None
-                and not entry["phase"] and not entry["pct75_date"]
+                and not entry["phase"] and not entry["inverter"] and not entry["pct75_date"]
                 and not entry["full_payment_date"]):
             continue
         details.setdefault(customer.lower(), []).append(entry)
@@ -2696,6 +2726,421 @@ SALES_REPORT_EXCLUDED_AGENTS = ("safwan",)
 def _sales_report_excluded(raw: str) -> bool:
     key = _normalize_search_text(raw)
     return any(key.startswith(x) for x in SALES_REPORT_EXCLUDED_AGENTS)
+
+
+def _sales_report_cancelled(row: dict) -> bool:
+    """A cancelled package is recorded by renaming the customer, e.g.
+    "GARY TAN (CANCEL PACKAGE REFUND ON 13/06/2026 RM934.79)"; the invoice
+    itself stays live. Such a case is not a sale."""
+    return "cancel" in str(row.get("customer_name") or "").lower()
+
+
+# Invoices left out of the report by hand: duplicates and cancellations the
+# data does not flag.
+# Keyed on bubble_id: an invoice number can be shared (1008400 is two cases).
+SALES_REPORT_EXCLUDED_INVOICES = {
+    # 1008358, BURHANUDDIN HALMI BIN HASIN (DUPLICATE) -- replaced by
+    # INV-1010069, which carries the same RM1,500 deposit of 4 Jan 2026.
+    "1767605082432x400928611535683600",
+    # INV-1008203, "Tuan Amirul Ref" -- placeholder for NOOR HAMIRUL ANUAR BIN
+    # NORDIN (1008537); same RM1,083 deposit of 31 Jan 2026.
+    "0f2a1442-b976-4c50-9847-655a1b088156",
+    # INV-1008594, NG KOK CHEU (ATAP), Chan Jia Wei -- a RM4,800 top-up on the
+    # February sale INV-1008241 (RM46,106), not a case of its own.
+    "48c00c12-fd1a-4bb1-a869-ae59748e9d40",
+    # INV-1009895, LIEW CHAN SANG (LIEW MIN HUI) (ATAP), and INV-1009932, GOH
+    # HOCK LYE (ATAP), Ching Zhe Hang -- first paid 1 June but not June cases
+    # per Finance. Left out until the month they belong to is decided.
+    "afcec34c-16ed-4c5a-91d4-8a2dadd6dc6b",
+    "e9807dd0-cadc-4b5a-a798-22a3bf05c746",
+    # 1008435, Cheong Hong Wee (Atap), Teng Kah Kent -- RM29,800, first paid
+    # 16 Jan 2026; not a January case per Finance, left out.
+    "1768594400823x535666973979967500",
+    # INV-1011043, LEE WAI LEONG (TOP UP), Tan Jia Hao -- a RM9,800 top-up on
+    # an earlier sale, not a case of its own.
+    "1a04c360-72b1-4909-b853-e29a7c9badd0",
+    # INV-1011046 (Ng Yih Chyn), Denise Ng -- top-up excluded per user request;
+    # INV-1011801 (TAN CHEN WEI) remains as the 1 September case.
+    "dd84422a-ff1d-4e8e-94fa-2c0a3dff213d",
+    # INV-1010795, Gursimran Woon Shu Yuan, Woon Jia Keat -- a RM2,278 EV
+    # charger with no solar; not a July case per Finance. Other EV-only
+    # invoices still count.
+    "d3232cec-61c8-4c7a-b669-5c2e825bc8cc",
+    # INV-1011484, NG CHOON FONG (ATAP), Olivier Koh Cong Lee -- RM21,000,
+    # invoiced 31 Aug (23:08 local), first paid 2 Sep. Left off the report per
+    # user request so September RES is 8 cases, RM219,500.00; see the +RM300 on
+    # INV-1011861 in SALES_REPORT_SALES_ADJUSTMENTS.
+    "6e44e83e-57b4-42bc-8fc9-6f4d7856d163",
+    # INV-1008170, CHO CHOOI PENG, Sin Wei Fong -- the original RM54,765 quote
+    # (36 panels, RM2,100 deposit of 30 Jan, nothing else paid), replaced by
+    # 1008534, the same package at RM42,000 after discounts with the same
+    # deposit, fully paid. Counted once, at RM42,000, per user request.
+    "7b92371e-a931-4777-9298-ae53c00ca541",
+    # INV-1010527, CHEW TECK CHAI (ATAP), Hongki You Teng Hoong -- RM50,300,
+    # invoiced 22 Jun, paid in full on 1 Jul. Left off the report per user
+    # request so July RES is the one case, Classic Optometry, RM60,000.00.
+    "46d7262c-d5d0-4349-b8db-fd162e6c74ef",
+    # INV-1011470, TEY CHIN CHUAN (ATAP), RM36,000, and INV-1011474, LEONG CHEE
+    # HAU, RM53,500, Hongki You Teng Hoong -- both first paid 31 Aug (payments
+    # keyed in 7 Sep and 1 Sep). Left off the report per user request so August
+    # RES is My Liberica Coffee and Mega Signcraft, RM251,000.00.
+    "a3f87028-fa69-4255-a36e-f46b009cb60b",
+    "591fb12e-0c31-4008-92dc-5110fac81aeb",
+    # Carol Siow -- left off the report per user request so July and September
+    # have no COM line (her ESA / Oct early-bird qualification falls with the
+    # S.O.S Mewah EP):
+    # INV-1010817, TOWA HARDWARE (M) SDN BHD (FACTORY), RM2,908 -- a cable add-on,
+    # paid in full 30 Jul.
+    "d83f837c-6586-43c7-9303-6107aae95645",
+    # INV-1011854, INV-1011855, INV-1011856, S.O.S MEWAH SDN BHD (LOT 1236A, 1197,
+    # 1194), RM184,000 + RM184,000 + RM78,000 -- 30% deposits paid 30 Sep, keyed
+    # in 2 Oct. Before this they sat on the COM line so September RES stayed at
+    # 2 cases, RM57,300.00.
+    "88a4940d-4593-4f12-b641-ee4e4f87ee34",
+    "1846aa9d-a038-4fcb-a114-a7b0a3c8d849",
+    "6d41560c-1933-4ffc-b2ed-736cca73c770",
+    # INV-1010885, YAP CHOON FAH (TOP UP), Ling Liang Kang -- top-up excluded per user request.
+    "84a07187-36ec-4bea-9440-e5587570827c",
+    "INV-1010885",
+    # INV-1011801, TAN CHEN WEI (ATAP), Denise Ng Pei Sing -- excluded so Denise has 0 September cases per user request.
+    "637144bd-6a52-466c-b8d4-43d1b81408fc",
+    "INV-1011801",
+}
+
+# Hand corrections to an invoice's sales value on the report, keyed on
+# bubble_id like the exclusions above. Added to the sales price, so ANS and
+# EP both follow.
+SALES_REPORT_SALES_ADJUSTMENTS = {
+    # INV-1010386, FOO MUN YOKE (ATAP), Joshua Yap Jia Hao -- EPP interest of
+    # RM1,423.32 added back so June 3 RES sales are counted at RM91,840.00.
+    "f79f732f-6ac2-466c-82fe-bf38438fdbc8": "1423.3183856502242",
+    # INV-1011236, Wong Chee Meng, Woon Jia Keat -- adjusted by +RM1,060 so
+    # August 4 RES sales are counted at RM100,630.00 per user request.
+    "1090ce85-4f2b-4166-bc23-38fabbe79321": "1060",
+    # INV-1008800, Chai Shang Tat, Tan Jia Hao -- adjusted by +RM500 so March
+    # 1 RES sale is counted at RM21,000.00 per user request.
+    "97e74ffe-8ba0-48c7-b739-5de2f28c09e9": "500",
+    # INV-1008377, BONG KUET TSIN (ATAP), Tan Jia Hao -- RM20,500 less the
+    # RM500 "SAJ M2-1.0K S2 Micro Inverter (RM1,500 -> RM1,000)" add-on.
+    "df7d36c4-a0e0-4ebe-8b40-55c037dcbcd7": "-500",
+    # INV-1009209, JC PRINT & OFFICE SDN. BHD. (FACTORY), Ching Zhe Hang --
+    # RM45,000 less the RM1,000 + RM500 SAJ micro inverter add-ons.
+    "2ebb5452-8b6a-4260-9cb2-0c2dcf98c5e8": "-1500",
+    # INV-1010036, LIM KIM HOI (ATAP), Chan Jia Wei -- counted at the full
+    # RM19,627 invoice total; the RM627 EPP interest is added back.
+    "557b3b07-9827-46cb-bac3-46d867f0f73f": "627",
+    # INV-1010037, TAN BEE LING (ATAP), Chan Jia Wei -- counted at the full
+    # RM25,290.90 invoice total; the RM2,490.90 EPP interest is added back.
+    "f96da89a-35f7-4bf3-bdf5-e4c71c280235": "2490.90",
+    # INV-1010642, LEE MENG WAI (ATAP), Chan Jia Wei -- counted at RM27,465:
+    # RM28,205 less RM740, not the RM1,785 EPP interest on the invoice.
+    "c79bec50-7536-438b-8ab4-355ef45f25c9": "1045",
+    # INV-1011142, TAM PUI TENG (ATAP), Chan Jia Wei -- counted at RM37,750,
+    # before the RM6,670 "Discount (RM 6670)" line (RM31,080 after it).
+    "4809d0b2-abf7-4841-952c-cfde02f8adbb": "6670",
+    # INV-1011869, TAN KIM CHAI (ATAP), Chan Jia Wei -- counted at RM41,929,
+    # before the RM8,929 "Discount (RM 8929)" line (RM33,000 after it).
+    "8f449830-8d6c-4ad6-9cc9-7ae4db432f27": "8929",
+    # INV-1009303, CHEW SWEE ANNE (ATAP), Ching Zhe Hang -- counted at the full
+    # RM20,043 invoice total; the RM1,179 EPP interest is added back.
+    "211630d1-c2aa-4840-9d75-8a11149bfb8c": "1179",
+    # INV-1010357, KOH CHIN TIN (ATAP), Louis Ng -- counted at the full
+    # RM30,102.57 invoice total; the RM1,102.57 EPP interest is added back.
+    "7816fdb7-b094-4766-aa3e-ee0fa0d3cb08": "1102.57",
+    # INV-1010700, SEAH AH MOI (ATAP), Louis Ng -- RM28,400 less the RM1,500 add-on.
+    "a69cd8e6-e1a2-46fd-999d-203c2ac4e327": "-1500",
+    # INV-1010937, CHAT CHEH MAN (ATAP), Sunny Tan -- counted at the full
+    # RM40,825 invoice total; the RM825 EPP interest is added back.
+    "45e99d46-ced1-4574-8d41-1f0485d0d41d": "825",
+    # INV-1010591, LEE IK SOON (ATAP), Zulkarnain -- RM31,750 less the RM1,500 add-on.
+    "592b67cd-04a6-4d4d-b8b8-9387471959ef": "-1500",
+    # INV-1010718, OOI TZU WEI (ATAP), Denise Ng -- counted at the full
+    # RM27,905.50 invoice total; the RM1,105.50 EPP interest is added back.
+    "ac31a283-dedf-4d3f-a79a-c32247150d48": "1105.50",
+    # INV-1010998, WILLIAM TAN TECK SWEE (ATAP), Vincent Tan -- counted at the
+    # full RM33,990 invoice total; the RM2,990 EPP interest is added back.
+    "62937f12-2cf1-4884-979d-92bf15a38fbb": "2990",
+    # INV-1011408, SIN CHIAN YING (ATAP), Vincent Tan -- RM36,088 less the
+    # RM2,588 "Add On 1X EV wallbox 11kw + Installation" line.
+    "ec8c8e7b-c783-4aae-ab10-ef3dc463e0a8": "-2588",
+    # INV-1010637, GAN ENG YI (ATAP), Wong Jia Xuan -- counted at RM27,280,
+    # before the RM580 CEO discount in its "Discount (RM 6680) CEO Discount
+    # (RM 580)" line (RM26,700 after it).
+    "195e123e-2ce3-4f3c-8acb-4be579994f9e": "580",
+    # INV-1010993, MOO MEI JEN (ATAP), Lim Chin Seng (JS) -- counted at the full
+    # RM60,210 invoice total; the RM3,105 EPP interest is added back so July RES
+    # sales are counted at 2 cases, RM85,710.00 per user request.
+    "3b8e6989-1e60-41af-82aa-f69ab470273f": "3105",
+    "INV-1010993": "3105",
+    # Olivier Koh Cong Lee, January: the four RES cases (INV-1008384 SIBLING
+    # KITCHEN RM40,800, INV-1008437 MARIANNE CHEW RM24,000, INV-1008494 NG JONG
+    # SERN RM29,368, INV-1008274 TEE SIAN SAN RM24,995.02) sum to RM119,163.02;
+    # adjusted by -RM1,170 so January RES sales are counted at RM117,993.02 per
+    # user request. No single invoice line is RM1,170, so it is carried on
+    # INV-1008274 (RES EP is 1 pt per RM1, so EP follows whichever it sits on).
+    "1766909226924x213014302931288060": "-1170",
+    # INV-1008474, TON JYUE SHII (ATAP), Olivier Koh Cong Lee -- counted at the
+    # full RM21,397.50 invoice total; the RM1,597.50 EPP interest (RM1,170 +
+    # RM427.50) is added back so March RES sales are counted at 3 cases,
+    # RM76,397.50 per user request.
+    "79dc8f2d-d066-47fb-ac0d-e5447a97278f": "1597.5",
+    # Olivier Koh Cong Lee, May: the five RES cases (INV-1009168 LEE LIANG KAI
+    # RM23,200, INV-1009213 T&T KOTA MASAI RM25,900, INV-1009410 ONG KANG YEE
+    # RM28,600, INV-1009520 QUEK POH HUI RM30,500, INV-1009606 TEE SHY LEE
+    # RM25,900) sum to RM134,100; adjusted by -RM6,900 so May RES sales are
+    # counted at RM127,200.00 per user request. No invoice line or pair of lines
+    # is RM6,900, so it is carried on INV-1009213 (RES EP is 1 pt per RM1, so EP
+    # follows whichever it sits on).
+    "76d396e5-ecdc-448f-83a1-b6a72369e507": "-6900",
+    # INV-1010467, CHAN ZHEN YUAN (ATAP), Olivier Koh Cong Lee -- counted at the
+    # full RM45,862.78 invoice total; the RM3,562.78 EPP interest (RM1,500 +
+    # RM2,062.78) is added back so June RES sales are counted at 3 cases,
+    # RM81,862.78 per user request.
+    "a33a9a02-6797-4824-9662-553407147a4c": "3562.78",
+    # Olivier Koh Cong Lee, August: with the two Jin Seng invoices on RES (see
+    # SALES_REPORT_PROPERTY_OVERRIDES) the six RES cases (LEE ENG CHAI RM20,800,
+    # LEE MENG LIANG RM28,800, OOI YI WEI RM36,000, WENG KAR CHON RM26,000,
+    # JIN SENG 20PCS RM30,000, JIN SENG NO 33 RM33,000) sum to RM174,600;
+    # adjusted by +RM760 so August RES sales are counted at RM175,360.00 per
+    # user request. No invoice line is RM760, so it is carried on INV-1011399
+    # (RES EP is 1 pt per RM1, so EP follows whichever it sits on).
+    "5c0eee3d-3aa5-4acb-8156-701f544dcd8e": "760",
+    # Olivier Koh Cong Lee, September: without INV-1011484 (NG CHOON FONG, see
+    # SALES_REPORT_EXCLUDED_INVOICES) the eight RES cases sum to RM219,200;
+    # adjusted by +RM300 so September RES sales are counted at RM219,500.00 per
+    # user request. No invoice line is RM300, so it is carried on INV-1011861
+    # (TAN YUAN TAT; RES EP is 1 pt per RM1, so EP follows whichever it sits on).
+    "cf420a9e-60b9-4e86-9ff7-e4a85fbeee38": "300",
+    # INV-1010463, TOR SENG CHO (ATAP), Dean Wai Leong Yee -- counted at RM26,620,
+    # before the RM620 "CEO Discount" line (RM26,000 after it), so June RES sales
+    # are counted at 4 cases, RM102,840.00 per user request.
+    "2a988208-a156-41c1-adef-f0875914255f": "620",
+    # INV-1011002, TAN CHIN ING (ATAP), Wilson Tan Wei Sheng -- counted at the
+    # full RM34,150 invoice total; the RM1,150 EPP interest is added back so July
+    # RES sales are counted at 1 case, RM34,150.00 per user request.
+    "d40a1c5a-5e32-49b4-b262-6e5b93b0e6f6": "1150",
+    # INV-1008398, THONG PEIK CHOO (ATAP), Caryn Dong Leong Moi -- the RM688
+    # "KLUANG OPENING 16/5/2026 LUCKY DRAW RM688" prize line is added back (the
+    # RM118 guarantee is already restored by _sales_report_line_adjustments), so
+    # the case counts at RM27,800 and February RES sales are 3 cases, RM78,600.00
+    # per user request. Only this invoice; other lucky-draw prizes stay deducted.
+    "663a1b59-7e1f-4094-95c6-b92ac64652a5": "688",
+    # INV-1010912, TAN KONG HAO (ATAP), Caryn Dong Leong Moi -- counted at the
+    # full RM34,669.60 invoice total; the RM1,869.60 EPP interest (RM31,160 x 6%)
+    # is added back so July RES sales are counted at 2 cases, RM57,929.60 per
+    # user request.
+    "d4998ba3-c577-446a-9524-42c49a626bcd": "1869.6",
+    # INV-1008774, TEE LI LEONG (ATAP), Chan Wing On -- fully paid, with the
+    # RM118 "Kluang Opening Day (16/05/2026) Special Discount RM118" line. That
+    # wording is not "lucky draw", so _sales_report_line_adjustments does not
+    # restore it; added back here so March RES sales are counted at 4 cases,
+    # RM94,400.00 per user request.
+    "198457ae-43c7-493c-9c14-da248624f52d": "118",
+    # INV-1009889, LOW BOON HUAT, Ivan Low Chin Chai -- counted at RM24,153,
+    # before the RM653 CEO discount in its "Discount (RM 1567) | CEO Discount
+    # (RM 653)" line (RM23,500 after it), so May RES sales are counted at 2
+    # cases, RM47,913.00 per user request.
+    "efc30b6f-ee81-4550-8dd0-5b9688a4b9d4": "653",
+    # INV-1010797, HO KHEE FATT, Phil Moo Wui Kead -- counted at RM43,960, before
+    # the RM5,960 CEO discount in its "Discount (RM 12030) | CEO Discount
+    # (RM5960)" line (RM38,000 after it), so September RES sales are counted at 1
+    # case, RM43,960.00 per user request. August's Lay Chee Wan (INV-1011438)
+    # stays at its invoice value, RM35,900.00.
+    "136aa3a5-0f57-4b93-85f1-49d55bf8482c": "5960",
+    # INV-1009792, GAN TAI SHENG (573-L)(SHOP LOT) (ATAP), and INV-1009919, GAN
+    # TAI SHENG (NO 60) (ATAP), See Cheak Ching -- counted at the full invoice
+    # totals, RM19,026 and RM17,969; the RM1,026 and RM969 EPP interest is added
+    # back so May RES sales are counted at 2 cases, RM36,995.00 per user request.
+    "335842d7-bf44-4061-b368-eaeb753f96e1": "1026",
+    "4dac557b-ae9a-4686-8d11-c2ecd781a283": "969",
+    # INV-1010818, LEW CHEE KHAN (ATAP), See Cheak Ching -- counted at RM27,095,
+    # before the RM2,095 CEO discount in its "SPECIAL DISCOUNT LEW CHEE KHAN (RM
+    # 5880) | CEO Discount (RM 2095)" line (RM25,000 after it), so July RES sales
+    # are counted at 1 case, RM27,095.00 per user request.
+    "fb0a08e0-7079-4c96-8d4e-1e84c42109e8": "2095",
+    # INV-1010679, GUI LEE LAI (ATAP), Viggy Gui Choon Fong -- counted at the
+    # full RM21,364 invoice total; the RM1,363.64 EPP interest (RM13,636.36 x
+    # 10%) is added back so July RES sales are counted at 3 cases, RM71,764.00
+    # per user request. The other two July cases stay net of their EPP interest.
+    "27c33d44-24ba-40c1-bc9a-5d484f26fbe3": "1363.64",
+    # INV-1010367, KALA A/P SUKUMAR (ATAP), Carol Siow -- counted at full
+    # RM33,742 invoice total; the RM2,942 EPP interest is added back.
+    "18f34384-f543-4b61-a033-7eb5193543f8": "2942",
+    "INV-1010367": "2942",
+    # INV-1010605, CHAN HWA KWONG (ATAP), Carol Siow -- counted at full
+    # RM35,497.50 invoice total; the RM1,997.50 EPP interest is added back so
+    # June RES sales are counted at 7 cases, RM233,639.50 per user request.
+    "1ed55d0a-cf30-4b56-b13b-a4b767d29a72": "1997.50",
+    "INV-1010605": "1997.50",
+    # 1008563, TAN LIAN KENG, Chan Wing On -- adjusted by +118 so February RES
+    # sales are counted at 2 cases, RM57,000.00 per user request.
+    "1771658583603x991793478265471000": "118",
+    "1008563": "118",
+    # INV-1009694, VILASINI A/P K S VASAN (ATAP), Chan Wing On -- adjusted by +1,100 so
+    # May RES sales are counted at 4 cases, RM114,412.00 per user request.
+    "60d8670f-b6ec-48bb-bfb8-f0d210479452": "1100",
+    "INV-1009694": "1100",
+    # INV-1010031, ONG LAY MIN (ATAP), Ling Liang Kang -- adjusted by +8,970 so
+    # May RES sales are counted at 7 cases, RM192,479.00 per user request.
+    "11bb249e-ecdd-4e74-a643-801700d55845": "8970",
+    "INV-1010031": "8970",
+    # INV-1010448, CHANG YUK LENG (ATAP), Ling Liang Kang -- adjusted by -2,500 so
+    # June RES sales are counted at 3 cases, RM69,460.00 per user request.
+    "dc17faa8-5000-494b-9a6d-e9c157b3584e": "-2500",
+    "INV-1010448": "-2500",
+    # INV-1010672, TAN YONG KOK (ATAP), Ling Liang Kang -- adjusted by +5,210 so
+    # July RES sales are counted at 7 cases, RM206,070.00 per user request.
+    "9851d7df-92b9-4868-9997-dd3734cc70b4": "5210",
+    "INV-1010672": "5210",
+    # INV-1009464, T-KHEN LAI AUTO SDN. BHD. (FACTORY) (ATAP), Ling Liang Kang -- adjusted by +8,000 so
+    # April COM sales are counted at 1 case, RM81,800.00 per user request.
+    "9d02ee37-fb92-44ad-ae06-13132699125a": "8000",
+    "INV-1009464": "8000",
+    # INV-1010803, LEE TIEK SEANG (TOP UP) (ATAP), Ling Liang Kang -- adjusted by -10,000 so
+    # August RES sales are counted at 3 cases, RM55,920.00 per user request.
+    "1d49aed9-3532-4915-a843-4883af3b180b": "-10000",
+    "INV-1010803": "-10000",
+    # INV-1010536, DALINA BINTI ALI (ATAP), Mohd Azhar Bin Ibrahim -- adjusted by -30 so
+    # June RES sales are counted at 1 case, RM35,140.00 per user request.
+    "a5cee2bd-c8b4-4796-9502-cbb66e4b6c6a": "-30",
+    "INV-1010536": "-30",
+    # INV-1008421, MOHD RAZIF BIN SENIN @ ATTAN (ATAP), Nur Anisah -- adjusted by +10,000 so
+    # January RES sales are counted at 2 cases, RM63,600.00 per user request.
+    "e5f87cb6-8917-4eba-91c3-521a37fc111b": "10000",
+    "INV-1008421": "10000",
+    # INV-1011497, CHIENG JIN SOON (ATAP), Louis Ng Zhan Yi -- adjusted by +700 so
+    # September RES sales are counted at 3 cases, RM108,300.00 per user request.
+    "0bd6e7f9-dce9-4638-9c2a-1b3ca2b02ff7": "700",
+    "INV-1011497": "700",
+}
+
+# EP for an invoice set by hand, in place of calc_ep_points() (keyed on
+# bubble_id). Sales and ANS are untouched; only the points change.
+SALES_REPORT_EP_OVERRIDES = {
+    # Chan Jia Wei's two large commercial jobs, which the ERP leaves with no
+    # panel count or site type, so calc_ep_points() gave them a point per
+    # ringgit. The factory rule is applied with one RM40,000 full-rate block
+    # across both, then 40%:
+    # INV-1011588, YONG AN EVERCARE SDN BHD (SELCO), RM182,000 -- 40,000 +
+    # 142,000 x 40%.
+    "499cff9f-f29c-4c0d-9fce-e2dd165cc87d": "96800",
+    # INV-1011849, SALAM INDERA SDN. BHD. (PERTOL STATION) (SELCO), RM136,000
+    # -- all at 40%, the block already used above.
+    "558d56d4-3bee-4c31-93ea-8b125ec5c526": "54400",
+    # INV-1009623, GAIN MIRAGE (M) SDN BHD, Sunny Tan -- RM142,400: 40,000 + 102,400 x 40%.
+    "66cc8021-4ea3-4d41-86df-9c6df03a4244": "80960",
+    # Louis Ng Zhan Yi commercial jobs follow the commercial 40k + 40% rule like Chan Jia Wei:
+    # INV-1009088, ENG ANN (M) SDN. BHD. (COMMERCIAL), RM96,000 -- 40,000 + 56,000 x 40%.
+    "0e2734b3-1d2e-4964-bc8e-b5db46d41b50": "62400",
+    "INV-1009088": "62400",
+    # INV-1010710, KIEN HIN TRADING SDN. BHD. (FACTORY), RM100,000 -- adjusted so up to date EP is 1,245,388.07 per user request.
+    "e894ce6a-9780-4069-92b6-e59b34be35ff": "40700",
+    "INV-1010710": "40700",
+}
+
+# Cases placed in a month by hand, overriding the first-payment date (keyed
+# on bubble_id; the value is the date that decides the month).
+SALES_REPORT_DATE_OVERRIDES = {
+    # INV-1009623, GAIN MIRAGE (M) SDN BHD, Sunny Tan -- paid 14 May 2026 but
+    # the payment was only keyed in on 25 July, so it counts in July.
+    "66cc8021-4ea3-4d41-86df-9c6df03a4244": "2026-07-25",
+    # INV-1010896, CHAMPION PRECISION TECHNOLOGY SDN. BHD. (FACTORY), Olivier Koh
+    # Cong Lee -- RM628,000, invoiced 23 Jul, 30% paid 3 Aug. Counted in July,
+    # the invoice month, per user request, so August has no COM line and July
+    # has 1 COM case, RM628,000.00.
+    "f3bc3a72-1f48-4c1b-8015-6205cde96618": "2026-07-23",
+    # INV-1008421, MOHD RAZIF BIN SENIN @ ATTAN (ATAP), Nur Anisah -- shifted to January
+    # so January RES sales are counted at 2 cases, RM63,600.00 per user request.
+    "e5f87cb6-8917-4eba-91c3-521a37fc111b": "2026-01-31",
+    "INV-1008421": "2026-01-31",
+}
+
+# Cases placed on a RES/COM line by hand, overriding _sales_report_property.
+SALES_REPORT_PROPERTY_OVERRIDES = {
+    # INV-1009087, ENG ANN (M) SDN. BHD. (COMMERCIAL) (PLO46) (ATAP), Louis Ng.
+    "a93e1554-caf7-42db-b233-c3c4976ba756": "RES",
+    # INV-1009209, JC PRINT & OFFICE SDN. BHD. (FACTORY), Ching Zhe Hang.
+    "2ebb5452-8b6a-4260-9cb2-0c2dcf98c5e8": "RES",
+    # INV-1010758, IEM CORPORATE SDN. BHD. (COMMERCIAL) (PERMAS JAYA), Denise.
+    "5d802a36-6f08-4397-9871-f89939f1e730": "RES",
+    # INV-1009623, GAIN MIRAGE (M) SDN BHD, Sunny Tan -- 120 panels, 50kW
+    # 3-phase inverter and a capacitor bank; the name carries no site tag.
+    "66cc8021-4ea3-4d41-86df-9c6df03a4244": "COM",
+    # INV-1011588, YONG AN EVERCARE SDN BHD (PERTUBUHAN) (SELCO), Chan Jia Wei --
+    # RM182,000: 100 x 650W panels, 2 x 18kW hybrid inverters and 4 x 16kWh
+    # batteries. SEDA, referral and package type are all blank and panel_qty is
+    # unset, so it fell back to Residential.
+    "499cff9f-f29c-4c0d-9fce-e2dd165cc87d": "COM",
+    # INV-1010583, TEE SOON SIEW (NO 3), Teng Kah Kent -- RM60,000: 45 x 625W
+    # panels and a 20kW inverter. The name carries no site tag.
+    "118e3946-2579-4131-966b-7fc008b2dcf5": "COM",
+    # INV-1008558, DIESEL TRUCK SDN BHD (SELCO) (DIESEL), Olivier Koh Cong Lee --
+    # RM62,800: 50 x 620W panels and a 25kW 3-phase inverter. The name carries
+    # no site tag, so it fell back to Residential; moved to COM so February RES
+    # is the other two cases, RM41,988.00 per user request.
+    "1770626846451x595611071444156400": "COM",
+    # INV-1008785, JMM HOMEMADE SDN BHD (SHOP-LOT) (ATAP), Olivier Koh Cong Lee --
+    # RM68,960: 55 x 620W panels and a 25kW 3-phase inverter. The classifier
+    # leaves a company shop lot on Residential; moved to COM so March RES is the
+    # other three cases, RM76,397.50 per user request.
+    "73299f48-3e8d-4929-942e-dbed470f0408": "COM",
+    # INV-1011062, JIN SENG METAL WORKS (20PCS) (FACTORY), RM30,000, and
+    # INV-1011109, JIN SENG METAL WORKS (NO 33) (FACTORY) (ATAP), RM33,000,
+    # Olivier Koh Cong Lee -- 20 and 24 panels on 3-phase inverters, both under
+    # the RM40,000 full-rate EP block. Moved to RES per user request so August
+    # RES has 6 cases; Champion Precision stays COM.
+    "90186345-d61c-4344-91c1-f32b38d74411": "RES",
+    "fa52eced-ae8d-4f7b-b952-0ec48962486d": "RES",
+    # INV-1010766, LEA COURT HOTEL SDN BHD 90A-B (SHOP-LOT) (ATAP), RM30,000, and
+    # INV-1010895, LEA COURT HOTEL SDN BHD 92A-B (SHOP-LOT) (ATAP), RM30,000,
+    # Koh Yi Jay -- 23 and 21 panels on 3-phase inverters, both under the
+    # RM40,000 full-rate EP block. Moved to RES per user request so September
+    # shows 2 RES cases, RM60,000.00, and no COM.
+    "e280062c-a506-4bc9-9d73-9a419a5b90d0": "RES",
+    "4fc343d0-f5f4-4ef9-9cf3-d190318c080d": "RES",
+    # INV-1011316, MEGA SIGNCRAFT SDN BHD (FACTORY), RM135,000, Hongki You Teng
+    # Hoong -- 110 panels and a 50kW 3-phase inverter. Moved to RES per user
+    # request so August shows 2 RES cases, RM251,000.00, and no COM.
+    "2eb420cc-1ba4-4e52-94f3-881d45a7e36e": "RES",
+    # INV-1008371, T S BEACH RESORT SDN. BHD. (ATAP), Dean Wai Leong Yee --
+    # RM119,800, first paid 9 Jan (10%): a resort on a commercial scale. The
+    # classifier left it on Residential; moved to COM per user request so
+    # January shows 1 COM case, RM119,800.00, and no RES. Invoice number 1008371
+    # is shared with another case, hence the bubble_id.
+    "1767781549782x938580067228319700": "COM",
+    # INV-1010250, AIR TO AIR ENGINEERING SDN BHD (FACTORY), Carol Siow --
+    # moved to RES per user request so June RES has 7 cases.
+    "aba17398-0623-48a6-91ba-6834a5146c97": "RES",
+    "INV-1010250": "RES",
+    # 1008532, GOH LAY MUI (SHOP-LOT) (ATAP - SELCO), Chan Wing On --
+    # moved to COM per user request.
+    "1769926340720x294573873479811100": "COM",
+    "1008532": "COM",
+    # INV-1009339, MX FRESH MART (M) SDN BHD (SHOP-LOT), Winson Tan --
+    # moved to COM so April has 2 RES (RM37,600.00) and 1 COM (RM58,000.00) per user request.
+    "79937470-ca19-405e-9154-8238918a95df": "COM",
+    "INV-1009339": "COM",
+}
+
+# Cases credited on the report to a different agent than the invoice names,
+# keyed on bubble_id. The value is the agent's ERP name, so the case joins
+# that agent's existing row.
+SALES_REPORT_AGENT_OVERRIDES = {
+    # INV-1008782, PANG CHONG PENG ("5ba7279e-efd8-467e-a419-984cbf5a9f5d"), RM19,800,
+    # invoiced under Kenyou, used to be credited here to CHAN JIA WEI alone. It is
+    # now a shared case instead (SALES_REPORT_SHARED_CASES below), so it counts
+    # for Kenyou, the agent on the invoice, as well.
+}
+# Cases credited to a second agent IN ADDITION to the one the invoice names,
+# keyed on bubble_id; the value lists the extra agents' ERP names. The invoice
+# is then on the report once per agent, so the company-wide case and sales
+# totals run higher than the real invoices by each shared case.
+SALES_REPORT_SHARED_CASES = {
+    # INV-1008782, PANG CHONG PENG, RM19,800, 31 Mar -- invoiced under Kenyou and
+    # also Chan Jia Wei's case. Counted for both per user request: Kenyou's March
+    # is 2 RES, RM51,800.00 and Chan Jia Wei's is 9 RES, RM221,020.15.
+    "5ba7279e-efd8-467e-a419-984cbf5a9f5d": ("CHAN JIA WEI",),
+}
 SALES_REPORT_TARGETS = {"Internal": 600000.0, "Outsource": 720000.0}
 # ESA is the higher award and runs to December, where EGA closes in June.
 # Both are overridden per channel by the Data page; these are only the fallback
@@ -2774,6 +3219,45 @@ def _qualifier_label(month) -> str:
     return f"{SALES_REPORT_MONTHS[int(month) - 1]} Qualifier"
 
 
+# The ESA early-bird bars for October and November, per channel. The Data page
+# holds these as the Oct and Nov rungs of each channel's ESA ladder and wins
+# when it has them; these are only the fallback, and they are the scheme's own
+# numbers: Internal 1M / 1.2M, Outsource 1.36M / 1.46M.
+SALES_REPORT_EARLY_BIRD_DEFAULTS = {
+    10: {"Internal": 1000000.0, "Outsource": 1360000.0},
+    11: {"Internal": 1200000.0, "Outsource": 1460000.0},
+}
+
+
+def _sales_report_early_bird_targets(ladders: dict) -> dict[int, dict[str, float]]:
+    """{10: {channel: bar}, 11: {channel: bar}} read from each channel's ESA
+    ladder (the Data page), falling back to SALES_REPORT_EARLY_BIRD_DEFAULTS
+    for a rung the page does not carry."""
+    out: dict[int, dict[str, float]] = {}
+    for month, defaults in SALES_REPORT_EARLY_BIRD_DEFAULTS.items():
+        bag = dict(defaults)
+        for channel in bag:
+            rung = ((ladders.get(channel) or ({}, {}))[1] or {}).get(month)
+            rung = rung[0] if isinstance(rung, (tuple, list)) else rung
+            try:
+                if rung is not None:
+                    bag[channel] = float(rung)
+            except (TypeError, ValueError):
+                pass
+        out[month] = bag
+    return out
+
+
+def _sales_report_early_bird_stage(year: int, today=None) -> str:
+    """Which early-bird column the report carries: "oct" until the end of
+    October, "nov" from 1 November of `year`. One column at a time, the same
+    way EGA gives way to ESA -- October's deadline has passed by then, and the
+    November column still tells an October qualifier apart from the rest."""
+    from datetime import date
+    today = today or date.today()
+    return "nov" if today >= date(int(year), 11, 1) else "oct"
+
+
 def _sales_report_award_targets(year: int) -> tuple[dict[str, float], dict[str, float]]:
     """(EGA thresholds, ESA thresholds) per channel, from the Data page.
 
@@ -2823,6 +3307,218 @@ def _sales_report_local_day(value) -> str:
         return str(value)[:10]
 
 
+def _first_paid_in_year_sql(alias: str, year: int) -> str:
+    """SQL test: the invoice's first payment landed in `year`, Malaysia time.
+
+    The first payment is the invoice's own 1st_payment_date when it is filled,
+    otherwise its earliest payment row: KAREN WONG KAI LIN's INV-1008492 was
+    paid on 28 February 2026 but the field was never set. Written as an
+    uncorrelated IN so the payment table is aggregated once rather than probed
+    invoice by invoice -- the correlated form took a query to ~30s."""
+    y = int(year)
+    return (f'(EXTRACT(YEAR FROM ({alias}."1st_payment_date" AT TIME ZONE '
+            f"'Asia/Kuala_Lumpur'))::int = {y}"
+            f' OR ({alias}."1st_payment_date" IS NULL AND {alias}.bubble_id IN ('
+            f"SELECT fp.linked_invoice FROM payment fp GROUP BY fp.linked_invoice "
+            f"HAVING EXTRACT(YEAR FROM (MIN(fp.payment_date) AT TIME ZONE "
+            f"'Asia/Kuala_Lumpur'))::int = {y})))")
+
+
+_CARRIED_ROWS_CACHE: dict[int, tuple[float, list]] = {}
+
+
+def _sales_report_carried_rows(year: int, out_mod) -> list:
+    """Cases first paid in `year` that the cached EGA rows miss.
+
+    The cached rows hold only invoices dated in `year` with 1st_payment_date
+    filled, yet the report places a case by its first payment, so two kinds
+    belong here: invoiced in an earlier year (Vincent Tan's 1007996, invoiced
+    20 November 2025, first paid 29 January 2026), and paid but with the date
+    never set (his INV-1008492, paid 28 February 2026). Same query and row
+    shape as the EGA rows, only the year filter differs. A failure returns
+    nothing -- the report then reads as it did before."""
+    key = int(year)
+    hit = _CARRIED_ROWS_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _RESPONSE_CACHE_TTL_SECONDS:
+        return hit[1]
+    try:
+        rows = _pg_query(out_mod._invoices_sql(year, upto_month=None, carried_in=True)) or []
+    except Exception:
+        _log("[SALES REPORT] could not read cases carried in from last year")
+        return hit[1] if hit else []
+    _CARRIED_ROWS_CACHE[key] = (time.time(), rows)
+    return rows
+
+
+_LINE_ADJUSTMENTS_CACHE: dict[int, tuple[float, dict]] = {}
+
+
+def _sales_report_line_adjustments(year: int) -> dict[str, "Decimal"]:
+    """invoice bubble_id -> correction to its sales value from invoice lines.
+
+    Two kinds, netted per invoice:
+
+    * +118, the Kluang Opening (16/5/2026) lucky draw. Every Feb & Mar customer
+      was guaranteed RM118, keyed as a -118 line ("KLUANG OPENING 16/5/2026
+      LUCKY DRAW GUARANTEED FOR ATTENDEES : FEB & MAR 2026 CUSTOMERS -
+      RM118.00"). The report adds it back once the invoice is fully paid:
+      LIM CHIT CHOON (Louis, paid up) counts RM25,500, while ADNAN BIN AB
+      WAHAB (Zul) and James (Wong Jia Xuan), on deposit only, stay at their
+      invoice totals. Paid-up is judged as of today, so a case gains the RM118
+      when its last payment lands. Only the -118 lines -- the real prizes
+      (RM688 and up, e.g. LOH KAH GUAN's RM6,888) stay deducted.
+    * -600, a free robot. A customer could take a vacuum robot or RM600 off
+      ("No IMILAB V1 Robot swap discount"). Most took the money; one who took
+      the robot (an RM0 "Free Imilab V1 Vacuum Robot" or "FOC : 1x IMILAB V1
+      Robot" line) is valued the same: SALLY LIM (Denise) counts RM17,400.
+
+    Each distinct line is taken once per invoice, since revisions repeat their
+    items. Retried like the case dates: an empty map would quietly drop every
+    correction."""
+    from decimal import Decimal as _D
+
+    key = int(year)
+    hit = _LINE_ADJUSTMENTS_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _RESPONSE_CACHE_TTL_SECONDS:
+        return hit[1]
+    in_year = (f"COALESCE(i.is_deleted, FALSE) IS NOT TRUE "
+               f"AND (EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)} "
+               f"OR {_first_paid_in_year_sql('i', year)})")
+    items_join = ("JOIN invoice_item ii ON (ii.linked_invoice = i.bubble_id "
+                  "OR ii.bubble_id = ANY(i.linked_invoice_item))")
+    sql = f"""
+        SELECT bubble_id, SUM(amt) AS amt FROM (
+          SELECT DISTINCT ON (i.bubble_id, TRIM(ii.description))
+                 i.bubble_id, 118::numeric AS amt
+            FROM invoice i {items_join}
+           WHERE {in_year}
+             AND ii.description ILIKE '%lucky draw%'
+             AND COALESCE(ii.amount, ii.unit_price, 0) = -118
+             AND COALESCE((SELECT SUM(p.amount) FROM payment p
+                            WHERE p.linked_invoice = i.bubble_id), 0)
+                 >= COALESCE(i.total_amount, 0) - 0.005
+           ORDER BY i.bubble_id, TRIM(ii.description)
+        ) lucky GROUP BY bubble_id
+        UNION ALL
+        SELECT DISTINCT i.bubble_id, -600::numeric AS amt
+          FROM invoice i {items_join}
+         WHERE {in_year}
+           AND ii.description ~* '^\\s*(free|foc)\\M.*robot'
+           AND COALESCE(ii.amount, ii.unit_price, 0) = 0
+    """
+    rows = None
+    for attempt in range(3):
+        try:
+            rows = _pg_query(sql)
+            break
+        except Exception:
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    if rows is None:
+        _log("[SALES REPORT] could not read invoice line corrections after 3 tries")
+        return hit[1] if hit else {}
+    out: dict[str, "Decimal"] = {}
+    for r in rows or []:
+        bid = str(r.get("bubble_id") or "").strip()
+        if bid:
+            out[bid] = out.get(bid, _D("0")) + _D(str(r.get("amt") or 0))
+    _LINE_ADJUSTMENTS_CACHE[key] = (time.time(), out)
+    return out
+
+
+_SOLAR_EV_CACHE: dict[int, tuple[float, frozenset]] = {}
+
+
+def _sales_report_solar_or_ev(year: int) -> frozenset | None:
+    """bubble_ids of `year`'s invoices that sell solar panels or an EV charger.
+
+    Only those are sales on this report. ZHU, HUAIZHAO's 1008497 (Woon Jia
+    Keat, April) is a DC cable and conceal fee added to a 2025 solar job;
+    capacitor banks, a lone inverter, a battery or a cleaning service are not
+    solar packages either. Judged on the lines, not the package flag, which is
+    missing on many real jobs (the factory and S.O.S MEWAH invoices): a panel
+    line reads "<count> x <wattage | brand>", e.g. "50X Jinko Tiger Neo",
+    "34 x ASTRONERGY580W", "(33+1)X Jinko".
+
+    None when the lookup fails, so the caller can skip the filter rather than
+    empty the report."""
+    key = int(year)
+    hit = _SOLAR_EV_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _RESPONSE_CACHE_TTL_SECONDS:
+        return hit[1]
+    sql = f"""
+        SELECT DISTINCT i.bubble_id
+          FROM invoice i
+          JOIN invoice_item ii
+            ON (ii.linked_invoice = i.bubble_id
+                OR ii.bubble_id = ANY(i.linked_invoice_item))
+         WHERE COALESCE(i.is_deleted, FALSE) IS NOT TRUE
+           AND (EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
+                OR {_first_paid_in_year_sql("i", year)})
+           AND (ii.description ~* '\\m\\d+\\s*\\)?\\s*x\\s*(\\d{{3}}\\s*w\\M|jinko|astro|longi|trina|ja\\s*solar|canadian)'
+                OR ii.description ~* '\\mev\\M.*charg|charger')
+    """
+    rows = None
+    for attempt in range(3):
+        try:
+            rows = _pg_query(sql)
+            break
+        except Exception:
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    if rows is None:
+        _log("[SALES REPORT] could not read solar/EV lines; not filtering on them")
+        return hit[1] if hit else None
+    out = frozenset(str(r.get("bubble_id") or "").strip() for r in rows if r.get("bubble_id"))
+    _SOLAR_EV_CACHE[key] = (time.time(), out)
+    return out
+
+
+_DELETED_STATUS_CACHE: dict[int, tuple[float, frozenset]] = {}
+
+
+def _sales_report_deleted_status(year: int) -> frozenset:
+    """bubble_ids of `year`'s cases whose invoice status reads "deleted".
+
+    The is_deleted flag is not always set when an invoice is deleted:
+    LEE THIEN BOON's INV-1008402 has status "deleted" and is_deleted false.
+    Judged on the same latest revision the case dates use, so an invoice that
+    was deleted and then restored still counts. Retried like the case dates:
+    an empty set would quietly put the deleted cases back."""
+    key = int(year)
+    hit = _DELETED_STATUS_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _RESPONSE_CACHE_TTL_SECONDS:
+        return hit[1]
+    sql = f"""
+        SELECT bubble_id FROM (
+          SELECT i.bubble_id, i.status,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY i.bubble_id
+                   ORDER BY COALESCE(i.is_latest, FALSE) DESC,
+                            i.invoice_date DESC NULLS LAST, i.id DESC) AS rn
+            FROM invoice i
+           WHERE i.invoice_date IS NOT NULL
+             AND (EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
+                  OR {_first_paid_in_year_sql("i", year)})
+             AND COALESCE(i.is_deleted, FALSE) IS NOT TRUE
+        ) z WHERE rn = 1 AND LOWER(BTRIM(COALESCE(status, ''))) = 'deleted'
+    """
+    rows = None
+    for attempt in range(3):
+        try:
+            rows = _pg_query(sql)
+            break
+        except Exception:
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    if rows is None:
+        _log("[SALES REPORT] could not read deleted invoice statuses after 3 tries")
+        return hit[1] if hit else frozenset()
+    out = frozenset(str(r.get("bubble_id") or "").strip() for r in rows if r.get("bubble_id"))
+    _DELETED_STATUS_CACHE[key] = (time.time(), out)
+    return out
+
+
 def _sales_report_case_dates(year: int) -> dict[str, str]:
     """invoice bubble_id -> the date that decides which month a case falls in.
 
@@ -2840,6 +3536,14 @@ def _sales_report_case_dates(year: int) -> dict[str, str]:
     and 2025-12-30 -- so keying on the number can return a revision the report
     is not using. The same "latest revision" rule the report applies keeps the
     date and the money on one row.
+
+    Dates are read in Malaysia time. Older rows store a Malaysian date as
+    16:00 UTC the day before, so a plain ::date put NG CHEE HONG (1008310),
+    first paid 1 January 2026, on 31 December and dropped him from the year.
+
+    The invoice date does not limit the map either: Vincent Tan's 1007996 was
+    invoiced 20 November 2025 and first paid 29 January 2026, so it is a
+    January case. See _sales_report_carried_rows().
     """
     key = int(year)
     hit = _FIRST_PAYMENT_CACHE.get(key)
@@ -2849,15 +3553,22 @@ def _sales_report_case_dates(year: int) -> dict[str, str]:
     sql = f"""
         SELECT bubble_id, p1, c FROM (
           SELECT i.bubble_id,
-                 i."1st_payment_date"::date AS p1,
-                 i.created_at::date AS c,
+                 (COALESCE(i."1st_payment_date", fp.first_paid)
+                    AT TIME ZONE 'Asia/Kuala_Lumpur')::date AS p1,
+                 (i.created_at AT TIME ZONE 'Asia/Kuala_Lumpur')::date AS c,
                  ROW_NUMBER() OVER (
                    PARTITION BY i.bubble_id
                    ORDER BY COALESCE(i.is_latest, FALSE) DESC,
                             i.invoice_date DESC NULLS LAST, i.id DESC) AS rn
             FROM invoice i
+            -- Earliest payment row, for invoices whose 1st_payment_date was
+            -- never set (see _first_paid_in_year_sql). Joined, not per row.
+            LEFT JOIN (SELECT linked_invoice, MIN(payment_date) AS first_paid
+                         FROM payment GROUP BY linked_invoice) fp
+                   ON fp.linked_invoice = i.bubble_id
            WHERE i.invoice_date IS NOT NULL
-             AND EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
+             AND (EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
+                  OR {_first_paid_in_year_sql("i", year)})
              AND COALESCE(i.is_deleted, FALSE) IS NOT TRUE
         ) z WHERE rn = 1
     """
@@ -2917,18 +3628,21 @@ def _sales_report_payment_rows(year: int, upto_month: int) -> dict[str, list]:
     sql = f"""
         WITH inv AS (
           SELECT bubble_id FROM invoice
-           WHERE invoice_date >= DATE '{year:04d}-01-01'
-             AND invoice_date <  DATE '{year + 1:04d}-01-01'
+           WHERE ((invoice_date >= DATE '{year:04d}-01-01'
+                   AND invoice_date <  DATE '{year + 1:04d}-01-01')
+                  OR {_first_paid_in_year_sql("invoice", year)})
              AND COALESCE(is_deleted, FALSE) IS NOT TRUE
         )
         SELECT p.linked_invoice AS inv,
                COALESCE(p.amount, 0)::numeric AS a,
-               p.payment_date::date AS d,
-               COALESCE(p.created_date, p.created_at)::date AS m
+               (p.payment_date AT TIME ZONE 'Asia/Kuala_Lumpur')::date AS d,
+               (COALESCE(p.created_date, p.created_at)
+                  AT TIME ZONE 'Asia/Kuala_Lumpur')::date AS m
           FROM payment p
           JOIN inv ON inv.bubble_id = p.linked_invoice
          WHERE p.payment_date IS NOT NULL
-           AND p.payment_date < DATE '{end_year:04d}-{end_month:02d}-01'
+           AND (p.payment_date AT TIME ZONE 'Asia/Kuala_Lumpur')
+                 < DATE '{end_year:04d}-{end_month:02d}-01'
          ORDER BY p.payment_date DESC
     """
     try:
@@ -2964,6 +3678,97 @@ def _case_hover_entry(customer_name, payments):
     return {"n": name, "p": list(payments or [])}
 
 
+# Sales staff tag non-residential sites in the customer name:
+# "JC PRINT & OFFICE SDN. BHD. (FACTORY) (ATAP)". (ATAP)/(20PCS) describe the
+# roof or package, not the property, so only these words count.
+# Shop lots are not here: on the Sales Report they count as Residential.
+_SR_SITE_TAG = re.compile(r"\b(?:FACTORY|KILANG|COMMERCIAL)\b", re.I)
+_SR_BUSINESS_PREMISE = re.compile(
+    r"\bHOTEL\b|\bRESORT\b|\b(?:PETROL|PERTOL)\s+STATION\b|\bCLINIC\b|\bKLINIK\b", re.I)
+# A company can own a house, so these only ask for a look; they never decide.
+_SR_COMPANY_NAME = re.compile(
+    r"SDN\.?\s*BHD|\bBHD\b|\bENTERPRISE\b|\bTRADING\b|\bSYARIKAT\b|\bINDUSTRIES\b"
+    r"|\bMETAL\s+WORKS\b|\bMANUFACTUR", re.I)
+
+
+def _sales_report_property(row: dict, recorded: str) -> tuple[str, str | None]:
+    """("RES" | "COM", review note or None) for one Sales Report invoice.
+
+    `recorded` is classify_property_type()'s answer. Anything it calls
+    non-residential (Factory, Government, ...) is COM -- except a shop lot,
+    which the report counts as Residential (HAPPY ART CREATION STUDIO
+    (SHOP-LOT), Louis, March). The classifier also files plain "COMMERCIAL"
+    under Shop Lot, so a case whose own fields say COMMERCIAL stays COM. Its
+    Residential is often only a fallback, so the customer name gets a say: an
+    explicit site tag or a business premise makes it COM. A Residential that
+    SEDA or the referral actually recorded is kept, and a disagreeing name is
+    flagged instead. EP points keep using `recorded`; this only places the case
+    on a RES/COM line.
+    """
+    shop_lot = recorded == "Shop Lot" and "COMMERCIAL" not in " ".join(
+        str(row.get(k) or "") for k in (
+            "seda_nem_type", "referral_project_type", "package_type",
+            "package_name_snapshot", "description", "customer_name")).upper()
+    if not recorded.lower().startswith("resid") and not shop_lot:
+        return "COM", None
+    name = str(row.get("customer_name") or "")
+    explicit = (
+        "RAKYAT" in str(row.get("seda_nem_type") or "").upper()
+        or "RESIDENTIAL" in str(row.get("referral_project_type") or "").upper())
+    named = _SR_SITE_TAG.search(name) or _SR_BUSINESS_PREMISE.search(name)
+    if named and explicit:
+        return "RES", (f"Customer name says {named.group(0).upper()} but SEDA/referral "
+                       "records Residential")
+    if named:
+        return "COM", None
+    if _SR_COMPANY_NAME.search(name) and not explicit:
+        return "RES", "Company name with no property tag; site type not recorded"
+    return "RES", None
+
+
+def _sales_report_commission_prices(year: int) -> dict[str, "Decimal"]:
+    """invoice number -> its Commission Price (Basic + NFP commission), from the
+    cached commission runs.
+
+    Each channel's NFP figure is read only for invoices in that channel's Basic
+    lines: the two NFP maps can carry the same invoice number for different
+    cases, and pairing across channels would mix them up.
+    """
+    from decimal import Decimal
+
+    out: dict[str, Decimal] = {}
+    for agent_type in ("internal", "outsource"):
+        bundle = get_cached_data(year, agent_type) or {}
+        basic, nfp = bundle.get("basic"), bundle.get("nfp")
+        if not basic or not nfp:
+            continue
+        nfp_by_inv = nfp[-1] or {}
+        prices: dict[str, Decimal] = {}
+        for ln in basic[-1] or []:
+            inv = str(getattr(ln, "invoice_number", "") or "").strip()
+            if inv:
+                prices[inv] = (prices.get(inv, Decimal("0"))
+                               + Decimal(str(getattr(ln, "basic_commission", 0) or 0)))
+        for inv, price in prices.items():
+            nfp_row = nfp_by_inv.get(inv)
+            nfp_comm = getattr(nfp_row, "nfp_commission", None) if nfp_row else None
+            out[inv] = (price + Decimal(str(nfp_comm or 0))).quantize(Decimal("0.01"))
+    return out
+
+
+def _paid_in_full_on_first_payment(payments: list | None, net_total) -> bool:
+    """True when the money received on the first payment day covers the whole
+    invoice. Paying in full later, over several payments, does not count."""
+    if not payments:
+        return False
+    days = [p["d"] for p in payments if p.get("d")]
+    if not days:
+        return False
+    first_day = min(days)
+    first = sum(p["a"] for p in payments if p.get("d") == first_day)
+    return net_total > 0 and first >= float(net_total) - 0.005
+
+
 def _sales_report_payments(year: int, upto_month: int) -> dict[str, "Decimal"]:
     """Cash received against `year`'s invoices, keyed by invoice bubble_id.
 
@@ -2993,15 +3798,17 @@ def _sales_report_payments(year: int, upto_month: int) -> dict[str, "Decimal"]:
     sql = f"""
         WITH inv AS (
           SELECT bubble_id FROM invoice
-           WHERE invoice_date >= DATE '{year:04d}-01-01'
-             AND invoice_date <  DATE '{year + 1:04d}-01-01'
+           WHERE ((invoice_date >= DATE '{year:04d}-01-01'
+                   AND invoice_date <  DATE '{year + 1:04d}-01-01')
+                  OR {_first_paid_in_year_sql("invoice", year)})
              AND COALESCE(is_deleted, FALSE) IS NOT TRUE
         )
         SELECT p.linked_invoice AS inv, SUM(COALESCE(p.amount, 0))::numeric AS paid
           FROM payment p
           JOIN inv ON inv.bubble_id = p.linked_invoice
          WHERE p.payment_date IS NOT NULL
-           AND p.payment_date < DATE '{end_year:04d}-{end_month:02d}-01'
+           AND (p.payment_date AT TIME ZONE 'Asia/Kuala_Lumpur')
+                 < DATE '{end_year:04d}-{end_month:02d}-01'
          GROUP BY p.linked_invoice
     """
     try:
@@ -3377,7 +4184,7 @@ def _sales_report_campaign_label(last_month: int) -> str:
     return f"1/5 - {SALES_REPORT_SPLIT_DAY}/{SALES_REPORT_SPLIT_MONTH}"
 
 
-_SALES_REPORT_PAYLOAD_CACHE: dict[tuple, tuple[float, dict]] = {}
+# _SALES_REPORT_PAYLOAD_CACHE defined above
 
 
 def _sales_report_payload(year: int, through: int | None = None) -> dict | None:
@@ -3402,7 +4209,16 @@ def _sales_report_payload(year: int, through: int | None = None) -> dict | None:
         scope = _overview_scope_agent() or ""
     except Exception:
         scope = ""          # called outside a request; treat as unscoped
-    key = (int(year), None if through is None else int(through), scope)
+    # The early-bird stage is part of the key so the October column hands over
+    # to November's at midnight on 1 November, not up to a TTL later.
+    key = (int(year), None if through is None else int(through), scope,
+           _sales_report_early_bird_stage(year))
+    try:
+        from flask import has_request_context, request
+        if has_request_context() and (request.args.get("_t") or request.args.get("refresh") or request.args.get("nocache")):
+            _SALES_REPORT_PAYLOAD_CACHE.clear()
+    except Exception:
+        pass
     hit = _SALES_REPORT_PAYLOAD_CACHE.get(key)
     if hit and (time.time() - hit[0]) < _RESPONSE_CACHE_TTL_SECONDS:
         return hit[1]
@@ -3433,10 +4249,22 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
 
     max_month = _sales_report_last_month(year)
     last_month = max_month if through is None else max(1, min(int(through), max_month))
+    if "sql_replay" in _data_cache and _data_cache["sql_replay"]:
+        try:
+            query_replay.restore(_data_cache["sql_replay"])
+        except Exception:
+            pass
     bundle = get_cached_data(year, "outsource")
     if not bundle or "ega_raw" not in bundle:
         load_disk_cache()
         bundle = get_cached_data(year, "outsource")
+    if not bundle or "ega_raw" not in bundle:
+        try:
+            bundle = _fetch_commission_bundle(year, "outsource")
+            if bundle:
+                set_cached_data(year, "outsource", bundle)
+        except Exception as err:
+            _log(f"[SALES REPORT] failed to auto-fetch outsource bundle for {year}: {err}")
     if not bundle or "ega_raw" not in bundle:
         _log(f"[SALES REPORT] {year} not ready; no cached outsource ega_raw")
         return None
@@ -3466,24 +4294,38 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
             _log(f"[SALES REPORT] could not apply {label} EGA rules; using built-in ladder")
         ladders[label] = (dict(getattr(mod, "EGA_EARLY_BIRD", {}) or {}),
                           dict(getattr(mod, "ESA_EARLY_BIRD", {}) or {}))
+    # The October and November early-bird bars, per channel, from the same ESA
+    # ladders -- so a bar edited on the Data page moves the column with it.
+    early_targets = _sales_report_early_bird_targets(ladders)
+    oct_targets, nov_targets = early_targets[10], early_targets[11]
+    early_stage = _sales_report_early_bird_stage(year)
 
-    # Six independent lookups, fetched together rather than one after another.
+    # Ten independent lookups, fetched together rather than one after another.
     # Run in sequence they cost about 15 seconds, and profiling puts nearly all
-    # of that in socket reads -- this is not Python being slow, it is six round
+    # of that in socket reads -- this is not Python being slow, it is ten round
     # trips to the proxy taken one at a time. In parallel the wait is the
     # slowest of them instead of their sum.
     #
-    # Safe to thread: none of the six touches the Flask request context, and
+    # Safe to thread: none of the ten touches the Flask request context, and
     # db.py takes its lock for writes only, so these reads do not serialise
     # against each other. The scope filter that DOES read the request is
     # applied further down, on this thread.
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        f_roles = ex.submit(_sales_report_role_index)
-        f_payments = ex.submit(_sales_report_payments, year, last_month)
-        f_payment_rows = ex.submit(_sales_report_payment_rows, year, last_month)
-        f_case_dates = ex.submit(_sales_report_case_dates, year)
-        f_carryover = ex.submit(_sales_report_carryover, year)
-        f_targets = ex.submit(_sales_report_award_targets, year)
+    def _with_replay(fn, *args):
+        import contextlib
+        with (query_replay.replaying() if "sql_replay" in _data_cache and _data_cache["sql_replay"] else contextlib.nullcontext()):
+            return fn(*args)
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        f_roles = ex.submit(_with_replay, _sales_report_role_index)
+        f_payments = ex.submit(_with_replay, _sales_report_payments, year, last_month)
+        f_payment_rows = ex.submit(_with_replay, _sales_report_payment_rows, year, last_month)
+        f_case_dates = ex.submit(_with_replay, _sales_report_case_dates, year)
+        f_carryover = ex.submit(_with_replay, _sales_report_carryover, year)
+        f_targets = ex.submit(_with_replay, _sales_report_award_targets, year)
+        f_carried = ex.submit(_with_replay, _sales_report_carried_rows, year, out_mod)
+        f_deleted = ex.submit(_with_replay, _sales_report_deleted_status, year)
+        f_lines = ex.submit(_with_replay, _sales_report_line_adjustments, year)
+        f_solar = ex.submit(_with_replay, _sales_report_solar_or_ev, year)
 
         # .result() re-raises in this thread, so a failing lookup still fails
         # the request the way it did when these ran in a straight line.
@@ -3493,41 +4335,93 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         case_dates = f_case_dates.result()
         carryover = f_carryover.result()
         targets, esa_targets = f_targets.result()
+        # A new list, not +=: `rows` is the cached bundle's own list.
+        rows = rows + f_carried.result()
+        deleted = f_deleted.result()
+        line_adj = f_lines.result()
+        solar_ev = f_solar.result()
     # The multiplier is a first-half device. A report that runs into July or
     # beyond applies none at all.
     multiplier_in_period = last_month <= SALES_REPORT_SPLIT_MONTH
     zero = Decimal("0")
+    commission_prices = _sales_report_commission_prices(year)
     agents: dict[str, dict] = {}
     seen_bubble: set = set()
     prop_counts: dict[str, int] = {}
 
-    for r in rows:
+    def _credited(rows_):
+        """Each row once for the agent it is credited to, then once more for
+        every extra agent in SALES_REPORT_SHARED_CASES."""
+        for row in rows_:
+            yield row, None
+            for extra in SALES_REPORT_SHARED_CASES.get(str(row.get("bubble_id") or ""), ()):
+                yield row, extra
+
+    for r, shared_with in _credited(rows):
         bubble = r.get("bubble_id")
-        if bubble in seen_bubble:
+        if (bubble, shared_with) in seen_bubble:
             continue
-        seen_bubble.add(bubble)
+        seen_bubble.add((bubble, shared_with))
 
         # A case lands in the month its money first arrived. An invoice
         # raised in December and first paid in January is January's; one raised
         # in January but first paid last December belongs to last year and
         # drops out of this report entirely.
-        placed_on = case_dates.get(str(bubble or ""))
+        placed_on = (SALES_REPORT_DATE_OVERRIDES.get(str(bubble or "").strip())
+                     or SALES_REPORT_DATE_OVERRIDES.get(str(r.get("invoice_number") or "").strip())
+                     or case_dates.get(str(bubble or "")))
         when = int_mod._parse_invoice_date(placed_on) if placed_on else None
-        if when is None and not case_dates:
-            # The lookup failed outright; fall back to invoice dates rather
-            # than emptying the report.
+        if when is None:
+            # Fall back to invoice date if first payment date is not recorded.
             when = int_mod._parse_invoice_date(r.get("invoice_date"))
         if when is None or when.year != year or when.month > last_month:
             continue
 
-        raw = str(r.get("agent_name") or "").strip()
-        if _sales_report_excluded(raw):
+        raw = shared_with or SALES_REPORT_AGENT_OVERRIDES.get(
+            str(bubble or ""), str(r.get("agent_name") or "").strip())
+        if (_sales_report_excluded(raw) or _sales_report_cancelled(r)
+                or str(bubble or "") in SALES_REPORT_EXCLUDED_INVOICES
+                or str(bubble or "") in deleted):
             continue
+        # No money received by the end of the period: not a sale yet. The five
+        # QUEK JOO HIANG invoices (Denise, 29 Apr) carry only RM0 payments and
+        # were replaced in July by real ones dated back to that day. Skipped
+        # when the payments lookup failed, which would otherwise empty the
+        # report.
+        is_overridden = (str(bubble or "") in SALES_REPORT_EP_OVERRIDES
+                         or str(r.get("invoice_number") or "") in SALES_REPORT_EP_OVERRIDES
+                         or str(bubble or "") in SALES_REPORT_SALES_ADJUSTMENTS
+                         or str(r.get("invoice_number") or "") in SALES_REPORT_SALES_ADJUSTMENTS)
+        if not is_overridden and payments and payments.get(str(bubble or ""), zero) <= 0:
+            continue
+        # Not a solar or EV sale (add-ons, capacitor banks, cleaning...).
+        if solar_ev is not None and not is_overridden and str(bubble or "") not in solar_ev:
+            continue
+        # Sales price: invoice total net of EPP interest, corrected for lucky draw
+        # and free robot lines (_sales_report_line_adjustments) and by hand.
+        adj_val = (SALES_REPORT_SALES_ADJUSTMENTS.get(str(bubble or "").strip())
+                   or SALES_REPORT_SALES_ADJUSTMENTS.get(str(r.get("invoice_number") or "").strip())
+                   or "0")
         sales = (Decimal(str(r.get("total_amount") or 0))
-                 - Decimal(str(r.get("epp_interest") or 0)))
+                 - Decimal(str(r.get("epp_interest") or 0))
+                 + line_adj.get(str(bubble or ""), zero)
+                 + Decimal(adj_val))
+        # ANS: an invoice paid 100% on its first payment counts at its
+        # Commission Price; everything else at its sales price. "Paid in full"
+        # is still judged against the full invoice amount, since that is what
+        # the customer pays.
+        ans = sales
+        if _paid_in_full_on_first_payment(payment_rows.get(str(bubble or "")),
+                                          Decimal(str(r.get("total_amount") or 0))):
+            price = commission_prices.get(str(r.get("invoice_number") or "").strip())
+            if price is not None:
+                ans = price
         prop = int_mod.classify_property_type(r)
-        prop_counts[prop] = prop_counts.get(prop, 0) + 1
-        kind = "RES" if prop.lower().startswith("resid") else "COM"
+        kind, review = _sales_report_property(r, prop)
+        if str(bubble or "") in SALES_REPORT_PROPERTY_OVERRIDES:
+            kind, review = SALES_REPORT_PROPERTY_OVERRIDES[str(bubble or "")], None
+        mix_key ="Residential" if kind == "RES" else "Commercial"
+        prop_counts[mix_key] = prop_counts.get(mix_key, 0) + 1
 
         role = _sales_report_lookup_role(raw, roles)
         identity = _sales_report_identity(raw, role)
@@ -3554,23 +4448,30 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
                 "campaign_custs": [],
                 "jun": {},                # kind -> [1-10, 11-30]
                 "campaign_cases": 0, "campaign_ans": zero,
+                # Cases whose RES/COM placement deserves a human look.
+                "reviews": [],
                 "acc_noc": 0, "acc_ans": zero, "collected": zero,
                 "ep": zero, "ep_rows": [],
             }
 
         entry["raw_names"].add(raw)
+        if review:
+            entry["reviews"].append({
+                "invoice": str(r.get("invoice_number") or "").strip(),
+                "customer": str(r.get("customer_name") or "").strip(),
+                "agent": entry["agent"], "type": kind, "reason": review})
 
         months = entry["lines"].setdefault(kind, {})
         cell = months.setdefault(when.month, [0, zero])
         cell[0] += 1
-        cell[1] += sales
+        cell[1] += ans
         customer = _case_hover_entry(r.get("customer_name"),
                                      payment_rows.get(str(bubble or "")))
         if customer:
             entry["custs"].setdefault(kind, {}).setdefault(when.month, []).append(customer)
         if when.month == SALES_REPORT_SPLIT_MONTH:
             split = entry["jun"].setdefault(kind, [zero, zero])
-            split[0 if when.day <= SALES_REPORT_SPLIT_DAY else 1] += sales
+            split[0 if when.day <= SALES_REPORT_SPLIT_DAY else 1] += ans
         # Campaign window: 1 May through 10 June. Fixed to the actual EGA
         # campaign dates regardless of how far the ledger now extends -- a
         # period that stops earlier simply never reaches the later rows.
@@ -3582,14 +4483,26 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
                 entry["campaign_custs"].append(customer)
 
         entry["acc_noc"] += 1
-        entry["acc_ans"] += sales
+        entry["acc_ans"] += ans
         # One invoice is visited once (seen_bubble above), so its receipts are
         # added once. An invoice nobody has paid simply contributes nothing.
         entry["collected"] += payments.get(str(bubble or ""), zero)
+        ep_fixed = (SALES_REPORT_EP_OVERRIDES.get(str(bubble or "").strip())
+                    or SALES_REPORT_EP_OVERRIDES.get(str(r.get("invoice_number") or "").strip()))
+        if "louis" in entry["agent"].lower():
+            _log(f"[DEBUG LOUIS] inv={r.get('invoice_number')}, bubble={bubble}, ep_fixed={ep_fixed}")
+        # A case on the report's COM line earns EP by the commercial rule -- the
+        # first RM40,000 at 100%, the balance at 40%, for invoices dated from the
+        # Data page's cutoff (1 May 2026) -- whatever the ERP recorded: it holds
+        # most of these jobs as plain "Residential", which calc_ep_points pays at
+        # a point per ringgit. A RES-line case keeps the recorded type, and a
+        # hand-set EP above still wins.
+        ep_prop = "Factory" if kind == "COM" else prop
         entry["ep_rows"].append((
             when.strftime("%Y-%m-%d"),
-            int_mod.calc_ep_points(sales, prop, r.get("invoice_date"),
-                                   int(r.get("panel_qty") or 0)),
+            Decimal(ep_fixed) if ep_fixed is not None
+            else int_mod.calc_ep_points(sales, ep_prop, r.get("invoice_date"),
+                                        int(r.get("panel_qty") or 0)),
         ))
 
     scope_agent = _overview_scope_agent()
@@ -3624,6 +4537,8 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
 
         threshold = Decimal(str(targets.get(entry["channel"], 720000.0)))
         esa_threshold = Decimal(str(esa_targets.get(entry["channel"], 1560000.0)))
+        oct_threshold = Decimal(str(oct_targets.get(entry["channel"], 1360000.0)))
+        nov_threshold = Decimal(str(nov_targets.get(entry["channel"], 1460000.0)))
         # Qualification is the EGA one -- that is what the summary card counts
         # and what the printed report's own qualifier column means.
         ega_ladder, esa_ladder = ladders.get(entry["channel"], ({}, {}))
@@ -3646,6 +4561,14 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         ega_double = ep_jun >= threshold * 2
         esa_qualified = esa_month is not None
         esa_ep = base_ep
+        oct_qualified = esa_ep >= oct_threshold
+        # November: the earliest rung wins, as it does on the ESA ladder. Anyone
+        # who had cleared October's bar by the end of October already holds the
+        # early bird, so they read as an October qualifier rather than as
+        # someone still short of November's higher bar.
+        ep_by_oct = sum((e for d, e in entry["ep_rows"] if d <= f"{year:04d}-10-31"), zero)
+        won_oct = ep_by_oct >= oct_threshold
+        nov_qualified = won_oct or esa_ep >= nov_threshold
         types = [k for k in ("RES", "COM") if entry["lines"].get(k)]
         out_agents.append({
             "agent": entry["agent"],
@@ -3698,6 +4621,15 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
             # the basis the award is judged on.
             "esa_ep": float(esa_ep),
             "esa_balance": 0.0 if esa_qualified else float(esa_threshold - esa_ep),
+            "oct_threshold": float(oct_threshold),
+            "oct_qualified": oct_qualified,
+            "oct_balance": 0.0 if oct_qualified else float(oct_threshold - esa_ep),
+            "oct_status": "Qualifier" if oct_qualified else "",
+            "nov_threshold": float(nov_threshold),
+            "nov_qualified": nov_qualified,
+            "nov_balance": 0.0 if nov_qualified else float(nov_threshold - esa_ep),
+            "nov_status": (("Oct Qualifier" if won_oct else "Qualifier")
+                           if nov_qualified else ""),
             # "Apr Qualifier" and the like, in the printed report's wording.
             "status": _qualifier_label(ega_month) if qualified else "",
             "esa_status": _qualifier_label(esa_month) if esa_qualified else "",
@@ -3749,6 +4681,13 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         "scoped_to_agent": scope_agent,
         "targets": targets,
         "esa_targets": esa_targets,
+        "oct_targets": oct_targets,
+        "nov_targets": nov_targets,
+        # One early-bird column at a time: October's until the end of October,
+        # November's from 1 November (see _sales_report_early_bird_stage).
+        "early_bird": early_stage,
+        "show_oct": early_stage == "oct",
+        "show_nov": early_stage == "nov",
         "multiplier_in_period": multiplier_in_period,
         "branches": branches,
         "agents": out_agents,
@@ -3757,10 +4696,13 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
             "sales": sum(a["acc_ans"] for a in out_agents),
             "agents": len(out_agents),
         },
-        # Surfaced so the page can say why the RES/COM split looks thin: the
-        # classifier falls back to Residential whenever SEDA nem type, referral
-        # project type and the package fields are all silent.
+        # Surfaced so the page can say why the RES/COM split looks thin: with
+        # no SEDA nem type, referral project type, package wording or customer
+        # name tag, a case falls back to Residential. Factory counts as Commercial.
         "property_mix": prop_counts,
+        "property_review": sorted(
+            (rv for e in agents.values() for rv in e["reviews"]),
+            key=lambda rv: (rv["agent"], rv["invoice"])),
     }
 
 
@@ -3777,13 +4719,19 @@ def sales_report_page():
 def get_sales_report():
     year = request.args.get("year", 2026, type=int)
     through = request.args.get("month", type=int)
+    if request.args.get("refresh") == "1":
+        clear_commission_cache()
     try:
         payload = _sales_report_payload(year, through)
         if payload is None:
             _trigger_background_refresh(year, "outsource")
             return jsonify({"ready": False,
                             "message": "Sales data is still being prepared. Refresh shortly."})
-        return jsonify(payload)
+        resp = make_response(jsonify(payload))
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
     except Exception as e:
         _log("[SALES REPORT ERROR]\n" + traceback.format_exc())
         return jsonify({"error": str(e)}), 500
@@ -3796,9 +4744,19 @@ def _sales_report_visible(payload: dict, search: str) -> list[dict]:
     q = _normalize_search_text(search or "")
     if not q:
         return payload.get("agents") or []
+
+    def has_customer(a: dict) -> bool:
+        """One of the agent's customers matches -- the names the NOC hovers
+        show, compared in the same compact form as the aliases."""
+        return any(q in _normalize_search_text((c or {}).get("n") or "")
+                   for t in (a.get("types") or [])
+                   for m in (t.get("months") or [])
+                   for c in (m.get("custs") or []))
+
     return [a for a in (payload.get("agents") or [])
             if q in _normalize_search_text(a.get("agent") or "")
-            or any(q in k for k in (a.get("aliases") or []))]
+            or any(q in k for k in (a.get("aliases") or []))
+            or has_customer(a)]
 
 
 def _sales_report_pdf(payload: dict, search: str) -> bytes:
@@ -3862,6 +4820,8 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
             spans.append(("SPAN", (col, 0), (col + 1, 0)))
             col += 2
     campaign_label = payload.get("campaign_label") or f"1/5 - {sd}/{sm}"
+    # TOTAL and ACC open the groups below, so their first columns are known.
+    total_col, acc_col = col, col + 2
     # The multiplier columns only exist while the period reaches the campaign.
     groups = [("TOTAL", ("NOC", "ANS")), ("ACC", ("NOC", "ANS"))]
     if not no_campaign:
@@ -3877,10 +4837,13 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
     # ESA from July. Same rule the page follows, from the same payload flags.
     show_ega = payload.get("show_ega", lm <= sm) is not False
     show_esa = bool(payload.get("show_esa", lm > sm))
-    top += ["COLLECTED\nPAYMENT", "UP TO DATE\nEP POINT"]
-    sub += ["", ""]
-    collected_col, ep_col = col, col + 1
-    col += 2
+    # The early-bird column is October's until the end of October and
+    # November's from 1 November; the payload says which, as it does for the page.
+    early = "nov" if payload.get("show_nov") else "oct"
+    top += ["UP TO DATE\nEP POINT", "COLLECTED\nPAYMENT", ""]
+    sub += ["", "", ""]
+    ep_col, collected_col, oct_col = col, col + 1, col + 2
+    col += 3
     ega_col = esa_col = None
     if show_ega:
         top += [""]
@@ -3897,7 +4860,8 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
     spans += [("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1)),
               ("SPAN", (2, 0), (2, 1)),
               ("SPAN", (collected_col, 0), (collected_col, 1)),
-              ("SPAN", (ep_col, 0), (ep_col, 1))]
+              ("SPAN", (ep_col, 0), (ep_col, 1)),
+              ("SPAN", (oct_col, 0), (oct_col, 1))]
     for award in (ega_col, esa_col):
         if award is not None:
             spans.append(("SPAN", (award, 0), (award, 1)))
@@ -3921,6 +4885,13 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
                     f"/{fmt_threshold(bag.get('Outsource'))}")
 
         head = list(top)
+        if oct_col is not None:
+            if early == "nov":
+                head[oct_col] = ("NOV EARLY BIRD\nBALANCE TO QUALIFY\n"
+                                 f"({bars(payload.get('nov_targets'))} EP Point Till 30Nov)")
+            else:
+                head[oct_col] = ("OCT EARLY BIRD\nBALANCE TO QUALIFY\n"
+                                 f"({bars(payload.get('oct_targets'))} EP Point Till 30Oct)")
         if ega_col is not None:
             head[ega_col] = ("EGA - HANOI\nBalance to Qualify\n"
                              f"({bars(payload.get('targets'))} EP Point Till 30Jun)")
@@ -3967,8 +4938,10 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
             tier = float(agent.get("bonus_tier") or 0)
             row += [
                 str(t.get("total_noc", 0)), rm(t.get("total_ans")),
-                str(agent.get("acc_noc", 0)) if last else "",
-                rm(agent.get("acc_ans")) if last else "",
+                # ACC is one merged cell down the agent's lines (see the SPANs in
+                # block()), so the value sits on the first line of the span.
+                str(agent.get("acc_noc", 0)) if first else "",
+                rm(agent.get("acc_ans")) if first else "",
             ]
             if not no_campaign:
                 row += [
@@ -3985,9 +4958,11 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
                     ("-" if first else ""), ("-" if first else ""),
                 ]
             row += [
+                rm(agent.get("ep")) if first else "",
                 ((rm(agent.get("collected")) if agent.get("collected") else "-")
                  if first else ""),
-                rm(agent.get("ep")) if first else "",
+                ((agent.get(f"{early}_status") or "Qualifier" if agent.get(f"{early}_qualified")
+                  else rm(agent.get(f"{early}_balance"))) if first else ""),
             ]
             if not first:
                 row += [""] * ((1 if show_ega else 0) + (1 if show_esa else 0))
@@ -4033,8 +5008,8 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
                            + (a.get("campaign_bonus") or 0)
                            for a in members if a.get("bonus_tier"))),
                     "-", "-"]
-        # Collected, EP, then one blank per award column in the header.
-        row += [rm(sum(a.get("collected") or 0 for a in members)), ""]
+        # EP, Collected, Oct Early Bird, then one blank per award column in the header.
+        row += ["", rm(sum(a.get("collected") or 0 for a in members)), ""]
         row += [""] * ((1 if show_ega else 0) + (1 if show_esa else 0))
         return row
 
@@ -4065,13 +5040,29 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
             ("TOPPADDING", (0, 0), (-1, -1), 1.2),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 1.2),
         ] + spans
+        # Column bands, as on the page: TOTAL green, ACC blue, UP TO DATE EP
+        # POINT beige, a deeper shade of each on the subtotal row.
+        for first_col, last_col, body, subtotal in (
+                (total_col, total_col + 1, "#E6F4EA", "#CDE9D5"),
+                (acc_col, acc_col + 1, "#E3EEFB", "#C9DDF5"),
+                (ep_col, ep_col, "#F5EEDC", "#EBDFC0")):
+            style += [
+                ("BACKGROUND", (first_col, 2), (last_col, -2), colors.HexColor(body)),
+                ("BACKGROUND", (first_col, -1), (last_col, -1), colors.HexColor(subtotal)),
+            ]
         # Qualified reads green and short reads red, the same signal the page
         # gives with .sr-qualified / .sr-short.
         green, red = colors.HexColor("#166534"), colors.HexColor("#b91c1c")
         r = 2
         for a in members:
-            for i in range(max(1, len(a.get("types") or []))):
+            n_lines = max(1, len(a.get("types") or []))
+            for i in range(n_lines):
                 if i == 0:
+                    # ACC adds RES and COM together: one merged cell per agent,
+                    # as on the page.
+                    if n_lines > 1:
+                        for c in (acc_col, acc_col + 1):
+                            style.append(("SPAN", (c, r), (c, r + n_lines - 1)))
                     if ega_col is not None:
                         style.append(("TEXTCOLOR", (ega_col, r), (ega_col, r),
                                       green if a.get("qualified") else red))
@@ -4198,11 +5189,15 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
                                     textColor=colors.HexColor("#64748b"))
         story.append(Paragraph(
             "<b>Three columns differ from the printed report.</b> "
-            f"<b>RES / COM</b> - the property classifier returned Residential for {res} "
-            f"of {mix_total} invoices (others: {html.escape(others)}); it falls back to "
-            "Residential whenever SEDA nem type, referral project type and the package "
-            "fields are all silent, so most agents show a single RES line where the print "
-            "splits them. <b>EP point</b> - 1 point per RM1 of sales, plus the campaign "
+            f"<b>RES / COM</b> - {res} of {mix_total} invoices are Residential (others: "
+            f"{html.escape(others)}). Factory counts as Commercial; shop lot as Residential. A case is "
+            "Commercial when SEDA nem type, referral project type, the package or a customer "
+            "name tag such as (FACTORY) says so; with none of those it falls back to "
+            "Residential, so most agents show a single RES line where the print "
+            "splits them. <b>ANS</b> - an invoice paid 100% on its first payment counts "
+            "at its Commission Price (Basic + NFP commission); every other invoice counts at "
+            "its sales price, net of EPP interest. EP points also leave EPP interest out. "
+            "<b>EP point</b> - 1 point per RM1 of sales, plus the campaign "
             "bonus: every third case an agent closed before the cutoff adds half a point "
             "per ringgit of their campaign sales. Those case counts are typed in under "
             "Data &rarr; EGA/ESA Award; an agent with no row there earns no bonus, shown "

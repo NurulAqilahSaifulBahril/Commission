@@ -2372,6 +2372,30 @@ body {
     border-top: 2px solid #cbd5e1;
 }
 
+/* Column bands: TOTAL green, ACC blue, UP TO DATE EP POINT beige. The
+   subtotal row takes a deeper shade of each so it still reads as a total. */
+.sr-table th.sr-col-total,
+.sr-table td.sr-col-total { background-color: #E6F4EA; }
+.sr-table th.sr-col-acc,
+.sr-table td.sr-col-acc { background-color: #E3EEFB; }
+/* ACC is one merged cell down an agent's RES and COM lines; centre it there. */
+.sr-table td.sr-col-acc[rowspan] { vertical-align: middle; }
+.sr-table th.sr-col-ep,
+.sr-table td.sr-col-ep { background-color: #F5EEDC; }
+.sr-table tr.sr-subtotal td.sr-col-total { background-color: #CDE9D5; }
+.sr-table tr.sr-subtotal td.sr-col-acc { background-color: #C9DDF5; }
+.sr-table tr.sr-subtotal td.sr-col-ep { background-color: #EBDFC0; }
+
+.sr-table th.sr-col-jun-val,
+.sr-table td.sr-col-jun-val {
+    min-width: 110px;
+    padding-left: 10px;
+    padding-right: 10px;
+}
+.sr-table th.sr-col-jun-header {
+    min-width: 220px;
+}
+
 .sr-caveat {
     background-color: #FFF8E6;
     border-left: 3px solid #D9A441;
@@ -2383,6 +2407,14 @@ body {
     color: #5C4813;
 }
 .sr-caveat strong { font-weight: 700; }
+/* Scrolls inside a wrapper: overflow on the box itself lets the flex column shrink it. */
+.sr-prop-review-scroll { overflow-x: auto; }
+.sr-prop-review summary { cursor: pointer; }
+.sr-prop-review-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+.sr-prop-review-table th, .sr-prop-review-table td {
+    text-align: left; padding: 5px 8px; border-bottom: 1px solid #EBDDB8; vertical-align: top;
+}
+.sr-prop-review-table th { font-weight: 700; }
 
 /* ── Sales Report: case hover panel ─────────────────────────────────────────
    A browser tooltip cannot draw a table, and the payment detail behind a NOC

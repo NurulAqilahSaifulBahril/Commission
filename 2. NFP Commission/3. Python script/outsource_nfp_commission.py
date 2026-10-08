@@ -194,7 +194,10 @@ def get_agent_hierarchy_info(agent_name: str) -> dict[str, Any] | None:
     if "dean wai" in n or "leong yee" in n:
         return {"canonical_name": "Dean Wai", "tier": "OUM",
                 "osa_parent": None, "oum_parent": None}
-    if "oliver koh" in n or "chong lee" in n:
+    # The ERP holds him twice: "OLIVIER KOH CHONG LEE" (invoices up to
+    # 29 Jul 2026) and "OLIVIER KOH CONG LEE" (from then on). Both are
+    # one OUM, or he shows as two agents with split totals.
+    if "oliver koh" in n or "olivier koh" in n or "chong lee" in n:
         return {"canonical_name": "Oliver Koh", "tier": "OUM",
                 "osa_parent": None, "oum_parent": None}
     if "wing on" in n:
@@ -390,7 +393,8 @@ pkg_ranked AS (
     FROM invoice_items_mapped
 ),
 pkg AS (
-    SELECT p.invoice_bubble_id, p.system_price, p.package_description, COALESCE(pkg_table.nett_price, 0) AS db_net_floor_price
+    SELECT p.invoice_bubble_id, p.system_price, p.package_description, COALESCE(pkg_table.nett_price, 0) AS db_net_floor_price,
+        pkg_table.package_name
     FROM pkg_ranked p
     LEFT JOIN package pkg_table ON pkg_table.bubble_id = p.linked_package
     WHERE p.rn = 1
@@ -458,6 +462,7 @@ candidates AS (
         COALESCE(pay.epp_sum, 0) AS payment_epp_sum,
         COALESCE(pkg.system_price, 0) AS system_price,
         pkg.package_description,
+        pkg.package_name,
         COALESCE(pkg.db_net_floor_price, 0) AS db_net_floor_price,
         items.all_item_text,
         COALESCE(tng.has_tng, FALSE) AS has_tng_rebate,
@@ -542,6 +547,7 @@ SELECT
     r.phase_type,
     r.system_price,
     r.package_description,
+    r.package_name,
     r.db_net_floor_price,
     r.all_item_text,
     r.has_tng_rebate,
@@ -611,6 +617,9 @@ class OutsourceNfpLine:
     commission_c: float
     nfp_commission: float
     package_description: Optional[str] = None
+    # The linked package's own name, e.g. "[1P] HYBRID SAJ JINKO 15 PCS" --
+    # the only place a hybrid invoice says it is hybrid.
+    package_name: Optional[str] = None
     pct75_date: Optional[str] = None
     # The month this commission is recognised in. Equal to full_payment_date
     # unless a Data page tier states a different payment stage, so consumers
@@ -963,6 +972,7 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[Outsource
                 commission_c=float(money(c)),
                 nfp_commission=float(money(total_comm)),
                 package_description=row.get("package_description"),
+                package_name=row.get("package_name"),
                 pct75_date=row_p75,
                 payout_date=row_payout,
                 payout_trigger_pct=float(row_trigger),

@@ -837,6 +837,13 @@ def milestone_column(t) -> str:
     return f"pct_{_threshold_slug(t)}_date"
 
 
+def milestone_created_column(t) -> str:
+    """The result column holding the Created at date (Malaysia time) of the
+    payment that reached this threshold -- when Finance entered it, which can
+    be days after the payment date typed on it."""
+    return f"pct_{_threshold_slug(t)}_created"
+
+
 def milestone_sql_parts(thresholds=None, exclusions: str = None):
     """(ctes, selects, joins) SQL fragments for the milestone dates.
 
@@ -858,6 +865,7 @@ def milestone_sql_parts(thresholds=None, exclusions: str = None):
     for t in sorted(set(Decimal(x) for x in thresholds)):
         name = f"pct_{_threshold_slug(t)}"
         col = milestone_column(t)
+        ccol = milestone_created_column(t)
         if t == Decimal("100"):
             cmp_sql = "sub.running_total >= sub.total_amount - 0.01"
         else:
@@ -866,10 +874,15 @@ def milestone_sql_parts(thresholds=None, exclusions: str = None):
         ctes.append(f"""-- earliest date each invoice reached {t}% of total_amount paid
 {name} AS (
   SELECT sub.linked_invoice,
-         MIN(sub.payment_date) AS {col}
+         MIN(sub.payment_date) AS {col},
+         -- the same crossing payment's Created at, in Malaysia time
+         (ARRAY_AGG((sub.created_at AT TIME ZONE 'Asia/Kuala_Lumpur')::date
+                    ORDER BY sub.payment_date, sub.id))[1] AS {ccol}
   FROM (
     SELECT p.linked_invoice,
+           p.id,
            p.payment_date,
+           p.created_at,
            SUM(p.amount) OVER (
              PARTITION BY p.linked_invoice
              ORDER BY p.payment_date ASC, p.id ASC
@@ -882,7 +895,7 @@ def milestone_sql_parts(thresholds=None, exclusions: str = None):
   WHERE {cmp_sql}
   GROUP BY sub.linked_invoice
 )""")
-        selects.append(f"    {name}.{col},")
+        selects.append(f"    {name}.{col}, {name}.{ccol},")
         joins.append(f"  LEFT JOIN {name} ON {name}.linked_invoice = i.bubble_id")
     return ",\n".join(ctes), "\n".join(selects), "\n".join(joins)
 
@@ -918,6 +931,21 @@ def milestone_date(row: dict, threshold) -> str:
     if threshold is None:
         return ""
     return str(row.get(milestone_column(threshold)) or "")[:10]
+
+
+def milestone_created(row: dict, threshold) -> str:
+    """Created at date of the payment that reached one threshold, or ""."""
+    if threshold is None:
+        return ""
+    return str(row.get(milestone_created_column(threshold)) or "")[:10]
+
+
+def invoice_milestone_created(row: dict, policy) -> tuple:
+    """(advance_created, balance_created) for the stages `policy` names."""
+    if policy is None:
+        return "", ""
+    advance = milestone_created(row, policy.advance_trigger) if policy.is_multi_stage else ""
+    return advance, milestone_created(row, policy.balance_trigger)
 
 
 def default_payout_policy(month: int, year: int = 2026) -> "PayoutPolicy":

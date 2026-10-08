@@ -368,7 +368,10 @@ def get_agent_hierarchy_info(agent_name: str) -> dict[str, Any] | None:
         return {"canonical_name": "Wilson Tan", "tier": "OUM", "osa_parent": None, "oum_parent": None}
     if "dean wai" in n or "leong yee" in n:
         return {"canonical_name": "Dean Wai", "tier": "OUM", "osa_parent": None, "oum_parent": None}
-    if "oliver koh" in n or "chong lee" in n:
+    # The ERP holds him twice: "OLIVIER KOH CHONG LEE" (invoices up to
+    # 29 Jul 2026) and "OLIVIER KOH CONG LEE" (from then on). Both are
+    # one OUM, or he shows as two agents with split totals.
+    if "oliver koh" in n or "olivier koh" in n or "chong lee" in n:
         return {"canonical_name": "Oliver Koh", "tier": "OUM", "osa_parent": None, "oum_parent": None}
     if "wing on" in n:
         return {"canonical_name": "Chan Wing On", "tier": "OUM", "osa_parent": None, "oum_parent": None}
@@ -643,12 +646,14 @@ def _invoices_sql(year: int) -> str:
     # basic_commission_rates.milestone_sql_parts); they used to be 0.05/0.75/1.0
     # literals here, which made every payout trigger entered on that page inert.
     from basic_commission_rates import (milestone_sql_parts, milestone_column,
+                                        milestone_created_column,
                                         multi_stage_cutover, payout_thresholds_in_use)
     from decimal import Decimal as _D
     milestone_ctes, milestone_selects, milestone_joins = milestone_sql_parts()
     # Re-select the milestone columns out of `candidates` by name.
     milestone_out_selects = "\n".join(
-        f"  {milestone_column(t)}," for t in payout_thresholds_in_use())
+        f"  {milestone_column(t)}, {milestone_created_column(t)},"
+        for t in payout_thresholds_in_use())
     full_col = milestone_column(_D("100"))
     cutover = multi_stage_cutover(year)
     # No multi-stage rule this year means the old full-payment rule governs all

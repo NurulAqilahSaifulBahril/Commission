@@ -355,7 +355,14 @@ def _get_token() -> str | None:
 # ---------------------------------------------------------------------------
 # SQL
 # ---------------------------------------------------------------------------
-def _invoices_sql(year: int, may_only: bool = False, upto_month: int | None = None) -> str:
+def _invoices_sql(year: int, may_only: bool = False, upto_month: int | None = None,
+                  carried_in: bool = False) -> str:
+    """`carried_in` swaps the invoice-year filter for the Sales Report's cases
+    the ordinary query misses: invoiced in an earlier year but first paid
+    (Malaysia time) in `year`, or with no 1st_payment_date at all but an
+    earliest payment row in `year`. Neither overlaps the ordinary rows, which
+    are invoiced in `year` with the date filled. Nothing else in the query
+    changes, so the rows have the same shape."""
     # Both the CLI and the commission pack call this first, so it is the one
     # place the year is known before any figure is computed.
     ensure_rules_applied(year)
@@ -365,6 +372,20 @@ def _invoices_sql(year: int, may_only: bool = False, upto_month: int | None = No
         month_filter = f"AND EXTRACT(MONTH FROM i.invoice_date)::int <= {int(upto_month)}"
     else:
         month_filter = ""
+    if carried_in:
+        year_filter = (
+            f"AND ((EXTRACT(YEAR FROM i.invoice_date)::int < {int(year)}\n"
+            f"      AND EXTRACT(YEAR FROM (i.\"1st_payment_date\" AT TIME ZONE "
+            f"'Asia/Kuala_Lumpur'))::int = {int(year)})\n"
+            f"     OR (i.\"1st_payment_date\" IS NULL\n"
+            f"      AND i.bubble_id IN (\n"
+            f"        SELECT fp.linked_invoice FROM payment fp GROUP BY fp.linked_invoice\n"
+            f"        HAVING EXTRACT(YEAR FROM (MIN(fp.payment_date)\n"
+            f"                                  AT TIME ZONE 'Asia/Kuala_Lumpur'))::int = {int(year)})))")
+        first_paid_filter = ""
+    else:
+        year_filter = f"AND EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}"
+        first_paid_filter = 'AND i."1st_payment_date" IS NOT NULL'
     # Notice we remove the agent_type = 'internal', 'full time' filter here.
     # The python logic filters strictly for outsource agents.
     return f"""
@@ -462,10 +483,10 @@ WITH candidates AS (
     WHERE p.linked_invoice = i.bubble_id
   ) pay ON TRUE
   WHERE i.invoice_date IS NOT NULL
-    AND EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
+    {year_filter}
     {month_filter}
     AND COALESCE(i.is_deleted, FALSE) IS NOT TRUE
-    AND i."1st_payment_date" IS NOT NULL
+    {first_paid_filter}
 )
 SELECT
   bubble_id,
@@ -593,8 +614,8 @@ def calc_ep_points(
     comes from the Data page via ensure_rules_applied(); only which package
     types the reduced rate applies to is fixed here.
     """
-    # Anything that is not a large factory job earns a point per ringgit.
-    if prop_type != "Factory" or int(panel_qty or 0) < FACTORY_MIN_PANELS:
+    # Residential always earns 1 pt per RM1 (100%). Only Commercial / Factory / Shop Lot / SELCO jobs earn reduced EP.
+    if prop_type in ("Residence", "RES") or prop_type not in ("Factory", "Commercial", "Shop Lot", "COM", "SELCO"):
         return sales_price
 
     when = _parse_invoice_date(invoice_date_val)

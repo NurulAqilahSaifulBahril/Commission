@@ -481,11 +481,13 @@ def _invoices_sql(*, year: int, customer_filter_sql: str) -> str:
     # 0.05/0.75/1.0 literals here, which made the payout triggers entered on
     # that page inert.
     from basic_commission_rates import (milestone_sql_parts, milestone_column,
+                                        milestone_created_column,
                                         multi_stage_cutover, payout_thresholds_in_use)
     from decimal import Decimal as _D
     milestone_ctes, milestone_selects, milestone_joins = milestone_sql_parts()
     milestone_out_selects = "\n".join(
-        f"  {milestone_column(t)}," for t in payout_thresholds_in_use())
+        f"  {milestone_column(t)}, {milestone_created_column(t)},"
+        for t in payout_thresholds_in_use())
     full_col = milestone_column(_D("100"))
     cutover = multi_stage_cutover(year)
     cutover_month = cutover[0] if cutover else 13
@@ -802,6 +804,10 @@ class InvoiceLine:
     pct100_date: str = ""
     pct75_date: str = ""
     pct5_date: str = ""
+    # Created at (Malaysia time) of the payments that reached pct5_date /
+    # pct75_date -- when Finance entered them, shown on the Basic hover.
+    pct5_created: str = ""
+    pct75_created: str = ""
     # The Data page payout condition this invoice was recognised under, so the
     # month-bucketing in build_commission_pack does not have to re-derive it.
     payout_policy: object = None
@@ -971,6 +977,11 @@ def _process_invoices(
             pct75_str = ""
             pct100_str = ""
 
+        from basic_commission_rates import invoice_milestone_created as _created
+        pct5_created, pct75_created = _created(row, policy)
+        pct5_created = pct5_created if pct5_str else ""
+        pct75_created = pct75_created if pct75_str else ""
+
         if policy.is_multi_stage:
             pay_dt = pct75_str
             first_pay_dt = pct5_str if pct5_str else str(row.get("first_payment_date") or "")[:10]
@@ -1066,6 +1077,8 @@ def _process_invoices(
                 pct100_date=pct100_str,
                 pct75_date=pct75_str,
                 pct5_date=pct5_str,
+                pct5_created=pct5_created,
+                pct75_created=pct75_created,
                 payout_policy=policy,
                 ev_item_amount=ev_amt,
                 ev_rate=ev_rate,

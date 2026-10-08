@@ -1569,10 +1569,19 @@ document.addEventListener("DOMContentLoaded", () => {
         if (rowAdjustedRate) rowAdjustedRate.classList.toggle("hidden", type !== "adjusted_rate");
         if (rowAdjustedSalesPrice) rowAdjustedSalesPrice.classList.toggle("hidden", !showNewSales);
         if (rowRevisedSalesPrice) rowRevisedSalesPrice.classList.toggle("hidden", !showNewSales);
+        // NFP form: New Sales Price comes from the Basic Commission special
+        // case and is edited there, so it is read-only here.
+        if (modalAdjustedSalesPrice) {
+            modalAdjustedSalesPrice.readOnly = openedFromNfp;
+            modalAdjustedSalesPrice.classList.toggle("readonly-input", openedFromNfp);
+            modalAdjustedSalesPrice.placeholder = openedFromNfp
+                ? "No Basic Commission special case — invoice sales price is used"
+                : "e.g. 25000.00";
+        }
         const salesHint = rowAdjustedSalesPrice?.querySelector("label span");
         if (salesHint) {
             salesHint.textContent = openedFromNfp
-                ? "(from the Basic Commission special case — NFP commission uses this figure)"
+                ? "(from Special Case Basic Commission — edit it there)"
                 : "(used instead of the invoice sales price for commission)";
         }
         
@@ -3174,8 +3183,8 @@ modalPackageType.value = defaults.pkg || "-";
         };
     }
 
-    // Customer-column hover on the Basic & NFP table: the panels and the supply
-    // phase for that customer's invoice(s), served by app.py's system_details.
+    // Customer-column hover on the Basic & NFP table: the panels, inverter type
+    // and supply phase for that customer's invoice(s), served by app.py's system_details.
     // A customer with more than one invoice gets a line each rather than a
     // merged figure, since the panel counts belong to separate systems.
     function getCustomerSystemTooltip(customerName) {
@@ -3196,6 +3205,7 @@ modalPackageType.value = defaults.pkg || "-";
                 : "-";
             return `<div style="margin-bottom:8px;">
                     <div><strong>Panels</strong> ${escapeHtml(panel)}</div>
+                    <div><strong>Inverter</strong> ${escapeHtml(e.inverter || "-")}</div>
                     <div><strong>Phase</strong> ${escapeHtml(e.phase || "-")}</div>
                 </div>`;
         }).join("");
@@ -3245,11 +3255,6 @@ modalPackageType.value = defaults.pkg || "-";
             const s = String(v || "").trim();
             return !s || s === "-" ? "pending" : s;
         };
-        const line = (label, value) => `
-            <div style="display:flex; justify-content:space-between; gap:20px; margin-bottom:4px;">
-                <span>${label}:</span> <strong>${escapeHtml(shown(value))}</strong>
-            </div>`;
-
         // The advance is earned by reaching 5% payment, so it is dated by that
         // milestone. It used to show the invoice's 1st Payment Date, which is a
         // different thing: a first payment can fall short of the trigger, and
@@ -3258,18 +3263,40 @@ modalPackageType.value = defaults.pkg || "-";
         const advDateIdx = findIdx(n => n === "advance payment date");
         const advanceDate = advDateIdx === -1 ? cell(firstPayIdx) : cell(advDateIdx);
 
-        const out = [];
+        // Each stage shows two dates side by side: Payment at (the date typed
+        // on the payment that reached the stage) and Created at (when Finance
+        // entered it). A payload built before Created at existed shows "-" there.
+        const created = (value) => (value === undefined ? "-" : value);
+        const dateCell = (v) => `<strong style="width:78px; text-align:right;">${escapeHtml(shown(v))}</strong>`;
+        const heading = `
+            <div style="display:flex; justify-content:flex-end; gap:12px; margin-bottom:2px; font-size:11px; opacity:0.75;">
+                <span style="width:78px; text-align:right;">Payment at</span>
+                <span style="width:78px; text-align:right;">Created at</span>
+            </div>`;
+        const stage = (label, paymentAt, createdAt) => `
+            <div style="display:flex; align-items:baseline; gap:12px; margin-bottom:4px;">
+                <span style="flex:1;">${label}:</span>
+                ${dateCell(paymentAt)}
+                ${dateCell(createdAt)}
+            </div>`;
+
+        const out = [heading];
         if (policy) {
             if (policy.multi_stage) {
-                out.push(line(`Advance RM ${policy.advance_rm || "300"} (${policy.advance_pct}% Payment)`, advanceDate));
-                out.push(line(`Balance Payout (${policy.balance_pct}% Payment)`, payoutDate));
+                out.push(stage(`Advance RM ${policy.advance_rm || "300"} (${policy.advance_pct}% Payment)`,
+                               advanceDate, created(policy.advance_created)));
+                out.push(stage(`Balance Payout (${policy.balance_pct}% Payment)`,
+                               payoutDate, created(policy.balance_created)));
             } else {
-                out.push(line(`Payout (${policy.balance_pct}% Payment)`, payoutDate));
+                out.push(stage(`Payout (${policy.balance_pct}% Payment)`,
+                               payoutDate, created(policy.balance_created)));
             }
             return out.join("");
         }
-        if (!isPreJuly) out.push(line("Advance RM 300 (5% Payment)", advanceDate));
-        out.push(line(isPreJuly ? "Payout (100% Payment)" : "Balance Payout (75% Payment)", payoutDate));
+        const entry = payoutPolicyFor(custName) || {};
+        if (!isPreJuly) out.push(stage("Advance RM 300 (5% Payment)", advanceDate, created(entry.advance_created)));
+        out.push(stage(isPreJuly ? "Payout (100% Payment)" : "Balance Payout (75% Payment)",
+                       payoutDate, created(entry.balance_created)));
         return out.join("");
     }
 
@@ -6464,7 +6491,7 @@ modalPackageType.value = defaults.pkg || "-";
         return "all";
     }
 
-    function findNewSalesPriceForCustomer(agentName, customerName) {
+    function findNewSalesPriceForCustomer(agentName, customerName, basicOnly) {
         const wantAgent = String(agentName || "").toLowerCase().trim();
         const wantCustomer = String(customerName || "").toLowerCase().trim();
         if (!wantAgent || !wantCustomer) return "";
@@ -6483,7 +6510,7 @@ modalPackageType.value = defaults.pkg || "-";
             const price = priceOf(data);
             if (!price) return "";
             if (String(data.rowKind || "").toLowerCase() === "basic") return price;
-            fallback = fallback || price;
+            if (!basicOnly) fallback = fallback || price;
             return "";
         };
         for (const pair of state.specialCasePairs || []) {
@@ -6531,6 +6558,14 @@ modalPackageType.value = defaults.pkg || "-";
         modalCaseType.innerHTML = list.map(k =>
             `<option value="${k}">${SPECIAL_CASE_TYPE_LABELS[k] || k}</option>`).join("");
         modalCaseType.value = (preferred && list.includes(preferred)) ? preferred : list[0];
+    }
+
+    /** Modal heading for a standard (non-customer) special case, named after
+     *  the commission row it was opened from. */
+    function specialCaseTitleForKind(kind) {
+        if (kind === "basic") return "Special Case Basic Commission";
+        if (kind === "nfp") return "Special Case Net Floor Price Commission";
+        return "Special Case";
     }
 
     function openAddSpecialCaseModal(agentName, customerName, rowRef) {
@@ -6597,6 +6632,7 @@ modalPackageType.value = defaults.pkg || "-";
 
         state.specialCaseRowKind = getSpecialCaseRowKind(rowRef);
         setSpecialCaseTypeOptions(state.specialCaseRowKind);
+        document.querySelector("#specialCaseModal h3").textContent = specialCaseTitleForKind(state.specialCaseRowKind);
         if (modalFeeWaiver) modalFeeWaiver.value = "0";
         if (modalProfitSharingPct) modalProfitSharingPct.value = "0";
         if (modalAdjustedSalesPrice) modalAdjustedSalesPrice.value = "";
@@ -6610,8 +6646,7 @@ modalPackageType.value = defaults.pkg || "-";
         // on the restated sales, not the original invoice amount. The two
         // cases stay separate — this only copies the sales figure across.
         if (state.specialCaseRowKind === "nfp" && modalAdjustedSalesPrice) {
-            const price = findNewSalesPriceForCustomer(agentName, customerName);
-            if (price !== "") modalAdjustedSalesPrice.value = price;
+            modalAdjustedSalesPrice.value = findNewSalesPriceForCustomer(agentName, customerName, true);
         }
 
         onSpecialCaseTypeChange();
@@ -6729,6 +6764,9 @@ modalPackageType.value = defaults.pkg || "-";
             : (clickedKind === "nfp" || clickedKind === "basic"
                 ? clickedKind
                 : (data.rowKind || clickedKind));
+        if (!isCustomerMode) {
+            document.querySelector("#specialCaseModal h3").textContent = specialCaseTitleForKind(state.specialCaseRowKind);
+        }
         setSpecialCaseTypeOptions(
             state.specialCaseRowKind,
             (clickedKind === "nfp" && data.rowKind === "basic")
@@ -6738,12 +6776,11 @@ modalPackageType.value = defaults.pkg || "-";
         if (modalFeeWaiver) modalFeeWaiver.value = data.feeWaiver ?? 0;
         if (modalProfitSharingPct) modalProfitSharingPct.value = data.profitSharingPct ?? 0;
         if (modalAdjustedSalesPrice) {
-            modalAdjustedSalesPrice.value = data.adjustedSalesPrice ?? "";
-            if (state.specialCaseRowKind === "nfp"
-                && String(modalAdjustedSalesPrice.value || "").trim() === "") {
-                const price = findNewSalesPriceForCustomer(data.agent, data.customer);
-                if (price !== "") modalAdjustedSalesPrice.value = price;
-            }
+            // NFP form: New Sales Price always mirrors the Basic Commission
+            // special case (blank when there is none), never its own copy.
+            modalAdjustedSalesPrice.value = state.specialCaseRowKind === "nfp"
+                ? findNewSalesPriceForCustomer(data.agent, data.customer, true)
+                : (data.adjustedSalesPrice ?? "");
         }
         // Blank for cases saved before this field existed, which is exactly the
         // "use the standard rate" state they have always had.
@@ -7934,6 +7971,30 @@ modalPackageType.value = defaults.pkg || "-";
             invalidateStaleCommissionCacheOnServerRestart().finally(() => fetchData())
         )
     );
+
+    // Allow ArrowLeft and ArrowRight keys to scroll table containers horizontally
+    document.addEventListener("keydown", (e) => {
+        if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+        const active = document.activeElement;
+        if (active && (
+            active.tagName === "INPUT" ||
+            active.tagName === "TEXTAREA" ||
+            active.tagName === "SELECT" ||
+            active.isContentEditable
+        )) {
+            return;
+        }
+        const containers = Array.from(document.querySelectorAll(".table-container"))
+            .filter(c => c.offsetWidth > 0 && c.offsetHeight > 0 && c.scrollWidth > c.clientWidth);
+        if (!containers.length) return;
+        let target = containers.find(c => {
+            const rect = c.getBoundingClientRect();
+            return rect.top < window.innerHeight && rect.bottom > 0;
+        }) || containers[0];
+        const scrollAmount = e.key === "ArrowLeft" ? -180 : 180;
+        target.scrollBy({ left: scrollAmount, behavior: "smooth" });
+        e.preventDefault();
+    });
 });
 
 

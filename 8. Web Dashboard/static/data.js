@@ -1661,6 +1661,27 @@
             + `${flagged.length === 1 ? "has" : "have"} a role warning below —`;
     }
 
+    /** Rows -> one block per person, each block oldest role first.
+     *  Keyed like rowsForSamePerson(): the eeAdmin id when a row has one,
+     *  otherwise the name. Blocks keep the order their person first appears in,
+     *  which is the agent-name order rolesList is already sorted by. */
+    function groupRolesByPerson(rows) {
+        const keyOf = (r) => r.pg_bubble_id
+            ? `id:${r.pg_bubble_id}`
+            : `n:${String(r.agent || r.full_name || r.nick_name || "").trim().toLowerCase()}`;
+        // An undated row has no start yet, so it sorts after the dated ones.
+        const startOf = (r) => (r.needs_date || !String(r.effective_from || "").trim())
+            ? "9999-99" : effStart(r.effective_from);
+        const blocks = new Map();
+        rows.forEach((r) => {
+            const k = keyOf(r);
+            if (!blocks.has(k)) blocks.set(k, []);
+            blocks.get(k).push(r);
+        });
+        return [...blocks.values()].map((g) => g.slice().sort((a, b) =>
+            startOf(a) < startOf(b) ? -1 : startOf(a) > startOf(b) ? 1 : 0));
+    }
+
     /**
      * Render the table.
      */
@@ -1700,87 +1721,114 @@
             filtered = filtered.filter(rowNeedsReview);
         }
 
-        const total = filtered.length;
+        // One table entry per person, not per saved row: an agent who held
+        // role A and then role B is a single agent, so their roles read as one
+        // block. The saved data is untouched -- each role is still its own
+        // agent_roles row; only the grid groups them. Filtering above stays
+        // row-level, so a month or type filter shows just the roles that match.
+        const groups = groupRolesByPerson(filtered);
+        const total = groups.length;
         const totalPages = Math.max(1, Math.ceil(total / ROLES_PAGE_SIZE));
         rolesPage = Math.max(1, Math.min(rolesPage, totalPages));
 
         const start = (rolesPage - 1) * ROLES_PAGE_SIZE;
-        const pageRows = filtered.slice(start, start + ROLES_PAGE_SIZE);
+        const pageGroups = groups.slice(start, start + ROLES_PAGE_SIZE);
 
-        pageRows.forEach((r) => {
-            const tr = document.createElement("tr");
-            tr.className = "role-row";
-            
-            // A row that only carries a Postgres name has no effective month
-            // until somebody enters one. Until then the row is never written
-            // to the database and every commission lookup skips it, so it has
-            // to read as an open to-do, not as a date.
-            const needsDate = !!r.needs_date || !String(r.effective_from || "").trim();
-            // A range that has run out (or is about to) on the agent's newest
-            // row leaves them with no role from then on, so it has to be
-            // visible here rather than only showing up as a wrong payout.
-            const expiryHtml = r.role_expired
-                ? `<div style="margin-top:3px; font-size:10px; color:#b91c1c; font-weight:600;" title="This is this agent's newest row and its range ended in ${escapeHtml(fmtMonth(effEnd(r.effective_from)))}. From the month after that they have no role here at all, and the calculation falls back to the old hardcoded name matching. Add a follow-up row to cover the later months.">⚠ ended — no role after ${escapeHtml(fmtMonth(effEnd(r.effective_from)))}</div>`
-                : (r.role_expiring
-                    ? `<div style="margin-top:3px; font-size:10px; color:#b45309;" title="This is this agent's newest row and its range ends soon. Add a follow-up row before then, or the agent drops back to the old hardcoded name matching.">ends ${escapeHtml(fmtMonth(effEnd(r.effective_from)))} — needs a follow-up row</div>`
-                    : "");
-            // "To Present" is stored as a bare start month, so the cell would
-            // otherwise read "Jun 2026" -- indistinguishable from a row that
-            // applies to that one month only. Spelling out "→ Present" makes
-            // the open end visible, matching the Present tick in the popup;
-            // closed ranges already print both ends and need nothing added.
-            // (Open-ended rows can never be expiring, so this never collides
-            // with expiryHtml -- see flagExpiringRoles().)
-            const isOpenEnded = effEnd(r.effective_from) === OPEN_ENDED;
-            const presentHtml = isOpenEnded
-                ? ` <span style="color:#047857; font-weight:600;" title="Present — this role applies from ${escapeHtml(fmtMonth(effStart(r.effective_from)))} onwards, including every future month. Untick Present in the popup to set an end month.">→ Present</span>`
-                : "";
-            const monthCell = needsDate
-                ? `<span title="Only this agent's name came from eeAdmin. Nothing is saved and no commission calculation uses this row until you set the month and fill in the details here." style="color:#b45309; font-weight:600;">⚠ Set effective date</span>`
-                : escapeHtml(fmtMonth(r.effective_from)) + presentHtml + expiryHtml;
-            const displayAgent = r.agent || "—";
-            const displayFullName = r.full_name || "—";
-            const displayNick = r.nick_name || "—";
-            const displayIc = r.ic_no || "—";
-            // "Sales" is stored on rows seeded before this was tightened. It names
-            // no rate table, so RATE_ROLES quietly priced it as Internal — shown as
-            // unresolved rather than rewritten, since changing a saved type would
-            // reprice periods that already paid out.
-            const displayAtype = r.agent_type === "Sales"
-                ? "⚠ Sales (needs review)"
-                : (r.agent_type || "—");
-            const displayRole = r.hierarchy || "—";
-            const displayReports = r.reports_to || "—";
-            const displayBranch = r.branch || "—";
+        pageGroups.forEach((group, groupIdx) => {
+            const span = group.length;
+            // The person's own fields, from whichever role has them filled in.
+            const first = group[0];
+            const shared = (k) => first[k] || (group.find((x) => x[k]) || {})[k] || "";
 
-            // Kept, not deleted: the row holds an effective date somebody
-            // entered, and past months were priced with it.
-            // A role from the other agent type matches no rate row, so the
-            // agent quietly falls through to the hardcoded default. Loud on
-            // purpose — this is a wrong number, not untidy data.
-            const mismatchHtml = !roleBelongsToType(r.hierarchy, r.agent_type)
-                ? `<div style="margin-top:3px; font-size:10px; color:#b91c1c; font-weight:600;" title="${escapeHtml(r.hierarchy)} is a ${r.agent_type === "Internal" ? "Outsource" : "Internal"} role but this row is ${escapeHtml(r.agent_type || "—")}. No rate row matches that combination, so this agent falls back to the hardcoded default rate. Fix the Role or the Agent Type.">⚠ not a ${escapeHtml(r.agent_type || "—")} role — no rate matches</div>`
-                : "";
-            tr.innerHTML = `
-                <td class="sm-cell">${monthCell}</td>
-                <td class="sm-cell" style="font-weight:600;">${escapeHtml(displayAgent)}</td>
-                <td class="sm-cell">${escapeHtml(displayFullName)}</td>
-                <td class="sm-cell">${escapeHtml(displayNick)}</td>
-                <td class="sm-cell">${escapeHtml(displayIc)}</td>
-                <td class="sm-cell">${escapeHtml(displayAtype)}</td>
-                <td class="sm-cell"><span class="role-badge" style="background:#e0e7ff; color:#3730a3; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600;">${escapeHtml(displayRole)}</span>${mismatchHtml}</td>
-                <td class="sm-cell">${escapeHtml(displayReports)}</td>
-                <td class="sm-cell">${escapeHtml(displayBranch)}</td>
-                <td style="white-space:nowrap;">
-                    ${isAdmin ? `<button class="btn btn-secondary row-edit-btn" title="Edit agent details" style="padding:4px 8px; font-size:12px;">✏️ Edit</button>` : ""}
-                </td>
-            `;
+            group.forEach((r, gi) => {
+                const tr = document.createElement("tr");
+                tr.className = "role-row";
+                // A row that only carries a Postgres name has no effective month
+                // until somebody enters one. Until then the row is never written
+                // to the database and every commission lookup skips it, so it has
+                // to read as an open to-do, not as a date.
+                const needsDate = !!r.needs_date || !String(r.effective_from || "").trim();
+                // A range that has run out (or is about to) on the agent's newest
+                // row leaves them with no role from then on, so it has to be
+                // visible here rather than only showing up as a wrong payout.
+                const expiryHtml = r.role_expired
+                    ? `<div style="margin-top:3px; font-size:10px; color:#b91c1c; font-weight:600;" title="This is this agent's newest row and its range ended in ${escapeHtml(fmtMonth(effEnd(r.effective_from)))}. From the month after that they have no role here at all, and the calculation falls back to the old hardcoded name matching. Add a follow-up role to cover the later months.">⚠ ended — no role after ${escapeHtml(fmtMonth(effEnd(r.effective_from)))}</div>`
+                    : (r.role_expiring
+                        ? `<div style="margin-top:3px; font-size:10px; color:#b45309;" title="This is this agent's newest row and its range ends soon. Add a follow-up role before then, or the agent drops back to the old hardcoded name matching.">ends ${escapeHtml(fmtMonth(effEnd(r.effective_from)))} — needs a follow-up role</div>`
+                        : "");
+                // "To Present" is stored as a bare start month, so the cell would
+                // otherwise read "Jun 2026" -- indistinguishable from a row that
+                // applies to that one month only. Spelling out "→ Present" makes
+                // the open end visible, matching the Present tick in the popup;
+                // closed ranges already print both ends and need nothing added.
+                // (Open-ended rows can never be expiring, so this never collides
+                // with expiryHtml -- see flagExpiringRoles().)
+                const isOpenEnded = effEnd(r.effective_from) === OPEN_ENDED;
+                const presentHtml = isOpenEnded
+                    ? ` <span style="color:#047857; font-weight:600;" title="Present — this role applies from ${escapeHtml(fmtMonth(effStart(r.effective_from)))} onwards, including every future month. Untick Present in the popup to set an end month.">→ Present</span>`
+                    : "";
+                const monthCell = needsDate
+                    ? `<span title="Only this agent's name came from eeAdmin. Nothing is saved and no commission calculation uses this row until you set the month and fill in the details here." style="color:#b45309; font-weight:600;">⚠ Set effective date</span>`
+                    : escapeHtml(fmtMonth(r.effective_from)) + presentHtml + expiryHtml;
+                // "Sales" is stored on rows seeded before this was tightened. It names
+                // no rate table, so RATE_ROLES quietly priced it as Internal — shown as
+                // unresolved rather than rewritten, since changing a saved type would
+                // reprice periods that already paid out.
+                const displayAtype = r.agent_type === "Sales"
+                    ? "⚠ Sales (needs review)"
+                    : (r.agent_type || "—");
+                const displayRole = r.hierarchy || "—";
+                const displayReports = r.reports_to || "—";
+                const displayBranch = r.branch || "—";
 
-            tr.querySelector(".row-edit-btn")?.addEventListener("click", () => {
-                openAgentRoleModal(r);
+                // Kept, not deleted: the row holds an effective date somebody
+                // entered, and past months were priced with it.
+                // A role from the other agent type matches no rate row, so the
+                // agent quietly falls through to the hardcoded default. Loud on
+                // purpose — this is a wrong number, not untidy data.
+                const mismatchHtml = !roleBelongsToType(r.hierarchy, r.agent_type)
+                    ? `<div style="margin-top:3px; font-size:10px; color:#b91c1c; font-weight:600;" title="${escapeHtml(r.hierarchy)} is a ${r.agent_type === "Internal" ? "Outsource" : "Internal"} role but this row is ${escapeHtml(r.agent_type || "—")}. No rate row matches that combination, so this agent falls back to the hardcoded default rate. Fix the Role or the Agent Type.">⚠ not a ${escapeHtml(r.agent_type || "—")} role — no rate matches</div>`
+                    : "";
+
+                // Person-level cells are drawn once, on the block's first line,
+                // spanning every role the person has.
+                const personCells = gi === 0 ? `
+                    <td class="sm-cell" rowspan="${span}" style="font-weight:600;">${escapeHtml(first.agent || "—")}</td>
+                    <td class="sm-cell" rowspan="${span}">${escapeHtml(shared("full_name") || "—")}</td>
+                    <td class="sm-cell" rowspan="${span}">${escapeHtml(shared("nick_name") || "—")}</td>
+                    <td class="sm-cell" rowspan="${span}">${escapeHtml(shared("ic_no") || "—")}</td>` : "";
+                const editCell = gi === 0 ? `
+                    <td rowspan="${span}" style="white-space:nowrap;">
+                        ${isAdmin ? `<button class="btn btn-secondary row-edit-btn" title="${span > 1 ? `Edit ${span} roles` : "Edit agent details"}" style="padding:4px 8px; font-size:12px;">✏️ Edit</button>` : ""}
+                    </td>` : "";
+                tr.innerHTML = `
+                    <td class="sm-cell">${monthCell}</td>
+                    ${personCells}
+                    <td class="sm-cell">${escapeHtml(displayAtype)}</td>
+                    <td class="sm-cell"><span class="role-badge" style="background:#e0e7ff; color:#3730a3; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600;">${escapeHtml(displayRole)}</span>${mismatchHtml}</td>
+                    <td class="sm-cell">${escapeHtml(displayReports)}</td>
+                    <td class="sm-cell">${escapeHtml(displayBranch)}</td>
+                    ${editCell}
+                `;
+
+                // A grey rule above each person's block, so two neighbours do not
+                // read as one agent with several roles. Drawn on the cells: a
+                // border on the row itself does not show in this table. Skipped
+                // for the first person, who already sits under the header line.
+                if (gi === 0 && groupIdx > 0) {
+                    tr.querySelectorAll("td").forEach((td) => { td.style.borderTop = "2px solid #9ca3af"; });
+                }
+
+                if (gi === 0) {
+                    // Opens the whole person; the newest role is the one the
+                    // modal highlights, since that is the one in force today.
+                    tr.querySelector(".row-edit-btn")?.addEventListener("click", () => {
+                        openAgentRoleModal(group[group.length - 1]);
+                    });
+                }
+
+                tbody.appendChild(tr);
             });
-
-            tbody.appendChild(tr);
         });
 
         const isFiltered = !!(filterType || searchQuery);
@@ -1802,7 +1850,7 @@
             if (!filtered.length) {
                 paginationEl.innerHTML = "";
             } else {
-                const info = `<span style="font-size:13px; color:var(--text-muted); margin: 0 10px;">Page ${rolesPage} of ${totalPages} (${filtered.length} total rows)</span>`;
+                const info = `<span style="font-size:13px; color:var(--text-muted); margin: 0 10px;">Page ${rolesPage} of ${totalPages} (${total} agent${total === 1 ? "" : "s"})</span>`;
                 if (totalPages <= 1) {
                     paginationEl.innerHTML = info;
                 } else {
@@ -1975,78 +2023,300 @@
     });
 
 
+    // ── Roles over time ──────────────────────────────────────────────────────
+    // One agent can hold several roles in turn (role A Jan–Mar, role B Apr–Jun).
+    // Each is its own agent_roles row -- Invoice Date range, Agent Type, Role,
+    // Reports To and Branch together -- and this modal edits all of a person's
+    // rows at once. Name, Full Name, Nick Name and IC No. belong to the person,
+    // so they are typed once and written onto every row on save.
+
+    let rolePeriods = [];     // working copies, one per card; `src` is the rolesList row behind it
+    let editingGroup = [];    // the rolesList rows this person had when the modal opened
+    let rolePeriodUid = 0;
+    let focusPeriodUid = null;
+
+    /** "2026-04" -> "2026-03" */
+    function prevYm(ym) {
+        const m = /^(\d{4})-(\d{2})$/.exec(String(ym || "").trim());
+        if (!m) return ym;
+        let y = parseInt(m[1], 10);
+        let mo = parseInt(m[2], 10) - 1;
+        if (mo < 1) { mo = 12; y -= 1; }
+        return `${y}-${String(mo).padStart(2, "0")}`;
+    }
+
+    /** Every row saved for the same person as `r`: by eeAdmin id when it has
+     *  one, otherwise by name -- the same key savedRolesForPg() falls back to. */
+    function rowsForSamePerson(r) {
+        if (!r) return [];
+        const nameKey = (x) => String(x.agent || x.full_name || x.nick_name || "").trim().toLowerCase();
+        const rows = r.pg_bubble_id
+            ? rolesList.filter((x) => x.pg_bubble_id === r.pg_bubble_id)
+            : rolesList.filter((x) => !x.pg_bubble_id && nameKey(x) === nameKey(r));
+        if (!rows.includes(r)) rows.push(r);
+        return rows;
+    }
+
+    function periodFromRow(r) {
+        const needsDate = !!r.needs_date || !String(r.effective_from || "").trim();
+        const [from, to] = splitEffRange(needsDate ? "" : r.effective_from);
+        const open = needsDate || to === OPEN_ENDED;
+        return {
+            uid: ++rolePeriodUid, src: r,
+            from: from || "", to: open ? "" : to, present: open,
+            agent_type: r.agent_type || "", hierarchy: r.hierarchy || "",
+            reports_to: r.reports_to || "", branch: r.branch || "",
+        };
+    }
+
+    function compareFrom(a, b) {
+        // Undated cards sort last so a half-filled one stays at the bottom.
+        if (!a.from && !b.from) return 0;
+        if (!a.from) return 1;
+        if (!b.from) return -1;
+        return a.from < b.from ? -1 : a.from > b.from ? 1 : 0;
+    }
+
+    /** Keep the ranges from colliding after `changed` was added or moved.
+     *  An open-ended role that began earlier is closed the month before
+     *  `changed` starts, so an invoice dated in the earlier months still reads
+     *  the earlier role. And if `changed` is itself open-ended but another role
+     *  begins after it, it is closed the month before that one. Only runs on an
+     *  edit -- merely opening an agent never rewrites their ranges. */
+    function autoCloseAround(changed) {
+        if (!changed || !changed.from) return;
+        rolePeriods.forEach((p) => {
+            if (p === changed || !p.present || !p.from) return;
+            if (p.from < changed.from) {
+                p.present = false;
+                p.to = prevYm(changed.from);
+            }
+        });
+        if (changed.present) {
+            const later = rolePeriods
+                .filter((q) => q !== changed && q.from && q.from > changed.from)
+                .sort(compareFrom)[0];
+            if (later) {
+                changed.present = false;
+                changed.to = prevYm(later.from);
+            }
+        }
+    }
+
+    function addRolePeriod() {
+        syncRolePeriodsFromDom();
+        const latest = rolePeriods.filter((p) => p.from).sort(compareFrom).pop();
+        // This month, unless the latest role already starts then or later --
+        // the new unit must never begin on top of the one before it.
+        let from = CURRENT_YM;
+        if (latest && latest.from >= from) from = nextYm(latest.from);
+        const p = {
+            uid: ++rolePeriodUid, src: null, from, to: "", present: true,
+            agent_type: latest ? latest.agent_type : "",
+            hierarchy: latest ? latest.hierarchy : "",
+            reports_to: latest ? latest.reports_to : "",
+            branch: latest ? latest.branch : "",
+        };
+        rolePeriods.push(p);
+        autoCloseAround(p);
+        focusPeriodUid = p.uid;
+        renderRolePeriods();
+    }
+
+    /** Copy what is typed in the cards back into rolePeriods, so a field that
+     *  has not blurred yet (Reports To, mid-typing) is still saved. */
+    function syncRolePeriodsFromDom() {
+        document.querySelectorAll("#roleModalPeriods [data-uid]").forEach((card) => {
+            const p = rolePeriods.find((x) => x.uid === Number(card.dataset.uid));
+            if (!p) return;
+            card.querySelectorAll("[data-f]").forEach((el) => {
+                const f = el.dataset.f;
+                if (f === "present") p.present = el.checked;
+                else p[f] = String(el.value || "").trim();
+            });
+            if (p.present) p.to = "";
+        });
+    }
+
+    /** {overlaps, gaps} as readable sentences, from the ranges as they stand. */
+    function rolePeriodIssues() {
+        const list = rolePeriods
+            .filter((p) => p.from && (p.present || (p.to && p.to >= p.from)))
+            .map((p) => ({ p, s: p.from, e: p.present ? OPEN_ENDED : p.to }))
+            .sort((a, b) => (a.s < b.s ? -1 : a.s > b.s ? 1 : 0));
+        const name = (x) => `${x.p.hierarchy || "(no role)"} (${fmtMonth(x.s)} to ${x.e === OPEN_ENDED ? "Present" : fmtMonth(x.e)})`;
+        const overlaps = [];
+        const gaps = [];
+        for (let i = 0; i < list.length; i++) {
+            for (let j = i + 1; j < list.length; j++) {
+                if (list[j].s <= list[i].e) overlaps.push(`${name(list[i])} overlaps ${name(list[j])}`);
+            }
+        }
+        let reach = list.length ? list[0].e : "";
+        for (let k = 1; k < list.length; k++) {
+            if (reach !== OPEN_ENDED && list[k].s > nextYm(reach)) {
+                const a = nextYm(reach);
+                const b = prevYm(list[k].s);
+                gaps.push(a === b ? `no role in ${fmtMonth(a)}` : `no role from ${fmtMonth(a)} to ${fmtMonth(b)}`);
+            }
+            if (list[k].e > reach) reach = list[k].e;
+        }
+        return { overlaps, gaps };
+    }
+
+    function updateRolePeriodWarnings() {
+        const el = document.getElementById("roleModalPeriodWarnings");
+        if (!el) return;
+        const { overlaps, gaps } = rolePeriodIssues();
+        const lines = overlaps.map((t) => `⚠ Overlap: ${t}`).concat(gaps.map((t) => `⚠ Gap: ${t}`));
+        el.style.display = lines.length ? "" : "none";
+        el.innerHTML = lines.map(escapeHtml).join("<br>");
+    }
+
+    function renderRolePeriods() {
+        const host = document.getElementById("roleModalPeriods");
+        if (!host) return;
+        const inp = "padding:8px 12px; font-size:13.5px; border:1px solid var(--border-color); border-radius:6px; width:100%; box-sizing:border-box;";
+        const lbl = "font-weight:600; font-size:11.5px; color:var(--text-muted); display:block; margin-bottom:3px;";
+        const opt = (v, cur, text) => `<option value="${escapeHtml(v)}"${v === cur ? " selected" : ""}>${escapeHtml(text === undefined ? v : text)}</option>`;
+        host.innerHTML = rolePeriods.map((p, i) => {
+            const roleOpts = allRoleNames().slice();
+            // A retired label stays selectable on the row that holds it, so
+            // opening and saving cannot blank a role that is pricing invoices.
+            if (p.hierarchy && !roleOpts.includes(p.hierarchy)) roleOpts.push(p.hierarchy);
+            const branchOpts = BRANCHES.slice();
+            if (p.branch && !branchOpts.includes(p.branch)) branchOpts.push(p.branch);
+            const focused = p.uid === focusPeriodUid;
+            return `
+            <div data-uid="${p.uid}" style="border:1px solid ${focused ? "#6366f1" : "var(--border-color)"}; border-radius:8px; padding:12px; display:flex; flex-direction:column; gap:10px;">
+                <div style="display:flex; align-items:center; justify-content:space-between;">
+                    <strong style="font-size:12.5px;">Role ${i + 1}${p.src ? "" : " (new)"}</strong>
+                    ${rolePeriods.length > 1 ? `<button type="button" class="btn btn-secondary" data-act="remove" style="padding:2px 8px; font-size:11.5px;">Remove</button>` : ""}
+                </div>
+                <div>
+                    <span style="${lbl}">Invoice Date</span>
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                        <span style="font-size:12px; color:var(--text-muted); font-weight:600;">From</span>
+                        <input type="month" data-f="from" value="${escapeHtml(p.from)}" style="padding:8px 12px; font-size:13.5px; width:150px; border:1px solid var(--border-color); border-radius:6px;">
+                        <span style="font-size:12px; color:var(--text-muted); font-weight:600;">To</span>
+                        <input type="month" data-f="to" value="${escapeHtml(p.to)}" style="padding:8px 12px; font-size:13.5px; width:150px; border:1px solid var(--border-color); border-radius:6px;${p.present ? " opacity:0.5;" : ""}" title="${p.present ? "No end month — the role applies to this month and every later one. Pick a month here if it ended." : "The last month this role applies to."}">
+                        <label style="display:flex; align-items:center; gap:6px; font-size:12.5px; font-weight:600; cursor:pointer; white-space:nowrap;">
+                            <input type="checkbox" data-f="present" ${p.present ? "checked" : ""} style="cursor:pointer;"> Present
+                        </label>
+                    </div>
+                </div>
+                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:10px;">
+                    <div>
+                        <span style="${lbl}">Agent Type</span>
+                        <select data-f="agent_type" style="${inp}">
+                            ${opt("", p.agent_type, "(needs review)")}
+                            ${opt("Internal", p.agent_type)}
+                            ${opt("Outsource", p.agent_type)}
+                            ${p.agent_type === "Sales" ? opt("Sales", p.agent_type, "Sales (needs review - no rate table)") : ""}
+                        </select>
+                    </div>
+                    <div>
+                        <span style="${lbl}">Role</span>
+                        <select data-f="hierarchy" style="${inp}">
+                            ${opt("", p.hierarchy, "(none)")}
+                            ${roleOpts.map((x) => opt(x, p.hierarchy)).join("")}
+                        </select>
+                    </div>
+                    <div>
+                        <span style="${lbl}">Reports To</span>
+                        <input type="text" data-f="reports_to" list="agentNameList" placeholder="(nobody)" value="${escapeHtml(p.reports_to)}" style="${inp}">
+                    </div>
+                    <div>
+                        <span style="${lbl}">Branch</span>
+                        <select data-f="branch" style="${inp}">
+                            ${opt("", p.branch, "—")}
+                            ${branchOpts.map((x) => opt(x, p.branch)).join("")}
+                        </select>
+                    </div>
+                </div>
+            </div>`;
+        }).join("");
+        updateRolePeriodWarnings();
+        if (focusPeriodUid !== null) {
+            const card = host.querySelector(`[data-uid="${focusPeriodUid}"]`);
+            if (card && card.scrollIntoView) card.scrollIntoView({ block: "nearest" });
+        }
+    }
+
+    document.getElementById("roleModalAddPeriodBtn")?.addEventListener("click", addRolePeriod);
+
+    document.getElementById("roleModalPeriods")?.addEventListener("change", (ev) => {
+        const el = ev.target;
+        const card = el.closest && el.closest("[data-uid]");
+        const f = el.dataset && el.dataset.f;
+        if (!card || !f) return;
+        const p = rolePeriods.find((x) => x.uid === Number(card.dataset.uid));
+        if (!p) return;
+        syncRolePeriodsFromDom();
+        // Typing an end month is a clear statement that the role ended, so it
+        // unticks Present for you rather than leaving the field dead.
+        if (f === "to" && p.to) p.present = false;
+        if (f === "present" && p.present) p.to = "";
+        if (f === "from" || (f === "present" && p.present)) autoCloseAround(p);
+        if (f === "from" || f === "to" || f === "present") renderRolePeriods();
+        else updateRolePeriodWarnings();
+    });
+
+    document.getElementById("roleModalPeriods")?.addEventListener("click", (ev) => {
+        const btn = ev.target.closest && ev.target.closest("[data-act='remove']");
+        if (!btn) return;
+        const card = btn.closest("[data-uid]");
+        syncRolePeriodsFromDom();
+        const idx = rolePeriods.findIndex((x) => x.uid === Number(card.dataset.uid));
+        if (idx < 0 || rolePeriods.length < 2) return;
+        rolePeriods.splice(idx, 1);
+        renderRolePeriods();
+    });
+
     function openAgentRoleModal(r) {
         editingAgentObj = r;
         const modal = document.getElementById("agentRoleModal");
         if (!modal) return;
 
-        const roleSel = document.getElementById("roleModalRole");
-        if (roleSel) {
-            const opts = allRoleNames();
-            // A row saved under a retired label ("Senior", "OSA/OSA1", …) has to
-            // keep it as an option. Without this the select falls back to "" on
-            // open, and pressing Save would silently blank a role that is
-            // pricing real invoices.
-            if (r && r.hierarchy && !opts.includes(r.hierarchy)) opts.push(r.hierarchy);
-            roleSel.innerHTML = `<option value="">(none)</option>` +
-                opts.map((x) => `<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join("");
-        }
-
-        const branchSel = document.getElementById("roleModalBranch");
-        if (branchSel) {
-            const opts = BRANCHES.slice();
-            // Same reasoning as the role picker: a row still holding an old
-            // value keeps it as an option, so opening and saving cannot blank
-            // it behind your back. It is the only way that value stays
-            // selectable — it is not offered to any other row.
-            if (r && r.branch && !opts.includes(r.branch)) opts.push(r.branch);
-            branchSel.innerHTML = `<option value="">—</option>` +
-                opts.map((x) => `<option value="${escapeHtml(x)}">${escapeHtml(x)}</option>`).join("");
-        }
-
         if (r) {
+            editingGroup = rowsForSamePerson(r);
+            rolePeriods = editingGroup.map(periodFromRow).sort(compareFrom);
+            const clicked = rolePeriods.find((p) => p.src === r);
+            focusPeriodUid = rolePeriods.length > 1 && clicked ? clicked.uid : null;
             const needsDate = !!r.needs_date || !String(r.effective_from || "").trim();
+            // The person's own fields live on every row; take the clicked
+            // row's, falling back to a sibling for one that was never filled in.
+            const shared = (k) => r[k] || (editingGroup.find((x) => x[k]) || {})[k] || "";
             document.getElementById("agentRoleModalTitle").textContent = "Edit Agent Details";
             // The name of an existing row is eeAdmin's to change, not this
             // modal's — searching would only invite retargeting the row at a
             // different person by accident.
             pickedPgAgent = r.pg_bubble_id ? { bubble_id: r.pg_bubble_id, name: r.agent || "" } : null;
             setAgentNameMode(false);
-            // Left blank on purpose for a role read from eeAdmin's tags: the
-            // date is the one thing eeAdmin cannot tell us, so pre-filling this
-            // month would just be a guess the admin might not notice.
-            setRoleModalMonth(needsDate ? "" : r.effective_from);
             document.getElementById("roleModalAgent").value = r.agent || "";
-            document.getElementById("roleModalFullName").value = r.full_name || "";
-            document.getElementById("roleModalNickName").value = r.nick_name || "";
-            document.getElementById("roleModalIcNo").value = r.ic_no || "";
-            // Never preselect a type the row does not have: the grid flagging it
-            // as needing review would mean nothing if opening the modal and
-            // pressing Save quietly wrote "Internal".
-            document.getElementById("roleModalAgentType").value = r.agent_type || "";
-            if (roleSel) roleSel.value = r.hierarchy || "";
-            document.getElementById("roleModalReportsTo").value = r.reports_to || "";
-            document.getElementById("roleModalBranch").value = r.branch || "";
-            // Set after the options exist (populated above), so a legacy value
-            // still selects instead of silently falling back to blank.
+            document.getElementById("roleModalFullName").value = shared("full_name");
+            document.getElementById("roleModalNickName").value = shared("nick_name");
+            document.getElementById("roleModalIcNo").value = shared("ic_no");
             // Nothing to delete yet — an undated row exists only because
             // Postgres lists the name, and it is re-derived on every load.
             // Date it here to keep it.
-            document.getElementById("roleModalDeleteBtn").style.display = needsDate ? "none" : "";
+            document.getElementById("roleModalDeleteBtn").style.display =
+                (needsDate && editingGroup.length === 1) ? "none" : "";
             setRoleModalNote(needsDate
                 ? "Only this agent's name came from eeAdmin. Fill in the details and set the effective month to save the row — until then no commission calculation uses it."
                 : "");
         } else {
+            editingGroup = [];
+            rolePeriods = [{
+                uid: ++rolePeriodUid, src: null, from: CURRENT_YM, to: "", present: true,
+                agent_type: "", hierarchy: "", reports_to: "", branch: "",
+            }];
+            focusPeriodUid = null;
             document.getElementById("agentRoleModalTitle").textContent = "Add Agent Details";
-            setRoleModalMonth(CURRENT_YM);
             document.getElementById("roleModalAgent").value = "";
             document.getElementById("roleModalFullName").value = "";
             document.getElementById("roleModalNickName").value = "";
             document.getElementById("roleModalIcNo").value = "";
-            document.getElementById("roleModalAgentType").value = "";
-            if (roleSel) roleSel.value = "";
-            document.getElementById("roleModalReportsTo").value = "";
-            document.getElementById("roleModalBranch").value = "";
             document.getElementById("roleModalDeleteBtn").style.display = "none";
             setRoleModalNote("");
             pickedPgAgent = null;
@@ -2054,63 +2324,8 @@
             setTimeout(() => document.getElementById("roleModalAgent")?.focus(), 50);
         }
 
+        renderRolePeriods();
         modal.classList.remove("hidden");
-    }
-
-    /** Match the To field to the Present checkbox. Left enabled on purpose,
-     *  only dimmed: typing an end month is the natural way to say the role
-     *  ended, and a disabled field would force you to find the checkbox first
-     *  (and would stop the input handler that unticks it for you). */
-    function syncRoleMonthPresent() {
-        const present = document.getElementById("roleModalMonthPresent");
-        const to = document.getElementById("roleModalMonthTo");
-        if (!present || !to) return;
-        if (present.checked) to.value = "";
-        to.style.opacity = present.checked ? "0.5" : "";
-        to.title = present.checked
-            ? "No end month — the role applies to this month and every later one. Pick a month here if it ended."
-            : "The last month this role applies to.";
-    }
-
-    /** Show `eff` in the modal as From / To, ticking Present for the
-     *  open-ended form. "2026-07" and "2026-07 to present" are the same thing,
-     *  so there is only ever one control set to read. */
-    function setRoleModalMonth(eff) {
-        const s = String(eff || "").trim();
-        const [from, to] = splitEffRange(s);
-        const openEnded = !s || to === OPEN_ENDED;
-        document.getElementById("roleModalMonthFrom").value = from || "";
-        document.getElementById("roleModalMonthTo").value = openEnded ? "" : to;
-        const present = document.getElementById("roleModalMonthPresent");
-        if (present) present.checked = openEnded;
-        syncRoleMonthPresent();
-    }
-
-    /** {value, error} — what the modal is showing, in the same
-     *  "YYYY-MM" / "YYYY-MM to YYYY-MM" format the rates grid uses.
-     *
-     *  "To Present" is stored as the bare start month, not as the words. That
-     *  form already means "from here onwards" to every reader, and a literal
-     *  "to present" would be a third spelling all six of them would have to
-     *  learn — for a value that says nothing the start month does not. */
-    function getRoleModalMonth() {
-        const from = (document.getElementById("roleModalMonthFrom")?.value || "").trim();
-        const present = !!document.getElementById("roleModalMonthPresent")?.checked;
-        const to = (document.getElementById("roleModalMonthTo")?.value || "").trim();
-        if (!from) {
-            return { error: "Enter the month this role starts From.\n\nIt decides which months are calculated with it, so it has to be entered here." };
-        }
-        if (present) return { value: from };
-        if (!to) {
-            return { error: "Enter the month this role ends in the To field.\n\nIf it has not ended, tick Present instead — the role then applies to every later month." };
-        }
-        if (from > to) {
-            return { error: `The range runs backwards: ${fmtMonth(from)} is after ${fmtMonth(to)}.\n\nSwap them so From is the earlier month.` };
-        }
-        // A one-month range is a closed range that happens to span one month —
-        // keep it as a range, because collapsing it to "2026-05" would silently
-        // reopen it and let the role apply to every later month too.
-        return { value: `${from} to ${to}` };
     }
 
     /** One-line explanation shown above the modal's buttons; "" hides it. */
@@ -2123,6 +2338,7 @@
 
     // Modal Event Bindings
     document.getElementById("roleModalSaveBtn")?.addEventListener("click", async () => {
+        syncRolePeriodsFromDom();
         const agentName = document.getElementById("roleModalAgent").value.trim();
         const fullName = document.getElementById("roleModalFullName").value.trim();
         const nickNameCheck = document.getElementById("roleModalNickName").value.trim();
@@ -2131,7 +2347,7 @@
             return;
         }
 
-        // Adding a row: settle what this name points at in eeAdmin before
+        // Adding a person: settle what this name points at in eeAdmin before
         // anything is written. Typing a name in full and pressing Save without
         // touching the dropdown is the normal case, so an exact match is
         // adopted silently rather than being treated as unmatched.
@@ -2139,7 +2355,7 @@
             const dup = rolesList.find((x) =>
                 String(x.agent || "").trim().toLowerCase() === agentName.toLowerCase());
             if (dup) {
-                alert(`${dup.agent} is already on this page.\n\nOpen that row and add a new effective month instead of adding a second row for the same person.`);
+                alert(`${dup.agent} is already on this page.\n\nOpen that agent with Edit and use + Add role to give them another role from a later month.`);
                 return;
             }
             if (!pickedPgAgent || pickedPgAgent.name.toLowerCase() !== agentName.toLowerCase()) {
@@ -2158,59 +2374,91 @@
             }
         }
 
-        // Required, never defaulted: an effective month decides which invoices
-        // this role prices, so falling back to "this month" would quietly
-        // backdate or postdate a role nobody chose a date for.
-        const monthPick = getRoleModalMonth();
-        if (monthPick.error) {
-            alert(monthPick.error);
+        // Every role needs its own dates, never defaulted: an effective month
+        // decides which invoices this role prices, so falling back to "this
+        // month" would quietly backdate or postdate a role nobody chose a date for.
+        if (!rolePeriods.length) {
+            alert("Keep at least one role.\n\nTo remove the agent altogether, use Delete Agent.");
             return;
         }
-        const effMonth = monthPick.value;
-        const nickName = nickNameCheck;
-        const pickedType = document.getElementById("roleModalAgentType").value;
-        const pickedRole = document.getElementById("roleModalRole").value;
-        if (!roleBelongsToType(pickedRole, pickedType)) {
-            alert(`"${pickedRole}" is not a ${pickedType} role.\n\nRate rows are looked up by Agent Type AND Role together, so this combination matches nothing and the agent would silently fall back to the hardcoded default rate.\n\nPick a ${pickedType} role, or change the Agent Type.`);
-            return;
+        for (let i = 0; i < rolePeriods.length; i++) {
+            const p = rolePeriods[i];
+            const tag = rolePeriods.length > 1 ? `Role ${i + 1}: ` : "";
+            if (!p.from) {
+                alert(`${tag}Enter the month this role starts From.\n\nIt decides which months are calculated with it, so it has to be entered here.`);
+                return;
+            }
+            if (!p.present) {
+                if (!p.to) {
+                    alert(`${tag}Enter the month this role ends in the To field.\n\nIf it has not ended, tick Present instead — the role then applies to every later month.`);
+                    return;
+                }
+                if (p.from > p.to) {
+                    alert(`${tag}The range runs backwards: ${fmtMonth(p.from)} is after ${fmtMonth(p.to)}.\n\nSwap them so From is the earlier month.`);
+                    return;
+                }
+            }
+            if (!roleBelongsToType(p.hierarchy, p.agent_type)) {
+                alert(`${tag}"${p.hierarchy}" is not a ${p.agent_type} role.\n\nRate rows are looked up by Agent Type AND Role together, so this combination matches nothing and the agent would silently fall back to the hardcoded default rate.\n\nPick a ${p.agent_type} role, or change the Agent Type.`);
+                return;
+            }
         }
-        const icNo = document.getElementById("roleModalIcNo").value.trim();
-        const agentType = document.getElementById("roleModalAgentType").value;
-        const role = document.getElementById("roleModalRole").value;
-        const reportsTo = document.getElementById("roleModalReportsTo").value.trim();
-        const branch = document.getElementById("roleModalBranch").value.trim();
 
-        if (editingAgentObj) {
-            editingAgentObj.effective_from = effMonth;
-            editingAgentObj.needs_date = false;
-            editingAgentObj.agent = agentName;
-            editingAgentObj.full_name = fullName;
-            editingAgentObj.nick_name = nickName;
-            editingAgentObj.ic_no = icNo;
-            editingAgentObj.agent_type = agentType;
-            editingAgentObj.hierarchy = role;
-            editingAgentObj.reports_to = reportsTo;
-            editingAgentObj.branch = branch;
-        } else {
-            const newAgent = {
-                effective_from: effMonth,
-                // The eeAdmin id of the person picked in the search, when
-                // there was one. Rows keyed by id survive a rename in eeAdmin;
-                // a manual row saved past the "not found" warning has no id
-                // and stays matched by name.
-                pg_bubble_id: (pickedPgAgent && pickedPgAgent.name.toLowerCase() === agentName.toLowerCase())
-                    ? pickedPgAgent.bubble_id : "",
+        // Overlaps and gaps are allowed but never silent. Where two roles cover
+        // one month the later start wins; a month nobody covers falls back to
+        // the old hardcoded name matching.
+        const { overlaps, gaps } = rolePeriodIssues();
+        if (overlaps.length || gaps.length) {
+            const parts = [];
+            if (overlaps.length) {
+                parts.push("Overlapping roles:\n• " + overlaps.join("\n• ")
+                    + "\n\nWhere two roles cover the same month, the one that starts later is used.");
+            }
+            if (gaps.length) {
+                parts.push("Months with no role:\n• " + gaps.join("\n• ")
+                    + "\n\nInvoices dated in those months fall back to the old hardcoded name matching.");
+            }
+            if (!confirm(parts.join("\n\n") + "\n\nSave anyway?")) return;
+        }
+
+        const nickName = nickNameCheck;
+        const icNo = document.getElementById("roleModalIcNo").value.trim();
+        // A person added here is linked to eeAdmin by the id of whoever was
+        // picked in the search; rows keyed by id survive a rename in eeAdmin. A
+        // manual row saved past the "not found" warning has none and stays
+        // matched by name. An existing person keeps the id they already had.
+        const bubbleId = editingAgentObj
+            ? (editingAgentObj.pg_bubble_id || "")
+            : ((pickedPgAgent && pickedPgAgent.name.toLowerCase() === agentName.toLowerCase())
+                ? pickedPgAgent.bubble_id : "");
+
+        const kept = new Set();
+        rolePeriods.forEach((p) => {
+            const fields = {
+                effective_from: p.present ? p.from : `${p.from} to ${p.to}`,
+                needs_date: false,
+                // The person's own fields, identical on every role.
                 agent: agentName,
                 full_name: fullName,
                 nick_name: nickName,
                 ic_no: icNo,
-                agent_type: agentType,
-                hierarchy: role,
-                reports_to: reportsTo,
-                branch: branch
+                agent_type: p.agent_type,
+                hierarchy: p.hierarchy,
+                reports_to: p.reports_to,
+                branch: p.branch,
             };
-            rolesList.push(newAgent);
-        }
+            if (p.src) {
+                Object.assign(p.src, fields);
+                kept.add(p.src);
+            } else {
+                const row = Object.assign({ pg_bubble_id: bubbleId }, fields);
+                rolesList.push(row);
+                kept.add(row);
+            }
+        });
+        // A role removed from the cards leaves the table; the person's other
+        // rows are still there, so no tombstone is needed.
+        rolesList = rolesList.filter((x) => !editingGroup.includes(x) || kept.has(x));
 
         document.getElementById("agentRoleModal").classList.add("hidden");
         await saveRoles();
@@ -2218,7 +2466,13 @@
 
     document.getElementById("roleModalDeleteBtn")?.addEventListener("click", async () => {
         if (!editingAgentObj) return;
-        if (!confirm(`Are you sure you want to delete ${editingAgentObj.agent}?`)) return;
+        // Delete Agent removes the person, so every role they hold goes with
+        // them -- not just the one whose Edit button opened this.
+        const group = editingGroup.length ? editingGroup : [editingAgentObj];
+        const prompt1 = group.length > 1
+            ? `Are you sure you want to delete ${editingAgentObj.agent} and all ${group.length} of their roles?`
+            : `Are you sure you want to delete ${editingAgentObj.agent}?`;
+        if (!confirm(prompt1)) return;
 
         // A Postgres-linked agent reappears on the very next reload — Postgres
         // itself was never asked to remove them — unless a hidden tombstone
@@ -2231,20 +2485,11 @@
         // exactly what let a deleted agent come back with nothing to stop it.
         const bubbleId = editingAgentObj.pg_bubble_id || "";
         const nameKey = String(editingAgentObj.agent || "").trim().toLowerCase();
-        const isSamePerson = (r) => bubbleId
-            ? r.pg_bubble_id === bubbleId
-            : (!r.pg_bubble_id && String(r.agent || "").trim().toLowerCase() === nameKey);
-        // Only needed when this was their last visible row; if another
-        // role-history row still exists, plain removal is enough (Postgres
-        // won't recreate a baseline while a saved row exists).
-        const hasOtherVisibleRow = nameKey && rolesList.some(
-            (r) => r !== editingAgentObj && !r.hidden && isSamePerson(r)
-        );
-        rolesList = rolesList.filter(r => r !== editingAgentObj);
+        rolesList = rolesList.filter((r) => !group.includes(r));
         // A row identified only by Full Name / Nick Name (no eeAdmin Agent
         // Name — a pure Excel entry) has nothing in Postgres to ever
         // regenerate it from, so there is nothing to tombstone against.
-        if (nameKey && !hasOtherVisibleRow) {
+        if (nameKey) {
             const reason = (prompt(
                 `Optional: why is ${editingAgentObj.agent} being removed?\n`
                 + `(e.g. "not an agent — office staff", "left the company", "duplicate entry")\n\n`
@@ -2560,7 +2805,8 @@
         out = out.charAt(0).toUpperCase() + out.slice(1);
         out = out.replace(/\btng\b/gi, "TNG").replace(/\bcny(\d*)\b/gi, (m, d) => "CNY" + d)
                  .replace(/\brm\b/gi, "RM").replace(/\bapr\b/gi, "APR").replace(/\bmar\b/gi, "MAR")
-                 .replace(/\bfeb\b/gi, "FEB");
+                 .replace(/\bfeb\b/gi, "FEB").replace(/\bsep\b/gi, "Sep")
+                 .replace(/\bmid-autumn\b/gi, "Mid-Autumn");
         return out;
     }
 
@@ -3617,23 +3863,6 @@
         addPaymentRuleBtn.addEventListener("click", () => addPaymentRuleRow("", "Payout", ""));
     }
 
-    const roleMonthPresent = document.getElementById("roleModalMonthPresent");
-    if (roleMonthPresent) {
-        roleMonthPresent.addEventListener("change", syncRoleMonthPresent);
-    }
-    // Typing an end month is a clear statement that the role ended, so untick
-    // Present rather than making the field impossible to use until you notice
-    // the checkbox.
-    const roleMonthToInput = document.getElementById("roleModalMonthTo");
-    if (roleMonthToInput) {
-        roleMonthToInput.addEventListener("input", () => {
-            if (roleMonthToInput.value && roleMonthPresent && roleMonthPresent.checked) {
-                roleMonthPresent.checked = false;
-                syncRoleMonthPresent();
-            }
-        });
-    }
-
     const modalMonthModeSel = document.getElementById("modalMonthMode");
     if (modalMonthModeSel) {
         modalMonthModeSel.addEventListener("change", () => {
@@ -4557,7 +4786,7 @@
     };
 
     /** Keep the To field matched to the Present checkbox, same behaviour as
-     *  the Agent Roles & Hierarchy modal's syncRoleMonthPresent(). Works for
+     *  the Agent Roles & Hierarchy modal (its Present tick). Works for
      *  both a month range (ANP) and a year range (EGA/ESA). */
     function syncMonthRangePresent(toId, presentId) {
         const present = document.getElementById(presentId);

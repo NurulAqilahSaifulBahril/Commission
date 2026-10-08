@@ -510,6 +510,12 @@ def init_db() -> None:
             ALTER TABLE nfp_prices ADD COLUMN IF NOT EXISTS inverter_type TEXT DEFAULT 'string';
             ALTER TABLE nfp_prices ADD COLUMN IF NOT EXISTS power_system TEXT;
             ALTER TABLE nfp_prices ADD COLUMN IF NOT EXISTS columns_json TEXT;
+            -- A dated promo inside the month (e.g. Mid-Autumn, 18-30 Sep 2026):
+            -- invoices dated promo_from..promo_to (YYYY-MM-DD, inclusive) use
+            -- promo_price instead of final_price.
+            ALTER TABLE nfp_prices ADD COLUMN IF NOT EXISTS promo_price NUMERIC;
+            ALTER TABLE nfp_prices ADD COLUMN IF NOT EXISTS promo_from TEXT;
+            ALTER TABLE nfp_prices ADD COLUMN IF NOT EXISTS promo_to TEXT;
 
             ALTER TABLE agent_roles ADD COLUMN IF NOT EXISTS start_date TEXT;
             ALTER TABLE agent_roles ADD COLUMN IF NOT EXISTS ic_no TEXT;
@@ -937,7 +943,7 @@ def save_factory_rates(year: str, month: str, agent_type: str, new_rates: list[d
 BASIC_RATE_FIELDS = ["rate_type", "agent_type", "hierarchy", "agent", "condition", "rate_pct", "effective_from", "remarks"]
 NFP_PRICE_FIELDS = ["month", "panel_rating", "table_no", "panels", "final_price", "final_with_tng",
                     "package_price", "tng_rebate", "inverter_type", "power_system", "columns_json",
-                    "source_sheet"]
+                    "source_sheet", "promo_price", "promo_from", "promo_to"]
 RULE_SETTING_FIELDS = ["rule_key", "rule_type", "label", "value", "trigger_pct",
                        "agent_type", "hierarchy", "agent", "property_type",
                        "invoice_date_from", "effective_from", "remarks"]

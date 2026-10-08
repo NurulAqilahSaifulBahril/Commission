@@ -579,8 +579,8 @@ def calc_ep_points(
     comes from the Data page via ensure_rules_applied(); only which package
     types the reduced rate applies to is fixed here.
     """
-    # Anything that is not a large factory job earns a point per ringgit.
-    if prop_type != "Factory" or int(panel_qty or 0) < FACTORY_MIN_PANELS:
+    # Residential always earns 1 pt per RM1 (100%). Only Commercial / Factory / Shop Lot / SELCO jobs earn reduced EP.
+    if prop_type in ("Residence", "RES") or prop_type not in ("Factory", "Commercial", "Shop Lot", "COM", "SELCO"):
         return sales_price
 
     when = _parse_invoice_date(invoice_date_val)
