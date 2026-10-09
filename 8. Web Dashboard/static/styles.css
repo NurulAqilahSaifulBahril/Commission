@@ -2378,8 +2378,13 @@ body {
 .sr-table td.sr-col-total { background-color: #E6F4EA; }
 .sr-table th.sr-col-acc,
 .sr-table td.sr-col-acc { background-color: #E3EEFB; }
-/* ACC is one merged cell down an agent's RES and COM lines; centre it there. */
-.sr-table td.sr-col-acc[rowspan] { vertical-align: middle; }
+/* A Sales Report table that has been clicked or tabbed into takes the
+   left/right arrow keys; the outline says which one will scroll. */
+.sr-block .table-container:focus { outline: 2px solid var(--accent-blue); outline-offset: -2px; }
+
+/* Per-agent figures are one merged cell down an agent's RES and COM lines;
+   centre them there. */
+.sr-table td[rowspan] { vertical-align: middle; }
 .sr-table th.sr-col-ep,
 .sr-table td.sr-col-ep { background-color: #F5EEDC; }
 .sr-table tr.sr-subtotal td.sr-col-total { background-color: #CDE9D5; }

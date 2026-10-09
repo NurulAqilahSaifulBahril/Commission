@@ -386,13 +386,17 @@
         const types = agent.types.length ? agent.types : [{
             type: "RES", months: [], jun_early: 0, jun_late: 0, total_noc: 0, total_ans: 0,
         }];
+        // Per-agent figures (NO, NAME, ACC, EP, Collected, the award columns)
+        // are one merged cell down the agent's RES and COM lines: the first
+        // line carries it with a rowspan and the later lines leave it out.
+        const span = ` rowspan="${types.length}"`;
         return types.map((t, i) => {
             const first = i === 0;
-            const cells = [
-                `<td class="sr-no">${first ? no : ""}</td>`,
-                `<td class="sr-name">${first ? escapeHtml(agent.agent) : ""}</td>`,
-                `<td class="sr-type">${escapeHtml(t.type)}</td>`,
-            ];
+            const cells = first ? [
+                `<td class="sr-no"${span}>${no}</td>`,
+                `<td class="sr-name"${span}>${escapeHtml(agent.agent)}</td>`,
+            ] : [];
+            cells.push(`<td class="sr-type">${escapeHtml(t.type)}</td>`);
             for (let m = 1; m <= lm; m++) {
                 const cell = t.months[m - 1] || { noc: 0, ans: 0 };
                 if (m === sm && splitJune(data)) {
@@ -455,8 +459,8 @@
             // ACC adds RES and COM together, so it is one merged cell down the
             // agent's lines: carried by the first line and spanning the rest.
             if (first) {
-                cells.push(`<td class="numeric sr-col-acc" rowspan="${types.length}">${agent.acc_noc}</td>`,
-                    `<td class="numeric sr-strong sr-col-acc" rowspan="${types.length}">${fmtRM(agent.acc_ans)}</td>`);
+                cells.push(`<td class="numeric sr-col-acc"${span}>${agent.acc_noc}</td>`,
+                    `<td class="numeric sr-strong sr-col-acc"${span}>${fmtRM(agent.acc_ans)}</td>`);
             }
             if (showCampaign(data)) {
                 cells.push(
@@ -465,13 +469,10 @@
                     `<td class="numeric" title="${escapeHtml(vintageTitle)}">${first ? afterCell : ""}</td>`,
                     `<td class="numeric" title="${escapeHtml(vintageTitle)}">${first ? afterCell : ""}</td>`);
             }
-            cells.push(
-                `<td class="numeric sr-strong sr-col-ep" title="${escapeHtml(epTitle)}">${first ? fmtRM(agent.ep) : ""}</td>`,
-                `<td class="numeric" title="${escapeHtml(collectedTitle)}">${first ? collectedCell : ""}</td>`);
-            const awards = 1 + (showEga(data) ? 1 : 0) + (showEsa(data) ? 1 : 0);
-            if (!first) {
-                for (let k = 0; k < awards; k++) cells.push("<td></td>");
-            } else {
+            if (first) {
+                cells.push(
+                    `<td class="numeric sr-strong sr-col-ep"${span} title="${escapeHtml(epTitle)}">${fmtRM(agent.ep)}</td>`,
+                    `<td class="numeric"${span} title="${escapeHtml(collectedTitle)}">${collectedCell}</td>`);
                 // Early Bird Balance to Qualify: October's bar until the end of
                 // October, November's from 1 November (earlyKind decides).
                 const ek = earlyKind(data);
@@ -487,9 +488,9 @@
                     ? agent[ek + "_balance"] : Math.max(0, earlyThreshold - earlyEp);
                 const earlyTitle = `EP to date ${fmtRM(earlyEp)} against ${fmtThreshold(earlyThreshold)} for ${earlyName} Early Bird`;
                 if (earlyQualified) {
-                    cells.push(`<td class="sr-qualified" title="${escapeHtml(earlyTitle)}">${escapeHtml(agent[ek + "_status"] || "Qualifier")}</td>`);
+                    cells.push(`<td class="sr-qualified"${span} title="${escapeHtml(earlyTitle)}">${escapeHtml(agent[ek + "_status"] || "Qualifier")}</td>`);
                 } else {
-                    cells.push(`<td class="numeric sr-short" title="${escapeHtml(earlyTitle)}">${fmtRM(earlyBalance)}</td>`);
+                    cells.push(`<td class="numeric sr-short"${span} title="${escapeHtml(earlyTitle)}">${fmtRM(earlyBalance)}</td>`);
                 }
                 // Each award cell says one of two things: the label when the
                 // bar is cleared, or how much EP is still missing. Same shape
@@ -505,11 +506,11 @@
                         // count one agent's win twice.
                         const doubleTitle = `${egaTitle} — at least twice the bar, so two trip tickets.`
                             + ` This is about EGA alone; whether they also won ESA is a separate question.`;
-                        cells.push(`<td class="sr-qualified" title="${escapeHtml(doubleTitle)}">DOUBLE TICKET</td>`);
+                        cells.push(`<td class="sr-qualified"${span} title="${escapeHtml(doubleTitle)}">DOUBLE TICKET</td>`);
                     } else if (agent.qualified) {
-                        cells.push(`<td class="sr-qualified" title="${escapeHtml(egaTitle)}">${escapeHtml(agent.status || "Qualifier")}</td>`);
+                        cells.push(`<td class="sr-qualified"${span} title="${escapeHtml(egaTitle)}">${escapeHtml(agent.status || "Qualifier")}</td>`);
                     } else {
-                        cells.push(`<td class="numeric sr-short" title="${escapeHtml(egaTitle)}">${fmtRM(agent.balance)}</td>`);
+                        cells.push(`<td class="numeric sr-short"${span} title="${escapeHtml(egaTitle)}">${fmtRM(agent.balance)}</td>`);
                     }
                 }
                 if (showEsa(data)) {
@@ -520,9 +521,9 @@
                     const esaTitle = `EP to date ${fmtRM(esaEp)} against `
                         + `${fmtRM(agent.esa_threshold)}, excluding the May multiplier`;
                     if (agent.esa_qualified) {
-                        cells.push(`<td class="sr-qualified" title="${escapeHtml(esaTitle)}">${escapeHtml(agent.esa_status || "Qualifier")}</td>`);
+                        cells.push(`<td class="sr-qualified"${span} title="${escapeHtml(esaTitle)}">${escapeHtml(agent.esa_status || "Qualifier")}</td>`);
                     } else {
-                        cells.push(`<td class="numeric sr-short" title="${escapeHtml(esaTitle)}">${fmtRM(agent.esa_balance)}</td>`);
+                        cells.push(`<td class="numeric sr-short"${span} title="${escapeHtml(esaTitle)}">${fmtRM(agent.esa_balance)}</td>`);
                     }
                 }
             }
@@ -581,7 +582,7 @@
                 <span class="row-count-badge">${plural(members.length, "agent")} ·
                     target RM ${fmtRM(target)} EP</span>
             </div>
-            <div class="table-container">
+            <div class="table-container" tabindex="0" aria-label="${escapeHtml(title)} table; use the left and right arrow keys to scroll">
                 <table class="dashboard-table sr-table">
                     ${headerFor(data, members[0].channel)}
                     <tbody>${body}</tbody>
@@ -967,15 +968,21 @@
             )) {
                 return;
             }
+            // The table the user clicked or tabbed into wins; the containers
+            // are focusable, so a click anywhere in one gives it focus. With
+            // nothing selected, fall back to the first table on screen.
+            const focused = active && active.closest ? active.closest(".table-container") : null;
             const containers = Array.from(document.querySelectorAll(".table-container"))
                 .filter(c => c.offsetWidth > 0 && c.offsetHeight > 0 && c.scrollWidth > c.clientWidth);
-            if (!containers.length) return;
-            let target = containers.find(c => {
+            if (!focused && !containers.length) return;
+            const target = focused || containers.find(c => {
                 const rect = c.getBoundingClientRect();
                 return rect.top < window.innerHeight && rect.bottom > 0;
             }) || containers[0];
             const scrollAmount = e.key === "ArrowLeft" ? -180 : 180;
-            target.scrollBy({ left: scrollAmount, behavior: "smooth" });
+            // Instant, not smooth: a smooth scroll is cut short by the next
+            // key repeat, so holding the key barely moved the table.
+            target.scrollBy({ left: scrollAmount });
             e.preventDefault();
         });
     }

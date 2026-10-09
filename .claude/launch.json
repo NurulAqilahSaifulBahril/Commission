@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "dashboard",
-      "runtimeExecutable": "C:\\Users\\User\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe",
+      "runtimeExecutable": "C:\\Users\\User\\OneDrive\\Documents\\Commission\\.venv\\Scripts\\python.exe",
       "runtimeArgs": [
         "8. Web Dashboard/app.py"
       ],
