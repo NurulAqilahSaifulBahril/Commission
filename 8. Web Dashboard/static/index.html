@@ -48,11 +48,16 @@
                 </div>
             </div>
 
+            <!-- Same Sales Section as the Overview and Sales Report sidebars,
+                 so Sales Report stays reachable from every commission
+                 section. Neither item is .active here: a commission section
+                 is the page on screen. -->
             <div class="sidebar-group">
                 <label class="group-label">Sales Section</label>
-                <a href="/" class="nav-page-link">
-                    <span class="bullet"></span> Overview
-                </a>
+                <ul class="nav-list">
+                    <li class="nav-link-item"><a href="/"><span class="bullet"></span> Overview</a></li>
+                    <li class="nav-link-item"><a href="/sales-report"><span class="bullet"></span> Sales Report</a></li>
+                </ul>
             </div>
 
             <div class="sidebar-group">
@@ -613,7 +618,7 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=20260925-new-nfp-owns-case"></script>
+    <script src="/static/app.js?v=20261012-price-split"></script>
     <script src="/static/updater.js?v=20260923-adminonly"></script>
 </body>
 </html>
