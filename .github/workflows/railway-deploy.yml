@@ -1,0 +1,74 @@
+name: Deploy to Railway
+
+# Every push to main redeploys the web dashboard on Railway
+# (project "clean-deploy", service "commission-dashboard").
+#
+# WHY A WORKFLOW AND NOT RAILWAY'S OWN GITHUB LINK. The Railway project
+# belongs to an account that has no access to this repository, so Railway
+# cannot watch it for pushes ("no one in the project has access to it").
+# This job uploads the pushed commit with the Railway CLI instead; Railway
+# then builds it exactly as railway.json says.
+#
+# NEEDS ONE SECRET: RAILWAY_TOKEN, a *project* token for clean-deploy /
+# production (Railway > project settings > Tokens). Without it the job says
+# so and stops, rather than failing every push.
+#
+# The ids below are not secrets -- they only name the project, environment
+# and service; the token is what grants access.
+
+on:
+  push:
+    branches: [main]
+    # Nothing under these is part of the hosted dashboard.
+    paths-ignore:
+      - "10. Electron App/**"
+      - "installer/**"
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+
+# One deploy at a time; a newer push waits for the one in flight.
+concurrency:
+  group: railway-deploy
+  cancel-in-progress: false
+
+env:
+  RAILWAY_PROJECT_ID: 75f0e5f9-1a43-4f08-850f-30ad766032fb
+  RAILWAY_ENVIRONMENT_ID: 54b0fe3b-b2ce-434f-8390-2a94fff4ccbb
+  RAILWAY_SERVICE_ID: 5609577f-2038-44fe-9b26-0592c72d3aac
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check for the Railway token
+        id: token
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "::warning::RAILWAY_TOKEN is not set, so nothing was deployed. Add it under Settings > Secrets and variables > Actions."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.ok == 'true'
+
+      - name: Install the Railway CLI
+        if: steps.token.outputs.ok == 'true'
+        run: npm install -g @railway/cli@5.63.2
+
+      - name: Deploy this commit
+        if: steps.token.outputs.ok == 'true'
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        # --ci streams the build log and exits non-zero if the build or the
+        # /login health check fails, so a broken deploy fails this run.
+        run: |
+          railway up --ci \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment "$RAILWAY_ENVIRONMENT_ID" \
+            --service "$RAILWAY_SERVICE_ID"
