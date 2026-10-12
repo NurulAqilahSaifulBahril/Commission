@@ -5146,7 +5146,8 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
         return row
 
     def block(title: str, members: list[dict], channel: str,
-              section_total: list[dict] | None = None) -> list:
+              section_total: list[dict] | None = None,
+              branch: str | None = None) -> list:
         """One table. `section_total`, when given, is every agent in the
         section, added up under this table's SUBTOTAL as the Internal +
         Outsource line, in red as on the page."""
@@ -5245,7 +5246,11 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
         target = float(award_bars.get(channel, 0) or 0)
         head = Paragraph(
             # The table's name, with its agent count and target on the line below.
-            f"<b>{html.escape(title)}</b><br/>{len(members)} agent"
+            # A searched file names the branch here, under the table's name,
+            # rather than in a heading above it (see the layout below).
+            f"<b>{html.escape(title)}</b><br/>"
+            + (f"<font size=10><b>{html.escape(branch)} Branch</b></font><br/>" if branch else "")
+            + f"{len(members)} agent"
             f"{'' if len(members) == 1 else 's'} &middot; "
             f"{html.escape(award_name)} target RM {target:,.2f} EP",
             ParagraphStyle("blockHead", fontName="Helvetica", fontSize=8, leading=11,
@@ -5273,9 +5278,10 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
         for a in agents:
             by_customer = not (q in _normalize_search_text(a.get("agent") or "")
                                or any(q in k for k in (a.get("aliases") or [])))
-            out += [PageBreak(), Paragraph(
-                html.escape(f"Customer list · {a.get('agent')} · "
-                            f"January – {month_name[lm]} {year}"), section_style)]
+            # Opens like page 1: the report title, then whose list this is.
+            out += [PageBreak(),
+                    Paragraph(f"CUSTOMER LIST SALES REPORT {as_at}", title_style),
+                    Paragraph(html.escape(str(a.get("agent") or "")), section_style)]
             printed = False
             for m in range(1, lm + 1):
                 cases = [c for t in (a.get("types") or [])
@@ -5483,8 +5489,8 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
     # because strftime's no-padding flag differs between Windows and macOS.
     today = datetime.now()
     updated = f"{today.day} {today.strftime('%b %y')}"
-    story = [Paragraph(f"ETERNALGY SALES REPORT AS AT {MONTH_ABBR[lm - 1].title()} {year} "
-                       f"(UPDATED {updated})", title_style)]
+    as_at = f"AS AT {MONTH_ABBR[lm - 1].title()} {year} (UPDATED {updated})"
+    story = [Paragraph(f"ETERNALGY SALES REPORT {as_at}", title_style)]
     # No generated/totals line under the title: the cards below carry the
     # totals. A search still says so, or a filtered file reads as the company:
     # by the full names of the agents it found ("CHAN JIA WEI", not the
@@ -5517,24 +5523,38 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
 
         company_in, company_out = pick("Internal", None), pick("Outsource", None)
         company_all = company_in + company_out
-        story.extend(block("Internal Sales Agent", company_in, "Internal",
+        story.extend(block("Internal Sales Agent Report", company_in, "Internal",
                            None if company_out else company_all))
         if company_out:
             if company_in:
                 new_page()
             story.extend(block("Outsource Sales Agent", company_out, "Outsource",
                                company_all))
+        first_branch = True
         for branch in (payload.get("branches") or []):
             internal, outsource = pick("Internal", branch), pick("Outsource", branch)
             if not internal and not outsource:
                 continue
             # A branch's Internal and Outsource tables share its page, closing
-            # on the Internal + Outsource total.
-            new_page(f"{html.escape(str(branch))} Branch")
+            # on the Internal + Outsource total. The whole-company file opens
+            # the branch pages once with "BRANCH SALES REPORT", then heads each
+            # page with its branch; a searched file names the branch under
+            # each table's own title instead.
+            if search:
+                new_page()
+                label = str(branch)
+            else:
+                story.append(PageBreak())
+                if first_branch:
+                    story.append(Paragraph("BRANCH SALES REPORT", title_style))
+                story.append(Paragraph(f"{html.escape(str(branch))} Branch", section_style))
+                label = None
+            first_branch = False
             both = internal + outsource
-            story.extend(block("Internal Sales Agent", internal, "Internal",
-                               None if outsource else both))
-            story.extend(block("Outsource Sales Agent", outsource, "Outsource", both))
+            story.extend(block("Internal Sales Agent Report", internal, "Internal",
+                               None if outsource else both, branch=label))
+            story.extend(block("Outsource Sales Agent", outsource, "Outsource", both,
+                               branch=label))
 
         # The page's customer list follows a search: one table per month for
         # each agent found, January to the reporting month. Not printed for
