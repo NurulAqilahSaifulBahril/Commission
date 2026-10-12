@@ -2797,9 +2797,10 @@ SALES_REPORT_EXCLUDED_INVOICES = {
     # INV-1010885, YAP CHOON FAH (TOP UP), Ling Liang Kang -- top-up excluded per user request.
     "84a07187-36ec-4bea-9440-e5587570827c",
     "INV-1010885",
-    # INV-1011801, TAN CHEN WEI (ATAP), Denise Ng Pei Sing -- excluded so Denise has 0 September cases per user request.
-    "637144bd-6a52-466c-b8d4-43d1b81408fc",
-    "INV-1011801",
+    # INV-1011801, TAN CHEN WEI (ATAP), Denise Ng Pei Sing, is NOT excluded: it
+    # was briefly listed here (Denise 0 September cases), then restored on
+    # 12 Oct 2026 per user request as her September case -- first paid
+    # RM500 on 29 Sep. See the INV-1011046 note above.
 }
 
 # Hand corrections to an invoice's sales value on the report, keyed on
