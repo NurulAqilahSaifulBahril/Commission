@@ -3592,7 +3592,7 @@ modalPackageType.value = defaults.pkg || "-";
         headers.forEach((h, ci) => {
             if (hiddenSummaryCols.has(ci)) return;
             const th = document.createElement("th");
-            th.textContent = h;
+            th.textContent = basicNfpHeaderLabel(h);
             if (isNumericHeader(h)) th.classList.add("numeric");
             else if (isDateHeader(h)) th.classList.add("date");
             trHead.appendChild(th);
@@ -4156,7 +4156,7 @@ modalPackageType.value = defaults.pkg || "-";
                     });
                 } else {
                     const th = document.createElement("th");
-                    th.textContent = h;
+                    th.textContent = basicNfpHeaderLabel(h);
                     th.rowSpan = 2;
                     if (isNumericHeader(h)) th.classList.add("numeric");
                     else if (isDateHeader(h)) th.classList.add("date");
@@ -4169,7 +4169,7 @@ modalPackageType.value = defaults.pkg || "-";
             headers.forEach((h, ci) => {
                 if (hiddenDetailCols.has(ci)) return;
                 const th = document.createElement("th");
-                th.textContent = h;
+                th.textContent = basicNfpHeaderLabel(h);
                 if (isNumericHeader(h)) th.classList.add("numeric");
                 else if (isDateHeader(h)) th.classList.add("date");
                 tableHeaders.appendChild(th);
@@ -5792,6 +5792,16 @@ modalPackageType.value = defaults.pkg || "-";
         table.appendChild(tbody);
         subWrapper.appendChild(table);
         return subWrapper;
+    }
+
+    // On-screen label for a Basic & NFP column. Only the text drawn in the <th>
+    // changes: the header itself stays "Sales Price" because every column
+    // lookup (findIndex on "sales price") and the server match on that name.
+    function basicNfpHeaderLabel(h) {
+        if (state.activeSection !== "basic_nfp") return h;
+        return String(h).toLowerCase().trim() === "sales price"
+            ? "Original Price/Cash Price after discount"
+            : h;
     }
 
     // Helper functions for alignments

@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/styles.css?v=20261009-grid">
+    <link rel="stylesheet" href="/static/styles.css?v=20261012-custlist">
 </head>
 <body class="report-page">
     <div class="app-container">
@@ -121,6 +121,11 @@
 
             <section id="srSections"></section>
 
+            <!-- Customer lists for whoever the search finds, January to the
+                 month picked on the left, below the Company-wide and branch
+                 tables. Empty while the search is. -->
+            <section id="srCustList" hidden></section>
+
             <!-- Hover panel for the NOC cells. Lives outside the tables
                  so it is never clipped by their own scrolling. -->
             <div id="srCaseTip" class="sr-tip" hidden></div>
@@ -137,7 +142,7 @@
         </main>
     </div>
 
-    <script src="/static/sales_report.js?v=20261009-grid"></script>
+    <script src="/static/sales_report.js?v=20261012-bymonth"></script>
     <script src="/static/updater.js?v=20260923-adminonly"></script>
 </body>
 </html>

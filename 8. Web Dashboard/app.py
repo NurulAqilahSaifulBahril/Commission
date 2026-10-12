@@ -3703,17 +3703,21 @@ def _sales_report_payment_rows(year: int, upto_month: int) -> dict[str, list]:
     return out
 
 
-def _case_hover_entry(customer_name, payments):
+def _case_hover_entry(customer_name, payments, system_price=None):
     """One case for the hover panel, or None when there is no customer to name.
 
     An entry with no payments is still worth returning: the panel says "no
     payment recorded in this period", which is a real answer rather than a
     silently missing row.
+
+    "s" is the invoice's System Price -- its total amount, what the customer
+    is billed -- read by the customer list under the report; the hover panel
+    ignores it.
     """
     name = str(customer_name or "").strip()
     if not name:
         return None
-    return {"n": name, "p": list(payments or [])}
+    return {"n": name, "p": list(payments or []), "s": float(system_price or 0)}
 
 
 # Sales staff tag non-residential sites in the customer name:
@@ -4504,7 +4508,8 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         cell[0] += 1
         cell[1] += ans
         customer = _case_hover_entry(r.get("customer_name"),
-                                     payment_rows.get(str(bubble or "")))
+                                     payment_rows.get(str(bubble or "")),
+                                     r.get("total_amount"))
         if customer:
             entry["custs"].setdefault(kind, {}).setdefault(when.month, []).append(customer)
         if when.month == SALES_REPORT_SPLIT_MONTH:
@@ -5249,6 +5254,85 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
         table.setStyle(TableStyle(style))
         return [head, table, Spacer(1, 8)]
 
+    def customer_list(agents: list[dict]) -> list:
+        """The customer list under the page's tables, as on screen: per agent,
+        one table per month with cases -- each case under the month the report
+        counts it in -- with its System Price and every payment recorded to
+        the end of the period. An agent found by a customer's name, not their
+        own, lists only the matching customers, as renderCustomerList() does."""
+        q = _normalize_search_text(search)
+        cell = ParagraphStyle("srCust", fontName="Helvetica", fontSize=7.5, leading=9,
+                              textColor=colors.HexColor("#0f172a"))
+        month_style = ParagraphStyle("srCustMonth", fontName="Helvetica-Bold", fontSize=8.5,
+                                     leading=11, textColor=colors.HexColor("#334155"),
+                                     spaceBefore=6, spaceAfter=3, keepWithNext=1)
+        import calendar
+        month_name = calendar.month_name   # "February", as the page spells it
+        widths = [w * avail for w in (0.30, 0.12, 0.12, 0.10, 0.10)]
+        out = []
+        for a in agents:
+            by_customer = not (q in _normalize_search_text(a.get("agent") or "")
+                               or any(q in k for k in (a.get("aliases") or [])))
+            out += [PageBreak(), Paragraph(
+                html.escape(f"Customer list · {a.get('agent')} · "
+                            f"January – {month_name[lm]} {year}"), section_style)]
+            printed = False
+            for m in range(1, lm + 1):
+                cases = [c for t in (a.get("types") or [])
+                         for c in (((t.get("months") or [])[m - 1:m] or [{}])[0].get("custs") or [])
+                         if c and (not by_customer
+                                   or q in _normalize_search_text(c.get("n") or ""))]
+                if not cases:
+                    continue
+                printed = True
+                rows = [["Customer", "System Price", "Payments Amount", "Paid Date",
+                         "Created At Date"]]
+                style = [
+                    ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 7.5),
+                    ("FONT", (0, 1), (-1, -1), "Helvetica", 7.5),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EFF6FF")),
+                    ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                    ("ALIGN", (1, 1), (2, -1), "RIGHT"),
+                    ("ALIGN", (3, 1), (4, -1), "CENTER"),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9DEE5")),
+                    ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.black),
+                ]
+                sys_total = paid_total = 0.0
+                for c in cases:
+                    # Oldest first, as on the page.
+                    pays = sorted(c.get("p") or [], key=lambda p: str(p.get("d") or ""))
+                    first = len(rows)
+                    sys_total += float(c.get("s") or 0)
+                    lead = [Paragraph(html.escape(str(c.get("n") or "")), cell),
+                            rm(c.get("s")) if c.get("s") else "-"]
+                    if not pays:
+                        rows.append(lead + ["no payment recorded in this period", "", ""])
+                        style.append(("SPAN", (2, first), (4, first)))
+                        style.append(("ALIGN", (2, first), (4, first), "CENTER"))
+                        continue
+                    for i, p in enumerate(pays):
+                        paid_total += float(p.get("a") or 0)
+                        rows.append((lead if i == 0 else ["", ""])
+                                    + [rm(p.get("a")), p.get("d") or "-", p.get("m") or "-"])
+                    if len(pays) > 1:
+                        style.append(("SPAN", (0, first), (0, len(rows) - 1)))
+                        style.append(("SPAN", (1, first), (1, len(rows) - 1)))
+                rows.append(["TOTAL", rm(sys_total), rm(paid_total), "", ""])
+                style += [("FONT", (0, -1), (-1, -1), "Helvetica-Bold", 7.5),
+                          ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#f1f5f9")),
+                          ("LINEABOVE", (0, -1), (-1, -1), 1, colors.HexColor("#cbd5e1"))]
+                n_pay = sum(len(c.get("p") or []) for c in cases)
+                table = Table(rows, colWidths=widths, repeatRows=1, hAlign="LEFT")
+                table.setStyle(TableStyle(style))
+                out += [Paragraph(f"{month_name[m]} {year} &middot; "
+                                  f"{plural(len(cases), 'customer')} &middot; "
+                                  f"{plural(n_pay, 'payment')}", month_style),
+                        table, Spacer(1, 6)]
+            if not printed:
+                out.append(Paragraph("No cases in this period.", meta_style))
+        return out
+
     # Leading set explicitly: the 12pt default is shorter than the 15pt type,
     # so whatever sat under the title was drawn into it.
     title_style = ParagraphStyle("srTitle", fontName="Helvetica-Bold", fontSize=15,
@@ -5402,10 +5486,15 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
     story = [Paragraph(f"ETERNALGY SALES REPORT AS AT {MONTH_ABBR[lm - 1].title()} {year} "
                        f"(UPDATED {updated})", title_style)]
     # No generated/totals line under the title: the cards below carry the
-    # totals. A search still says so, or a filtered file reads as the company.
+    # totals. A search still says so, or a filtered file reads as the company:
+    # by the full names of the agents it found ("CHAN JIA WEI", not the
+    # "jia wei" typed), or by the search itself when it found nobody.
     if search:
-        story.append(Paragraph(f"Filtered to &ldquo;{html.escape(search)}&rdquo;",
-                               meta_style))
+        found = list(dict.fromkeys(str(a.get("agent") or "") for a in shown))
+        story.append(Paragraph(
+            html.escape(", ".join(found)) if found
+            else f"Filtered to &ldquo;{html.escape(search)}&rdquo;",
+            section_style if found else meta_style))
     story += [Spacer(1, 6), summary_cards(), Spacer(1, 12)]
 
     def pick(channel, branch):
@@ -5418,9 +5507,11 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
         # Page layout: company-wide Internal on the first page under the cards,
         # company-wide Outsource on its own page, then one page per branch,
         # each opening on its branch heading. The company-wide tables carry no
-        # section heading of their own.
+        # section heading of their own. A searched file holds a handful of
+        # rows, so its company-wide and branch tables run on together on one
+        # page instead of leaving most of every page empty.
         def new_page(heading: str | None = None) -> None:
-            story.append(PageBreak())
+            story.append(Spacer(1, 10) if search else PageBreak())
             if heading:
                 story.append(Paragraph(heading, section_style))
 
@@ -5444,6 +5535,12 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
             story.extend(block("Internal Sales Agent", internal, "Internal",
                                None if outsource else both))
             story.extend(block("Outsource Sales Agent", outsource, "Outsource", both))
+
+        # The page's customer list follows a search: one table per month for
+        # each agent found, January to the reporting month. Not printed for
+        # the whole company, which would run to dozens of pages.
+        if search:
+            story.extend(customer_list(shown))
 
     def footer(canvas, doc):
         canvas.saveState()

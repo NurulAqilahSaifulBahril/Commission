@@ -22,6 +22,7 @@
     const propReviewBox = document.getElementById("srPropReview");
     const loader = document.getElementById("srLoader");
     const emptyView = document.getElementById("srEmpty");
+    const custListBox = document.getElementById("srCustList");
 
     function fmtRM(value) {
         return (Number(value) || 0).toLocaleString(undefined, {
@@ -852,6 +853,110 @@
         state.through = Number(periodSelect.value);
     }
 
+    /** One month's table of an agent's customers: the cases behind that
+     *  agent's NOC cell for the month (RES and COM together), each with its
+     *  System Price and every payment recorded up to the end of the period,
+     *  closing on the month's total. */
+    function customerMonthCard(agent, m, cases, data) {
+        const rows = [];
+        let systemTotal = 0;
+        let paidTotal = 0;
+        let payCount = 0;
+        cases.forEach(c => {
+            // Oldest first, so each customer's payments read in order; the
+            // payload holds them newest first for the hover panel.
+            const pays = [...(c.p || [])].sort((x, y) => String(x.d).localeCompare(String(y.d)));
+            const span = Math.max(1, pays.length);
+            systemTotal += Number(c.s) || 0;
+            const lead = `<td class="sr-name" rowspan="${span}">${escapeHtml(c.n)}</td>`
+                + `<td rowspan="${span}">${c.s ? fmtRM(c.s) : `<span class="sr-muted">—</span>`}</td>`;
+            if (!pays.length) {
+                rows.push(`<tr>${lead}<td colspan="3" class="sr-muted sr-cust-none">`
+                    + `no payment recorded in this period</td></tr>`);
+                return;
+            }
+            pays.forEach((p, i) => {
+                paidTotal += Number(p.a) || 0;
+                payCount += 1;
+                rows.push(`<tr>${i === 0 ? lead : ""}`
+                    + `<td>${fmtRM(p.a)}</td>`
+                    + `<td class="sr-cust-date">${escapeHtml(p.d || "—")}</td>`
+                    + `<td class="sr-cust-date">${escapeHtml(p.m || "—")}</td></tr>`);
+            });
+        });
+        rows.push(`<tr class="sr-subtotal"><td class="sr-name">TOTAL</td>`
+            + `<td>${fmtRM(systemTotal)}</td><td>${fmtRM(paidTotal)}</td>`
+            + `<td></td><td></td></tr>`);
+
+        return `<div class="card table-card sr-block">
+            <div class="card-header">
+                <h3>${escapeHtml(`${MONTH_NAMES[m - 1]} ${data.year}`)}</h3>
+                <span class="row-count-badge">${plural(cases.length, "customer")} ·
+                    ${plural(payCount, "payment")}</span>
+            </div>
+            <div class="table-container">
+                <table class="dashboard-table sr-table sr-cust-table">
+                    <thead><tr>
+                        <th class="sr-name">Customer</th>
+                        <th>System Price</th>
+                        <th>Payments Amount</th>
+                        <th title="The day the money was paid">Paid Date</th>
+                        <th title="The day the payment was entered into the system">Created At Date</th>
+                    </tr></thead>
+                    <tbody>${rows.join("")}</tbody>
+                </table>
+            </div>
+        </div>`;
+    }
+
+    /** One agent's customer list for January to the reporting month, one
+     *  table per month that has cases, each month being the one the case is
+     *  counted in on the report. An agent the search found by a customer's
+     *  name lists only the matching customers; one found by their own name
+     *  lists all. */
+    function customerListCard(agent, data, q, qk) {
+        const byCustomerOnly = q && !nameMatches(agent, q, qk);
+        const period = `${MONTH_NAMES[0]} – ${MONTH_NAMES[lastMonth(data) - 1]} ${data.year}`;
+        const parts = [`<h3 class="sr-section-title">${escapeHtml(
+            `Customer list · ${agent.agent} · ${period}`)}</h3>`];
+        for (let m = 1; m <= lastMonth(data); m++) {
+            const cases = [];
+            (agent.types || []).forEach(t => {
+                const cell = (t.months || [])[m - 1];
+                (cell && cell.custs || []).forEach(c => {
+                    if (!c) return;
+                    if (byCustomerOnly
+                        && !normalizeName(c.n).replace(/ /g, "").includes(qk)) return;
+                    cases.push(c);
+                });
+            });
+            if (cases.length) parts.push(customerMonthCard(agent, m, cases, data));
+        }
+        if (parts.length === 1) {
+            parts.push(`<div class="card" style="padding:20px; text-align:center;">
+                <p style="margin:0; color:var(--text-muted);">No cases in this period.</p></div>`);
+        }
+        return parts.join("");
+    }
+
+    /** Customer lists for whoever the search box finds, over the period the
+     *  left panel's Month picks. Hidden while the box is empty: the whole
+     *  company's customers are what the report tables already summarise. */
+    function renderCustomerList() {
+        if (!custListBox) return;
+        const data = state.data;
+        const q = normalizeName(state.search);
+        if (!data || !q) {
+            custListBox.hidden = true;
+            custListBox.innerHTML = "";
+            return;
+        }
+        const qk = q.replace(/ /g, "");
+        const cards = visibleAgents(data).map(a => customerListCard(a, data, q, qk));
+        custListBox.innerHTML = cards.join("");
+        custListBox.hidden = !cards.length;
+    }
+
     function setBusy(busy) {
         loader.classList.toggle("hidden", !busy);
     }
@@ -866,6 +971,7 @@
         }
         renderCards(data);
         renderSections(data);
+        renderCustomerList();
         if (matchNote) {
             const list = visibleAgents(data);
             // Say how many are here because of a customer, not their own name,
@@ -915,6 +1021,7 @@
                 caveatBox.hidden = true;
                 propReviewBox.hidden = true;
                 if (filterPanel) filterPanel.hidden = true;
+                renderCustomerList();
                 const keepTrying = retries < MAX_RETRIES;
                 document.getElementById("srEmptyMsg").textContent = keepTrying
                     ? `${data.message || "Sales data is still being prepared."} Retrying…`

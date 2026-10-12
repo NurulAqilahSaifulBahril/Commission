@@ -2316,6 +2316,10 @@ body {
 
 .sr-block { margin-bottom: 18px; }
 
+/* Customer list under the report: the date columns centre. */
+.sr-cust-table td.sr-cust-date { text-align: center; }
+.sr-cust-table td.sr-cust-none { text-align: center; font-style: italic; }
+
 .sr-table {
     table-layout: auto;
     font-size: 12px;
