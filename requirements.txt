@@ -1,3 +1,12 @@
-# Railway installs from this file at the repo root. The dashboard's own list
-# is the source of truth; keep this a pointer to it.
--r requirements-dashboard.txt
+# What Railway installs. Railway copies ONLY this file into the build before
+# running pip, so it cannot "-r" the dashboard's own list -- the packages are
+# written out here instead. Keep it in step with requirements-dashboard.txt
+# (+ requirements-finance.txt), which the Windows/macOS release still uses.
+openpyxl>=3.1.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+pandas>=2.0.0
+tabulate>=0.9.0
+reportlab>=4.0.0
+psycopg2-binary>=2.9.0
+flask>=3.0.0
