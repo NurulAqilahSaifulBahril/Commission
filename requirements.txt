@@ -1,0 +1,3 @@
+# Railway installs from this file at the repo root. The dashboard's own list
+# is the source of truth; keep this a pointer to it.
+-r requirements-dashboard.txt
