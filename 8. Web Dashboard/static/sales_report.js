@@ -108,14 +108,37 @@
         return fmtRM(n);
     }
 
-    function makeCard(label, value, note) {
-        return `<div class="card metric-card">
+    /** `extra` is ready-made HTML placed under the note (the branch breakdown). */
+    function makeCard(label, value, note, extra = "") {
+        return `<div class="card metric-card${extra ? " sr-has-branches" : ""}">
             <div class="metric-details">
                 <span class="metric-label">${escapeHtml(label)}</span>
                 <span class="metric-value">${escapeHtml(value)}</span>
                 ${note ? `<span class="metric-delta flat">${escapeHtml(note)}</span>` : ""}
+                ${extra}
             </div>
         </div>`;
+    }
+
+    /** One line per branch under the Internal / Outsource card: name, agents
+     *  and cases, sales. Branches with nobody on screen are left out, so a
+     *  search shows only where its agents sit; anyone outside the listed
+     *  branches goes under "Other" so the lines still add up to the card. */
+    function branchBreakdown(members, data) {
+        const branches = data.branches || [];
+        const groups = branches.map(b => [b, members.filter(a => a.branch === b)]);
+        const other = members.filter(a => !branches.includes(a.branch));
+        if (other.length) groups.push(["Other", other]);
+        const rows = groups.filter(([, ag]) => ag.length).map(([b, ag]) => {
+            const cases = ag.reduce((s, a) => s + a.acc_noc, 0);
+            const sales = ag.reduce((s, a) => s + a.acc_ans, 0);
+            return `<div class="sr-branch">
+                <span class="sr-branch-name">${escapeHtml(b)}</span>
+                <span class="sr-branch-meta">${plural(ag.length, "agent")} · ${plural(cases, "case")}</span>
+                <span class="sr-branch-amt">${fmtCompact(sales)}</span>
+            </div>`;
+        });
+        return rows.length ? `<div class="sr-branches">${rows.join("")}</div>` : "";
     }
 
     function renderCards(data) {
@@ -130,16 +153,25 @@
         };
         const internal = shown.filter(a => a.channel === "Internal");
         const outsource = shown.filter(a => a.channel === "Outsource");
-        const qualified = shown.filter(a => a.qualified).length;
+        // EGA up to June; from July the card is "ESA Qualified", counting the
+        // ESA column's qualifiers against its own bars. Counting EGA after June
+        // put a figure on the card no column on screen explains.
+        const ega = showEga(data);
+        const qualified = shown.filter(a => ega ? a.qualified : a.esa_qualified).length;
+        const cardLabel = ega ? "Qualified · EGA" : "ESA Qualified";
+        const bars = ega ? data.targets
+            : (data.esa_targets || { Internal: 1300000, Outsource: 1560000 });
         cardsRow.innerHTML = [
             makeCard("Total Cases", String(t.cases), plural(t.agents, "agent")),
-            makeCard("Total Net Sales", fmtCompact(t.sales), "net of EPP interest"),
+            makeCard("Total Net Sales", fmtCompact(t.sales)),
             makeCard("Internal", fmtCompact(internal.reduce((s, a) => s + a.acc_ans, 0)),
-                `${plural(internal.length, "agent")} · ${plural(internal.reduce((s, a) => s + a.acc_noc, 0), "case")}`),
+                `${plural(internal.length, "agent")} · ${plural(internal.reduce((s, a) => s + a.acc_noc, 0), "case")}`,
+                branchBreakdown(internal, data)),
             makeCard("Outsource", fmtCompact(outsource.reduce((s, a) => s + a.acc_ans, 0)),
-                `${plural(outsource.length, "agent")} · ${plural(outsource.reduce((s, a) => s + a.acc_noc, 0), "case")}`),
-            makeCard("Qualified", `${qualified} / ${t.agents}`,
-                `RM ${fmtRM(data.targets.Internal)} internal · RM ${fmtRM(data.targets.Outsource)} outsource`),
+                `${plural(outsource.length, "agent")} · ${plural(outsource.reduce((s, a) => s + a.acc_noc, 0), "case")}`,
+                branchBreakdown(outsource, data)),
+            makeCard(cardLabel, `${qualified} / ${t.agents}`,
+                `RM ${fmtRM(bars.Internal)} internal · RM ${fmtRM(bars.Outsource)} outsource`),
         ].join("");
     }
 
@@ -231,6 +263,43 @@
         return data.show_nov ? "nov" : "oct";
     }
 
+    /** The award each table's target badge names: EGA while its column is up
+     *  (it closes in June), then the current early bird, October's and then
+     *  November's. */
+    function awardOnScreen(data) {
+        if (showEga(data)) return { ega: true, name: "EGA", bars: data.targets };
+        const nov = earlyKind(data) === "nov";
+        return {
+            ega: false,
+            name: `${nov ? "Nov" : "Oct"} Early Bird`,
+            bars: nov
+                ? (data.nov_targets || { Internal: 1200000, Outsource: 1460000 })
+                : (data.oct_targets || { Internal: 1000000, Outsource: 1360000 }),
+        };
+    }
+
+    /** Where one agent stands against the early-bird bar on screen. Shared by
+     *  the column and the Qualified card so the two can never disagree. */
+    function earlyStatus(agent, data) {
+        const ek = earlyKind(data);
+        const fallback = ek === "nov"
+            ? (agent.channel === "Internal" ? 1200000.0 : 1460000.0)
+            : (agent.channel === "Internal" ? 1000000.0 : 1360000.0);
+        const threshold = agent[ek + "_threshold"] || fallback;
+        const ep = agent.esa_ep != null ? agent.esa_ep : agent.ep;
+        return {
+            ek,
+            name: ek === "nov" ? "Nov" : "Oct",
+            threshold,
+            ep,
+            qualified: agent[ek + "_qualified"] != null
+                ? agent[ek + "_qualified"] : (ep >= threshold),
+            balance: agent[ek + "_balance"] != null
+                ? agent[ek + "_balance"] : Math.max(0, threshold - ep),
+            status: agent[ek + "_status"],
+        };
+    }
+
     function headerFor(data, channel) {
         const lm = lastMonth(data);
         const sm = splitMonth(data);
@@ -248,7 +317,7 @@
             ? bars(data.nov_targets || { Internal: 1200000, Outsource: 1460000 })
             : bars(data.oct_targets || { Internal: 1000000, Outsource: 1360000 });
         const earlyTh = earlyNov
-            ? `<th rowspan="2" title="Balance to qualify for the Nov Early Bird (${earlyBar} EP Point till 30 Nov). Anyone who had already cleared the Oct bar by 31 Oct is shown as Oct Qualifier.">NOV EARLY BIRD<br>Balance to Qualify<br>(${earlyBar} EP Point Till 30Nov)</th>`
+            ? `<th rowspan="2" title="Balance to qualify for the Nov Early Bird (${earlyBar} EP Point till 30 Nov). Anyone who had already cleared the Oct bar by 31 Oct keeps the month they cleared it (Sept or Oct Qualifier).">NOV EARLY BIRD<br>Balance to Qualify<br>(${earlyBar} EP Point Till 30Nov)</th>`
             : `<th rowspan="2" title="Balance to qualify for the Oct Early Bird (${earlyBar} EP Point till 30 Oct).">OCT EARLY BIRD<br>Balance to Qualify<br>(${earlyBar} EP Point Till 30Oct)</th>`;
         const monthCols = [];
         const subCols = [];
@@ -268,11 +337,11 @@
                 <th rowspan="2" class="sr-name">NAME</th>
                 <th rowspan="2">TYPE</th>
                 ${monthCols.join("")}
+                <th rowspan="2" title="Cash received against this agent's invoices in the period shown. Sales are counted when invoiced, so this is how much of that has actually been paid.">COLLECTED<br>PAYMENT</th>
                 <th colspan="2" class="sr-col-total">TOTAL</th>
                 <th colspan="2" class="sr-col-acc">ACC</th>
                 ${showCampaign(data) ? `<th colspan="4" title="Cases invoiced in the ${escapeHtml(campaignLabel(data))} window, and those sales with the multiplier applied. Every third case adds another half point per ringgit, so 3 cases pay 1.5x the window's sales and 6 pay 2x. The after-1/1/26 pair is empty because nothing available identifies a case's vintage.">MAY MULTIPLIER POINT ${escapeHtml(campaignLabel(data))}</th>` : ""}
                 <th rowspan="2" class="sr-col-ep">UP TO DATE<br>EP POINT</th>
-                <th rowspan="2" title="Cash received against this agent's invoices in the period shown. Sales are counted when invoiced, so this is how much of that has actually been paid.">COLLECTED<br>PAYMENT</th>
                 ${earlyTh}
                 ${showEga(data) ? `<th rowspan="2" title="Balance to qualify for the EGA Hanoi trip. EGA closes at the end of June, so this is measured on EP as at 30 June and cannot be reached on later sales.">EGA - HANOI<br>Balance to Qualify<br>(${egaBar} EP Point Till 30Jun)</th>` : ""}
                 ${showEsa(data) ? `<th rowspan="2" title="Balance to qualify for the ESA Chongqing trip. ESA runs to the end of December, so this is measured on the running EP.">ESA - CHONGQING<br>Balance to Qualify<br>(${esaBar} EP Point Till 31Dec)</th>` : ""}
@@ -454,6 +523,10 @@
             const epTitle = tier
                 ? `${fmtRM(agent.base_ep)} sales + ${tier.toFixed(1)}x campaign bonus ${fmtRM(agent.campaign_bonus)}`
                 : `${fmtRM(agent.base_ep)} sales, no campaign bonus`;
+            // Collected sits between the months and TOTAL, one merged cell per agent.
+            if (first) {
+                cells.push(`<td class="numeric"${span} title="${escapeHtml(collectedTitle)}">${collectedCell}</td>`);
+            }
             cells.push(`<td class="numeric sr-col-total">${t.total_noc}</td>`,
                 `<td class="numeric sr-col-total">${fmtRM(t.total_ans)}</td>`);
             // ACC adds RES and COM together, so it is one merged cell down the
@@ -471,26 +544,15 @@
             }
             if (first) {
                 cells.push(
-                    `<td class="numeric sr-strong sr-col-ep"${span} title="${escapeHtml(epTitle)}">${fmtRM(agent.ep)}</td>`,
-                    `<td class="numeric"${span} title="${escapeHtml(collectedTitle)}">${collectedCell}</td>`);
+                    `<td class="numeric sr-strong sr-col-ep"${span} title="${escapeHtml(epTitle)}">${fmtRM(agent.ep)}</td>`);
                 // Early Bird Balance to Qualify: October's bar until the end of
                 // October, November's from 1 November (earlyKind decides).
-                const ek = earlyKind(data);
-                const earlyName = ek === "nov" ? "Nov" : "Oct";
-                const earlyDefault = ek === "nov"
-                    ? (agent.channel === "Internal" ? 1200000.0 : 1460000.0)
-                    : (agent.channel === "Internal" ? 1000000.0 : 1360000.0);
-                const earlyThreshold = agent[ek + "_threshold"] || earlyDefault;
-                const earlyEp = agent.esa_ep != null ? agent.esa_ep : agent.ep;
-                const earlyQualified = agent[ek + "_qualified"] != null
-                    ? agent[ek + "_qualified"] : (earlyEp >= earlyThreshold);
-                const earlyBalance = agent[ek + "_balance"] != null
-                    ? agent[ek + "_balance"] : Math.max(0, earlyThreshold - earlyEp);
-                const earlyTitle = `EP to date ${fmtRM(earlyEp)} against ${fmtThreshold(earlyThreshold)} for ${earlyName} Early Bird`;
-                if (earlyQualified) {
-                    cells.push(`<td class="sr-qualified"${span} title="${escapeHtml(earlyTitle)}">${escapeHtml(agent[ek + "_status"] || "Qualifier")}</td>`);
+                const early = earlyStatus(agent, data);
+                const earlyTitle = `EP to date ${fmtRM(early.ep)} against ${fmtThreshold(early.threshold)} for ${early.name} Early Bird`;
+                if (early.qualified) {
+                    cells.push(`<td class="sr-qualified"${span} title="${escapeHtml(earlyTitle)}">${escapeHtml(early.status || "Qualifier")}</td>`);
                 } else {
-                    cells.push(`<td class="numeric sr-short"${span} title="${escapeHtml(earlyTitle)}">${fmtRM(earlyBalance)}</td>`);
+                    cells.push(`<td class="numeric sr-short"${span} title="${escapeHtml(earlyTitle)}">${fmtRM(early.balance)}</td>`);
                 }
                 // Each award cell says one of two things: the label when the
                 // bar is cleared, or how much EP is still missing. Same shape
@@ -531,10 +593,12 @@
         }).join("");
     }
 
-    function subtotalRow(members, data) {
+    /** The SUBTOTAL line under one table; with a label and class it is also
+     *  the section's Internal + Outsource total under the last table. */
+    function subtotalRow(members, data, label = "SUBTOTAL", extraClass = "") {
         const lm = lastMonth(data);
         const sm = splitMonth(data);
-        const cells = ['<td class="sr-no"></td>', '<td class="sr-name">SUBTOTAL</td>', "<td></td>"];
+        const cells = ['<td class="sr-no"></td>', `<td class="sr-name">${escapeHtml(label)}</td>`, "<td></td>"];
         const monthAns = m => members.reduce((sum, a) =>
             sum + a.types.reduce((s, t) => s + ((t.months[m] || {}).ans || 0), 0), 0);
         const monthNoc = m => members.reduce((sum, a) =>
@@ -550,7 +614,8 @@
                     `<td class="numeric${m === 6 ? " sr-col-jun-val" : ""}">${fmtRM(monthAns(m - 1))}</td>`);
             }
         }
-        cells.push(`<td class="numeric sr-col-total">${sum(a => a.acc_noc)}</td>`,
+        cells.push(`<td class="numeric">${fmtRM(sum(a => a.collected || 0))}</td>`,
+            `<td class="numeric sr-col-total">${sum(a => a.acc_noc)}</td>`,
             `<td class="numeric sr-col-total">${fmtRM(sum(a => a.acc_ans))}</td>`,
             `<td class="numeric sr-col-acc">${sum(a => a.acc_noc)}</td>`,
             `<td class="numeric sr-strong sr-col-acc">${fmtRM(sum(a => a.acc_ans))}</td>`);
@@ -561,26 +626,30 @@
                 `<td class="numeric sr-muted">—</td>`,
                 `<td class="numeric sr-muted">—</td>`);
         }
-        // EP, Collected, the early-bird column, then one blank per award column the header carries.
-        cells.push(`<td class="sr-col-ep"></td>`,
-            `<td class="numeric">${fmtRM(sum(a => a.collected || 0))}</td>`,
-            `<td></td>`);
+        // EP, the early-bird column, then one blank per award column the header carries.
+        cells.push(`<td class="sr-col-ep"></td>`, `<td></td>`);
         if (showEga(data)) cells.push("<td></td>");
         if (showEsa(data)) cells.push("<td></td>");
-        return `<tr class="sr-subtotal">${cells.join("")}</tr>`;
+        return `<tr class="sr-subtotal${extraClass ? " " + extraClass : ""}">${cells.join("")}</tr>`;
     }
 
-    function renderBlock(title, members, data) {
+    /** One table. `sectionTotal`, when given, is every agent in the section,
+     *  added up under this table's own SUBTOTAL as the Internal + Outsource line. */
+    function renderBlock(title, members, data, sectionTotal) {
         if (!members.length) return "";
-        const target = data.targets[members[0].channel];
+        const award = awardOnScreen(data);
+        const target = award.bars[members[0].channel];
         let body = "";
         members.forEach((a, i) => { body += agentRows(a, i + 1, data); });
         body += subtotalRow(members, data);
+        if (sectionTotal) {
+            body += subtotalRow(sectionTotal, data, "TOTAL (INTERNAL + OUTSOURCE)", "sr-grandtotal");
+        }
         return `<div class="card table-card sr-block">
             <div class="card-header">
                 <h3>${escapeHtml(title)}</h3>
                 <span class="row-count-badge">${plural(members.length, "agent")} ·
-                    target RM ${fmtRM(target)} EP</span>
+                    ${escapeHtml(award.name)} target RM ${fmtRM(target)} EP</span>
             </div>
             <div class="table-container" tabindex="0" aria-label="${escapeHtml(title)} table; use the left and right arrow keys to scroll">
                 <table class="dashboard-table sr-table">
@@ -619,17 +688,24 @@
 
         // Company-wide takes every visible agent, so it always has something
         // under it by the time we get past the no-matches return above.
+        // Each section closes on its Internal + Outsource total, carried by the
+        // Outsource table, or by Internal when the section has no outsource agent.
+        const section = (internal, outsource) => {
+            const all = internal.concat(outsource);
+            chunks.push(renderBlock("Internal Sales Agent", internal, data,
+                outsource.length ? null : all));
+            chunks.push(renderBlock("Outsource Sales Agent", outsource, data, all));
+        };
+
         chunks.push('<h3 class="sr-section-title">Company-wide</h3>');
-        chunks.push(renderBlock("Internal Sales Agent", pick("Internal", null), data));
-        chunks.push(renderBlock("Outsource Sales Agent", pick("Outsource", null), data));
+        section(pick("Internal", null), pick("Outsource", null));
 
         (data.branches || []).forEach(branch => {
             const internal = pick("Internal", branch);
             const outsource = pick("Outsource", branch);
             if (!internal.length && !outsource.length) return;
             chunks.push(`<h3 class="sr-section-title">${escapeHtml(branch)} Branch</h3>`);
-            chunks.push(renderBlock("Internal Sales Agent", internal, data));
-            chunks.push(renderBlock("Outsource Sales Agent", outsource, data));
+            section(internal, outsource);
         });
 
         sectionsBox.innerHTML = chunks.join("");
@@ -649,10 +725,10 @@
                 head.push(`${MONTH_ABBR[m - 1]} NOC`, `${MONTH_ABBR[m - 1]} ANS`);
             }
         }
-        head.push("TOTAL NOC", "TOTAL ANS",
+        head.push("COLLECTED PAYMENT", "TOTAL NOC", "TOTAL ANS",
             "ACC NOC", "ACC ANS", "CAMPAIGN CASES", "CAMPAIGN ANS",
             "MULTIPLIER RATE", "CAMPAIGN BONUS", "SALES EP",
-            "UP TO DATE EP POINT", "COLLECTED PAYMENT", "EP AT 30 JUN",
+            "UP TO DATE EP POINT", "EP AT 30 JUN",
             "EGA THRESHOLD", "EGA BALANCE", "EGA STATUS",
             "ESA THRESHOLD", "ESA BALANCE", "ESA STATUS");
 
@@ -669,14 +745,14 @@
                     }
                 }
                 const last = ti === a.types.length - 1;
-                row.push(t.total_noc, t.total_ans.toFixed(2),
+                row.push(ti === 0 ? (a.collected || 0).toFixed(2) : "",
+                    t.total_noc, t.total_ans.toFixed(2),
                     last ? a.acc_noc : "", last ? a.acc_ans.toFixed(2) : "",
                     ti === 0 ? a.campaign_cases : "", ti === 0 ? a.campaign_ans.toFixed(2) : "",
                     ti === 0 ? (Number(a.bonus_tier) || 0).toFixed(1) : "",
                     ti === 0 ? (a.campaign_bonus || 0).toFixed(2) : "",
                     ti === 0 ? (a.base_ep || 0).toFixed(2) : "",
                     ti === 0 ? a.ep.toFixed(2) : "",
-                    ti === 0 ? (a.collected || 0).toFixed(2) : "",
                     ti === 0 ? (a.ep_jun || 0).toFixed(2) : "",
                     ti === 0 ? (a.ega_threshold || 0).toFixed(2) : "",
                     ti === 0 && !a.qualified ? a.balance.toFixed(2) : "",

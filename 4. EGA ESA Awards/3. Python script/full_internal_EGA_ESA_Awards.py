@@ -571,9 +571,12 @@ def calc_ep_points(
         Residence              1 pt per RM1, before and after the cutoff
         Shop Lot / Commercial  1 pt per RM1, before and after the cutoff
         Factory, < 36 pcs      "price follows residence" -> 1 pt per RM1
-        Factory, >= 36 pcs     before the cutoff: 1 pt per RM1
-                               from the cutoff:   first RM40,000 at 100%,
-                                                  the balance at 40%
+        Commercial jobs        before the cutoff: a flat 40% of the sale
+        (Factory, Commercial,  from the cutoff:   first RM40,000 at 100%,
+         Shop Lot, SELCO)                         the balance at 40%
+
+    The flat 40% before the cutoff follows HR's figures (decided 9 Oct 2026:
+    CHAN WING ON's EP is 1,099,255.55 on that basis).
 
     Every figure above (block size, balance rate, panel minimum, cutoff month)
     comes from the Data page via ensure_rules_applied(); only which package
@@ -591,7 +594,7 @@ def calc_ep_points(
     # Compared at month granularity: the cutoff is always the 1st of a month,
     # and this sidesteps naive/aware datetime comparisons on the invoice date.
     if (when.year, when.month) < (FACTORY_CUTOFF_DATE.year, FACTORY_CUTOFF_DATE.month):
-        return sales_price
+        return sales_price * FACTORY_BALANCE_RATE
 
     if sales_price <= FACTORY_FIRST_BLOCK:
         return sales_price

@@ -2748,11 +2748,6 @@ SALES_REPORT_EXCLUDED_INVOICES = {
     # INV-1008594, NG KOK CHEU (ATAP), Chan Jia Wei -- a RM4,800 top-up on the
     # February sale INV-1008241 (RM46,106), not a case of its own.
     "48c00c12-fd1a-4bb1-a869-ae59748e9d40",
-    # INV-1009895, LIEW CHAN SANG (LIEW MIN HUI) (ATAP), and INV-1009932, GOH
-    # HOCK LYE (ATAP), Ching Zhe Hang -- first paid 1 June but not June cases
-    # per Finance. Left out until the month they belong to is decided.
-    "afcec34c-16ed-4c5a-91d4-8a2dadd6dc6b",
-    "e9807dd0-cadc-4b5a-a798-22a3bf05c746",
     # 1008435, Cheong Hong Wee (Atap), Teng Kah Kent -- RM29,800, first paid
     # 16 Jan 2026; not a January case per Finance, left out.
     "1768594400823x535666973979967500",
@@ -3053,6 +3048,14 @@ SALES_REPORT_DATE_OVERRIDES = {
     # so January RES sales are counted at 2 cases, RM63,600.00 per user request.
     "e5f87cb6-8917-4eba-91c3-521a37fc111b": "2026-01-31",
     "INV-1008421": "2026-01-31",
+    # INV-1009895, LIEW CHAN SANG (LIEW MIN HUI) (ATAP), and INV-1009932, GOH
+    # HOCK LYE (ATAP), Ching Zhe Hang -- first paid 1 June but not June cases
+    # per Finance; counted in May, on their invoice dates, per user request
+    # (9 Oct 2026). Until then they were left out of the report.
+    "afcec34c-16ed-4c5a-91d4-8a2dadd6dc6b": "2026-05-25",
+    "INV-1009895": "2026-05-25",
+    "e9807dd0-cadc-4b5a-a798-22a3bf05c746": "2026-05-26",
+    "INV-1009932": "2026-05-26",
 }
 
 # Cases placed on a RES/COM line by hand, overriding _sales_report_property.
@@ -3213,10 +3216,45 @@ def _award_qualified_month(rows, threshold, ladder, max_month: int):
 
 
 def _qualifier_label(month) -> str:
-    """"Apr Qualifier", in the printed report's wording."""
+    """"Apr Qualifier", in the printed report's wording -- which spells
+    September "Sept"."""
     if not month or not (1 <= int(month) <= 12):
         return "Qualifier"
-    return f"{SALES_REPORT_MONTHS[int(month) - 1]} Qualifier"
+    name = "Sept" if int(month) == 9 else SALES_REPORT_MONTHS[int(month) - 1]
+    return f"{name} Qualifier"
+
+
+# The early-bird and ESA columns name a qualifier by the month they cleared
+# the bar, but HR counts anyone who had cleared it by 30 September as a
+# "Sept Qualifier", however early (CHAN JIA WEI crossed in July, LOUIS NG in
+# August; both read Sept). Later crossings read as their own month.
+SALES_REPORT_EARLIEST_QUALIFIER_MONTH = 9
+
+
+def _first_crossing_month(rows, bar, max_month: int):
+    """The month these (date, EP) rows' running total first reaches `bar`,
+    looking no further than `max_month`; None if it never does."""
+    from decimal import Decimal as _D
+    running, target = _D("0"), _D(str(bar))
+    for when, ep in sorted(rows, key=lambda x: str(x[0])):
+        try:
+            mth = int(str(when)[5:7])
+        except (TypeError, ValueError):
+            continue
+        if mth > max_month:
+            break
+        running += ep
+        if running >= target:
+            return mth
+    return None
+
+
+def _early_qualifier_label(rows, bar, max_month: int, latest: int) -> str:
+    """"Sept Qualifier" / "Oct Qualifier" ... for an early-bird or ESA win:
+    the month the bar was first cleared, no earlier than September and no
+    later than `latest` (the rung the award was won on)."""
+    crossed = _first_crossing_month(rows, bar, max_month) or latest
+    return _qualifier_label(min(latest, max(crossed, SALES_REPORT_EARLIEST_QUALIFIER_MONTH)))
 
 
 # The ESA early-bird bars for October and November, per channel. The Data page
@@ -4569,6 +4607,27 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         ep_by_oct = sum((e for d, e in entry["ep_rows"] if d <= f"{year:04d}-10-31"), zero)
         won_oct = ep_by_oct >= oct_threshold
         nov_qualified = won_oct or esa_ep >= nov_threshold
+        # Each label names the month the bar was cleared, with September the
+        # earliest (see SALES_REPORT_EARLIEST_QUALIFIER_MONTH).
+        rows_ep = list(entry["ep_rows"])
+        oct_status = (_early_qualifier_label(rows_ep, oct_threshold, last_month, 10)
+                      if oct_qualified else "")
+        if not nov_qualified:
+            nov_status = ""
+        elif won_oct:
+            nov_status = _early_qualifier_label(rows_ep, oct_threshold, min(10, last_month), 10)
+        else:
+            nov_status = _early_qualifier_label(rows_ep, nov_threshold, last_month, 11)
+        if not esa_qualified:
+            esa_status = ""
+        elif esa_month in (esa_ladder or {}):
+            # Won on an early-bird rung: named for when that rung's bar was
+            # cleared, not simply for the rung's month.
+            rung = esa_ladder[esa_month]
+            rung = rung[0] if isinstance(rung, (tuple, list)) else rung
+            esa_status = _early_qualifier_label(rows_ep, rung, last_month, esa_month)
+        else:
+            esa_status = _qualifier_label(esa_month)
         types = [k for k in ("RES", "COM") if entry["lines"].get(k)]
         out_agents.append({
             "agent": entry["agent"],
@@ -4624,15 +4683,15 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
             "oct_threshold": float(oct_threshold),
             "oct_qualified": oct_qualified,
             "oct_balance": 0.0 if oct_qualified else float(oct_threshold - esa_ep),
-            "oct_status": "Qualifier" if oct_qualified else "",
+            # "Sept Qualifier" / "Oct Qualifier" / "Nov Qualifier": see above.
+            "oct_status": oct_status,
             "nov_threshold": float(nov_threshold),
             "nov_qualified": nov_qualified,
             "nov_balance": 0.0 if nov_qualified else float(nov_threshold - esa_ep),
-            "nov_status": (("Oct Qualifier" if won_oct else "Qualifier")
-                           if nov_qualified else ""),
+            "nov_status": nov_status,
             # "Apr Qualifier" and the like, in the printed report's wording.
             "status": _qualifier_label(ega_month) if qualified else "",
-            "esa_status": _qualifier_label(esa_month) if esa_qualified else "",
+            "esa_status": esa_status,
         })
 
     # Qualifiers first, then everyone else, each group by EP descending.
@@ -4768,13 +4827,11 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
     from reportlab.lib.pagesizes import A3, landscape
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import mm
-    from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate,
+    from reportlab.platypus import (BaseDocTemplate, Frame, PageBreak, PageTemplate,
                                     Paragraph, Spacer, Table, TableStyle)
 
     MONTH_ABBR = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
                   "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-    MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
-                   "July", "August", "September", "October", "November", "December"]
 
     lm = int(payload.get("last_month") or 6)
     sm = int(payload.get("split_month") or 6)
@@ -4806,8 +4863,12 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
     top = ["NO", "NAME", "TYPE"]
     sub = ["", "", ""]
     spans = []
+    # Every NOC column (each month, TOTAL, ACC): a case count, so it is printed
+    # narrow and centred, and the room it gives up goes to the RM columns.
+    noc_cols = []
     col = 3
     for m in range(1, lm + 1):
+        noc_cols.append(col)
         if m == sm and split_june:
             top += [MONTH_ABBR[m - 1], "", ""]
             sub += ["NOC", f"1-{sd} {MONTH_ABBR[m - 1]}",
@@ -4820,8 +4881,14 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
             spans.append(("SPAN", (col, 0), (col + 1, 0)))
             col += 2
     campaign_label = payload.get("campaign_label") or f"1/5 - {sd}/{sm}"
+    # Collected sits between the months and TOTAL, as on the page.
+    top += ["COLLECTED\nPAYMENT"]
+    sub += [""]
+    collected_col = col
+    col += 1
     # TOTAL and ACC open the groups below, so their first columns are known.
     total_col, acc_col = col, col + 2
+    noc_cols += [total_col, acc_col]
     # The multiplier columns only exist while the period reaches the campaign.
     groups = [("TOTAL", ("NOC", "ANS")), ("ACC", ("NOC", "ANS"))]
     if not no_campaign:
@@ -4840,10 +4907,19 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
     # The early-bird column is October's until the end of October and
     # November's from 1 November; the payload says which, as it does for the page.
     early = "nov" if payload.get("show_nov") else "oct"
-    top += ["UP TO DATE\nEP POINT", "COLLECTED\nPAYMENT", ""]
-    sub += ["", "", ""]
-    ep_col, collected_col, oct_col = col, col + 1, col + 2
-    col += 3
+    # The award each table's target line names -- the page's awardOnScreen():
+    # EGA while its column is up, then the current early bird.
+    if show_ega:
+        award_name, award_bars = "EGA", targets
+    else:
+        award_name = f"{'Nov' if early == 'nov' else 'Oct'} Early Bird"
+        award_bars = payload.get(f"{early}_targets") or (
+            {"Internal": 1200000.0, "Outsource": 1460000.0} if early == "nov"
+            else {"Internal": 1000000.0, "Outsource": 1360000.0})
+    top += ["UP TO DATE\nEP POINT", ""]
+    sub += ["", ""]
+    ep_col, oct_col = col, col + 1
+    col += 2
     ega_col = esa_col = None
     if show_ega:
         top += [""]
@@ -4856,21 +4932,35 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
         esa_col = col
         col += 1
     ncols = col
-    # NO/NAME/TYPE and the trailing columns are one logical cell each.
+    # NO/NAME/TYPE, Collected and EP are one heading cell down both header
+    # rows. The award columns are not: their name sits in the top row and
+    # "Balance To Qualify (...)" in the row below, as in the printed report.
     spans += [("SPAN", (0, 0), (0, 1)), ("SPAN", (1, 0), (1, 1)),
               ("SPAN", (2, 0), (2, 1)),
               ("SPAN", (collected_col, 0), (collected_col, 1)),
-              ("SPAN", (ep_col, 0), (ep_col, 1)),
-              ("SPAN", (oct_col, 0), (oct_col, 1))]
-    for award in (ega_col, esa_col):
-        if award is not None:
-            spans.append(("SPAN", (award, 0), (award, 1)))
+              ("SPAN", (ep_col, 0), (ep_col, 1))]
+
+    # The column groups the heading shows -- NO, NAME, TYPE, each month (its
+    # NOC/ANS pair, or June's three), Collected, TOTAL, ACC, the May multiplier
+    # block, EP and each award -- as (first, last) column pairs. Each is
+    # outlined in black down the whole table.
+    month_starts = noc_cols[:lm]
+    col_groups = [(0, 0), (1, 1), (2, 2)]
+    col_groups += [(start, (month_starts[i + 1] if i + 1 < lm else collected_col) - 1)
+                   for i, start in enumerate(month_starts)]
+    col_groups += [(collected_col, collected_col), (total_col, total_col + 1),
+                   (acc_col, acc_col + 1)]
+    if not no_campaign:
+        col_groups.append((acc_col + 2, acc_col + 5))
+    col_groups += [(c, c) for c in (ep_col, oct_col, ega_col, esa_col) if c is not None]
 
     def fmt_threshold(value) -> str:
-        """"600K", "1.3M" -- the page's own shorthand for a bar."""
+        """"600K", "1.0M", "1.36M" -- the printed report's shorthand for a
+        bar, which keeps one decimal on a whole million."""
         n = float(value or 0)
         if n >= 1e6:
-            return f"{n / 1e6:.2f}".rstrip("0").rstrip(".") + "M"
+            m = f"{n / 1e6:.2f}".rstrip("0")
+            return (m + "0" if m.endswith(".") else m) + "M"
         if n >= 1e3:
             return f"{round(n / 1e3):.0f}K"
         return rm(n)
@@ -4884,27 +4974,51 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
             return (f"{fmt_threshold(bag.get('Internal'))}"
                     f"/{fmt_threshold(bag.get('Outsource'))}")
 
-        head = list(top)
+        head, subhead = list(top), list(sub)
+        # Award name on top, "Balance To Qualify (bars ...)" underneath.
+        awards = []
         if oct_col is not None:
             if early == "nov":
-                head[oct_col] = ("NOV EARLY BIRD\nBALANCE TO QUALIFY\n"
-                                 f"({bars(payload.get('nov_targets'))} EP Point Till 30Nov)")
+                awards.append((oct_col, "NOV EARLY BIRD",
+                               bars(payload.get("nov_targets")), "30Nov"))
             else:
-                head[oct_col] = ("OCT EARLY BIRD\nBALANCE TO QUALIFY\n"
-                                 f"({bars(payload.get('oct_targets'))} EP Point Till 30Oct)")
+                awards.append((oct_col, "OCT EARLY BIRD",
+                               bars(payload.get("oct_targets")), "30Oct"))
         if ega_col is not None:
-            head[ega_col] = ("EGA - HANOI\nBalance to Qualify\n"
-                             f"({bars(payload.get('targets'))} EP Point Till 30Jun)")
+            awards.append((ega_col, "EGA - HANOI", bars(payload.get("targets")), "30Jun"))
         if esa_col is not None:
-            head[esa_col] = ("ESA - CHONGQING\nBalance to Qualify\n"
-                             f"({bars(payload.get('esa_targets'))} EP Point Till 31Dec)")
-        return [head, list(sub)]
+            awards.append((esa_col, "ESA - CHONG QING",
+                           bars(payload.get("esa_targets")), "31Dec"))
+        for c, name, bar, till in awards:
+            head[c] = name
+            # Three lines, broken where the printed report breaks them.
+            subhead[c] = Paragraph(
+                f"Balance To Qualify<br/>({html.escape(bar)} EP<br/>Point Till {till})",
+                head_style)
+        for c in (ep_col, collected_col):
+            head[c] = Paragraph(
+                "<br/>".join(html.escape(line) for line in head[c].split("\n")),
+                head_style)
+        return [head, subhead]
 
     page_w, page_h = landscape(A3)
     avail = page_w - 24 * mm
     no_w, name_w, type_w = 15.0, 74.0, 20.0
-    num_w = (avail - no_w - name_w - type_w) / (ncols - 3)
-    col_widths = [no_w, name_w, type_w] + [num_w] * (ncols - 3)
+    # Wide enough for the bold "NOC" heading at the largest type (5pt) plus
+    # padding; a count of cases never needs more.
+    noc_w = 16.0
+    # The award columns carry the longest headings, so they take a larger
+    # share than an ordinary RM column: num_w each for the rest, AWARD_SHARE
+    # times that for each award.
+    AWARD_SHARE = 1.4
+    award_cols = [c for c in (oct_col, ega_col, esa_col) if c is not None]
+    n_num = ncols - 3 - len(noc_cols) - len(award_cols)
+    num_w = ((avail - no_w - name_w - type_w - noc_w * len(noc_cols))
+             / (n_num + AWARD_SHARE * len(award_cols)))
+    award_w = num_w * AWARD_SHARE
+    col_widths = [no_w, name_w, type_w] + [
+        noc_w if c in noc_cols else award_w if c in award_cols else num_w
+        for c in range(3, ncols)]
     # A longer period means more month columns and less room in each, so the
     # type shrinks to keep "1,234,567.89" inside its cell instead of letting it
     # run over the neighbour. Capped at 5pt, which is what the shorter periods
@@ -4916,6 +5030,17 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
     name_style = ParagraphStyle("srName", fontName="Helvetica", fontSize=font_size,
                                 leading=font_size + 0.8,
                                 textColor=colors.HexColor("#0f172a"))
+    # The long right-hand headings (see header_rows), matching the other
+    # heading cells: bold, black, centred.
+    head_style = ParagraphStyle("srHead", fontName="Helvetica-Bold", fontSize=font_size,
+                                leading=font_size + 1.2, alignment=1,
+                                textColor=colors.black)
+    # Heading colours: the lightest blue by default; a column with a colour of
+    # its own (TOTAL, ACC, EP, the awards) carries that colour up into its heading.
+    HEAD_BLUE = "#EFF6FF"
+    AWARD_PINK = "#FBD3E0"
+    AWARD_PINK_LIGHT = "#FCE4EF"
+    AWARD_PINK_DEEP = "#EFC6E4"
 
     def agent_rows(agent: dict, no: int) -> list[list]:
         types = agent.get("types") or [{"type": "RES", "months": [], "jun_early": 0,
@@ -4937,6 +5062,9 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
                     row += [str(cell.get("noc", 0)), rm(cell.get("ans"))]
             tier = float(agent.get("bonus_tier") or 0)
             row += [
+                # Collected, between the months and TOTAL.
+                ((rm(agent.get("collected")) if agent.get("collected") else "-")
+                 if first else ""),
                 str(t.get("total_noc", 0)), rm(t.get("total_ans")),
                 # ACC is one merged cell down the agent's lines (see the SPANs in
                 # block()), so the value sits on the first line of the span.
@@ -4959,8 +5087,6 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
                 ]
             row += [
                 rm(agent.get("ep")) if first else "",
-                ((rm(agent.get("collected")) if agent.get("collected") else "-")
-                 if first else ""),
                 ((agent.get(f"{early}_status") or "Qualifier" if agent.get(f"{early}_qualified")
                   else rm(agent.get(f"{early}_balance"))) if first else ""),
             ]
@@ -4982,8 +5108,8 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
             out.append(row)
         return out
 
-    def subtotal_row(members: list[dict]) -> list:
-        row = ["", "SUBTOTAL", ""]
+    def subtotal_row(members: list[dict], label: str = "SUBTOTAL") -> list:
+        row = ["", label, ""]
         for m in range(1, lm + 1):
             noc = sum((t.get("months") or [{}] * m)[m - 1].get("noc", 0)
                       for a in members for t in (a.get("types") or [])
@@ -5001,45 +5127,62 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
                 row += [str(noc), rm(ans)]
         acc_noc = sum(a.get("acc_noc", 0) for a in members)
         acc_ans = sum(a.get("acc_ans", 0) for a in members)
-        row += [str(acc_noc), rm(acc_ans), str(acc_noc), rm(acc_ans)]
+        row += [rm(sum(a.get("collected") or 0 for a in members)),
+                str(acc_noc), rm(acc_ans), str(acc_noc), rm(acc_ans)]
         if not no_campaign:
             row += [str(sum(a.get("campaign_cases", 0) for a in members)),
                     rm(sum((a.get("campaign_ans") or 0)
                            + (a.get("campaign_bonus") or 0)
                            for a in members if a.get("bonus_tier"))),
                     "-", "-"]
-        # EP, Collected, Oct Early Bird, then one blank per award column in the header.
-        row += ["", rm(sum(a.get("collected") or 0 for a in members)), ""]
+        # EP, Oct Early Bird, then one blank per award column in the header.
+        row += ["", ""]
         row += [""] * ((1 if show_ega else 0) + (1 if show_esa else 0))
         return row
 
-    def block(title: str, members: list[dict], channel: str) -> list:
+    def block(title: str, members: list[dict], channel: str,
+              section_total: list[dict] | None = None) -> list:
+        """One table. `section_total`, when given, is every agent in the
+        section, added up under this table's SUBTOTAL as the Internal +
+        Outsource line, in red as on the page."""
         if not members:
             return []
         rows = header_rows(channel)
         for i, a in enumerate(members):
             rows += agent_rows(a, i + 1)
         rows.append(subtotal_row(members))
+        sub_r = len(rows) - 1
+        if section_total is not None:
+            rows.append(subtotal_row(section_total, "TOTAL"))
         style = [
             ("FONTNAME", (0, 0), (-1, 1), "Helvetica-Bold"),
             ("FONTNAME", (0, 2), (-1, -1), "Helvetica"),
             ("FONTSIZE", (0, 0), (-1, -1), font_size),
             ("LEADING", (0, 0), (-1, -1), font_size + 1.2),
-            ("BACKGROUND", (0, 0), (-1, 1), colors.HexColor("#1f2a44")),
-            ("TEXTCOLOR", (0, 0), (-1, 1), colors.white),
+            ("BACKGROUND", (0, 0), (-1, 1), colors.HexColor(HEAD_BLUE)),
+            ("TEXTCOLOR", (0, 0), (-1, 1), colors.black),
             ("ALIGN", (3, 0), (-1, -1), "RIGHT"),
             ("ALIGN", (0, 0), (2, -1), "CENTER"),
             ("ALIGN", (3, 0), (-1, 1), "CENTER"),
             ("ALIGN", (1, 2), (1, -1), "LEFT"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#c8cedb")),
-            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#eef1f7")),
-            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
+            ("BACKGROUND", (0, sub_r), (-1, -1), colors.HexColor("#eef1f7")),
+            ("FONTNAME", (0, sub_r), (-1, -1), "Helvetica-Bold"),
             ("LEFTPADDING", (0, 0), (-1, -1), 1.5),
             ("RIGHTPADDING", (0, 0), (-1, -1), 1.5),
             ("TOPPADDING", (0, 0), (-1, -1), 1.2),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 1.2),
-        ] + spans
+        ] + [("ALIGN", (c, 2), (c, -1), "CENTER") for c in noc_cols] + spans
+        # EP and the award columns are centred.
+        for c in (ep_col, oct_col, ega_col, esa_col):
+            if c is not None:
+                style.append(("ALIGN", (c, 2), (c, -1), "CENTER"))
+        # Every line is black: a thin grid, a heavier outline round each
+        # column group (see col_groups) and round the two heading rows.
+        for first_col, last_col in col_groups:
+            style.append(("BOX", (first_col, 0), (last_col, -1), 0.8, colors.black))
+        style.append(("BOX", (0, 0), (-1, 1), 0.8, colors.black))
         # Column bands, as on the page: TOTAL green, ACC blue, UP TO DATE EP
         # POINT beige, a deeper shade of each on the subtotal row.
         for first_col, last_col, body, subtotal in (
@@ -5047,41 +5190,70 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
                 (acc_col, acc_col + 1, "#E3EEFB", "#C9DDF5"),
                 (ep_col, ep_col, "#F5EEDC", "#EBDFC0")):
             style += [
-                ("BACKGROUND", (first_col, 2), (last_col, -2), colors.HexColor(body)),
-                ("BACKGROUND", (first_col, -1), (last_col, -1), colors.HexColor(subtotal)),
+                ("BACKGROUND", (first_col, 0), (last_col, 1), colors.HexColor(body)),
+                ("BACKGROUND", (first_col, 2), (last_col, sub_r - 1), colors.HexColor(body)),
+                ("BACKGROUND", (first_col, sub_r), (last_col, -1), colors.HexColor(subtotal)),
             ]
-        # Qualified reads green and short reads red, the same signal the page
-        # gives with .sr-qualified / .sr-short.
-        green, red = colors.HexColor("#166534"), colors.HexColor("#b91c1c")
+        # Award headings, as in the printed report: the name in plain type on
+        # a light pink, "Balance To Qualify" in bold on a deeper pink below.
+        for c in (oct_col, ega_col, esa_col):
+            if c is not None:
+                style += [("BACKGROUND", (c, 0), (c, 0), colors.HexColor(AWARD_PINK_LIGHT)),
+                          ("FONTNAME", (c, 0), (c, 0), "Helvetica"),
+                          ("BACKGROUND", (c, 1), (c, 1), colors.HexColor(AWARD_PINK_DEEP))]
+        if section_total is not None:
+            red_total = colors.HexColor("#C62828")
+            style += [("TEXTCOLOR", (0, -1), (-1, -1), red_total),
+                      ("LINEABOVE", (0, -1), (-1, -1), 1.0, colors.black)]
+        # Award columns: a qualifier reads red on white; anyone still short
+        # shows the balance in black on pink, across the whole merged cell.
+        won_red, pink = colors.HexColor("#C62828"), colors.HexColor(AWARD_PINK)
+
+        def award_cell(col: int, row: int, lines: int, won: bool) -> None:
+            if won:
+                style.append(("TEXTCOLOR", (col, row), (col, row), won_red))
+            else:
+                style.extend([
+                    ("TEXTCOLOR", (col, row), (col, row), colors.black),
+                    ("BACKGROUND", (col, row), (col, row + lines - 1), pink),
+                ])
+
         r = 2
         for a in members:
             n_lines = max(1, len(a.get("types") or []))
             for i in range(n_lines):
                 if i == 0:
-                    # ACC adds RES and COM together: one merged cell per agent,
-                    # as on the page.
+                    # Per-agent figures are one merged cell down the agent's RES
+                    # and COM lines, as on the page: NO, NAME, ACC (which adds
+                    # RES and COM together), EP, Collected and the award columns.
                     if n_lines > 1:
-                        for c in (acc_col, acc_col + 1):
-                            style.append(("SPAN", (c, r), (c, r + n_lines - 1)))
+                        for c in (0, 1, acc_col, acc_col + 1, ep_col, collected_col,
+                                  oct_col, ega_col, esa_col):
+                            if c is not None:
+                                style.append(("SPAN", (c, r), (c, r + n_lines - 1)))
+                    award_cell(oct_col, r, n_lines, bool(a.get(f"{early}_qualified")))
                     if ega_col is not None:
-                        style.append(("TEXTCOLOR", (ega_col, r), (ega_col, r),
-                                      green if a.get("qualified") else red))
+                        award_cell(ega_col, r, n_lines, bool(a.get("qualified")))
                     if esa_col is not None:
-                        style.append(("TEXTCOLOR", (esa_col, r), (esa_col, r),
-                                      green if a.get("esa_qualified") else red))
+                        award_cell(esa_col, r, n_lines, bool(a.get("esa_qualified")))
                 r += 1
-        target = float(targets.get(channel, 0) or 0)
+        target = float(award_bars.get(channel, 0) or 0)
         head = Paragraph(
-            f"<b>{html.escape(title)}</b> &nbsp;&nbsp;{len(members)} agent"
-            f"{'' if len(members) == 1 else 's'} &middot; target RM {target:,.2f} EP",
-            ParagraphStyle("blockHead", fontName="Helvetica", fontSize=8,
+            # The table's name, with its agent count and target on the line below.
+            f"<b>{html.escape(title)}</b><br/>{len(members)} agent"
+            f"{'' if len(members) == 1 else 's'} &middot; "
+            f"{html.escape(award_name)} target RM {target:,.2f} EP",
+            ParagraphStyle("blockHead", fontName="Helvetica", fontSize=8, leading=11,
                            textColor=colors.HexColor("#334155"), spaceAfter=3))
         table = Table(rows, colWidths=col_widths, repeatRows=2)
         table.setStyle(TableStyle(style))
         return [head, table, Spacer(1, 8)]
 
+    # Leading set explicitly: the 12pt default is shorter than the 15pt type,
+    # so whatever sat under the title was drawn into it.
     title_style = ParagraphStyle("srTitle", fontName="Helvetica-Bold", fontSize=15,
-                                 textColor=colors.HexColor("#0f172a"), spaceAfter=2)
+                                 leading=19, textColor=colors.HexColor("#0f172a"),
+                                 spaceAfter=2)
     meta_style = ParagraphStyle("srMeta", fontName="Helvetica", fontSize=8,
                                 textColor=colors.HexColor("#64748b"), spaceAfter=10)
     section_style = ParagraphStyle("srSection", fontName="Helvetica-Bold", fontSize=10,
@@ -5105,57 +5277,136 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
         data.totals, so a search moves them."""
         internal = [a for a in shown if a.get("channel") == "Internal"]
         outsource = [a for a in shown if a.get("channel") == "Outsource"]
-        qual = sum(1 for a in shown if a.get("qualified"))
+        # EGA up to June; from July "ESA Qualified", counting the ESA column's
+        # qualifiers against its own bars -- as the page's renderCards() does.
+        if show_ega:
+            qual_label, qual_bars = "Qualified · EGA", targets
+            qual = sum(1 for a in shown if a.get("qualified"))
+        else:
+            qual_label = "ESA Qualified"
+            qual_bars = payload.get("esa_targets") or {"Internal": 1300000.0,
+                                                       "Outsource": 1560000.0}
+            qual = sum(1 for a in shown if a.get("esa_qualified"))
         cards = [
             ("Total Cases", str(sum(a.get("acc_noc", 0) for a in shown)),
              plural(len(shown), "agent")),
-            ("Total Net Sales", fmt_compact(sum(a.get("acc_ans", 0) for a in shown)),
-             "net of EPP interest"),
+            ("Total Net Sales", fmt_compact(sum(a.get("acc_ans", 0) for a in shown)), ""),
             ("Internal", fmt_compact(sum(a.get("acc_ans", 0) for a in internal)),
              f"{plural(len(internal), 'agent')} · "
              f"{plural(sum(a.get('acc_noc', 0) for a in internal), 'case')}"),
             ("Outsource", fmt_compact(sum(a.get("acc_ans", 0) for a in outsource)),
              f"{plural(len(outsource), 'agent')} · "
              f"{plural(sum(a.get('acc_noc', 0) for a in outsource), 'case')}"),
-            ("Qualified", f"{qual} / {len(shown)}",
-             f"RM {rm(targets.get('Internal'))} internal · "
-             f"RM {rm(targets.get('Outsource'))} outsource"),
+            (qual_label, f"{qual} / {len(shown)}",
+             f"RM {rm(qual_bars.get('Internal'))} internal · "
+             f"RM {rm(qual_bars.get('Outsource'))} outsource"),
         ]
-        width = (page_w - 24 * mm) / len(cards)
-        table = Table([[c[0] for c in cards], [c[1] for c in cards],
-                       [c[2] for c in cards]],
-                      colWidths=[width] * len(cards))
-        table.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica"),
-            ("FONTSIZE", (0, 0), (-1, 0), 6.5),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#64748b")),
-            ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 1), (-1, 1), 12),
-            ("TEXTCOLOR", (0, 1), (-1, 1), colors.HexColor("#0f172a")),
-            ("FONTNAME", (0, 2), (-1, 2), "Helvetica"),
-            ("FONTSIZE", (0, 2), (-1, 2), 6),
-            ("TEXTCOLOR", (0, 2), (-1, 2), colors.HexColor("#94a3b8")),
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
-            ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#e2e8f0")),
-            ("LINEAFTER", (0, 0), (-2, -1), 0.4, colors.HexColor("#e2e8f0")),
+        # Each card is its own light-grey box, no border, all-black text, with a
+        # narrow blank column between neighbours.
+        gap = 6.0
+        width = (page_w - 24 * mm - gap * (len(cards) - 1)) / len(cards)
+        black = colors.black
+        card_fill = colors.HexColor("#F1F5F9")
+        # The divider above the branch lines, a shade darker than the fill.
+        card_rule = colors.HexColor("#CBD5E1")
+
+        def branch_breakdown(members: list[dict]):
+            """The page's branchBreakdown(): one line per branch -- name, agents
+            and cases, sales -- skipping empty branches, with anyone outside
+            the listed branches under "Other" so the lines add up to the card."""
+            branches = list(payload.get("branches") or [])
+            groups = [(b, [a for a in members if a.get("branch") == b]) for b in branches]
+            other = [a for a in members if a.get("branch") not in branches]
+            if other:
+                groups.append(("Other", other))
+            lines = [[b, f"{plural(len(ag), 'agent')} · "
+                         f"{plural(sum(a.get('acc_noc', 0) for a in ag), 'case')}",
+                      fmt_compact(sum(a.get("acc_ans", 0) for a in ag))]
+                     for b, ag in groups if ag]
+            if not lines:
+                return ""
+            inner = width - 16
+            sub = Table(lines, colWidths=[34, inner - 34 - 48, 48])
+            sub.setStyle(TableStyle([
+                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 6.5),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+                ("TEXTCOLOR", (0, 0), (-1, -1), black),
+                ("ALIGN", (2, 0), (2, -1), "RIGHT"),
+                ("LINEABOVE", (0, 0), (-1, 0), 0.4, card_rule),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 1.5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+                ("TOPPADDING", (0, 0), (-1, 0), 4),
+            ]))
+            return sub
+
+        breakdown = ["", "", branch_breakdown(internal), branch_breakdown(outsource), ""]
+
+        def card_body(card: tuple, extra) -> Table:
+            """One card's label, figure, note and (Internal/Outsource only) branch
+            lines, as a block of its own so the card can be centred in its box."""
+            rows = [[card[0]], [card[1]], [card[2]]] + ([[extra]] if extra else [])
+            body = Table(rows, colWidths=[width - 16])
+            body.setStyle(TableStyle([
+                ("FONTNAME", (0, 0), (0, 0), "Helvetica"),
+                ("FONTSIZE", (0, 0), (0, 0), 6.5),
+                ("FONTNAME", (0, 1), (0, 1), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 1), (0, 1), 12),
+                ("FONTNAME", (0, 2), (0, 2), "Helvetica"),
+                ("FONTSIZE", (0, 2), (0, 2), 6),
+                ("TEXTCOLOR", (0, 0), (-1, -1), black),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ("TOPPADDING", (0, 1), (0, 1), 5),
+                ("TOPPADDING", (0, 3), (0, 3), 4),
+            ]))
+            return body
+
+        # One row of boxes with a narrow blank column between neighbours. The
+        # Internal and Outsource cards are the tallest and set the row height;
+        # the other three are centred vertically inside it.
+        cells, widths = [], []
+        for i, card in enumerate(cards):
+            if i:
+                cells.append("")
+                widths.append(gap)
+            cells.append(card_body(card, breakdown[i]))
+            widths.append(width)
+        style = [
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("LEFTPADDING", (0, 0), (-1, -1), 8),
-            ("TOPPADDING", (0, 0), (-1, 0), 6),
-            ("BOTTOMPADDING", (0, 2), (-1, 2), 6),
-        ]))
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]
+        for i, c in enumerate(range(0, len(cells), 2)):
+            style.append(("BACKGROUND", (c, 0), (c, 0), card_fill))
+            # Internal and Outsource stay top-aligned so their headings line
+            # up even when a search leaves one with fewer branch lines.
+            if breakdown[i]:
+                style.append(("VALIGN", (c, 0), (c, 0), "TOP"))
+        table = Table([cells], colWidths=widths)
+        table.setStyle(TableStyle(style))
         return table
 
-    period = f"January &ndash; {MONTH_NAMES[lm - 1]} {year}"
-    cases = sum(a.get("acc_noc", 0) for a in shown)
-    sales = sum(a.get("acc_ans", 0) for a in shown)
-    qualified = sum(1 for a in shown if a.get("qualified"))
-    meta = (f"Generated {datetime.now().strftime('%d %b %Y %H:%M')} &middot; "
-            f"{len(shown)} agents &middot; {cases} cases &middot; "
-            f"RM {sales:,.2f} net sales &middot; {qualified} qualified for EGA")
+    # "ETERNALGY SALES REPORT AS AT Oct 2026 (UPDATED 9 Oct 26)": the month the
+    # report runs to, then the day the file was made. The day is built by hand
+    # because strftime's no-padding flag differs between Windows and macOS.
+    today = datetime.now()
+    updated = f"{today.day} {today.strftime('%b %y')}"
+    story = [Paragraph(f"ETERNALGY SALES REPORT AS AT {MONTH_ABBR[lm - 1].title()} {year} "
+                       f"(UPDATED {updated})", title_style)]
+    # No generated/totals line under the title: the cards below carry the
+    # totals. A search still says so, or a filtered file reads as the company.
     if search:
-        meta += f" &middot; filtered to &ldquo;{html.escape(search)}&rdquo;"
-
-    story = [Paragraph(f"Sales Report &mdash; {period}", title_style),
-             Paragraph(meta, meta_style), summary_cards(), Spacer(1, 12)]
+        story.append(Paragraph(f"Filtered to &ldquo;{html.escape(search)}&rdquo;",
+                               meta_style))
+    story += [Spacer(1, 6), summary_cards(), Spacer(1, 12)]
 
     def pick(channel, branch):
         return [a for a in shown if a.get("channel") == channel
@@ -5164,54 +5415,43 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
     if not shown:
         story.append(Paragraph("No agent matches the current filter.", meta_style))
     else:
-        story.append(Paragraph("Company-wide", section_style))
-        story += block("Internal Sales Agent", pick("Internal", None), "Internal")
-        story += block("Outsource Sales Agent", pick("Outsource", None), "Outsource")
+        # Page layout: company-wide Internal on the first page under the cards,
+        # company-wide Outsource on its own page, then one page per branch,
+        # each opening on its branch heading. The company-wide tables carry no
+        # section heading of their own.
+        def new_page(heading: str | None = None) -> None:
+            story.append(PageBreak())
+            if heading:
+                story.append(Paragraph(heading, section_style))
+
+        company_in, company_out = pick("Internal", None), pick("Outsource", None)
+        company_all = company_in + company_out
+        story.extend(block("Internal Sales Agent", company_in, "Internal",
+                           None if company_out else company_all))
+        if company_out:
+            if company_in:
+                new_page()
+            story.extend(block("Outsource Sales Agent", company_out, "Outsource",
+                               company_all))
         for branch in (payload.get("branches") or []):
             internal, outsource = pick("Internal", branch), pick("Outsource", branch)
             if not internal and not outsource:
                 continue
-            story.append(Paragraph(f"{html.escape(str(branch))} Branch", section_style))
-            story += block("Internal Sales Agent", internal, "Internal")
-            story += block("Outsource Sales Agent", outsource, "Outsource")
-
-    # The page carries a note about the three columns that differ from the
-    # printed report. Leaving it out of the file would let the RES/COM split be
-    # read as data loss, so it travels with the tables.
-    mix = payload.get("property_mix") or {}
-    mix_total = sum(mix.values())
-    res = mix.get("Residential", 0)
-    if mix_total and res >= mix_total * 0.9:
-        others = ", ".join(f"{v} {k}" for k, v in mix.items()
-                           if k != "Residential") or "none"
-        note_style = ParagraphStyle("srNote", fontName="Helvetica", fontSize=6.5,
-                                    leading=8.5, spaceBefore=6,
-                                    textColor=colors.HexColor("#64748b"))
-        story.append(Paragraph(
-            "<b>Three columns differ from the printed report.</b> "
-            f"<b>RES / COM</b> - {res} of {mix_total} invoices are Residential (others: "
-            f"{html.escape(others)}). Factory counts as Commercial; shop lot as Residential. A case is "
-            "Commercial when SEDA nem type, referral project type, the package or a customer "
-            "name tag such as (FACTORY) says so; with none of those it falls back to "
-            "Residential, so most agents show a single RES line where the print "
-            "splits them. <b>ANS</b> - an invoice paid 100% on its first payment counts "
-            "at its Commission Price (Basic + NFP commission); every other invoice counts at "
-            "its sales price, net of EPP interest. EP points also leave EPP interest out. "
-            "<b>EP point</b> - 1 point per RM1 of sales, plus the campaign "
-            "bonus: every third case an agent closed before the cutoff adds half a point "
-            "per ringgit of their campaign sales. Those case counts are typed in under "
-            "Data &rarr; EGA/ESA Award; an agent with no row there earns no bonus, shown "
-            "as a dash. The print also splits the campaign window into cases before "
-            "31/12/25 and after 1/1/26, which is not derivable here, so it is shown as "
-            "one figure.", note_style))
+            # A branch's Internal and Outsource tables share its page, closing
+            # on the Internal + Outsource total.
+            new_page(f"{html.escape(str(branch))} Branch")
+            both = internal + outsource
+            story.extend(block("Internal Sales Agent", internal, "Internal",
+                               None if outsource else both))
+            story.extend(block("Outsource Sales Agent", outsource, "Outsource", both))
 
     def footer(canvas, doc):
         canvas.saveState()
         canvas.setFont("Helvetica", 7)
         canvas.setFillColor(colors.HexColor("#94a3b8"))
         canvas.drawString(12 * mm, 8 * mm,
+                          "Template prepared by HR, Autogenerated in "
                           f"Eternalgy Commission Portal - Sales Report {year}")
-        canvas.drawCentredString(page_w / 2, 8 * mm, "Template prepared by HR")
         canvas.drawRightString(page_w - 12 * mm, 8 * mm,
                                f"Page {canvas.getPageNumber()}")
         canvas.restoreState()

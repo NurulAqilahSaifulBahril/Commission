@@ -2333,6 +2333,16 @@ body {
 /* Grouped month headers sit above their own NOC/ANS pair, so they centre. */
 .sr-table thead tr:first-child th { text-align: center; }
 
+/* A thin grey grid on every Sales Report cell. The page-wide rule leaves
+   report cells borderless (white on white); the heavier lines stay: black
+   under the headings, grey above SUBTOTAL, red above the section TOTAL. */
+.report-page .sr-table td { border: 1px solid #D9DEE5; }
+.report-page .sr-table th {
+    border-top: 1px solid #D9DEE5;
+    border-left: 1px solid #D9DEE5;
+    border-right: 1px solid #D9DEE5;
+}
+
 .sr-table th.sr-no,
 .sr-table td.sr-no { width: 38px; text-align: center; }
 
@@ -2378,6 +2388,45 @@ body {
 .sr-table td.sr-col-total { background-color: #E6F4EA; }
 .sr-table th.sr-col-acc,
 .sr-table td.sr-col-acc { background-color: #E3EEFB; }
+/* Branch breakdown under the Sales Report's Internal / Outsource cards. One
+   line per branch (name, agents and cases, sales) when the card is wide
+   enough; in a narrow card the agents and cases drop under the name so the
+   amounts never get squeezed. */
+.metric-card.sr-has-branches { align-items: flex-start; }
+.metric-card.sr-has-branches .metric-details { flex: 1; min-width: 0; }
+.sr-branches {
+    container-type: inline-size;
+    margin-top: 12px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border-color);
+}
+.sr-branch {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    grid-template-areas: "name amt" "meta meta";
+    column-gap: 8px;
+    padding: 4px 0;
+    font-size: 12px;
+    line-height: 1.35;
+}
+.sr-branch-name { grid-area: name; font-weight: 600; color: var(--text-main); }
+.sr-branch-meta { grid-area: meta; color: var(--text-muted); }
+.sr-branch-amt {
+    grid-area: amt;
+    text-align: right;
+    font-weight: 600;
+    color: var(--text-main);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+@container (min-width: 225px) {
+    .sr-branch {
+        grid-template-columns: 50px 1fr auto;
+        grid-template-areas: "name meta amt";
+    }
+    .sr-branch-meta { font-size: 11px; white-space: nowrap; }
+}
+
 /* A Sales Report table that has been clicked or tabbed into takes the
    left/right arrow keys; the outline says which one will scroll. */
 .sr-block .table-container:focus { outline: 2px solid var(--accent-blue); outline-offset: -2px; }
@@ -2390,6 +2439,14 @@ body {
 .sr-table tr.sr-subtotal td.sr-col-total { background-color: #CDE9D5; }
 .sr-table tr.sr-subtotal td.sr-col-acc { background-color: #C9DDF5; }
 .sr-table tr.sr-subtotal td.sr-col-ep { background-color: #EBDFC0; }
+
+/* A section's Internal + Outsource total, under the last table's SUBTOTAL:
+   red so it is not read as one more channel subtotal. */
+.sr-table tr.sr-grandtotal td {
+    color: #C62828;
+    border-top: 2px solid #C62828;
+}
+.sr-table tr.sr-grandtotal td .sr-muted { color: inherit; }
 
 .sr-table th.sr-col-jun-val,
 .sr-table td.sr-col-jun-val {
