@@ -564,11 +564,11 @@
                         <span class="row-count-badge" id="rolesCount">0 agents</span>
                     </div>
                     <div class="section-hint">
-                        Who holds which role and who they report to — this drives the override
-                        attribution. <strong>Only the Agent Name is pulled from eeAdmin</strong>,
-                        so a newly tagged agent appears here by itself; Agent Type, Role, Reports
-                        To, Branch, IC No and Nick Name are entered and kept on this page and are
-                        never changed by eeAdmin.
+                        Who holds which role, and at what rate. <strong>Only the Agent Name is pulled
+                        from eeAdmin</strong>, so a newly tagged agent appears here by itself; Agent Type,
+                        Role, Branch, IC No and Nick Name are entered and kept on this page and are
+                        never changed by eeAdmin. (Reports To, which decides who earns the override, is
+                        kept as saved but no longer shown or edited here.)
                         <strong>One entry per agent, with a line per role.</strong> A promotion or
                         transfer is a new role with its own Invoice Date range (use <em>Edit</em>
                         then <em>+ Add role</em>), not an overwrite, so every role is kept with
@@ -625,7 +625,7 @@
                     <div class="table-container">
                         <table class="dashboard-table" id="rolesTable" style="table-layout:auto;">
                             <thead>
-                                <tr><th>Invoice Date</th><th>Agent Type</th><th>Role</th><th>Full Name</th><th>IC No.</th><th>Reports To</th><th>Branch</th><th></th></tr>
+                                <tr><th>Invoice Date</th><th>Agent Type</th><th>Role</th><th>Rate</th><th>Full Name</th><th>Branch</th><th></th></tr>
                             </thead>
                             <tbody id="rolesBody"></tbody>
                         </table>
@@ -1255,12 +1255,12 @@
 
     <!-- Agent Role Edit Modal Pop-Up -->
     <div id="agentRoleModal" class="modal hidden">
-        <div class="modal-content card" style="width: 90%; max-width: 1040px; max-height: 94vh;">
+        <div class="modal-content card" style="width: 100%; max-width: none; max-height: 96vh;">
             <div class="modal-header">
                 <h3 id="agentRoleModalTitle">Edit Agent Details</h3>
                 <button id="closeAgentRoleModalBtn" class="btn-close">&times;</button>
             </div>
-            <div class="modal-body" style="padding: 24px; gap: 18px; overflow-y: auto; overflow-x: hidden;">
+            <div class="modal-body" style="padding: 16px 18px; gap: 16px; overflow-y: auto; overflow-x: hidden;">
                 <!-- Agent Name. Read-only when editing an existing row — the
                      name is eeAdmin's, and Full Name / Nick Name are there to
                      change what is displayed. Typeable only when adding, where
@@ -1295,7 +1295,8 @@
                 </div>
 
                 <!-- Roles over time. Each card is one linked unit -- Invoice Date
-                     range, Agent Type, Role, Branch and Reports To travel together,
+                     range, Agent Type, Role and Branch travel together (with the saved,
+                     no longer shown Reports To),
                      because together they are one row of the agent_roles table.
                      The commission engine reads the unit whose range covers an
                      invoice's date. Under them, the card's Override Rules and this
@@ -1307,13 +1308,13 @@
                         <button type="button" id="roleModalAddPeriodBtn" class="btn btn-secondary" style="padding:4px 10px; font-size:12px;">+ Add role</button>
                     </div>
                     <div style="font-size:11px; color:var(--text-muted); margin:4px 0 8px; line-height:1.45;">
-                        Each role below is one unit: its <strong>Invoice Date</strong> range, Agent Type, Role,
-                        Branch and Reports To apply together to invoices dated inside that range. Adding a
+                        Each row below is one role: its <strong>Invoice Date</strong> range, Agent Type, Role,
+                        and Branch apply together to invoices dated inside that range.
+                        <strong>Override Rate %, From Role, Rate %, Property and Payment Rules</strong> are this
+                        agent's own rate for the role, over the role's dates, and take the place of the role's
+                        rate; left blank, the role's rate from Basic Commission applies. Adding a
                         role from a later month closes the open role before it automatically, so an invoice
                         dated in the earlier months still reads the earlier role.
-                        <strong>Rates for this agent</strong> (Property Type, Rate % and Payment Rules) are this
-                        agent's own Basic Commission rates for the role's dates, and take the place of the
-                        role's rate; with none, the role's rate from Basic Commission applies.
                     </div>
                     <div id="roleModalPeriods" style="display:flex; flex-direction:column; gap:12px;"></div>
                     <div id="roleModalPeriodWarnings" style="display:none; margin-top:10px; font-size:11.5px; color:#b45309; line-height:1.5;"></div>
@@ -1331,7 +1332,7 @@
         </div>
     </div>
 
-    <script src="/static/data.js?v=20261014-hide-name-cols"></script>
+    <script src="/static/data.js?v=20261014-no-reports-to"></script>
     <script src="/static/sidebar_toggle.js?v=20261014-2"></script>
 </body>
 </html>

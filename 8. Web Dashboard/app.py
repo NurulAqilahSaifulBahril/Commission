@@ -2842,19 +2842,12 @@ SALES_REPORT_EXCLUDED_INVOICES = {
     # RES is My Liberica Coffee and Mega Signcraft, RM251,000.00.
     "a3f87028-fa69-4255-a36e-f46b009cb60b",
     "591fb12e-0c31-4008-92dc-5110fac81aeb",
-    # Carol Siow -- left off the report per user request so July and September
-    # have no COM line (her ESA / Oct early-bird qualification falls with the
-    # S.O.S Mewah EP):
+    # Carol Siow -- left off the report per user request so July has no COM
+    # line (her ESA / Oct early-bird qualification falls with the S.O.S Mewah
+    # EP; the September COM cases are in, see SALES_REPORT_PROPERTY_OVERRIDES):
     # INV-1010817, TOWA HARDWARE (M) SDN BHD (FACTORY), RM2,908 -- a cable add-on,
     # paid in full 30 Jul.
     "d83f837c-6586-43c7-9303-6107aae95645",
-    # INV-1011854, INV-1011855, INV-1011856, S.O.S MEWAH SDN BHD (LOT 1236A, 1197,
-    # 1194), RM184,000 + RM184,000 + RM78,000 -- 30% deposits paid 30 Sep, keyed
-    # in 2 Oct. Before this they sat on the COM line so September RES stayed at
-    # 2 cases, RM57,300.00.
-    "88a4940d-4593-4f12-b641-ee4e4f87ee34",
-    "1846aa9d-a038-4fcb-a114-a7b0a3c8d849",
-    "6d41560c-1933-4ffc-b2ed-736cca73c770",
     # INV-1010885, YAP CHOON FAH (TOP UP), Ling Liang Kang -- top-up excluded per user request.
     "84a07187-36ec-4bea-9440-e5587570827c",
     "INV-1010885",
@@ -3122,6 +3115,13 @@ SALES_REPORT_DATE_OVERRIDES = {
 
 # Cases placed on a RES/COM line by hand, overriding _sales_report_property.
 SALES_REPORT_PROPERTY_OVERRIDES = {
+    # INV-1011854, INV-1011855, INV-1011856, S.O.S MEWAH SDN BHD (LOT 1236A, 1197,
+    # 1194), Carol Siow -- RM184,000 + RM184,000 + RM78,000, invoiced 30 Sep,
+    # 30% deposits paid 30 Sep. Counted on the September COM line per user
+    # request (14 Oct 2026); the raw data classifies them as Residential.
+    "88a4940d-4593-4f12-b641-ee4e4f87ee34": "COM",
+    "1846aa9d-a038-4fcb-a114-a7b0a3c8d849": "COM",
+    "6d41560c-1933-4ffc-b2ed-736cca73c770": "COM",
     # INV-1009087, ENG ANN (M) SDN. BHD. (COMMERCIAL) (PLO46) (ATAP), Louis Ng.
     "a93e1554-caf7-42db-b233-c3c4976ba756": "RES",
     # INV-1009209, JC PRINT & OFFICE SDN. BHD. (FACTORY), Ching Zhe Hang.
