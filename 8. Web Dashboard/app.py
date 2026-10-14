@@ -3206,6 +3206,20 @@ SALES_REPORT_SHARED_CASES = {
     # is 2 RES, RM51,800.00 and Chan Jia Wei's is 9 RES, RM221,020.15.
     "5ba7279e-efd8-467e-a419-984cbf5a9f5d": ("CHAN JIA WEI",),
 }
+# Cases counted by hand before any payment is on the invoice, keyed on
+# bubble_id; the value is the date the case is placed in. Such invoices are
+# left out of the EGA rows (no 1st payment) and out of the payments check, so
+# they are read in by bubble_id here, see _sales_report_manual_rows.
+SALES_REPORT_MANUAL_CASES = {
+    # Caryn Dong, May RES -- per user request (14 Oct 2026). Each is a RM24,000
+    # draft invoiced 8 May 2026 with no payment recorded yet.
+    # INV-1009569, KOK YON LAN
+    "6592d0b3-d3ff-4e2f-934d-a8213ff51b66": "2026-05-08",
+    # INV-1009570, KOK MING CHOO (ATAP)
+    "ad72813c-401d-485a-9da6-49788ba54ecf": "2026-05-08",
+    # INV-1009573, KOK JIA XUAN (ATAP)
+    "711ddc87-4de2-4d95-8eb7-0db57755fb8a": "2026-05-08",
+}
 SALES_REPORT_TARGETS = {"Internal": 600000.0, "Outsource": 720000.0}
 # ESA is the higher award and runs to December, where EGA closes in June.
 # Both are overridden per channel by the Data page; these are only the fallback
@@ -3446,8 +3460,22 @@ def _sales_report_carried_rows(year: int, out_mod) -> list:
     except Exception:
         _log("[SALES REPORT] could not read cases carried in from last year")
         return hit[1] if hit else []
+    rows = rows + _sales_report_manual_rows(year, out_mod)
     _CARRIED_ROWS_CACHE[key] = (time.time(), rows)
     return rows
+
+
+def _sales_report_manual_rows(year: int, out_mod) -> list:
+    """The invoices in SALES_REPORT_MANUAL_CASES, in the same row shape as the
+    EGA rows. A failure returns nothing, so the report reads without them."""
+    if not SALES_REPORT_MANUAL_CASES:
+        return []
+    try:
+        return _pg_query(out_mod._invoices_sql(
+            year, upto_month=None, only_bubbles=tuple(SALES_REPORT_MANUAL_CASES))) or []
+    except Exception:
+        _log("[SALES REPORT] could not read the manually counted cases")
+        return []
 
 
 _LINE_ADJUSTMENTS_CACHE: dict[int, tuple[float, dict]] = {}
@@ -4473,6 +4501,7 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         # drops out of this report entirely.
         placed_on = (SALES_REPORT_DATE_OVERRIDES.get(str(bubble or "").strip())
                      or SALES_REPORT_DATE_OVERRIDES.get(str(r.get("invoice_number") or "").strip())
+                     or SALES_REPORT_MANUAL_CASES.get(str(bubble or "").strip())
                      or case_dates.get(str(bubble or "")))
         when = int_mod._parse_invoice_date(placed_on) if placed_on else None
         if when is None:
@@ -4493,6 +4522,7 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         # when the payments lookup failed, which would otherwise empty the
         # report.
         is_overridden = (str(bubble or "") in SALES_REPORT_EP_OVERRIDES
+                         or str(bubble or "") in SALES_REPORT_MANUAL_CASES
                          or str(r.get("invoice_number") or "") in SALES_REPORT_EP_OVERRIDES
                          or str(bubble or "") in SALES_REPORT_SALES_ADJUSTMENTS
                          or str(r.get("invoice_number") or "") in SALES_REPORT_SALES_ADJUSTMENTS)

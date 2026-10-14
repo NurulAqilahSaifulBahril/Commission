@@ -356,13 +356,17 @@ def _get_token() -> str | None:
 # SQL
 # ---------------------------------------------------------------------------
 def _invoices_sql(year: int, may_only: bool = False, upto_month: int | None = None,
-                  carried_in: bool = False) -> str:
+                  carried_in: bool = False, only_bubbles: tuple = ()) -> str:
     """`carried_in` swaps the invoice-year filter for the Sales Report's cases
     the ordinary query misses: invoiced in an earlier year but first paid
     (Malaysia time) in `year`, or with no 1st_payment_date at all but an
     earliest payment row in `year`. Neither overlaps the ordinary rows, which
     are invoiced in `year` with the date filled. Nothing else in the query
-    changes, so the rows have the same shape."""
+    changes, so the rows have the same shape.
+
+    `only_bubbles` returns just those invoices, whatever their date or payment
+    state, for cases the Sales Report counts by hand (SALES_REPORT_MANUAL_CASES
+    in the dashboard). Empty by default, so the EGA packs are unaffected."""
     # Both the CLI and the commission pack call this first, so it is the one
     # place the year is known before any figure is computed.
     ensure_rules_applied(year)
@@ -386,6 +390,11 @@ def _invoices_sql(year: int, may_only: bool = False, upto_month: int | None = No
     else:
         year_filter = f"AND EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}"
         first_paid_filter = 'AND i."1st_payment_date" IS NOT NULL'
+    if only_bubbles:
+        # Keyed on fixed bubble_ids from the dashboard, never user input.
+        ids = ", ".join(f"'{b}'" for b in only_bubbles)
+        year_filter = f"AND i.bubble_id IN ({ids})"
+        first_paid_filter = ""
     # Notice we remove the agent_type = 'internal', 'full time' filter here.
     # The python logic filters strictly for outsource agents.
     return f"""
