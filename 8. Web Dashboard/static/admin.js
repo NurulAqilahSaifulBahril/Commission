@@ -32,8 +32,16 @@
 
     async function loadUsers() {
         const res = await api("/api/admin/users");
-        const users = await res.json();
-        document.getElementById("userCountBadge").textContent = `${users.length} user${users.length === 1 ? "" : "s"}`;
+        const all = await res.json();
+        // Deactivated accounts are hidden unless asked for. They are never
+        // deleted: their login and audit history still names them, and an
+        // admin may want to reactivate one.
+        const showInactive = document.getElementById("showInactive").checked;
+        const users = showInactive ? all : all.filter((u) => u.is_active);
+        const hidden = all.length - users.length;
+        document.getElementById("userCountBadge").textContent =
+            `${users.length} user${users.length === 1 ? "" : "s"}`
+            + (hidden ? ` · ${hidden} deactivated hidden` : "");
         const tbody = document.getElementById("usersBody");
         tbody.innerHTML = "";
         users.forEach((u) => {
@@ -41,6 +49,11 @@
             if (!u.is_active) tr.classList.add("inactive-row");
             tr.innerHTML = `
                 <td>${escapeHtml(u.username)}</td>
+                <td class="name-col"><div class="name-cell">
+                    <span class="name-text${u.name ? "" : " name-empty"}">${u.name ? escapeHtml(u.name) : "-"}</span>
+                    <button class="btn btn-secondary name-edit" data-action="name" data-id="${u.id}"
+                            data-name="${escapeHtml(u.name || "")}" title="Edit name">Edit</button>
+                </div></td>
                 <td>${escapeHtml(u.role)}</td>
                 <td>${u.is_active ? "Active" : "Deactivated"}</td>
                 <td>${fmtDate(u.created_at)}</td>
@@ -84,6 +97,11 @@
         const id = btn.getAttribute("data-id");
         const action = btn.getAttribute("data-action");
 
+        if (action === "name") {
+            editName(btn);
+            return;
+        }
+
         if (action === "password") {
             openPasswordModal(id, btn.getAttribute("data-username"),
                               btn.getAttribute("data-active") === "1");
@@ -119,6 +137,45 @@
         }
         loadUsers();
         loadAudit();
+    }
+
+    // ── Name, edited in place ────────────────────────────────────────────────
+    // Swaps the cell for a text box: Enter or leaving the box saves, Esc puts
+    // it back. In place rather than a prompt() for the reason given below.
+    function editName(btn) {
+        const id = btn.getAttribute("data-id");
+        const original = btn.getAttribute("data-name") || "";
+        const cell = btn.closest(".name-cell");
+        cell.innerHTML = "";
+        const input = document.createElement("input");
+        input.type = "text";
+        input.value = original;
+        input.placeholder = "Full name";
+        cell.appendChild(input);
+        input.focus();
+        input.select();
+
+        let done = false;
+        async function finish(save) {
+            if (done) return;
+            done = true;
+            const name = input.value.trim();
+            if (save && name !== original) {
+                input.disabled = true;
+                try {
+                    await sendUserUpdate(id, { name });
+                } catch (e) {
+                    alert(e.message);
+                }
+                loadAudit();
+            }
+            loadUsers();
+        }
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") finish(true);
+            else if (e.key === "Escape") finish(false);
+        });
+        input.addEventListener("blur", () => finish(true));
     }
 
     // ── Set-password dialog ──────────────────────────────────────────────────
@@ -199,6 +256,7 @@
 
     async function addUser() {
         const username = document.getElementById("newUsername").value.trim();
+        const name = document.getElementById("newName").value.trim();
         const password = document.getElementById("newPassword").value;
         const role = document.getElementById("newRole").value;
         const errorBox = document.getElementById("userFormError");
@@ -212,7 +270,7 @@
         const res = await api("/api/admin/users", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username, password, role })
+            body: JSON.stringify({ username, name, password, role })
         });
         const data = await res.json();
         if (!res.ok) {
@@ -220,6 +278,7 @@
             return;
         }
         document.getElementById("newUsername").value = "";
+        document.getElementById("newName").value = "";
         document.getElementById("newPassword").value = "";
         loadUsers();
         loadAudit();
@@ -278,6 +337,7 @@
     }
 
     document.getElementById("addUserBtn").addEventListener("click", addUser);
+    document.getElementById("showInactive").addEventListener("change", loadUsers);
     document.getElementById("pwSaveBtn").addEventListener("click", savePassword);
     document.getElementById("pwCancelBtn").addEventListener("click", closePasswordModal);
     document.getElementById("pwModalClose").addEventListener("click", closePasswordModal);

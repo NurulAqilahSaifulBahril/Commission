@@ -495,12 +495,8 @@ def _annotate_gan_override(rows: list, headers: list, agent_i: int, customer_i: 
     """Show a revised OGM override on the invoice's existing Basic row.
 
     A case raised from Gan Lai Soon's column changes his cut and nothing else,
-    so no row is restated. The old figure stays on top with the new one in red
-    beneath it, the same shape the Net Floor Price cell uses for a revised
-    floor price. The markup is emitted here rather than client-side because
-    this path also feeds a fresh page load, where the browser has no memory of
-    the edit; the table writes cell values with innerHTML, as it already does
-    for the factory profit-sharing cell.
+    so no row is restated: the new figure simply replaces his cell. The old
+    one is kept in the special case itself, not shown (decided 12 Oct 2026).
     """
     want_agent = agent.strip().lower()
     want_customer = customer.strip().lower()
@@ -516,18 +512,13 @@ def _annotate_gan_override(rows: list, headers: list, agent_i: int, customer_i: 
         original = str(row[gan_i] or "-").strip()
         # Already annotated (two cases for one invoice, or a repeat render), or
         # an invoice he earns nothing on: leave the cell alone either way.
-        if original.startswith("<") or original == "-":
+        if len(row) > len(headers) or original == "-":
             return
 
         new_value = _special_case_money(gan_comm)
         if new_value == original:
             return
-        row[gan_i] = (
-            '<div class="special-case-merge-stack">'
-            f'<span class="special-case-primary-value">{html.escape(original)}</span>'
-            f'<span class="special-case-secondary-value">{html.escape(new_value)}</span>'
-            "</div>"
-        )
+        row[gan_i] = new_value
         # The browser recognises a stored case by the extra element on the row,
         # and needs it here so re-opening this cell loads the rate that was
         # saved instead of an empty box. It reads rowKind to know this one
@@ -932,6 +923,26 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
             pos = len(rows)
         rows.insert(pos, new_row)
 
+    _package_prices: dict = {}
+
+    def _package_price(customer_name: str) -> float:
+        """The customer's package price -- the package line on their invoice(s),
+        summed -- from the cached NFP rows. The table's System Price column
+        shows the invoice Total Amount, so it cannot answer this. 0 if unknown."""
+        if not _package_prices:
+            try:
+                bundle = get_cached_data(year, agent_type) or {}
+                nfp_tuple = bundle.get("nfp") or ()
+                by_inv = nfp_tuple[4] if len(nfp_tuple) > 4 else {}
+                for inv in (by_inv or {}).values():
+                    key = str(getattr(inv, "customer_name", "") or "").strip().lower()
+                    _package_prices[key] = (_package_prices.get(key, 0.0)
+                                            + float(getattr(inv, "system_price", 0) or 0))
+            except Exception:
+                pass
+            _package_prices.setdefault("", 0.0)
+        return _package_prices.get(customer_name.strip().lower(), 0.0)
+
     def _inject_order(c):
         kind = str((c or {}).get("rowKind") or "all").strip().lower()
         # Basic first so its auto NFP restatement (new sales, same floor)
@@ -955,9 +966,16 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
             rate = float(case.get("rate") or 0)
             profit_sharing_pct = float(case.get("profitSharingPct") or 0)
             special_case_type = str(case.get("specialCaseType") or "adjusted_nfp")
-            fee_waiver = float(case.get("feeWaiver") or 0)
             adjusted_sales_price = case.get("adjustedSalesPrice")
             adjusted_sales_price = float(adjusted_sales_price) if adjusted_sales_price else 0.0
+            # "Adjusted Cash Price After Discount" and "Adjusted Rate on
+            # Adjusted Cash Price %": the NFP commission's own Cash Price. It
+            # outranks a Basic case's New Sales Price (copied below for other
+            # NFP types), and only an NFP case carries one.
+            adjusted_cash_price = case.get("adjustedCashPrice")
+            adjusted_cash_price = float(adjusted_cash_price) if adjusted_cash_price else 0.0
+            if special_case_type in ("adjusted_cash_price", "adjusted_cash_price_rate") and adjusted_cash_price:
+                adjusted_sales_price = adjusted_cash_price
             remarks = str(case.get("remarks") or "").strip() or "-"
             # Blank means "use the standard rate", which is not the same as 0.
             # Anything unparseable falls back to the standard rate rather than
@@ -1008,22 +1026,54 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
         basic_comm = sales_for_calc * ((rate + profit_sharing_pct) / 100)
 
         if special_case_type == "fee_waiver":
-            if sales_for_calc > nfp:
-                orig_nfp_comm = (sales_for_calc - nfp) * 0.25
-            elif sales_for_calc < nfp:
-                orig_nfp_comm = (sales_for_calc - nfp) * 0.20
-            else:
-                orig_nfp_comm = 0.0
-            nfp_comm = orig_nfp_comm + fee_waiver
+            # A fee waiver sets the Net Floor Price Commission to RM 0 outright
+            # (decided 12 Oct 2026). It used to add a typed amount to the
+            # original figure, which Finance only ever used to cancel a
+            # deduction, and which stopped landing on 0 once NFP moved to the
+            # Cash Price.
+            nfp_comm = 0.0
         else:
-            if sales_for_calc > nfp:
-                nfp_comm = (sales_for_calc - nfp) * 0.25
-            elif sales_for_calc < nfp:
-                nfp_comm = (sales_for_calc - nfp) * 0.20
+            # NFP commission = (Cash Price - Net Floor Price) x Rate
+            # (invoice_price_basis.nfp_commission, corrected 13 Oct 2026): 100%
+            # above the package price, 25% above the floor, 20% below it, where
+            # the difference is negative and so deducts. "Adjusted Net Floor
+            # Price Commission Rate %" replaces whichever rate applies and is
+            # taken as it stands: 0.5 pays (Cash Price - Floor) x 0.5%.
+            above_rate, below_rate, package_rate = 0.25, 0.20, 1.00
+            floor_gap = sales_for_calc - nfp
+            typed_rate = None
+            cash_rate = None
+            if special_case_type in ("adjusted_nfp_rate", "cash_price_rate", "adjusted_cash_price_rate"):
+                try:
+                    raw_nfp_rate = str(case.get("nfpRatePct") or "").strip()
+                    if raw_nfp_rate:
+                        if special_case_type in ("cash_price_rate", "adjusted_cash_price_rate"):
+                            cash_rate = float(raw_nfp_rate) / 100
+                        else:
+                            typed_rate = float(raw_nfp_rate) / 100
+                except (TypeError, ValueError):
+                    pass
+            package_price = _package_price(customer)
+            if cash_rate is not None:
+                # "Adjusted Rate on Cash Price %" and "Adjusted Rate on Adjusted
+                # Cash Price %" (13 Oct 2026): the whole Cash Price -- the
+                # invoice's, or the one typed with the case -- x the typed rate,
+                # sign included; the floor plays no part.
+                nfp_comm = sales_for_calc * cash_rate
+            elif typed_rate is not None:
+                nfp_comm = floor_gap * typed_rate
+            elif package_price > 0 and sales_for_calc > package_price and floor_gap > 0:
+                nfp_comm = floor_gap * package_rate
+            elif floor_gap > 0:
+                nfp_comm = floor_gap * above_rate
+            elif floor_gap < 0:
+                nfp_comm = floor_gap * below_rate
             else:
                 nfp_comm = 0.0
 
-        if nfp == 0:
+        if special_case_type == "fee_waiver":
+            nfp_comm_str = "RM 0.00"
+        elif nfp == 0:
             nfp_comm_str = "TBC with Finance"
         elif nfp_comm != 0:
             nfp_comm_str = _special_case_money(nfp_comm)
@@ -1793,6 +1843,7 @@ def admin_users_api():
 
     req_data = request.json or {}
     username = str(req_data.get("username", "")).strip()
+    name = str(req_data.get("name", "") or "").strip()
     password = str(req_data.get("password", ""))
     role = str(req_data.get("role", "staff"))
     if role not in ("admin", "staff"):
@@ -1802,7 +1853,7 @@ def admin_users_api():
     if db.get_user_by_username(username):
         return jsonify({"error": f"User '{username}' already exists"}), 409
 
-    user_id = db.create_user(username, auth.hash_password(password), role)
+    user_id = db.create_user(username, auth.hash_password(password), role, name)
     actor = auth.current_user()
     db.insert_audit(actor["username"], "create", "user", f"Created user '{username}' ({role})", user_id=actor["id"])
     return jsonify({"status": "success", "id": user_id})
@@ -1826,6 +1877,9 @@ def admin_user_detail_api(user_id: int):
     updates: dict = {}
     if "username" in req_data and str(req_data["username"]).strip():
         updates["username"] = str(req_data["username"]).strip()
+    if "name" in req_data:
+        # Blank is allowed and clears the name.
+        updates["name"] = str(req_data["name"] or "").strip()
     if "role" in req_data:
         role = str(req_data["role"])
         if role not in ("admin", "staff"):
@@ -1848,6 +1902,8 @@ def admin_user_detail_api(user_id: int):
     changed = []
     if "username" in updates:
         changed.append(f"renamed to '{updates['username']}'")
+    if "name" in updates:
+        changed.append(f"name -> '{updates['name']}'" if updates["name"] else "name cleared")
     if "role" in updates:
         changed.append(f"role -> {updates['role']}")
     if "password_hash" in updates:
@@ -2251,6 +2307,11 @@ def _build_system_details(nfp_by_inv_all: dict) -> dict:
             # hover can name the date each tranche actually became payable.
             "pct75_date": str(getattr(inv, "pct75_date", "") or ""),
             "full_payment_date": str(getattr(inv, "full_payment_date", "") or ""),
+            # The package line's own price. The table's System Price column
+            # shows the invoice Total Amount instead, so the Special Case NFP
+            # Baseline Rate reads this to spot a Cash Price above the package
+            # price (the 100% rate).
+            "package_price": float(getattr(inv, "system_price", 0) or 0),
         }
         if (not entry["package"] and entry["panel_qty"] is None and entry["panel_rating"] is None
                 and not entry["phase"] and not entry["inverter"] and not entry["pct75_date"]

@@ -8,13 +8,31 @@ Filters:
   - EXTRACT(YEAR FROM invoice.invoice_date) = report year (default 2026)
 
 Formulas:
-  Sales Price  = invoice total_amount - epp_cost
-  System Price = main package line unit_price
-  Sales Price    = total_amount - EPP interest (always)
-  Commission a   = (Sales Price - NFP) * tier rate   when Sales Price > NFP
-  Commission b   = (System Price - NFP) * tier rate  when System Price > NFP (audit only)
-  Commission c   = (NFP - Sales Price) * tier rate   when Sales Price < NFP (deduction)
-  NFP Commission = a - c   (sales-price component only; b is not added)
+  Sales Price  = the Cash Price: total_amount less the add-on lines, for
+                 invoices dated 2026 onwards (see invoice_price_basis.py);
+                 total_amount - epp_cost before that
+  System Price   = main package line unit_price (the package price)
+
+  Invoices dated 2026 onwards -- NFP Commission = (Sales Price - NFP) x Rate:
+    Sales Price > package price   Rate = 100%  (b)
+    Sales Price > NFP             Rate = 25%   (a)
+    Sales Price < NFP             Rate = 20%, a deduction (c)
+  (invoice_price_basis.nfp_commission, corrected 13 Oct 2026.)
+
+  Earlier invoices:
+    Commission a   = (Sales Price - NFP) * 25%   when Sales Price > NFP
+    Commission b   = (System Price - NFP) * 100% (audit only, not summed)
+    Commission c   = (NFP - Sales Price) * 20%   when Sales Price < NFP
+    NFP Commission = a - c
+
+  NFP (the floor) = the price list's final price. When the invoice carries fewer
+  of the sheet's discounts, the price after the max discount less only the
+  rebates the invoice itself carries -- TV/robot cash option, Atap, Ang Pow, the
+  CNY / Raya / Earth Month promos (net_floor_prices.invoice_floor_price,
+  13 Oct 2026). Sim Chee Geng, 25 panels, Feb 2026: 38,850.75 - 1,000 - 3,000
+  - 900 = 33,950.75. A plain "Discount" line can stand in for a missing rebate
+  (Lee Chui Yin's RM1,284 for the CNY promo). A CEO / manager discount does not
+  lower the floor (decided 13 Oct 2026).
 
   Tier rates come from the dashboard Data page (Net Floor Price section),
   resolved on the invoice month per agent. Tiers with nothing entered fall back
@@ -53,6 +71,8 @@ from api_client import query_sql, test_connection
 from nfp_paths import ensure_output_dir, ensure_reports_dir
 from net_floor_prices import (
     NFP_CUTOFF,
+    invoice_approved_discount,
+    invoice_rebate_kinds,
     infer_panel_qty_from_text,
     infer_panel_rating_from_text,
     load_620w_schedule,
@@ -62,6 +82,18 @@ from net_floor_prices import (
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
+
+
+def _price_basis():
+    """invoice_price_basis, which lives with the Basic Commission scripts: the
+    Cash Price an NFP row is calculated on."""
+    rates_dir = str(REPO_ROOT / "1. Basic Commission" / "3. Python Script")
+    if rates_dir not in sys.path:
+        sys.path.append(rates_dir)
+    import invoice_price_basis
+    return invoice_price_basis
+
+
 REPORTS_DIR = ensure_reports_dir()
 OUTPUT_DIR = ensure_output_dir()
 
@@ -283,6 +315,7 @@ candidates AS (
         i.is_latest,
         i.id AS invoice_row_id,
         COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name) AS customer_name,
+        price_items_lat.price_items,
         a.name AS agent_name,
         a.agent_type,
         COALESCE(sr_link.phase_type, sr_back.phase_type) AS phase_type,
@@ -323,6 +356,7 @@ candidates AS (
     LEFT JOIN pkg ON pkg.invoice_bubble_id = i.bubble_id
     LEFT JOIN items ON items.invoice_bubble_id = i.bubble_id
     LEFT JOIN tng ON tng.invoice_bubble_id = i.bubble_id
+{price_items_join}
     WHERE (
         LOWER(TRIM(COALESCE(a.agent_type, ''))) IN ({agent_types})
         OR LOWER(TRIM(COALESCE(a.name, ''))) IN ({agent_type_overrides})
@@ -384,7 +418,8 @@ SELECT
     r.db_net_floor_price,
     r.all_item_text,
     r.has_tng_rebate,
-    r.tng_evidence
+    r.tng_evidence,
+    r.price_items
 FROM ranked r
 INNER JOIN epp_once e ON e.invoice_key = r.invoice_key
 WHERE r.rn = 1
@@ -501,6 +536,7 @@ def calc_commission(
     system_price: Decimal,
     net_floor: Optional[Decimal],
     tier_rates: Optional[dict] = None,
+    invoice_date: Any = None,
 ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
     if net_floor is None:
         return Decimal("0"), Decimal("0"), Decimal("0"), Decimal("0")
@@ -510,6 +546,15 @@ def calc_commission(
         for k, v in tier_rates.items():
             if k in rates and v is not None:
                 rates[k] = Decimal(str(v))
+
+    # Invoices dated 2026 onwards: (Cash Price - Net Floor Price) x Rate, with
+    # 100% when the Cash Price is above the package price
+    # (invoice_price_basis.nfp_commission).
+    pb = _price_basis()
+    if pb.applies(invoice_date):
+        return pb.nfp_commission(sales_price, system_price, net_floor,
+                                 rates["sales_above"], rates["system_above"],
+                                 rates["sales_below"])
 
     a = Decimal("0")
     b = Decimal("0")
@@ -681,7 +726,8 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[InvoiceCo
     agent_types = [t.lower() for t in AGENT_TYPES]
     types_sql = ", ".join(f"'{t}'" for t in agent_types)
     sql = INVOICES_SQL.format(year=year, agent_types=types_sql,
-                              agent_type_overrides=_agent_type_override_sql())
+                              agent_type_overrides=_agent_type_override_sql(),
+                              price_items_join=_price_basis().PRICE_ITEMS_JOIN_SQL)
     rows = [r for r in q(sql) if _is_internal_row(r)]
     # Resolve each invoice's payout trigger and the date it was reached BEFORE
     # the month filter: the trigger decides which month a row belongs to, so it
@@ -707,7 +753,9 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[InvoiceCo
     for row in rows:
         total = to_decimal(row.get("total_amount"))
         epp = to_decimal(row.get("epp_cost"))
-        sales = money(total - epp)
+        # Cash Price: Total less the add-on lines (invoice_price_basis).
+        sales = money(_price_basis().cash_price(total, epp, row.get("invoice_date"),
+                                                row.get("price_items")))
         system = money(to_decimal(row.get("system_price")))
         db_nfp = to_decimal(row.get("db_net_floor_price"))
 
@@ -731,6 +779,10 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[InvoiceCo
                 schedules_650,
                 schedule_620,
                 three_phase=three_phase,
+                # The floor takes off only the rebates this invoice carries.
+                rebate_kinds=invoice_rebate_kinds(row.get("price_items")),
+                # Passed for the record; a CEO discount no longer lowers the floor.
+                approved_discount=invoice_approved_discount(row.get("price_items")),
             )
             if nfp_raw is not None:
                 nfp_value = money(Decimal(str(nfp_raw)))
@@ -752,7 +804,8 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[InvoiceCo
             sales, system, nfp_value,
             nfp_tier_rates_for(row.get("agent_name"), row.get("agent_type"),
                                inv_date.month if inv_date else None,
-                               inv_date.year if inv_date else None))
+                               inv_date.year if inv_date else None),
+            invoice_date=row.get("invoice_date"))
 
         inv_num = str(row.get("invoice_number") or "").strip()
         row_fp = str(row.get("full_payment_date") or "")[:10] or None

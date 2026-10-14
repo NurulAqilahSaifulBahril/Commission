@@ -22,6 +22,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import invoice_price_basis as _price_basis
+
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent.parent
 _OUTPUT_DIR = _SCRIPT_DIR.parent / "2. Output"
@@ -648,6 +650,7 @@ def _invoices_sql(year: int) -> str:
     from basic_commission_rates import (milestone_sql_parts, milestone_column,
                                         milestone_created_column,
                                         multi_stage_cutover, payout_thresholds_in_use)
+    from invoice_price_basis import PRICE_ITEMS_JOIN_SQL
     from decimal import Decimal as _D
     milestone_ctes, milestone_selects, milestone_joins = milestone_sql_parts()
     # Re-select the milestone columns out of `candidates` by name.
@@ -697,6 +700,8 @@ candidates AS (
       ),
       0
     )::numeric AS epp_interest,
+    -- Every line on the invoice, for the Original Price (see invoice_price_basis).
+    price_items_lat.price_items,
     COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name, '(unknown)') AS customer_name,
     COALESCE(NULLIF(TRIM(a.name), ''), '(unknown)') AS agent_name,
     a.agent_type,
@@ -902,6 +907,7 @@ candidates AS (
     WHERE p.linked_invoice = i.bubble_id
       AND p.id NOT IN (101334, 104412, 101333, 104413, 4899)
   ) pay ON TRUE
+{PRICE_ITEMS_JOIN_SQL}
   WHERE (
     -- Before the multi-stage cutover: the commission is recognised only at full
     -- payment, so an invoice that never got there has nothing to report.
@@ -941,7 +947,8 @@ SELECT
   has_jinko,
   seda_nem_type,
   referral_project_type,
-  referral_name
+  referral_name,
+  price_items
 FROM candidates
 WHERE rn = 1
 ORDER BY agent_name ASC, real_full_payment_date ASC NULLS LAST, invoice_number ASC NULLS LAST;
@@ -1183,7 +1190,8 @@ def main(argv: list[str]) -> int:
             cust_name = str(r.get("customer_name") or "(unknown)").strip()
             total = _to_decimal(r.get("total_amount"))
             epp = _to_decimal(r.get("epp_interest"))
-            sales_price = total - epp
+            sales_price = _price_basis.original_price(total, epp, r.get("invoice_date"),
+                                                      r.get("price_items"))
 
             inv_month_dt = _parse_invoice_date(r.get("invoice_date"))
             dash_rate = get_dashboard_factory_rate(agent_nm, cust_name, args.year, inv_month_dt.month) \
@@ -1242,7 +1250,9 @@ def main(argv: list[str]) -> int:
         total = _to_decimal(r.get("total_amount"))
         paid_amount = _to_decimal(r.get("paid_amount"))
         epp = _to_decimal(r.get("epp_interest"))
-        sales_price = total - epp
+        # Original Price: Total - EPP, plus any lucky draw (invoice_price_basis).
+        sales_price = _price_basis.original_price(total, epp, r.get("invoice_date"),
+                                                  r.get("price_items"))
         
         real_full_pay_str = str(r.get("real_full_payment_date") or "")[:10]
         # Which payment milestones this invoice is measured against comes from

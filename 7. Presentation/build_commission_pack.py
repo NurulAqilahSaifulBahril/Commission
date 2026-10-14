@@ -1119,7 +1119,9 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
 
         total = basic._to_decimal(r.get("total_amount"))
         epp = basic._to_decimal(r.get("epp_interest"))
-        sales_price = total - epp
+        # Original Price: Total - EPP, plus any lucky draw (invoice_price_basis).
+        sales_price = basic._price_basis.original_price(
+            total, epp, r.get("invoice_date"), r.get("price_items"))
 
         inv_dt = str(r.get("invoice_date") or "")[:10]
         pay_dt = _effective_recognition_date(r)
@@ -1563,6 +1565,14 @@ def fetch_invoice_dates(year: int, basic_module) -> dict[str, tuple[str, str, st
         full_pay = _clean_dt(r.get("full_payment_date"))
         dates_map[inv_key] = (inv_date, first_pay, full_pay)
     return dates_map
+
+
+def _nfp_cash_cell(nfp_info: dict, basic_info: dict) -> str:
+    """The NFP row's Sales Price cell: the Cash Price its commission is worked
+    on. A customer whose NFP is still pending full payment has no NFP figure
+    this month, so it shows the Cash Price of the invoices on its Basic row."""
+    cash = nfp_info.get("sales") or basic_info.get("cash") or 0.0
+    return ensure_rm_prefix(f"{cash:,.2f}" if cash != 0 else "-")
 
 
 def get_dates_for_invoices(inv_nums: list[str], dates_map: dict) -> tuple[str, str, str]:
@@ -2314,10 +2324,12 @@ def build_internal_summary_tables(
                 "referral": referral_rm,
             }
 
-            basic_system = sum(float(nfp_by_inv[ln.invoice_number.strip()].system_price) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
+            # The report's System Price column is the invoice's Total Amount
+            # (decided 12 Oct 2026), not the package line's unit price.
+            basic_system = sum(float(nfp_by_inv[ln.invoice_number.strip()].total_amount) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
             basic_nfp = sum(float(nfp_by_inv[ln.invoice_number.strip()].net_floor_price or 0.0) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
 
-            nfp_system = sum(float(r.system_price) for r in month_nfp_rows if r.agent_name.strip() == agent)
+            nfp_system = sum(float(r.total_amount) for r in month_nfp_rows if r.agent_name.strip() == agent)
             nfp_nfp = sum(float(r.net_floor_price or 0.0) for r in month_nfp_rows if r.agent_name.strip() == agent)
 
             # Package types
@@ -2387,7 +2399,7 @@ def build_internal_summary_tables(
             agent_anp_by_month[m] = agent_anp_rows
 
         # Customer summary
-        basic_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False, "advance": 0.0, "advance_date": ""})
+        basic_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "cash": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False, "advance": 0.0, "advance_date": ""})
         for ln in month_basic_lines:
             key = (ln.agent_name.strip(), ln.customer_name.strip())
             basic_by_cust[key]["comm"] += float(ln.basic_commission)
@@ -2404,8 +2416,12 @@ def build_internal_summary_tables(
             inv_num = ln.invoice_number.strip()
             r_nfp = nfp_by_inv.get(inv_num) or nfp_by_inv_all.get(inv_num)
             if r_nfp:
-                basic_by_cust[key]["system_price"] += float(r_nfp.system_price)
+                # Shown as System Price: the invoice's Total Amount.
+                basic_by_cust[key]["system_price"] += float(r_nfp.total_amount)
                 basic_by_cust[key]["net_floor_price"] += float(r_nfp.net_floor_price or 0.0)
+                # The invoice's Cash Price, for an NFP row with no NFP
+                # figure of its own this month (pending full payment).
+                basic_by_cust[key]["cash"] += float(r_nfp.sales_price or 0.0)
                 if _is_cleaning_inspection_service(r_nfp):
                     basic_by_cust[key]["is_cleaning_service"] = True
             rate_str = _basic_line_rate_label(ln)
@@ -2417,7 +2433,7 @@ def build_internal_summary_tables(
             nfp_by_cust[key]["comm"] += float(r.nfp_commission)
             nfp_by_cust[key]["sales"] += float(r.sales_price)
             nfp_by_cust[key]["rate"].add(determine_nfp_rate([r]))
-            nfp_by_cust[key]["system_price"] += float(r.system_price)
+            nfp_by_cust[key]["system_price"] += float(r.total_amount)
             nfp_by_cust[key]["net_floor_price"] += float(r.net_floor_price or 0.0)
             if _is_cleaning_inspection_service(r):
                 nfp_by_cust[key]["is_cleaning_service"] = True
@@ -2588,7 +2604,7 @@ def build_internal_summary_tables(
                         cust_nfp_pkg_str,
                         ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
                         nfp_nfp_cell,
-                        ensure_rm_prefix(f"{nfp_info['sales']:,.2f}" if nfp_info['sales'] != 0 else "-"),
+                        _nfp_cash_cell(nfp_info, basic_info),
                         "Net Floor Price Commission", nfp_comm_val,
                         "-", "-", "-", "-", "-", "-", "-"
                     ])
@@ -2816,10 +2832,12 @@ def build_outsource_summary_tables(
             basic_sales = sum(float(ln.sales_price) for ln in month_basic_lines if ln.agent_name.strip() == agent)
             nfp_sales = sum(float(r.sales_price) for r in month_nfp_rows if r.agent_name.strip() == agent)
 
-            basic_system = sum(float(nfp_by_inv[ln.invoice_number.strip()].system_price) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
+            # The report's System Price column is the invoice's Total Amount
+            # (decided 12 Oct 2026), not the package line's unit price.
+            basic_system = sum(float(nfp_by_inv[ln.invoice_number.strip()].total_amount) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
             basic_nfp = sum(float(nfp_by_inv[ln.invoice_number.strip()].net_floor_price or 0.0) for ln in month_basic_lines if ln.agent_name.strip() == agent and ln.invoice_number.strip() in nfp_by_inv)
 
-            nfp_system = sum(float(r.system_price) for r in month_nfp_rows if r.agent_name.strip() == agent)
+            nfp_system = sum(float(r.total_amount) for r in month_nfp_rows if r.agent_name.strip() == agent)
             nfp_nfp = sum(float(r.net_floor_price or 0.0) for r in month_nfp_rows if r.agent_name.strip() == agent)
 
             basic_invs = [ln.invoice_number for ln in month_basic_lines if ln.agent_name.strip() == agent]
@@ -2890,7 +2908,7 @@ def build_outsource_summary_tables(
             agent_summary_by_month[m] = agent_rows
 
         # Customer summary
-        basic_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False, "advance": 0.0, "advance_date": ""})
+        basic_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "cash": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False, "advance": 0.0, "advance_date": ""})
         for ln in month_basic_lines:
             key = (ln.agent_name.strip(), ln.customer_name.strip())
             basic_by_cust[key]["comm"] += ln.basic_commission
@@ -2907,8 +2925,12 @@ def build_outsource_summary_tables(
             inv_num = ln.invoice_number.strip()
             r_nfp = nfp_by_inv.get(inv_num) or nfp_by_inv_all.get(inv_num)
             if r_nfp:
-                basic_by_cust[key]["system_price"] += float(r_nfp.system_price)
+                # Shown as System Price: the invoice's Total Amount.
+                basic_by_cust[key]["system_price"] += float(r_nfp.total_amount)
                 basic_by_cust[key]["net_floor_price"] += float(r_nfp.net_floor_price or 0.0)
+                # The invoice's Cash Price, for an NFP row with no NFP
+                # figure of its own this month (pending full payment).
+                basic_by_cust[key]["cash"] += float(r_nfp.sales_price or 0.0)
                 if _is_cleaning_inspection_service(r_nfp):
                     basic_by_cust[key]["is_cleaning_service"] = True
             rate_str = _basic_line_rate_label(ln)
@@ -2920,7 +2942,7 @@ def build_outsource_summary_tables(
             nfp_by_cust[key]["comm"] += float(r.nfp_commission)
             nfp_by_cust[key]["sales"] += float(r.sales_price)
             nfp_by_cust[key]["rate"].add(determine_nfp_rate([r]))
-            nfp_by_cust[key]["system_price"] += float(r.system_price)
+            nfp_by_cust[key]["system_price"] += float(r.total_amount)
             nfp_by_cust[key]["net_floor_price"] += float(r.net_floor_price or 0.0)
             if _is_cleaning_inspection_service(r):
                 nfp_by_cust[key]["is_cleaning_service"] = True
@@ -3105,7 +3127,7 @@ def build_outsource_summary_tables(
                         cust_nfp_pkg_str,
                         ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
                         nfp_nfp_cell,
-                        ensure_rm_prefix(f"{nfp_info['sales']:,.2f}" if nfp_info['sales'] != 0 else "-"),
+                        _nfp_cash_cell(nfp_info, basic_info),
                         "Net Floor Price Commission", nfp_comm_val,
                         "-", "-", "-", "-", "-", "-", "-", "-"
                     ])
@@ -3659,16 +3681,14 @@ def _build_customer_summary_table_chunk(title: str, headers: list[str], rows: li
             except ValueError:
                 pass
 
-    # Vertical span for Customer, Package Type, and Sales Price on each Basic/NFP customer pair
+    # Vertical span for Customer and Package Type on each Basic/NFP customer
+    # pair. Sales Price is not spanned: the Basic row carries the Original
+    # Price and the NFP row the Cash Price (invoice_price_basis.py).
     lower_hdrs = [h.lower().strip() for h in headers]
     if "customer" in lower_hdrs and "package type" in lower_hdrs and "commission" in lower_hdrs:
         cust_idx = lower_hdrs.index("customer")
         pkg_idx = lower_hdrs.index("package type")
-        try:
-            sales_idx = lower_hdrs.index("sales price")
-        except ValueError:
-            sales_idx = -1
-        
+
         for r_idx in range(0, len(rows), 2):
             if r_idx + 1 < len(rows):
                 row_start = r_idx + 1
@@ -3677,9 +3697,6 @@ def _build_customer_summary_table_chunk(title: str, headers: list[str], rows: li
                 t_styles.append(("VALIGN", (cust_idx, row_start), (cust_idx, row_end), "MIDDLE"))
                 t_styles.append(("SPAN", (pkg_idx, row_start), (pkg_idx, row_end)))
                 t_styles.append(("VALIGN", (pkg_idx, row_start), (pkg_idx, row_end), "MIDDLE"))
-                if sales_idx != -1:
-                    t_styles.append(("SPAN", (sales_idx, row_start), (sales_idx, row_end)))
-                    t_styles.append(("VALIGN", (sales_idx, row_start), (sales_idx, row_end), "MIDDLE"))
 
     # Vertical span System Price and Net Floor Price on each Basic/NFP customer pair if identical
     try:

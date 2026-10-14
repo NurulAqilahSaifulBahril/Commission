@@ -85,6 +85,18 @@ SPECIAL_CASE_FIELDS = [
     # lookup above and for exact matching when a customer has more than one
     # invoice (customer-name matching alone would be ambiguous).
     "linkedInvoiceNumber",
+    # The typed NFP rate, as a signed percent, for three types: "Adjusted Net
+    # Floor Price Commission Rate %" -- (Cash Price - Net Floor Price) x rate --
+    # "Adjusted Rate on Cash Price %" (cash_price_rate) -- Cash Price x rate, so
+    # 2 pays 2% of the whole Cash Price -- and "Adjusted Rate on Adjusted Cash
+    # Price %" (adjusted_cash_price_rate) -- the typed Cash Price below x rate.
+    # Blank for every other type.
+    "nfpRatePct",
+    # "Adjusted Cash Price After Discount (RM)": the Cash Price the NFP
+    # commission is worked on instead of the invoice's own. Only for an NFP case
+    # of that type or "Adjusted Rate on Adjusted Cash Price %"; blank for every other. Kept apart from "adjustedSalesPrice",
+    # which the NFP form merely mirrors from the Basic case.
+    "adjustedCashPrice",
 ]
 
 # Gan Lai Soon's OGM override when a case does not name its own rate. Defined
@@ -496,6 +508,10 @@ def init_db() -> None:
             ALTER TABLE rule_settings ADD COLUMN IF NOT EXISTS property_type TEXT;
             ALTER TABLE rule_settings ADD COLUMN IF NOT EXISTS invoice_date_from TEXT;
 
+            -- A person's name beside the login, shown on the Admin page. Blank
+            -- for accounts made before it existed until an admin fills it in.
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT;
+
             ALTER TABLE commission_rates ADD COLUMN IF NOT EXISTS override_from TEXT;
             ALTER TABLE commission_rates ADD COLUMN IF NOT EXISTS profit_sharing_mode TEXT;
             -- Solar Services / EV Services. Blank reads as Solar Services: every
@@ -627,26 +643,31 @@ def get_user_by_id(user_id: int) -> dict[str, Any] | None:
 def list_users() -> list[dict[str, Any]]:
     with _connect() as conn:
         return conn.execute(
-            "SELECT id, username, role, is_active, created_at FROM users ORDER BY created_at ASC"
+            "SELECT id, username, name, role, is_active, created_at FROM users ORDER BY created_at ASC"
         ).fetchall()
 
 
-def create_user(username: str, password_hash: str, role: str) -> int:
+def create_user(username: str, password_hash: str, role: str, name: str | None = None) -> int:
     with _lock, _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO users (username, password_hash, role, is_active, created_at) VALUES (%s, %s, %s, 1, %s) RETURNING id",
-            (username, password_hash, role, _now()),
+            "INSERT INTO users (username, name, password_hash, role, is_active, created_at) VALUES (%s, %s, %s, %s, 1, %s) RETURNING id",
+            (username, name or None, password_hash, role, _now()),
         )
         return cur.fetchone()["id"]
 
 
 def update_user(user_id: int, *, username: str | None = None, password_hash: str | None = None,
-                 role: str | None = None, is_active: bool | None = None) -> None:
+                 role: str | None = None, is_active: bool | None = None,
+                 name: str | None = None) -> None:
     fields = []
     values: list[Any] = []
     if username is not None:
         fields.append("username = %s")
         values.append(username)
+    if name is not None:
+        # "" clears it: stored as NULL, shown as a dash.
+        fields.append("name = %s")
+        values.append(name or None)
     if password_hash is not None:
         fields.append("password_hash = %s")
         values.append(password_hash)

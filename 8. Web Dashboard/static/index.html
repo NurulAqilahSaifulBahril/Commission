@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/styles.css?v=20260910-referral">
+    <link rel="stylesheet" href="/static/styles.css?v=20261013-remark-special-case">
 </head>
 <body class="report-page">
     <div class="app-container">
@@ -229,6 +229,13 @@
                         <label>Customer Name</label>
                         <input type="text" id="modalCustomerName" disabled>
                     </div>
+                    <!-- Sits beside Agent and Customer. In customer mode this
+                         row is hidden, so setSpecialCaseModalMode() moves the
+                         field next to the two dropdowns instead. -->
+                    <div class="form-row" id="modalPackageTypeRow">
+                        <label>Package Type</label>
+                        <input type="text" id="modalPackageType" disabled>
+                    </div>
                 </div>
                 <div class="form-group-row hidden" id="modalSelectionGroupRow">
                     <div class="form-row" id="modalAgentSelectRow">
@@ -269,15 +276,9 @@
                 </div>
                 <div class="form-group-row">
                     <div class="form-row">
-                        <label>Package Type</label>
-                        <input type="text" id="modalPackageType" disabled>
-                    </div>
-                    <div class="form-row">
                         <label>Sales Price (RM)</label>
                         <input type="number" id="modalSalesPrice" disabled>
                     </div>
-                </div>
-                <div class="form-group-row">
                     <div class="form-row">
                         <label>System Price (RM)</label>
                         <input type="number" id="modalSystemPrice" disabled>
@@ -285,6 +286,11 @@
                     <div class="form-row">
                         <label>Baseline Rate (%)</label>
                         <input type="number" id="modalBaselineRate" disabled>
+                        <!-- The NFP form shows the rate this invoice's NFP commission
+                             is paid at here ("25%", or "-20%" below the floor), instead
+                             of the Basic Commission rate above, which stays hidden for
+                             the calculation. Filled by setNfpBaselineRate(). -->
+                        <input type="text" id="modalNfpBaselineRates" class="hidden" disabled value="-">
                     </div>
                 </div>
                 
@@ -318,6 +324,14 @@
                     <input type="number" id="modalAdjustedSalesPrice" placeholder="e.g. 25000.00" step="100">
                 </div>
 
+                <!-- NFP form only (Adjusted Cash Price After Discount). Replaces the
+                     invoice's Cash Price for the Net Floor Price commission alone:
+                     Basic Commission and its Original Price are left as they are. -->
+                <div class="form-row hidden" id="rowAdjustedCashPrice">
+                    <label>Adjusted Cash Price After Discount (RM) <span style="font-size: 11px; color: #64748b; font-weight: normal;">(used instead of the invoice's Cash Price for the NFP commission)</span></label>
+                    <input type="number" id="modalAdjustedCashPrice" placeholder="e.g. 25000.00" step="100">
+                </div>
+
                 <div class="form-row" id="rowAdjustedNfp">
                     <label>New Net Floor Price (RM) <span style="font-size: 11px; color: #64748b; font-weight: normal;">(NFP commission uses the New Sales Price when one is entered)</span></label>
                     <input type="number" id="modalNetFloorPrice" placeholder="0.00" value="0.00" step="100">
@@ -331,6 +345,17 @@
                 <div class="form-row hidden" id="rowAdjustedRate">
                     <label>New Basic Commission Rate (%)</label>
                     <input type="number" id="modalRatePct" placeholder="e.g. 4.0" value="3.0" step="0.05">
+                </div>
+
+                <!-- Shared by three types (app.js onSpecialCaseTypeChange relabels it):
+                     "Adjusted Net Floor Price Commission Rate %" -- NFP commission =
+                     (Cash Price - Net Floor Price) x this rate, pre-filled with the
+                     rate that applies today -- and "Adjusted Rate on Cash Price %" /
+                     "Adjusted Rate on Adjusted Cash Price %" -- NFP commission = the
+                     invoice's / the typed Cash Price x this rate, starting empty. -->
+                <div class="form-row hidden" id="rowAdjustedNfpRate">
+                    <label>New Net Floor Price Commission Rate (%)</label>
+                    <input type="number" id="modalNfpRatePct" placeholder="e.g. 0.5" step="0.5">
                 </div>
 
                 <div class="form-row hidden" id="rowProfitSharing">
@@ -618,7 +643,8 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=20261012-price-split"></script>
+    <script src="/static/app.js?v=20261014-no-summary-remark"></script>
     <script src="/static/updater.js?v=20260923-adminonly"></script>
+    <script src="/static/sidebar_toggle.js?v=20261014-2"></script>
 </body>
 </html>

@@ -28,6 +28,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import invoice_price_basis as _price_basis
+
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent.parent
 _OUTPUT_DIR = _SCRIPT_DIR.parent / "2. Output"
@@ -483,6 +485,7 @@ def _invoices_sql(*, year: int, customer_filter_sql: str) -> str:
     from basic_commission_rates import (milestone_sql_parts, milestone_column,
                                         milestone_created_column,
                                         multi_stage_cutover, payout_thresholds_in_use)
+    from invoice_price_basis import PRICE_ITEMS_JOIN_SQL
     from decimal import Decimal as _D
     milestone_ctes, milestone_selects, milestone_joins = milestone_sql_parts()
     milestone_out_selects = "\n".join(
@@ -527,6 +530,8 @@ candidates AS (
       ),
       0
     )::numeric AS epp_interest,
+    -- Every line on the invoice, for the Original Price (see invoice_price_basis).
+    price_items_lat.price_items,
     COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name, '(unknown)') AS customer_name,
     COALESCE(NULLIF(TRIM(a.name), ''), '(unknown)') AS agent_name,
     a.agent_type,
@@ -731,6 +736,7 @@ candidates AS (
     WHERE p.linked_invoice = i.bubble_id
       AND p.id NOT IN (101334, 104412, 101333, 104413, 4899)
   ) pay ON TRUE
+{PRICE_ITEMS_JOIN_SQL}
   WHERE (
     -- Before the multi-stage cutover: recognised only at full payment.
     ({full_col} IS NOT NULL
@@ -775,7 +781,8 @@ SELECT
   has_jinko,
   seda_nem_type,
   referral_project_type,
-  referral_name
+  referral_name,
+  price_items
 FROM candidates
 WHERE rn = 1
 ORDER BY agent_name ASC, real_full_payment_date ASC NULLS LAST, invoice_number ASC NULLS LAST
@@ -941,7 +948,9 @@ def _process_invoices(
         total = _to_decimal(row.get("total_amount"))
         paid_amount = _to_decimal(row.get("paid_amount"))
         epp = _to_decimal(row.get("epp_interest"))
-        sales_price = total - epp
+        # Original Price: Total - EPP, plus any lucky draw (invoice_price_basis).
+        sales_price = _price_basis.original_price(total, epp, row.get("invoice_date"),
+                                                  row.get("price_items"))
         
         is_agent_senior = is_senior(agent_name)
         sharing = Decimal("0")
@@ -1244,7 +1253,8 @@ def get_factory_rates(raw_rows: list[dict[str, Any]], cli_factory_rates: dict[st
             cust_name = str(r.get("customer_name") or "(unknown)").strip()
             total = _to_decimal(r.get("total_amount"))
             epp = _to_decimal(r.get("epp_interest"))
-            sales_price = total - epp
+            sales_price = _price_basis.original_price(total, epp, r.get("invoice_date"),
+                                                      r.get("price_items"))
 
             if inv_num in cli_factory_rates:
                 factory_rates[inv_num] = cli_factory_rates[inv_num]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
@@ -40,6 +41,13 @@ SCHEDULE_650W_FROM = date(2025, 11, 1)
 DASHBOARD_DB_PATH = Path(__file__).resolve().parent.parent.parent / "8. Web Dashboard" / "dashboard.db"
 USE_DB_PRICES = True
 _DB_PRICES = None  # {month: {rating: [table dicts keyed by panels, ordered by table_no]}}
+# The dashboard builds the internal and outsource reports at the same time, in
+# two threads sharing this cache. Loading used to publish an empty {} first and
+# fill it from the database afterwards, so the second thread could arrive in
+# between, read the empty list, miss every floor price and file the invoice as
+# "missing_in_excel" (seen 12 Oct 2026: ~160 outsource invoices, Lim Lee Peng
+# among them). The list is now built privately and published once complete.
+_DB_PRICES_LOCK = threading.Lock()
 
 
 def reset_db_prices_cache():
@@ -52,14 +60,22 @@ def _load_db_prices():
     global _DB_PRICES
     if _DB_PRICES is not None:
         return _DB_PRICES
-    _DB_PRICES = {}
-    if not DASHBOARD_DB_PATH.exists():
+    with _DB_PRICES_LOCK:
+        if _DB_PRICES is None:
+            _DB_PRICES = _read_db_prices()
         return _DB_PRICES
+
+
+def _read_db_prices():
+    """The nfp_prices rows as {month: {rating: [tables]}}; {} if unreadable."""
+    prices: dict = {}
+    if not DASHBOARD_DB_PATH.exists():
+        return prices
     _NFP_SQL = (
         # String-inverter rows only: hybrid rows are display data for the
         # dashboard and must never feed commission calculations.
         "SELECT month, panel_rating, table_no, panels, final_price, final_with_tng,"
-        " promo_price, promo_from, promo_to"
+        " promo_price, promo_from, promo_to, columns_json, source_sheet"
         " FROM nfp_prices"
         " WHERE inverter_type IS NULL OR inverter_type = '' OR LOWER(inverter_type) = 'string'"
         " ORDER BY month, panel_rating, table_no, panels"
@@ -91,12 +107,12 @@ def _load_db_prices():
                 conn.close()
         except Exception as e:
             print(f"[NFP] Warning: could not read nfp_prices from dashboard DB: {e}")
-            return _DB_PRICES
+            return prices
     for r in rows:
         month = str(r["month"])
         rating = int(r["panel_rating"])
         table_no = int(r["table_no"])
-        tables = _DB_PRICES.setdefault(month, {}).setdefault(rating, {})
+        tables = prices.setdefault(month, {}).setdefault(rating, {})
         promo_price = r["promo_price"] if "promo_price" in r.keys() else None
         tables.setdefault(table_no, {})[int(r["panels"])] = PriceRow(
             int(r["panels"]), float(r["final_price"]),
@@ -104,11 +120,13 @@ def _load_db_prices():
             float(promo_price) if promo_price is not None else None,
             _parse_iso_date(r["promo_from"]) if promo_price is not None else None,
             _parse_iso_date(r["promo_to"]) if promo_price is not None else None,
+            _row_columns(r["columns_json"] if "columns_json" in r.keys() else None),
+            str(r["source_sheet"] or "") if "source_sheet" in r.keys() else "",
         )
-    for month, ratings in _DB_PRICES.items():
+    for month, ratings in prices.items():
         for rating in list(ratings.keys()):
             ratings[rating] = [ratings[rating][k] for k in sorted(ratings[rating].keys())]
-    return _DB_PRICES
+    return prices
 
 
 def _parse_iso_date(value) -> Optional[date]:
@@ -120,9 +138,310 @@ def _parse_iso_date(value) -> Optional[date]:
         return None
 
 
+def _row_columns(raw) -> tuple:
+    """A price row's stored sheet columns as ((label, amount), ...); () when the
+    row carries none or they cannot be read."""
+    if not raw:
+        return ()
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return ()
+    out = []
+    for item in raw if isinstance(raw, (list, tuple)) else []:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            out.append((" ".join(str(item[0]).split()), item[1]))
+    return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# Rebates the invoice actually carries
+# ---------------------------------------------------------------------------
+# The price list's "Max amount after discount" takes EVERY rebate column off the
+# price after the max discount, for every invoice. A customer who never received
+# one of those rebates (no CNY promo line on the invoice, say) was still being
+# measured against a floor that assumed it. Decided with Finance 13 Oct 2026:
+# the floor takes off only the rebates the invoice itself carries, e.g. Sim Chee
+# Geng, 25 panels, Feb 2026: 38,850.75 - 1,000 (Xiaomi 55" TV Cash Option) -
+# 3,000 (Atap) - 900 (Ang Pow) = 33,950.75, without the sheet's 1,500 CNY promo.
+#
+# A rebate is "carried" when the invoice has a negative line worded like it. The
+# amount taken off is the sheet's own (it already varies with the panel count).
+_INVOICE_REBATE_PATTERNS = {
+    # Free gift taken as cash: "No TV swap discount ...", "Xiaomi 55" TV. Cash
+    # Option", "No IMILAB V1 Robot swap discount ...". Road-show "swap TNG" lines
+    # are the TNG rebate, which has its own flag.
+    "gift": re.compile(r"(?=.*\b(?:tv|robot|imilab|xiaomi)\b)(?=.*(?:swap|cash option))|no\s+xiaomi\s+robot",
+                       re.I | re.S),
+    # "Pre-Atap" and "Pre-order" rebates are the Nov-Dec 2025 Atap-type rebate.
+    "atap": re.compile(r"atap|solaris|pre-?\s*order", re.I),
+    # Billed as "Ang Pow rebate" (also spelt "angpao") and, in March, as "Duit
+    # Raya rebate".
+    "angpow": re.compile(r"ang\s*pow|ang\s*pao|duit\s*raya", re.I),
+    # The sheet's "马上装 马上赚 CNY2026 Promo Reward" is billed as "CNY 2026
+    # Promo Discount (Panel Qty: N)" in Feb-Mar and "Earn Now Rebate" later.
+    "earnnow": re.compile(r"earn\s*now|cny\s*\d*\s*promo|马上装", re.I),
+    # The sheet's "RAYA Promo Reward (1MAR~31MAR 2026)" is billed as "Holiday
+    # Boost Reward (Panel Qty: N)".
+    "raya": re.compile(r"holiday\s*boost|raya\s*promo", re.I),
+    "earth": re.compile(r"earth\s*month|go\s*green|地球", re.I),
+}
+
+# Wordings that name no rebate but are one of two, told apart by the amount: the
+# Ang Pow rebate is only ever RM500 or RM900, the Atap rebate is larger
+# ("The RM900 rebate is limited to customers who sign ...", "Early Bird").
+_AMBIGUOUS_REBATE = re.compile(r"rebate is limited|early\s*bird", re.I)
+_ANG_POW_MAX = 1000.0
+
+
+def _line_kind(description: str, amount: float) -> Optional[str]:
+    """The rebate kind one negative invoice line stands for, or None."""
+    for kind, pattern in _INVOICE_REBATE_PATTERNS.items():
+        if pattern.search(description):
+            return kind
+    if _AMBIGUOUS_REBATE.search(description):
+        return "angpow" if abs(amount) <= _ANG_POW_MAX else "atap"
+    return None
+
+# Sheets that label their rebate columns differently (the Nov-Dec 2025 and Jan
+# 2026 620W table calls its Atap and Ang Pow columns SOLARIS and EARLY BIRD
+# DISCOUNT) take every column between the price after max discount and the final
+# price, whatever it is called.
+_ALL_COLUMNS_SHEETS = ("nov and dec 2025", "jan 2026")
+
+_REBATE_COLUMN_KEYS = ("freegift", "atap", "ang pow", "rebate", "promo", "reward",
+                       "raya", "earth", "cny", "地球")
+_NON_REBATE_COLUMN_WORDS = ("no.panels", "price package", "max discount", "price after max",
+                            "final price", "roadshow tng", "with tng")
+
+
+def _negative_lines(price_items):
+    """(amount, description) for each negative invoice line, counting an exact
+    repeat (same amount, same wording) once. Some invoices carry every line
+    twice under different ids -- Lee Chui Yin's 1008554 -- and summing those
+    would double her discount."""
+    if isinstance(price_items, str):
+        try:
+            price_items = json.loads(price_items)
+        except ValueError:
+            price_items = []
+    seen = set()
+    out = []
+    for item in price_items if isinstance(price_items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            amount = float(str(item.get("amount") if item.get("amount") is not None else 0).replace(",", ""))
+        except ValueError:
+            continue
+        if amount >= 0:
+            continue
+        description = str(item.get("description") or "")
+        key = (round(amount, 2), " ".join(description.split()).lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((amount, description))
+    return out
+
+
+class RebateKinds(frozenset):
+    """The rebate kinds an invoice carries, plus `plain_discount`: what its
+    ordinary "Discount" lines come to (CEO / manager parts excluded). That
+    discount stands in for sheet rebates the invoice does not name -- see
+    invoice_floor_price."""
+    plain_discount: float = 0.0
+
+
+_PLAIN_DISCOUNT = re.compile(r"discount", re.I)
+# How close an invoice's plain discount must be to the total of the sheet
+# rebates it lacks to stand in for all of them ("the value range is not too
+# far"), as a share of that total.
+_DISCOUNT_COVER_TOLERANCE = 0.30
+
+
+def invoice_rebate_kinds(price_items) -> frozenset:
+    """Which rebates an invoice carries, from its negative lines. `price_items`
+    is the invoice's lines as the reports select them (a JSON array of
+    {amount, description, ...}, or the parsed list)."""
+    kinds = set()
+    plain = 0.0
+    for amount, description in _negative_lines(price_items):
+        kind = _line_kind(description, amount)
+        if kind:
+            kinds.add(kind)
+        elif _PLAIN_DISCOUNT.search(description):
+            plain += max(0.0, -amount - _approved_part(description, amount))
+    result = RebateKinds(kinds)
+    result.plain_discount = round(plain, 2)
+    return result
+
+
+# A discount the CEO or a manager approved is the company's own, so it lowers the
+# floor by the same amount (an ordinary discount is the agent's and does not).
+# Decided with Finance 13 Oct 2026, e.g. Liew Miu Yoong, 36 panels, Nov 2025:
+# 50,931 - 1,000 (TV swap) - 900 (rebate) - 4,865 (CEO discount) = 44,166.
+# Manager Discount (June 2026 on) is treated the same way.
+_APPROVER_WORD = re.compile(r"ceo|manager", re.I)
+_RM_AMOUNT = re.compile(r"rm\s*([\d,]+(?:\.\d+)?)", re.I)
+
+
+def _money(text: str) -> float:
+    return float(text.replace(",", ""))
+
+
+def _approved_part(description: str, amount: float) -> float:
+    """The CEO / manager discount inside one negative invoice line, as a positive
+    amount.
+
+    A line that is only that discount ("CEO Discount", "CEO Special Discount",
+    "Manager Discount (RM 4000)") gives its whole amount. In a combined line the
+    part naming the approver gives the RM figure written after it ("... CEO
+    Discount (RM1969.40)", "MANAGER DISCOUNT (RM 4093) | Discount (RM 1876)");
+    with no figure it gives whatever the other parts do not account for, and the
+    ordinary "Discount (6% RM2340.60)" or Opening Day parts stay out of it."""
+    if not _APPROVER_WORD.search(description):
+        return 0.0
+    lines = [p for p in re.split(r"[\r\n]+", description) if p.strip()]
+    if len(lines) <= 1:
+        cut = _APPROVER_WORD.search(description).start()
+        lines = [p for p in (description[:cut], description[cut:]) if p.strip()]
+    approved_text = " ".join(p for p in lines if _APPROVER_WORD.search(p))
+    other_text = " ".join(p for p in lines if not _APPROVER_WORD.search(p))
+    after_word = approved_text[_APPROVER_WORD.search(approved_text).start():]
+    stated = _RM_AMOUNT.search(after_word)
+    if stated:
+        return min(_money(stated.group(1)), -amount)
+    others = sum(_money(m.group(1)) for m in _RM_AMOUNT.finditer(other_text))
+    return max(0.0, -amount - others)
+
+
+def invoice_approved_discount(price_items) -> float:
+    """The CEO / manager-approved discount an invoice carries, from its negative
+    lines."""
+    total = 0.0
+    for amount, description in _negative_lines(price_items):
+        total += _approved_part(description, amount)
+    return round(total, 2)
+
+
+def _column_kind(label: str) -> Optional[str]:
+    """The rebate kind a sheet column stands for, or None when it is not one this
+    module can recognise on an invoice (such a column is always taken off, as it
+    always was)."""
+    low = label.lower()
+    if "freegift" in low:
+        return "gift"
+    if "atap" in low or "solaris" in low:
+        return "atap"
+    if "ang pow" in low or "early bird" in low:
+        return "angpow"
+    if "raya" in low:
+        return "raya"
+    if "earth" in low or "地球" in low:
+        return "earth"
+    if "cny" in low or "马上装" in low:
+        return "earnnow"
+    return None
+
+
+def invoice_floor_price(row: "PriceRow", has_tng_rebate: bool, kinds) -> Optional[float]:
+    """The floor price for one invoice: the row's price after the max discount,
+    less only the rebate columns whose kind the invoice carries (and the TNG
+    rebate when it has one). None when the row has no columns to rebuild from,
+    in which case the caller keeps the stored price.
+
+    With every rebate present this is exactly the stored price, rounded the way
+    the sheet's own parser rounds it."""
+    if kinds is None or not row.columns:
+        return None
+    labels = [lab for lab, _ in row.columns]
+    low = [lab.lower() for lab in labels]
+    i_after = next((i for i, l in enumerate(low) if "price after max" in l), None)
+    if i_after is None:
+        return None
+
+    def is_final(l: str) -> bool:
+        return (("final price" in l or "max amount after discount" in l or "nett price after discount" in l)
+                and not any(w in l for w in ("tng", "with", "roadshow")))
+
+    i_final = next((i for i, l in enumerate(low) if i > i_after and is_final(l)), None)
+    if i_final is None:
+        return None
+
+    sheet = row.sheet or ""
+    # To the cent, like the price list itself (19,565.75), not the 1-decimal
+    # schedule rounding, which turned a rebuilt floor into 19,565.6.
+    rnd = lambda v: round_rm(v, 2)
+    try:
+        after = rnd(row.columns[i_after][1])
+    except (TypeError, ValueError):
+        return None
+    every_column = sheet.strip().lower() in _ALL_COLUMNS_SHEETS
+    rebate_columns = []          # (kind, amount) for each rebate column on the row
+    for j in range(i_after + 1, i_final):
+        l = low[j]
+        if not l or any(w in l for w in _NON_REBATE_COLUMN_WORDS):
+            continue
+        if not every_column and not any(k in l for k in _REBATE_COLUMN_KEYS):
+            continue
+        amount = row.columns[j][1]
+        if not isinstance(amount, (int, float)):
+            continue
+        rebate_columns.append((_column_kind(labels[j]), amount))
+
+    # An ordinary "Discount" on the invoice can stand in for sheet rebates it
+    # does not name (decided with Finance 13 Oct 2026) -- but it is usually the
+    # agent's percentage discount, which the price after max discount already
+    # allows for. So it covers the missing rebate(s) only when its amount is
+    # nearer to them than to the row's max percentage discount:
+    #   Lee Chui Yin  Discount 1,284 vs CNY 1,500 / 6% 2,321  -> the CNY promo
+    #   Sim Chee Geng Discount 2,575 vs CNY 1,500 / 7% 2,924  -> the 7%, CNY stays on
+    # One missing rebate is matched on its own amount; several together when
+    # the discount is near their total (within _DISCOUNT_COVER_TOLERANCE), else
+    # only the one nearest it.
+    covered = set()
+    plain = float(getattr(kinds, "plain_discount", 0.0) or 0.0)
+    missing = [(k, a) for k, a in rebate_columns if k is not None and k not in kinds]
+    if plain > 0 and missing:
+        missing_total = sum(a for _, a in missing)
+        if len(missing) == 1 or abs(plain - missing_total) <= _DISCOUNT_COVER_TOLERANCE * missing_total:
+            candidate, target = {k for k, _ in missing}, missing_total
+        else:
+            nearest = min(missing, key=lambda m: abs(m[1] - plain))
+            candidate, target = {nearest[0]}, nearest[1]
+        i_pkg = next((i for i, l in enumerate(low) if l.endswith("price package")), None)
+        pkg = row.columns[i_pkg][1] if i_pkg is not None else None
+        pct_discount = (pkg - row.columns[i_after][1]) if isinstance(pkg, (int, float)) else None
+        if pct_discount is None or abs(plain - target) < abs(plain - pct_discount):
+            covered = candidate
+
+    # The invoice carries every discount the list allows for: the floor is the
+    # list's own price, exactly as stored (rule 1, 13 Oct 2026). Only an invoice
+    # short of some is rebuilt from the price after the max discount (rule 2).
+    if not any(k is not None and k not in kinds and k not in covered for k, _ in rebate_columns):
+        return None
+
+    taken = 0.0
+    for kind, amount in rebate_columns:
+        if kind is None or kind in kinds or kind in covered:
+            taken += rnd(amount)
+    floor = rnd(after - taken)
+    if has_tng_rebate:
+        i_tng = next((i for i, l in enumerate(low)
+                      if ("roadshow" in l and "tng" in l and "after" not in l) or "tng rebate" in l), None)
+        tng = row.columns[i_tng][1] if i_tng is not None else None
+        if isinstance(tng, (int, float)):
+            floor = rnd(floor - rnd(tng))
+        elif row.final_with_tng is not None:
+            floor = rnd(floor - (row.final_price - row.final_with_tng))
+    return floor
+
+
 def _db_lookup_net_floor_price(
     invoice_date: date, panel_qty: int, panel_rating: int,
-    has_tng_rebate: bool, three_phase: bool
+    has_tng_rebate: bool, three_phase: bool, rebate_kinds=None
 ) -> Tuple[Optional[float], Optional[str]]:
     """DB-first price lookup mirroring the Excel-schedule behavior exactly:
     invoice month first, then nearest earlier months, then later months.
@@ -183,6 +502,12 @@ def _db_lookup_net_floor_price(
             else row.final_price
         )
         suffix = "_with_tng" if has_tng_rebate and row.final_with_tng is not None else ""
+        # Only the rebates this invoice carries come off the price after the
+        # max discount; a row with no sheet columns keeps its stored price.
+        invoice_price = invoice_floor_price(row, has_tng_rebate, rebate_kinds)
+        if invoice_price is not None:
+            price = invoice_price
+            suffix += "_invoice_rebates"
         if (m == inv_ym and row.promo_price is not None and row.promo_from and row.promo_to
                 and row.promo_from <= invoice_date <= row.promo_to):
             price = row.promo_price
@@ -207,6 +532,11 @@ class PriceRow:
     promo_price: Optional[float] = None
     promo_from: Optional[date] = None
     promo_to: Optional[date] = None
+    # The sheet row this price was built from, as ((label, amount), ...), and the
+    # sheet's name. Lets the floor be rebuilt from only the rebates an invoice
+    # actually carries (see invoice_floor_price); empty for rows stored without it.
+    columns: tuple = ()
+    sheet: str = ""
 
 
 def round_rm(value: float | int | str | Decimal, places: int = 2) -> float:
@@ -941,6 +1271,33 @@ def lookup_net_floor_price(
     schedules_650: Dict[str, List[Dict[int, PriceRow]]],
     schedule_620: Dict[int, float],
     three_phase: bool = False,
+    rebate_kinds=None,
+    approved_discount: float = 0.0,
+) -> Tuple[Optional[float], str]:
+    """The floor price for an invoice.
+
+    `rebate_kinds` (invoice_rebate_kinds of the invoice's lines) makes the price
+    list's floor take off only the rebates that invoice carries; left as None the
+    stored floor, with every rebate off, is returned as before.
+
+    `approved_discount` is accepted but no longer used: a CEO / manager discount
+    does not lower the floor (decided with Finance 13 Oct 2026, replacing the
+    rule that took it off -- Lim Rui Yeong's RM865.75 CEO discount stays on him)."""
+    price, source = _lookup_net_floor_price_base(
+        invoice_date, panel_qty, panel_rating, has_tng_rebate,
+        schedules_650, schedule_620, three_phase, rebate_kinds)
+    return price, source
+
+
+def _lookup_net_floor_price_base(
+    invoice_date: date,
+    panel_qty: int,
+    panel_rating: int,
+    has_tng_rebate: bool,
+    schedules_650: Dict[str, List[Dict[int, PriceRow]]],
+    schedule_620: Dict[int, float],
+    three_phase: bool = False,
+    rebate_kinds=None,
 ) -> Tuple[Optional[float], str]:
     if invoice_date < NFP_CUTOFF:
         return None, "before_oct_2025_no_nfp"
@@ -949,7 +1306,8 @@ def lookup_net_floor_price(
     # to the original Excel/JSON schedule logic below.
     if USE_DB_PRICES:
         db_price, db_source = _db_lookup_net_floor_price(
-            invoice_date, panel_qty, panel_rating, has_tng_rebate, three_phase
+            invoice_date, panel_qty, panel_rating, has_tng_rebate, three_phase,
+            rebate_kinds=rebate_kinds,
         )
         if db_price is not None:
             return db_price, db_source

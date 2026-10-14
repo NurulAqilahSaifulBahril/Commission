@@ -650,6 +650,7 @@
                 agent_type: r.agent_type || "", hierarchy: r.hierarchy || "", agent: r.agent || "",
                 label: r.label || "", condition: r.condition || "",
                 rate_pct: r.rate_pct || "", override_rate_pct: r.override_rate_pct || "",
+            override_from: r.override_from || "",
                 profit_sharing_rate_pct: r.profit_sharing_rate_pct || "",
                 profit_sharing_mode: r.profit_sharing_mode || "",
                 property_type: r.property_type || "", trigger_pct: r.trigger_pct || "",
@@ -1157,6 +1158,7 @@
             agent_type: r.agent_type || "", hierarchy: r.hierarchy || "", agent: r.agent || "",
             label: r.label || "", condition: r.condition || "",
             rate_pct: r.rate_pct || "", override_rate_pct: r.override_rate_pct || "",
+            override_from: r.override_from || "",
             profit_sharing_rate_pct: r.profit_sharing_rate_pct || "",
             profit_sharing_mode: r.profit_sharing_mode || "",
             property_type: r.property_type || "", trigger_pct: r.trigger_pct || "",
@@ -1682,6 +1684,41 @@
             startOf(a) < startOf(b) ? -1 : startOf(a) > startOf(b) ? 1 : 0));
     }
 
+    // Highest rank first, per agent type (confirmed 2026-10-14). The retired
+    // Regional Sales Director and OGM sit at the top of their type.
+    const ROLE_RANK_ORDER = {
+        "Internal": ["Regional Sales Director", "Senior Branch Director", "Branch Sales Manager",
+            "Sales Development Manager", "Sales Team Manager", "Senior Sales Consultant",
+            "Sales Consultant", "Sales Senior", "Sales Executive"],
+        "Outsource": ["OGM", "OUM", "OSA"]
+    };
+    const AGENT_TYPE_ORDER = ["Internal", "Outsource"];
+
+    /** Where a person's block sits: by their latest dated role (the last one
+     *  groupRolesByPerson put in the block that has a date) -- Internal before
+     *  Outsource, highest rank first, then by name. An unknown role or type
+     *  goes after the known ones. */
+    function personRankKey(group) {
+        const dated = group.filter((r) => !r.needs_date && String(r.effective_from || "").trim());
+        const cur = dated.length ? dated[dated.length - 1] : group[group.length - 1];
+        const type = AGENT_TYPE_ORDER.includes(cur.agent_type) ? cur.agent_type : "";
+        const typeIdx = type ? AGENT_TYPE_ORDER.indexOf(type) : AGENT_TYPE_ORDER.length;
+        const ranks = (ROLE_RANK_ORDER[type] || []).map(canonRole);
+        const roleIdx = ranks.indexOf(canonRole(cur.hierarchy));
+        // The name the table shows: Full Name, else the eeAdmin name.
+        const fullName = (group.find((r) => String(r.full_name || "").trim()) || {}).full_name;
+        const name = String(fullName || group[0].agent || group[0].nick_name || "").trim().toLowerCase();
+        return [typeIdx, roleIdx === -1 ? ranks.length : roleIdx, name];
+    }
+
+    function compareByRank(a, b) {
+        const ka = personRankKey(a);
+        const kb = personRankKey(b);
+        if (ka[0] !== kb[0]) return ka[0] - kb[0];
+        if (ka[1] !== kb[1]) return ka[1] - kb[1];
+        return ka[2].localeCompare(kb[2]);
+    }
+
     /**
      * Render the table.
      */
@@ -1726,7 +1763,7 @@
         // block. The saved data is untouched -- each role is still its own
         // agent_roles row; only the grid groups them. Filtering above stays
         // row-level, so a month or type filter shows just the roles that match.
-        const groups = groupRolesByPerson(filtered);
+        const groups = groupRolesByPerson(filtered).sort(compareByRank);
         const total = groups.length;
         const totalPages = Math.max(1, Math.ceil(total / ROLES_PAGE_SIZE));
         rolesPage = Math.max(1, Math.min(rolesPage, totalPages));
@@ -1778,6 +1815,10 @@
                     ? "⚠ Sales (needs review)"
                     : (r.agent_type || "—");
                 const displayRole = r.hierarchy || "—";
+                // The Role cell is shaded by Agent Type: Outsource light blue,
+                // Internal light purple; anything else stays plain.
+                const roleCellBg = r.agent_type === "Outsource" ? "#e0f2fe"
+                    : r.agent_type === "Internal" ? "#ede9fe" : "";
                 const displayReports = r.reports_to || "—";
                 const displayBranch = r.branch || "—";
 
@@ -1791,11 +1832,18 @@
                     : "";
 
                 // Person-level cells are drawn once, on the block's first line,
-                // spanning every role the person has.
+                // spanning every role the person has. Agent Name (from eeAdmin)
+                // and Nick Name are kept off the table (they stay in the Edit
+                // popup and the search); with no Full Name entered, the eeAdmin
+                // name stands in, greyed, so no row is left nameless.
+                const fullName = shared("full_name");
+                const nameCell = fullName
+                    ? escapeHtml(fullName)
+                    : (first.agent
+                        ? `<span style="color:var(--text-muted);" title="No Full Name entered — showing the eeAdmin name. Add the Full Name with Edit.">${escapeHtml(first.agent)}</span>`
+                        : "—");
                 const personCells = gi === 0 ? `
-                    <td class="sm-cell" rowspan="${span}" style="font-weight:600;">${escapeHtml(first.agent || "—")}</td>
-                    <td class="sm-cell" rowspan="${span}">${escapeHtml(shared("full_name") || "—")}</td>
-                    <td class="sm-cell" rowspan="${span}">${escapeHtml(shared("nick_name") || "—")}</td>
+                    <td class="sm-cell" rowspan="${span}" style="font-weight:600;">${nameCell}</td>
                     <td class="sm-cell" rowspan="${span}">${escapeHtml(shared("ic_no") || "—")}</td>` : "";
                 const editCell = gi === 0 ? `
                     <td rowspan="${span}" style="white-space:nowrap;">
@@ -1803,9 +1851,9 @@
                     </td>` : "";
                 tr.innerHTML = `
                     <td class="sm-cell">${monthCell}</td>
-                    ${personCells}
                     <td class="sm-cell">${escapeHtml(displayAtype)}</td>
-                    <td class="sm-cell"><span class="role-badge" style="background:#e0e7ff; color:#3730a3; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600;">${escapeHtml(displayRole)}</span>${mismatchHtml}</td>
+                    <td class="sm-cell"${roleCellBg ? ` style="background:${roleCellBg};"` : ""}>${escapeHtml(displayRole)}${mismatchHtml}</td>
+                    ${personCells}
                     <td class="sm-cell">${escapeHtml(displayReports)}</td>
                     <td class="sm-cell">${escapeHtml(displayBranch)}</td>
                     ${editCell}
@@ -1841,7 +1889,7 @@
             const msg = !rolesList.length
                 ? `Loading agents from Postgres… click "🔄 Refresh from Postgres" if nothing appears.`
                 : `No agents match the current filter.`;
-            tbody.innerHTML = `<tr><td colspan="10" style="color:var(--text-muted); text-align:center;">${msg}</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="8" style="color:var(--text-muted); text-align:center;">${msg}</td></tr>`;
         }
 
         // Render pagination controls
@@ -2066,6 +2114,7 @@
             from: from || "", to: open ? "" : to, present: open,
             agent_type: r.agent_type || "", hierarchy: r.hierarchy || "",
             reports_to: r.reports_to || "", branch: r.branch || "",
+            rates: [], oRules: [],
         };
     }
 
@@ -2116,6 +2165,7 @@
             hierarchy: latest ? latest.hierarchy : "",
             reports_to: latest ? latest.reports_to : "",
             branch: latest ? latest.branch : "",
+            rates: [], oRules: [],
         };
         rolePeriods.push(p);
         autoCloseAround(p);
@@ -2135,6 +2185,7 @@
                 else p[f] = String(el.value || "").trim();
             });
             if (p.present) p.to = "";
+            syncOwnRatesFromCard(card, p);
         });
     }
 
@@ -2223,10 +2274,6 @@
                         </select>
                     </div>
                     <div>
-                        <span style="${lbl}">Reports To</span>
-                        <input type="text" data-f="reports_to" list="agentNameList" placeholder="(nobody)" value="${escapeHtml(p.reports_to)}" style="${inp}">
-                    </div>
-                    <div>
                         <span style="${lbl}">Branch</span>
                         <select data-f="branch" style="${inp}">
                             ${opt("", p.branch, "—")}
@@ -2234,8 +2281,15 @@
                         </select>
                     </div>
                 </div>
+                <!-- Reports To on its own line, straight above the Override Rules. -->
+                <div style="max-width:380px;">
+                    <span style="${lbl}">Reports To</span>
+                    <input type="text" data-f="reports_to" list="agentNameList" placeholder="(nobody)" value="${escapeHtml(p.reports_to)}" style="${inp}">
+                </div>
+                ${ownRatesHtml(p, lbl)}
             </div>`;
         }).join("");
+        renderOtherAgentRates();
         updateRolePeriodWarnings();
         if (focusPeriodUid !== null) {
             const card = host.querySelector(`[data-uid="${focusPeriodUid}"]`);
@@ -2258,7 +2312,7 @@
         if (f === "to" && p.to) p.present = false;
         if (f === "present" && p.present) p.to = "";
         if (f === "from" || (f === "present" && p.present)) autoCloseAround(p);
-        if (f === "from" || f === "to" || f === "present") renderRolePeriods();
+        if (f === "from" || f === "to" || f === "present" || f === "agent_type") renderRolePeriods();
         else updateRolePeriodWarnings();
     });
 
@@ -2270,6 +2324,442 @@
         const idx = rolePeriods.findIndex((x) => x.uid === Number(card.dataset.uid));
         if (idx < 0 || rolePeriods.length < 2) return;
         rolePeriods.splice(idx, 1);
+        renderRolePeriods();
+    });
+
+    // ── This agent's own rates ───────────────────────────────────────────────
+    // Each role card also carries the agent's own Basic Commission rows for
+    // that role and Invoice Date range: one line per Property Type with its
+    // Rate % and Payment Rules, plus the role's Override Rules. They are
+    // ordinary commission_rates rows with this agent alone in the Agent cell,
+    // which the engine already ranks above the role's own rate
+    // (basic_commission_rates._scan_unified_rows), so Rate % and Payment Rules
+    // change this agent's commission. A row naming several agents, or naming
+    // this one over a range no card has, stays on the Basic Commission page and
+    // is listed under the cards, read-only.
+
+    // Mirrors COMMISSION_RATE_FIELDS in db.py -- the columns a rates save writes.
+    const COMMISSION_RATE_FIELDS = ["rate_type", "agent_type", "hierarchy", "agent", "label",
+        "rate_pct", "override_rate_pct", "override_from",
+        "profit_sharing_rate_pct", "profit_sharing_mode",
+        "property_type", "job_type", "ev_type", "trigger_pct", "invoice_date_from",
+        "rule_type", "amount_rm", "condition", "effective_from", "remarks"];
+    const OWN_RATE_REMARK = "set on Agent Roles & Hierarchy";
+
+    // {managed, others} once loaded; {loading} while the request is out; {error}
+    // when it failed -- then nothing about rates is written on save.
+    let agentRateLoad = { managed: [], others: [] };
+    let agentRateToken = 0;
+    let agentRateUid = 0;
+
+    function rateRowFromApi(r) {
+        const out = { id: r.id };
+        COMMISSION_RATE_FIELDS.forEach((k) => { out[k] = r[k] == null ? "" : String(r[k]); });
+        if (!out.rate_type) out.rate_type = "Basic Commission";
+        return out;
+    }
+
+    function ratePayload(r) {
+        const out = {};
+        COMMISSION_RATE_FIELDS.forEach((k) => { out[k] = r[k] == null ? "" : String(r[k]); });
+        return out;
+    }
+
+    function periodEff(p) {
+        return p.present ? p.from : `${p.from} to ${p.to}`;
+    }
+
+    function normEffText(s) {
+        return String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+    }
+
+    function rateRowAgents(r) {
+        return String(r.agent || "").split(",").map((a) => a.trim().toLowerCase()).filter(Boolean);
+    }
+
+    function isLiveBasicRow(r) {
+        return (r.rate_type || "Basic Commission") === "Basic Commission"
+            && String(r.remarks || "").trim().toLowerCase() !== "deleted";
+    }
+
+    /** A Solar row naming this agent and nobody else -- the rows a card owns. */
+    function isOwnSolarRow(r, agentKey) {
+        const agents = rateRowAgents(r);
+        const job = String(r.job_type || "").trim();
+        return isLiveBasicRow(r) && agents.length === 1 && agents[0] === agentKey
+            && (job === "" || job === "Solar Services");
+    }
+
+    /** The last month a role card covers, OPEN_ENDED while it is Present. */
+    function periodEnd(p) {
+        return p.present ? OPEN_ENDED : (p.to || OPEN_ENDED);
+    }
+
+    /** A rate line: from its stored row, or a new one over the card's dates.
+     *  Its dates are its own -- a role's rate can change part-way through it
+     *  (a July-August rate inside a role held since July). */
+    function ownRateLine(src, p) {
+        const [from, to] = src ? splitEffRange(src.effective_from) : [p.from, periodEnd(p)];
+        return {
+            uid: ++agentRateUid, src: src || null,
+            from: from || "", to: to === OPEN_ENDED ? "" : (to || ""), present: to === OPEN_ENDED,
+            property: src ? String(src.property_type || "").split(",").map((x) => x.trim()).filter(Boolean) : [],
+            rate_pct: src ? String(src.rate_pct || "").trim() : "",
+            pRules: src ? parsePaymentRulesFromEntry(src) : [],
+        };
+    }
+
+    function lineEff(line) {
+        return line.present ? line.from : `${line.from} to ${line.to}`;
+    }
+
+    /** Everything about a rate line the modal can change, as one string: the
+     *  line's own fields plus its card's Agent Type, Role and Override Rules. */
+    function ownLineState(line, p) {
+        const o = p.oRules.filter((x) => x.override_rate_pct || x.override_from);
+        return JSON.stringify([
+            lineEff(line), line.property.slice().sort(), line.rate_pct,
+            line.pRules.filter((r) => r.trigger_pct || r.amount_rm)
+                .map((r) => [r.trigger_pct, r.rule_type || "Payout", r.amount_rm || ""]),
+            p.agent_type, p.hierarchy,
+            o.map((x) => [x.override_rate_pct, x.override_from]),
+        ]);
+    }
+
+    async function loadAgentOwnRates(agentName) {
+        const token = ++agentRateToken;
+        const key = String(agentName || "").trim().toLowerCase();
+        if (agentName === null || !key) {
+            agentRateLoad = { managed: [], others: [] };
+            return;
+        }
+        agentRateLoad = { loading: true };
+        renderRolePeriods();
+        let all;
+        try {
+            const res = await api("/api/commission-rates");
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            all = (await res.json()).map(rateRowFromApi);
+        } catch (e) {
+            if (token !== agentRateToken) return;
+            agentRateLoad = { error: String((e && e.message) || e) };
+            syncRolePeriodsFromDom();
+            renderRolePeriods();
+            return;
+        }
+        if (token !== agentRateToken) return;
+        syncRolePeriodsFromDom();
+        const managed = [];
+        const others = [];
+        all.forEach((r) => {
+            if (!isLiveBasicRow(r) || !rateRowAgents(r).includes(key)) return;
+            // Its card: the same role, with the rate's dates inside the role's.
+            const [start, end] = splitEffRange(r.effective_from);
+            const p = isOwnSolarRow(r, key) && start && rolePeriods.find((q) => q.from
+                && canonRole(q.hierarchy) === canonRole(r.hierarchy)
+                && (!r.agent_type || String(q.agent_type).toLowerCase() === String(r.agent_type).toLowerCase())
+                && q.from <= start && end <= periodEnd(q));
+            if (!p) { others.push(r); return; }
+            managed.push(r);
+            p.rates.push(ownRateLine(r, p));
+            if (!p.oRules.length) p.oRules = parseOverrideRulesFromEntry(r).slice();
+        });
+        // What each loaded line looked like, so an untouched one is saved as is.
+        rolePeriods.forEach((p) => p.rates.forEach((line) => {
+            if (line.src) line.srcState = ownLineState(line, p);
+        }));
+        agentRateLoad = { managed, others };
+        renderRolePeriods();
+    }
+
+    /** The Override Rules and Rates blocks of one role card. */
+    function ownRatesHtml(p, lbl) {
+        const box = "border-top:1px dashed var(--border-color); padding-top:10px;";
+        if (agentRateLoad.loading) {
+            return `<div style="${box} font-size:12px; color:var(--text-muted);">Loading this agent's rates…</div>`;
+        }
+        if (agentRateLoad.error) {
+            return `<div style="${box} font-size:12px; color:#b45309;">Could not load this agent's rates (${escapeHtml(agentRateLoad.error)}). Their rates are left as they are when you save.</div>`;
+        }
+        const small = "padding:6px 8px; font-size:12.5px; border:1px solid var(--border-color); border-radius:6px;";
+        const muted = "font-size:12px; font-weight:600; color:var(--text-muted);";
+        const btn = "padding:2px 8px; font-size:11.5px;";
+        const roleOpts = getOverrideRolesForAgentType(p.agent_type || "Internal");
+        const oRows = p.oRules.map((o, i) => {
+            const from = o.override_from || "";
+            const opts = roleOpts.includes(from) ? roleOpts : roleOpts.concat([from]);
+            return `
+                <div data-orule="${i}" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                    <span style="${muted}">Override Rate</span>
+                    <input type="number" data-o="pct" step="0.05" value="${escapeHtml(o.override_rate_pct || "")}" placeholder="e.g. 0.5" style="${small} width:90px;">
+                    <span style="${muted}">% &nbsp;|&nbsp; From Role</span>
+                    <select data-o="from" style="${small} width:auto; min-width:150px;">
+                        ${opts.map((x) => `<option value="${escapeHtml(x)}"${x === from ? " selected" : ""}>${x ? escapeHtml(x) : "(all roles)"}</option>`).join("")}
+                    </select>
+                    <button type="button" class="btn btn-secondary" data-act="rm-orule" data-i="${i}" style="${btn} margin-left:auto;">✕</button>
+                </div>`;
+        }).join("");
+        const propList = PROPERTY_TYPES.filter(Boolean);
+        const lines = p.rates.map((line, j) => {
+            const props = propList.concat(line.property.filter((x) => !propList.includes(x)));
+            const pRows = line.pRules.map((r, k) => `
+                <div data-prule="${k}" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                    <span style="${muted}">Payment ≥</span>
+                    <input type="number" data-p="trigger_pct" step="1" value="${escapeHtml(r.trigger_pct || "")}" placeholder="e.g. 75" style="${small} width:80px;">
+                    <span style="${muted}">% &nbsp;|&nbsp; Rule</span>
+                    <select data-p="rule_type" style="${small} width:auto;">
+                        <option value="Payout"${r.rule_type !== "Advance" ? " selected" : ""}>Payout</option>
+                        <option value="Advance"${r.rule_type === "Advance" ? " selected" : ""}>Advance</option>
+                    </select>
+                    <span style="${muted}">Amount (RM)</span>
+                    <input type="number" data-p="amount_rm" step="10" value="${escapeHtml(r.amount_rm || "")}" placeholder="—" style="${small} width:90px;">
+                    <button type="button" class="btn btn-secondary" data-act="rm-prule" data-k="${k}" style="${btn} margin-left:auto;">✕</button>
+                </div>`).join("");
+            return `
+                <div data-rate="${line.uid}" style="border:1px solid var(--border-color); border-radius:6px; padding:10px; display:flex; flex-direction:column; gap:8px; background:#f8fafc;">
+                    <div style="display:flex; align-items:center; justify-content:space-between;">
+                        <strong style="font-size:12px;">Rate ${j + 1}</strong>
+                        <button type="button" class="btn btn-secondary" data-act="rm-rate" style="${btn}">Remove</button>
+                    </div>
+                    <div>
+                        <span style="${lbl}">Invoice Date <span style="font-weight:400;">(inside this role's dates)</span></span>
+                        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                            <span style="${muted}">From</span>
+                            <input type="month" data-rd="from" value="${escapeHtml(line.from)}" style="${small} width:150px;">
+                            <span style="${muted}">To</span>
+                            <input type="month" data-rd="to" value="${escapeHtml(line.to)}" style="${small} width:150px;${line.present ? " opacity:0.5;" : ""}">
+                            <label style="display:flex; align-items:center; gap:6px; font-size:12.5px; font-weight:600; cursor:pointer;">
+                                <input type="checkbox" data-rd="present"${line.present ? " checked" : ""}> Present
+                            </label>
+                        </div>
+                    </div>
+                    <div>
+                        <span style="${lbl}">Property Type <span style="font-weight:400;">(none ticked = all property types)</span></span>
+                        <div style="display:flex; flex-wrap:wrap; gap:6px 14px;">
+                            ${props.map((x) => `<label style="display:flex; align-items:center; gap:5px; font-size:12.5px; cursor:pointer;"><input type="checkbox" data-rp value="${escapeHtml(x)}"${line.property.includes(x) ? " checked" : ""}> ${escapeHtml(x)}</label>`).join("")}
+                        </div>
+                    </div>
+                    <div>
+                        <span style="${lbl}">Rate (%)</span>
+                        <input type="number" data-rf="rate_pct" step="0.05" value="${escapeHtml(line.rate_pct)}" placeholder="e.g. 3.25" style="${small} width:120px;">
+                    </div>
+                    <div style="display:flex; flex-direction:column; gap:6px;">
+                        <div style="display:flex; align-items:center; justify-content:space-between;">
+                            <span style="${lbl} margin-bottom:0;">Payment Rules (Payment ≥ %)</span>
+                            <button type="button" class="btn btn-secondary" data-act="add-prule" style="${btn}">+ Add Payment Stage</button>
+                        </div>
+                        ${pRows || `<div style="font-size:12px; color:var(--text-muted);">No payment stage — the role's payment rule applies.</div>`}
+                    </div>
+                </div>`;
+        }).join("");
+        const roleName = p.hierarchy || "role";
+        return `
+                <div data-sec="own-rates" style="${box} display:flex; flex-direction:column; gap:8px;">
+                    <div style="display:flex; align-items:center; justify-content:space-between;">
+                        <span style="${lbl} margin-bottom:0;">Override Rules</span>
+                        <button type="button" class="btn btn-secondary" data-act="add-orule" style="${btn}">+ Add Override</button>
+                    </div>
+                    ${oRows || `<div style="font-size:12px; color:var(--text-muted);">No override rule.</div>`}
+                </div>
+                <div style="${box} display:flex; flex-direction:column; gap:8px;">
+                    <div style="display:flex; align-items:center; justify-content:space-between;">
+                        <span style="${lbl} margin-bottom:0;">Rates for this agent</span>
+                        <button type="button" class="btn btn-secondary" data-act="add-rate" style="${btn}">+ Add Rate</button>
+                    </div>
+                    ${lines || `<div style="font-size:12px; color:var(--text-muted);">None — this agent gets the ${escapeHtml(roleName)} rate from Basic Commission.</div>`}
+                </div>`;
+    }
+
+    /** Copy one card's Override Rules and rate lines back into its period. Only
+     *  once they are drawn: while loading, the card has none to read. */
+    function syncOwnRatesFromCard(card, p) {
+        if (!card.querySelector("[data-sec='own-rates']")) return;
+        p.oRules = [...card.querySelectorAll("[data-orule]")].map((row) => ({
+            override_rate_pct: String(row.querySelector("[data-o='pct']").value || "").trim(),
+            override_from: row.querySelector("[data-o='from']").value || "",
+        }));
+        p.rates = [...card.querySelectorAll("[data-rate]")].map((el) => {
+            const uid = Number(el.dataset.rate);
+            const line = p.rates.find((x) => x.uid === uid) || ownRateLine(null, p);
+            line.from = String(el.querySelector("[data-rd='from']").value || "").trim();
+            line.present = el.querySelector("[data-rd='present']").checked;
+            line.to = line.present ? "" : String(el.querySelector("[data-rd='to']").value || "").trim();
+            line.property = [...el.querySelectorAll("[data-rp]")].filter((c) => c.checked).map((c) => c.value);
+            line.rate_pct = String(el.querySelector("[data-rf='rate_pct']").value || "").trim();
+            line.pRules = [...el.querySelectorAll("[data-prule]")].map((row) => ({
+                trigger_pct: String(row.querySelector("[data-p='trigger_pct']").value || "").trim(),
+                rule_type: row.querySelector("[data-p='rule_type']").value || "Payout",
+                amount_rm: String(row.querySelector("[data-p='amount_rm']").value || "").trim(),
+            }));
+            return line;
+        });
+    }
+
+    /** Rows naming this agent that no card owns, so they are not lost from view. */
+    function renderOtherAgentRates() {
+        const el = document.getElementById("roleModalOtherRates");
+        if (!el) return;
+        const others = agentRateLoad.others || [];
+        if (!others.length) { el.style.display = "none"; el.innerHTML = ""; return; }
+        const lines = others.map((r) => {
+            const n = rateRowAgents(r).length;
+            const why = n > 1 ? `shared with ${n - 1} other agent${n > 2 ? "s" : ""}`
+                : (r.job_type === "EV Services" ? "EV Services" : `its dates are not inside one of this agent's ${r.hierarchy || ""} roles`);
+            return `<li>${escapeHtml(r.hierarchy || "(any role)")} · ${escapeHtml(r.effective_from || "")} · `
+                + `${escapeHtml(r.property_type || "all property types")} · <strong>${escapeHtml(r.rate_pct || "—")}%</strong>`
+                + ` <span style="color:var(--text-muted);">(${escapeHtml(why)})</span></li>`;
+        }).join("");
+        el.style.display = "";
+        el.innerHTML = `<div style="font-weight:600; margin-bottom:4px;">Other Basic Commission rates naming this agent — edit these on the Basic Commission page:</div>`
+            + `<ul style="margin:0; padding-left:18px;">${lines}</ul>`;
+    }
+
+    /** The first problem with the cards' rates as a sentence, or "". */
+    function ownRatesProblem(agentName) {
+        if (agentRateLoad.loading || agentRateLoad.error) return "";
+        for (let i = 0; i < rolePeriods.length; i++) {
+            const p = rolePeriods[i];
+            const tag = rolePeriods.length > 1 ? `Role ${i + 1}: ` : "";
+            const hasOverride = p.oRules.some((o) => o.override_rate_pct || o.override_from);
+            if ((p.rates.length || hasOverride) && !agentName) {
+                return "Rates and Override Rules are kept against the Agent Name (from eeAdmin), so enter it first.";
+            }
+            if (hasOverride && !p.rates.length) {
+                return `${tag}Override Rules are saved on this agent's rates. Add a rate (+ Add Rate) for this role, or remove the Override Rules.`;
+            }
+            if (p.oRules.some((o) => o.override_from && !o.override_rate_pct)) {
+                return `${tag}An Override Rule has a From Role but no Override Rate %.`;
+            }
+            const roleRange = p.present ? `${fmtMonth(p.from)} to Present` : `${fmtMonth(p.from)} to ${fmtMonth(p.to)}`;
+            for (let j = 0; j < p.rates.length; j++) {
+                const line = p.rates[j];
+                const lt = `${tag}Rate ${j + 1}: `;
+                if (!line.from) return `${lt}enter the month it starts From.`;
+                if (!line.present && !line.to) return `${lt}enter the month it ends in To, or tick Present.`;
+                if (!line.present && line.from > line.to) return `${lt}its dates run backwards.`;
+                const lineEnd = line.present ? OPEN_ENDED : line.to;
+                if (line.from < p.from || lineEnd > periodEnd(p)) {
+                    return `${lt}its Invoice Date must sit inside this role's dates (${roleRange}).`;
+                }
+                if (line.rate_pct === "" || !Number.isFinite(parseFloat(line.rate_pct))) {
+                    return `${lt}enter the Rate %.`;
+                }
+                if (line.pRules.some((r) => !r.trigger_pct && r.amount_rm)) {
+                    return `${lt}a payment stage has an Amount but no Payment ≥ %.`;
+                }
+                // The engine ranks a rate naming property types above one that
+                // does not, then the later start; two rates level on both would
+                // be picked between by row order, so that is refused.
+                for (let k = 0; k < j; k++) {
+                    const other = p.rates[k];
+                    if (other.from !== line.from) continue;
+                    const a = line.property, b = other.property;
+                    const tie = (!a.length && !b.length) || a.some((x) => b.includes(x));
+                    if (tie) return `${lt}it starts in the same month as Rate ${k + 1} and covers the same property type. Change one's start month or property types.`;
+                }
+            }
+        }
+        return "";
+    }
+
+    /** Write the cards' rates over the rows they were loaded from. Every other
+     *  row goes back exactly as the server has it. */
+    async function saveAgentOwnRates(agentName, periods, load) {
+        if (!load || load.loading || load.error) return;
+        const newRows = [];
+        periods.forEach((p) => {
+            const o = p.oRules.filter((x) => x.override_rate_pct || x.override_from);
+            p.rates.forEach((line) => {
+                // Untouched, it goes back exactly as stored: rebuilding it would
+                // reword its condition text and mark a change nobody made.
+                if (line.src && ownLineState(line, p) === line.srcState) {
+                    newRows.push(ratePayload(line.src));
+                    return;
+                }
+                const pRules = line.pRules.filter((r) => r.trigger_pct || r.amount_rm);
+                const base = line.src ? ratePayload(line.src) : {};
+                newRows.push(Object.assign(base, {
+                    rate_type: "Basic Commission",
+                    agent_type: p.agent_type,
+                    hierarchy: p.hierarchy,
+                    agent: agentName,
+                    rate_pct: line.rate_pct,
+                    override_rate_pct: o.map((x) => x.override_rate_pct).filter(Boolean).join(", "),
+                    override_from: o.map((x) => x.override_from).filter(Boolean).join(", "),
+                    property_type: line.property.join(", "),
+                    job_type: "Solar Services",
+                    ev_type: "",
+                    trigger_pct: pRules.map((r) => r.trigger_pct).filter(Boolean).join(", "),
+                    rule_type: pRules.length > 1 ? "Multi-stage" : ((pRules[0] || {}).rule_type || ""),
+                    amount_rm: (pRules.find((r) => r.rule_type === "Advance") || {}).amount_rm || "",
+                    condition: formatPaymentRulesCondition(pRules),
+                    effective_from: lineEff(line),
+                    remarks: line.src ? line.src.remarks : OWN_RATE_REMARK,
+                }));
+            });
+        });
+        const sortKey = (r) => JSON.stringify(ratePayload(r));
+        const before = load.managed.map(sortKey).sort();
+        const after = newRows.map(sortKey).sort();
+        if (before.length === after.length && before.every((x, i) => x === after[i])) return;
+
+        const status = document.getElementById("rolesStatus");
+        status.className = "save-status";
+        status.textContent = "Saving rates...";
+        const res = await api("/api/commission-rates");
+        if (!res.ok) {
+            status.className = "save-status err";
+            status.textContent = "Roles saved, but the rates could not be loaded to save.";
+            return;
+        }
+        const fresh = (await res.json()).map(rateRowFromApi);
+        // The rows this modal loaded are replaced; a row someone else changed
+        // since then no longer matches and is kept as they left it.
+        const loadedKeys = new Set(load.managed.map(sortKey));
+        const kept = fresh.filter((r) => !loadedKeys.has(sortKey(r)));
+        // A rate taken away leaves a tombstone, as the Basic Commission page's
+        // own Delete does, so the resolved view does not fall back to an
+        // older copy of it.
+        const newKeys = new Set(newRows.map(fullEntryKey));
+        const tombstones = load.managed
+            .filter((r) => !newKeys.has(fullEntryKey(r)))
+            .map((r) => Object.assign(ratePayload(r), { rate_pct: "", remarks: "deleted" }));
+        const saveRes = await api("/api/commission-rates", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ entries: kept.map(ratePayload).concat(newRows, tombstones) })
+        });
+        if (!saveRes.ok) {
+            const d = await saveRes.json().catch(() => ({}));
+            status.className = "save-status err";
+            status.textContent = "Roles saved, but the rates failed: " + (d.error || `HTTP ${saveRes.status}`);
+            return;
+        }
+        status.className = "save-status ok";
+        status.textContent = "Saved, with this agent's rates. Commission cache cleared.";
+        await loadEntries();
+        loadPreview();
+        setTimeout(() => { status.textContent = ""; }, 2500);
+    }
+
+    document.getElementById("roleModalPeriods")?.addEventListener("click", (ev) => {
+        const btn = ev.target.closest && ev.target.closest("[data-act]");
+        const act = btn && btn.dataset.act;
+        if (!act || act === "remove") return;
+        const card = btn.closest("[data-uid]");
+        syncRolePeriodsFromDom();
+        const p = card && rolePeriods.find((x) => x.uid === Number(card.dataset.uid));
+        if (!p) return;
+        const rateEl = btn.closest("[data-rate]");
+        const line = rateEl && p.rates.find((x) => x.uid === Number(rateEl.dataset.rate));
+        if (act === "add-orule") p.oRules.push({ override_rate_pct: "", override_from: "" });
+        else if (act === "rm-orule") p.oRules.splice(Number(btn.dataset.i), 1);
+        else if (act === "add-rate") p.rates.push(ownRateLine(null, p));
+        else if (act === "rm-rate" && line) p.rates.splice(p.rates.indexOf(line), 1);
+        else if (act === "add-prule" && line) line.pRules.push({ trigger_pct: "", rule_type: "Payout", amount_rm: "" });
+        else if (act === "rm-prule" && line) line.pRules.splice(Number(btn.dataset.k), 1);
+        else return;
+        focusPeriodUid = p.uid;
         renderRolePeriods();
     });
 
@@ -2310,6 +2800,7 @@
             rolePeriods = [{
                 uid: ++rolePeriodUid, src: null, from: CURRENT_YM, to: "", present: true,
                 agent_type: "", hierarchy: "", reports_to: "", branch: "",
+                rates: [], oRules: [],
             }];
             focusPeriodUid = null;
             document.getElementById("agentRoleModalTitle").textContent = "Add Agent Details";
@@ -2326,6 +2817,7 @@
 
         renderRolePeriods();
         modal.classList.remove("hidden");
+        loadAgentOwnRates(r ? (r.agent || "") : null);
     }
 
     /** One-line explanation shown above the modal's buttons; "" hides it. */
@@ -2404,6 +2896,12 @@
             }
         }
 
+        const ratesProblem = ownRatesProblem(agentName);
+        if (ratesProblem) {
+            alert(ratesProblem);
+            return;
+        }
+
         // Overlaps and gaps are allowed but never silent. Where two roles cover
         // one month the later start wins; a month nobody covers falls back to
         // the old hardcoded name matching.
@@ -2460,8 +2958,11 @@
         // rows are still there, so no tombstone is needed.
         rolesList = rolesList.filter((x) => !editingGroup.includes(x) || kept.has(x));
 
+        const ratePeriods = rolePeriods.slice();
+        const rateLoad = agentRateLoad;
         document.getElementById("agentRoleModal").classList.add("hidden");
         await saveRoles();
+        await saveAgentOwnRates(agentName, ratePeriods, rateLoad);
     });
 
     document.getElementById("roleModalDeleteBtn")?.addEventListener("click", async () => {
@@ -3743,6 +4244,7 @@
             agent_type: r.agent_type || "", hierarchy: r.hierarchy || "", agent: r.agent || "",
             label: r.label || "", condition: r.condition || "",
             rate_pct: r.rate_pct || "", override_rate_pct: r.override_rate_pct || "",
+            override_from: r.override_from || "",
             profit_sharing_rate_pct: r.profit_sharing_rate_pct || "",
             profit_sharing_mode: r.profit_sharing_mode || "",
             property_type: r.property_type || "", trigger_pct: r.trigger_pct || "",
@@ -3803,6 +4305,7 @@
             agent_type: r.agent_type || "", hierarchy: r.hierarchy || "", agent: r.agent || "",
             label: r.label || "", condition: r.condition || "",
             rate_pct: r.rate_pct || "", override_rate_pct: r.override_rate_pct || "",
+            override_from: r.override_from || "",
             profit_sharing_rate_pct: r.profit_sharing_rate_pct || "",
             profit_sharing_mode: r.profit_sharing_mode || "",
             property_type: r.property_type || "", trigger_pct: r.trigger_pct || "",

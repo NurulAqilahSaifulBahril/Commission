@@ -278,6 +278,16 @@
             flex-wrap: wrap;
             gap: 16px;
         }
+        /* Agent Roles & Hierarchy: light grey grid lines between cells, as on
+           the Basic & NFP report. The header keeps its own underline; only its
+           sides are lined, so the columns run straight from header to body. */
+        #rolesTable td {
+            border: 1px solid #e2e8f0;
+        }
+        #rolesTable th {
+            border-left: 1px solid #e2e8f0;
+            border-right: 1px solid #e2e8f0;
+        }
 
     </style>
 </head>
@@ -442,7 +452,7 @@
                         <strong>Variables:</strong>
                         c = Sales Price &nbsp;·&nbsp; d = Net Floor Price &nbsp;·&nbsp; z = Rate %
                         &nbsp;&nbsp;|&nbsp;&nbsp; <strong>NFP Commission</strong> = (c − d) × z
-                        &nbsp;&nbsp;|&nbsp;&nbsp; a sale below the floor price carries a negative rate,
+                        &nbsp;&nbsp;|&nbsp;&nbsp; a sale below the floor price makes (c − d) negative,
                         so the tier becomes a deduction.
                     </div>
                     <div class="data-toolbar" style="flex-wrap:wrap; gap:16px; align-items:center;">
@@ -613,9 +623,9 @@
                         <span class="save-status" id="rolesStatus"></span>
                     </div>
                     <div class="table-container">
-                        <table class="dashboard-table" style="table-layout:auto;">
+                        <table class="dashboard-table" id="rolesTable" style="table-layout:auto;">
                             <thead>
-                                <tr><th>Invoice Date</th><th>Agent Name (from eeAdmin)</th><th>Full Name</th><th>Nick Name</th><th>IC No.</th><th>Agent Type</th><th>Role</th><th>Reports To</th><th>Branch</th><th></th></tr>
+                                <tr><th>Invoice Date</th><th>Agent Type</th><th>Role</th><th>Full Name</th><th>IC No.</th><th>Reports To</th><th>Branch</th><th></th></tr>
                             </thead>
                             <tbody id="rolesBody"></tbody>
                         </table>
@@ -1285,10 +1295,12 @@
                 </div>
 
                 <!-- Roles over time. Each card is one linked unit -- Invoice Date
-                     range, Agent Type, Role, Reports To and Branch travel together,
+                     range, Agent Type, Role, Branch and Reports To travel together,
                      because together they are one row of the agent_roles table.
                      The commission engine reads the unit whose range covers an
-                     invoice's date. Cards are drawn by renderRolePeriods(). -->
+                     invoice's date. Under them, the card's Override Rules and this
+                     agent's own rates (Basic Commission rows naming only them, over
+                     the same range). Cards are drawn by renderRolePeriods(). -->
                 <div class="form-row">
                     <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
                         <label style="font-weight:600; font-size:12px; color:var(--text-muted);">Roles over time</label>
@@ -1296,12 +1308,16 @@
                     </div>
                     <div style="font-size:11px; color:var(--text-muted); margin:4px 0 8px; line-height:1.45;">
                         Each role below is one unit: its <strong>Invoice Date</strong> range, Agent Type, Role,
-                        Reports To and Branch apply together to invoices dated inside that range. Adding a
+                        Branch and Reports To apply together to invoices dated inside that range. Adding a
                         role from a later month closes the open role before it automatically, so an invoice
                         dated in the earlier months still reads the earlier role.
+                        <strong>Rates for this agent</strong> (Property Type, Rate % and Payment Rules) are this
+                        agent's own Basic Commission rates for the role's dates, and take the place of the
+                        role's rate; with none, the role's rate from Basic Commission applies.
                     </div>
                     <div id="roleModalPeriods" style="display:flex; flex-direction:column; gap:12px;"></div>
                     <div id="roleModalPeriodWarnings" style="display:none; margin-top:10px; font-size:11.5px; color:#b45309; line-height:1.5;"></div>
+                    <div id="roleModalOtherRates" style="display:none; margin-top:10px; font-size:11.5px; color:var(--text-muted); line-height:1.5;"></div>
                 </div>
             </div>
             <div class="modal-footer">
@@ -1315,6 +1331,7 @@
         </div>
     </div>
 
-    <script src="/static/data.js?v=20261002-agent-role-rule"></script>
+    <script src="/static/data.js?v=20261014-hide-name-cols"></script>
+    <script src="/static/sidebar_toggle.js?v=20261014-2"></script>
 </body>
 </html>

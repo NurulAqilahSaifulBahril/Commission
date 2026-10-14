@@ -818,7 +818,15 @@ document.addEventListener("DOMContentLoaded", () => {
                     break;
                 }
             }
+            // A case that restated only one commission row has no partner. It
+            // still needs a group of its own, or it cannot be opened or deleted
+            // after a reload -- same as the cold-load path in fetchData().
+            if (!paired.has(row1)) {
+                state.specialCasePairs.push([row1]);
+                paired.add(row1);
+            }
         }
+        foldSpecialCaseRows();
     }
 
     async function applyCommissionPayload(data, { persistCache = false } = {}) {
@@ -1328,6 +1336,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         paired.add(row1);
                     }
                 }
+                foldSpecialCaseRows();
             }
 
             // Populate KPI totals
@@ -1386,6 +1395,11 @@ document.addEventListener("DOMContentLoaded", () => {
         const modalAgentCustomerDisplayRow = document.getElementById("modalAgentCustomerDisplayRow");
         if (modalSelectionGroupRow) modalSelectionGroupRow.classList.toggle("hidden", !isCustomerMode);
         if (modalAgentCustomerDisplayRow) modalAgentCustomerDisplayRow.classList.toggle("hidden", isCustomerMode);
+        // Package Type shares a row with Agent and Customer: the name boxes
+        // for a row's case, the two dropdowns for a customer case.
+        const modalPackageTypeRow = document.getElementById("modalPackageTypeRow");
+        const packageHome = isCustomerMode ? modalSelectionGroupRow : modalAgentCustomerDisplayRow;
+        if (modalPackageTypeRow && packageHome) packageHome.appendChild(modalPackageTypeRow);
         if (modalProfitSharingRow) modalProfitSharingRow.classList.remove("hidden");
         if (previewProfitSharingRow) previewProfitSharingRow.classList.remove("hidden");
         // The Restated Total / Invoice Number pair only makes sense for a
@@ -1555,20 +1569,177 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    // The NFP form's Baseline Rate: which rate this invoice's Net Floor Price
+    // commission takes (NFP commission = (Cash Price - Net Floor Price) x Rate) --
+    //   Cash Price above the package price      100%
+    //   Cash Price above the Net Floor Price     25%
+    //   Cash Price below the Net Floor Price     20%  (the gap is negative,
+    //                                                 so it comes out a deduction)
+    // Decided from the prices, not worked back from the row's commission: a
+    // stale or pre-2026 figure would otherwise show a rate like -0.3%.
+    function setNfpBaselineRate(cash, floor, comm, customer) {
+        const box = document.getElementById("modalNfpBaselineRates");
+        if (!box) return;
+        if (!floor || !cash) { box.value = "-"; box.title = ""; return; }
+        const packagePrice = packagePriceFor(customer);
+        if (packagePrice > 0 && cash > packagePrice && cash > floor) {
+            box.value = "100%";
+            box.title = "Cash Price is above the package price";
+        } else if (cash > floor) {
+            box.value = "25%";
+            box.title = "Cash Price is above the Net Floor Price";
+        } else if (cash < floor) {
+            box.value = "20%";
+            box.title = "Cash Price is below the Net Floor Price: the shortfall is deducted";
+        } else {
+            box.value = "0%";
+            box.title = "Cash Price equals the Net Floor Price";
+        }
+    }
+
+    // The NFP rates a case is worked on: 25% above the floor and 20% (a
+    // deduction) below it, unless it is an "Adjusted Net Floor Price
+    // Commission Rate %" case, whose typed rate replaces whichever applies.
+    // Mirrors _inject_special_case_rows() in app.py.
+    function nfpRatesFor(type) {
+        if (type === "adjusted_nfp_rate") {
+            const pct = parseFloat(modalNfpRatePct?.value);
+            if (Number.isFinite(pct)) return { above: 0.25, below: 0.20, package: 1.00, typed: pct / 100 };
+        }
+        // "Adjusted Rate on (Adjusted) Cash Price %": the typed rate on the
+        // whole Cash Price -- the invoice's, or the one typed with it.
+        if (isCashRateType(type)) {
+            const pct = parseFloat(modalNfpRatePct?.value);
+            if (Number.isFinite(pct)) return { above: 0.25, below: 0.20, package: 1.00, cashTyped: pct / 100 };
+        }
+        return { above: 0.25, below: 0.20, package: 1.00 };
+    }
+
+    // "Adjusted Rate on Cash Price %" (cash_price_rate) and "Adjusted Rate on
+    // Adjusted Cash Price %" (adjusted_cash_price_rate): Cash Price x rate.
+    function isCashRateType(type) {
+        return type === "cash_price_rate" || type === "adjusted_cash_price_rate";
+    }
+
+    // The types that take a new Cash Price typed on the NFP form.
+    function takesAdjustedCashPrice(type) {
+        return type === "adjusted_cash_price" || type === "adjusted_cash_price_rate";
+    }
+
+    // The customer's package price (the package line on their invoices), from
+    // system_details -- the table's System Price column is the Total Amount.
+    function packagePriceFor(customer) {
+        const details = state.rawData?.sections?.basic_nfp?.system_details;
+        const invoices = (details && customer) ? (details[String(customer).trim().toLowerCase()] || []) : [];
+        return invoices.reduce((sum, e) => sum + (parseFloat(e && e.package_price) || 0), 0);
+    }
+
+    // NFP commission = (Cash Price - Net Floor Price) x Rate (corrected 13 Oct
+    // 2026; mirrors invoice_price_basis.nfp_commission in Python): 100% when
+    // the Cash Price is above the package price, else 25% above the floor and
+    // 20% below it, where the gap is negative and so deducts.
+    function nfpCommissionFor(cash, floor, packagePrice, rates) {
+        // "Adjusted Rate on (Adjusted) Cash Price %": Cash Price x the typed rate, sign included
+        // (2 pays 2% of the Cash Price, -2 deducts it); the floor plays no part.
+        if (rates.cashTyped !== undefined) return cash * rates.cashTyped;
+        const gap = cash - floor;
+        // "Adjusted Net Floor Price Commission Rate %": the typed rate as it
+        // stands -- 0.5 pays (Cash Price - Floor) x 0.5%.
+        if (rates.typed !== undefined) return gap * rates.typed;
+        if (packagePrice > 0 && cash > packagePrice && gap > 0) return gap * rates.package;
+        if (gap > 0) return gap * rates.above;
+        if (gap < 0) return gap * rates.below;
+        return 0;
+    }
+
+    function specialCaseCustomerName() {
+        return state.selectedSpecialCaseCustomer || modalCustomerName?.value || "";
+    }
+
+    // The standard rate this invoice's NFP commission uses today, as a percent.
+    function standardNfpRatePct() {
+        const sales = parseFloat(modalAdjustedSalesPrice?.value) || parseFloat(modalSalesPrice?.value) || 0;
+        const nfp = parseFloat(modalNetFloorPrice?.value) || 0;
+        const pkg = packagePriceFor(specialCaseCustomerName());
+        if (pkg > 0 && sales > pkg && sales > nfp) return 100;
+        // Below the floor the rate is still 20: the negative gap makes it a deduction.
+        return sales < nfp ? 20 : 25;
+    }
+
+    // The Cash Price typed under "Adjusted Cash Price After Discount" or
+    // "Adjusted Rate on Adjusted Cash Price %", or null when neither type is
+    // selected or nothing valid has been typed. It beats the Basic case's New
+    // Sales Price, which the NFP form otherwise mirrors.
+    function adjustedCashPriceFor(type) {
+        if (!takesAdjustedCashPrice(type) || !modalAdjustedCashPrice) return null;
+        const raw = String(modalAdjustedCashPrice.value ?? "").trim();
+        if (raw === "") return null;
+        const value = parseFloat(raw);
+        return Number.isFinite(value) ? value : null;
+    }
+
     function onSpecialCaseTypeChange() {
         const type = modalCaseType ? modalCaseType.value : "adjusted_nfp";
+        // Grey while it still shows the "Select Type of Special Case" prompt.
+        if (modalCaseType) modalCaseType.classList.toggle("is-placeholder", !type);
         const openedFromNfp = state.specialCaseRowKind === "nfp";
         const openedFromBasic = state.specialCaseRowKind === "basic";
         // Basic cell: New Sales Price only, never New Net Floor Price.
-        // NFP cell: both, and New Sales Price sits above Type.
-        const showNewSales = openedFromNfp || type === "adjusted_sales_price";
-        const showNewNfp = !openedFromBasic && (openedFromNfp || type === "adjusted_nfp" || type === "adjusted_sales_price");
+        // NFP cell: New Net Floor Price only. A Basic case's New Sales Price is
+        // still copied into the (hidden) field and used by the NFP preview.
+        const showNewSales = !openedFromNfp && type === "adjusted_sales_price";
+        // NFP form: New Net Floor Price only for "Adjusted Net Floor Price" (not
+        // before a type is picked). Hidden, it goes back to the invoice's own
+        // floor, so a figure typed under that type cannot carry over unseen.
+        const showNewNfp = openedFromNfp
+            ? type === "adjusted_nfp"
+            : (!openedFromBasic && (type === "adjusted_nfp" || type === "adjusted_sales_price"));
         placeSpecialCaseSalesPriceRow();
         if (rowAdjustedNfp) rowAdjustedNfp.classList.toggle("hidden", !showNewNfp);
-        if (rowFeeWaiver) rowFeeWaiver.classList.toggle("hidden", type !== "fee_waiver");
+        if (openedFromNfp && !showNewNfp && modalNetFloorPrice
+            && modalNetFloorPrice.dataset.original !== undefined) {
+            modalNetFloorPrice.value = modalNetFloorPrice.dataset.original;
+        }
+        // A fee waiver sets the NFP commission to RM 0, so there is no amount
+        // to type; the preview shows what was waived instead.
+        if (rowFeeWaiver) rowFeeWaiver.classList.add("hidden");
         if (rowAdjustedRate) rowAdjustedRate.classList.toggle("hidden", type !== "adjusted_rate");
+        // One rate box serves every rate type: "Adjusted Net Floor Price
+        // Commission Rate %" (on the price above the floor) and the two
+        // "Adjusted Rate on ... Cash Price %" (on the whole Cash Price), each
+        // with its own label.
+        const isNfpRateType = type === "adjusted_nfp_rate" || isCashRateType(type);
+        if (rowAdjustedNfpRate) {
+            rowAdjustedNfpRate.classList.toggle("hidden", !isNfpRateType);
+            const rateLabel = rowAdjustedNfpRate.querySelector("label");
+            if (rateLabel) rateLabel.textContent = type === "adjusted_cash_price_rate"
+                ? "Adjusted Rate on Adjusted Cash Price (%)"
+                : type === "cash_price_rate"
+                    ? "Adjusted Rate on Cash Price (%)" : "New Net Floor Price Commission Rate (%)";
+        }
+        if (modalNfpRatePct) {
+            modalNfpRatePct.placeholder = isCashRateType(type) ? "e.g. 2 or -2" : "e.g. 0.5";
+            // A pre-filled rate belongs to the type it was filled for: 25% of the
+            // price above the floor must not carry over as 25% of the Cash Price.
+            if (modalNfpRatePct.dataset.autoFor && modalNfpRatePct.dataset.autoFor !== type) {
+                modalNfpRatePct.value = "";
+                delete modalNfpRatePct.dataset.autoFor;
+            }
+        }
+        // Starts on the rate the case would otherwise get, so typing a new one
+        // is a visible change from it. The Cash Price rate types have no such
+        // rate and start empty.
+        if (type === "adjusted_nfp_rate" && modalNfpRatePct && String(modalNfpRatePct.value).trim() === "") {
+            modalNfpRatePct.value = String(standardNfpRatePct());
+            modalNfpRatePct.dataset.autoFor = "adjusted_nfp_rate";
+        }
         if (rowAdjustedSalesPrice) rowAdjustedSalesPrice.classList.toggle("hidden", !showNewSales);
         if (rowRevisedSalesPrice) rowRevisedSalesPrice.classList.toggle("hidden", !showNewSales);
+        // The NFP row's own Cash Price, typed here rather than mirrored from a
+        // Basic case. Only offered on the NFP form (see SPECIAL_CASE_TYPES_BY_ROW).
+        if (rowAdjustedCashPrice) {
+            rowAdjustedCashPrice.classList.toggle("hidden", !(openedFromNfp && takesAdjustedCashPrice(type)));
+        }
         // NFP form: New Sales Price comes from the Basic Commission special
         // case and is edited there, so it is read-only here.
         if (modalAdjustedSalesPrice) {
@@ -1578,6 +1749,31 @@ document.addEventListener("DOMContentLoaded", () => {
                 ? "No Basic Commission special case — invoice sales price is used"
                 : "e.g. 25000.00";
         }
+        // Each row's price has its own name (invoice_price_basis.py): the
+        // Basic row's is the Original Price, the NFP row's the Cash Price. A
+        // case added for a whole customer covers both, so it says Sales Price.
+        const salesLabel = modalSalesPrice?.closest(".form-row")?.querySelector("label");
+        if (salesLabel) {
+            salesLabel.textContent = openedFromNfp ? "Cash Price After Discount (RM)"
+                : openedFromBasic ? "Original Price After Discount (RM)"
+                : "Sales Price (RM)";
+        }
+        // Each form shows only its own row's original commission: the Basic
+        // form works on the Original Price, the NFP form on the Cash Price.
+        const origNfpRow = document.getElementById("modalOrigNfpComm")?.closest(".form-row");
+        if (origNfpRow) origNfpRow.classList.toggle("hidden", openedFromBasic);
+        const origBasicRow = document.getElementById("modalOrigBasicComm")?.closest(".form-row");
+        if (origBasicRow) origBasicRow.classList.toggle("hidden", openedFromNfp);
+        // Baseline Rate: the Basic Commission rate on the Basic form, the three
+        // Net Floor Price rates (25% / 20% / 100%) on the NFP form. The Basic
+        // figure stays in its hidden box either way -- saving reads it.
+        if (modalBaselineRate) modalBaselineRate.classList.toggle("hidden", openedFromNfp);
+        const nfpBaselineRates = document.getElementById("modalNfpBaselineRates");
+        if (nfpBaselineRates) nfpBaselineRates.classList.toggle("hidden", !openedFromNfp);
+        const previewBasicRow = previewBasicComm?.closest(".preview-row");
+        if (previewBasicRow) previewBasicRow.classList.toggle("hidden", openedFromNfp);
+        const previewNfpRow = previewNfpComm?.closest(".preview-row");
+        if (previewNfpRow) previewNfpRow.classList.toggle("hidden", openedFromBasic);
         const salesHint = rowAdjustedSalesPrice?.querySelector("label span");
         if (salesHint) {
             salesHint.textContent = openedFromNfp
@@ -1666,7 +1862,7 @@ document.addEventListener("DOMContentLoaded", () => {
         // Left as-is when off: the type selector drives them normally.
         if (!on) return;
         [rowCaseType, rowAdjustedNfp, rowFeeWaiver, rowAdjustedRate,
-         rowProfitSharing, rowAdjustedSalesPrice, rowRevisedSalesPrice,
+         rowProfitSharing, rowAdjustedSalesPrice, rowAdjustedCashPrice, rowRevisedSalesPrice, rowAdjustedNfpRate,
          rowWaiverSummary, previewProfitSharingRow].forEach(el => {
             if (el) el.classList.add("hidden");
         });
@@ -1685,6 +1881,10 @@ document.addEventListener("DOMContentLoaded", () => {
         if (String(modalAdjustedSalesPrice?.value || "").trim() !== "" && !isNaN(adj)) {
             salesForCalc = adj;
         }
+        // Adjusted Cash Price After Discount is the NFP row's own price and
+        // wins over any mirrored New Sales Price.
+        const cashAdj = adjustedCashPriceFor(type);
+        if (cashAdj != null) salesForCalc = cashAdj;
 
         let rate = baselineRate;
         if (type === "adjusted_rate") {
@@ -1702,25 +1902,29 @@ document.addEventListener("DOMContentLoaded", () => {
         const profitSharingComm = salesForCalc * (profitSharingPct / 100);
 
         let nfp = parseFloat(modalNetFloorPrice?.value) || 0;
+        let nfpComm = nfpCommissionFor(salesForCalc, nfp, packagePriceFor(specialCaseCustomerName()),
+                                       nfpRatesFor(type));
+        // Fee waiver: the NFP commission becomes RM 0; the adjustment is
+        // whatever it takes to get there from the original figure.
         let feeWaiver = 0;
         if (type === "fee_waiver") {
-            feeWaiver = parseFloat(modalFeeWaiver?.value) || 0;
+            feeWaiver = -nfpComm;
+            nfpComm = 0;
         }
-
-        let nfpA = 0, nfpC = 0;
-        if (salesForCalc > nfp) nfpA = (salesForCalc - nfp) * 0.25;
-        if (salesForCalc < nfp) nfpC = (nfp - salesForCalc) * 0.20;
-        let nfpComm = nfpA - nfpC + feeWaiver;
 
         if (previewRevisedSalesPrice) previewRevisedSalesPrice.textContent = formatRM(salesForCalc);
         if (previewBasicComm) previewBasicComm.textContent = formatRM(basicComm);
-        if (previewNfpComm) previewNfpComm.textContent = nfp === 0 ? "TBC with Finance" : formatRM(nfpComm);
+        if (previewNfpComm) previewNfpComm.textContent = (nfp === 0 && type !== "fee_waiver") ? "TBC with Finance" : formatRM(nfpComm);
         if (previewProfitSharingComm) previewProfitSharingComm.textContent = formatRM(profitSharingComm);
-        if (previewWaiverSummary) previewWaiverSummary.textContent = `+${formatRM(feeWaiver)}`;
+        if (previewWaiverSummary) previewWaiverSummary.textContent = feeWaiver < 0
+            ? `-${formatRM(-feeWaiver)}` : `+${formatRM(feeWaiver)}`;
 
         // Shown for information only: this is Gan Lai Soon's money, so it stays
         // out of the agent's Total Net Commission below.
-        const ganApplies = ganOverrideApplies(currentSpecialCaseAgent());
+        // Not on the NFP form: his override rides on the Basic row only, so an
+        // NFP case never changes it (_inject_special_case_rows in app.py).
+        const ganApplies = ganOverrideApplies(currentSpecialCaseAgent())
+            && state.specialCaseRowKind !== "nfp";
         if (rowGanOverride) rowGanOverride.classList.toggle("hidden", !ganApplies);
         if (previewGanOverrideRow) previewGanOverrideRow.classList.toggle("hidden", !ganApplies);
         // Opened by clicking his column: put the caret on the rate that cell
@@ -1741,8 +1945,29 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         }
 
-        const totalNetComm = basicComm + (nfp === 0 ? 0 : nfpComm);
+        // Each row's form previews its own commission only, so its total is
+        // that alone; a whole-customer case shows and adds both.
+        const nfpPart = nfp === 0 ? 0 : nfpComm;
+        const totalNetComm = state.specialCaseRowKind === "nfp" ? nfpPart
+            : state.specialCaseRowKind === "basic" ? basicComm
+            : basicComm + nfpPart;
         if (previewTotalNetComm) previewTotalNetComm.textContent = formatRM(totalNetComm);
+
+        // A new case shows no figures until a Type of Special Case is chosen --
+        // before that there is nothing being changed to preview. Gan Lai Soon's
+        // override form has no type selector, so it always previews.
+        const showsFigures = !!type || !!state.specialCaseGanMode;
+        if (!showsFigures) {
+            [previewRevisedSalesPrice, previewBasicComm, previewNfpComm, previewProfitSharingComm,
+             previewWaiverSummary, previewGanOverrideComm, previewTotalNetComm].forEach(el => {
+                if (el) el.textContent = "";
+            });
+        }
+        // Once there are figures, the "Revised ..." labels go blue to match them.
+        [previewRevisedSalesPrice, previewBasicComm, previewNfpComm].forEach(el => {
+            const label = el?.closest(".preview-row")?.querySelector("span");
+            if (label) label.classList.toggle("preview-revised-label", showsFigures);
+        });
 
         applyGanModeVisibility();
     }
@@ -2425,16 +2650,107 @@ modalPackageType.value = defaults.pkg || "-";
     // A special case appends "New ..." rows next to the invoice's originals, so
     // summing a column blind counts that invoice at both the old rate and the
     // new one. Returns a predicate spotting the originals that were superseded.
+    // Matched per commission: a case on the NFP row supersedes the original NFP
+    // row only, never the customer's Basic row (and the other way round).
+    // foldSpecialCaseRows() normally removes those originals already; this
+    // covers any it could not pair.
     function makeIsReplacedPredicate(processed, commIdx) {
+        const kindOf = (rawRow) => {
+            const t = commIdx === -1 ? "" : String(rawRow[commIdx] || "").toLowerCase();
+            return (t.includes("net floor") || t.includes("netfloor")) ? "nfp" : "basic";
+        };
+        const keyOf = (p) => `${String(p.fullAgentName).toLowerCase()}||${String(p.customerName).toLowerCase()}||${kindOf(p.rawRow)}`;
         const supersededKeys = new Set();
         (processed || []).forEach(p => {
-            if (p.isSpecialCase && !p.isTotalRow) {
-                supersededKeys.add(`${String(p.fullAgentName).toLowerCase()}||${String(p.customerName).toLowerCase()}`);
-            }
+            if (p.isSpecialCase && !p.isTotalRow) supersededKeys.add(keyOf(p));
         });
         if (supersededKeys.size === 0) return () => false;
-        return (p) => supersededKeys.has(`${String(p.fullAgentName).toLowerCase()}||${String(p.customerName).toLowerCase()}`)
-            && isSupersededOriginalRow(p, commIdx);
+        return (p) => supersededKeys.has(keyOf(p)) && isSupersededOriginalRow(p, commIdx);
+    }
+
+    // A saved special case changes the invoice's own commission row instead of
+    // sitting under it as a second row (decided 12 Oct 2026). The server still
+    // sends the case as its own "New ..." row, so each one is folded into the
+    // original it restates: it takes the original's place and every cell the
+    // case does not change (dates, override, referral, payout columns), and the
+    // original drops out of the rows. `replacedOriginal` keeps it, so deleting
+    // the case can put it back and the All-agents totals can take it off the
+    // server rollup. Rows with no original (a hand-added customer) stay as
+    // they are. Safe to run repeatedly.
+    function foldSpecialCaseRows() {
+        const sec = state.rawData?.sections?.basic_nfp;
+        if (!sec || !Array.isArray(sec.rows) || !Array.isArray(sec.headers)) return;
+        const headers = sec.headers, rows = sec.rows;
+        const col = (...names) => headers.findIndex(h => names.includes(String(h).toLowerCase().trim()));
+        const agentIdx = col("agent"), customerIdx = col("customer");
+        const commIdx = col("commission", "commission type"), priceIdx = col("commission price");
+        const salesIdx = col("sales price"), nfpIdx = col("net floor price", "netfloor price");
+        const remarksIdx = col("remarks"), ganIdx = col("gan lai soon", "gan lai soon (rm)");
+        const safwanIdx = col("safwan", "safwan (rm)");
+        if (commIdx === -1 || priceIdx === -1) return;
+
+        const kindOf = (r) => {
+            const t = String(r[commIdx] || "").toLowerCase();
+            if (t.includes("net floor") || t.includes("netfloor")) return "nfp";
+            return t.includes("basic") ? "basic" : "";
+        };
+        // The Agent cell names the agent on the first row of their block only,
+        // so the owner of every row is carried forward, as the table does.
+        const ownerKeys = () => {
+            let a = "", c = "";
+            return rows.map(r => {
+                const av = agentIdx !== -1 ? String(r[agentIdx] || "").trim() : "";
+                if (av && av !== "-") a = av;
+                const cv = customerIdx !== -1 ? String(r[customerIdx] || "").trim() : "";
+                if (cv && cv !== "-") c = cv;
+                return `${a.toLowerCase()}||${c.toLowerCase()}`;
+            });
+        };
+        const isBlank = (v) => { const s = String(v ?? "").trim(); return !s || s === "-"; };
+
+        let keys = ownerKeys();
+        for (const r of [...state.specialCaseRowRefs]) {
+            const sc = r.specialCaseData;
+            if (!sc || String(sc.rowKind || "").toLowerCase() === "gan") continue;
+            const ri = rows.indexOf(r);
+            const kind = kindOf(r);
+            if (ri === -1 || !kind) continue;
+            // Already folded: re-apply the original's cells only, since editing
+            // the case rewrites the whole row from the form (setRowValues).
+            let o = r.replacedOriginal || null;
+            if (!o) {
+                const oi = rows.findIndex((x, i) => i !== ri && !state.specialCaseRowRefs.has(x)
+                    && keys[i] === keys[ri] && kindOf(x) === kind
+                    && !String(x[commIdx] || "").toLowerCase().includes("new"));
+                if (oi === -1) continue;
+                o = rows[oi];
+            }
+
+            // The cells this case decides; everything else stays the invoice's.
+            const owned = new Set([commIdx, priceIdx]);
+            if (kind === "nfp" && nfpIdx !== -1) owned.add(nfpIdx);
+            const adj = sc.adjustedSalesPrice;
+            if (salesIdx !== -1 && adj !== null && adj !== undefined && String(adj).trim() !== "") owned.add(salesIdx);
+            // An Adjusted Cash Price After Discount is the NFP row's price, so
+            // that row shows it in place of the invoice's Cash Price.
+            const cash = sc.adjustedCashPrice;
+            if (salesIdx !== -1 && kind === "nfp" && takesAdjustedCashPrice(sc.specialCaseType)
+                && cash !== null && cash !== undefined && String(cash).trim() !== "") owned.add(salesIdx);
+            if (remarksIdx !== -1 && !isBlank(r[remarksIdx])) owned.add(remarksIdx);
+            if (kind === "basic") {
+                [ganIdx, safwanIdx].forEach(i => { if (i !== -1 && !isBlank(r[i])) owned.add(i); });
+            }
+            for (let ci = 0; ci < headers.length; ci++) {
+                if (!owned.has(ci)) r[ci] = o[ci];
+            }
+            const oi = rows.indexOf(o);
+            if (oi !== -1) {
+                r.replacedOriginal = o;
+                rows.splice(ri, 1);
+                rows.splice(rows.indexOf(o), 1, r);
+                keys = ownerKeys();
+            }
+        }
     }
 
     // Override money always sits on the DOWNLINE agent's detail row while
@@ -2664,15 +2980,23 @@ modalPackageType.value = defaults.pkg || "-";
 
             (processed || []).forEach(p => {
                 if (p.isTotalRow) return;
+                // A case folded into its original row (foldSpecialCaseRows)
+                // carries that original, which the rollup still counts.
+                const folded = p.originalRow && p.originalRow.replacedOriginal;
+                // A Gan-only case is stored on the invoice's own Basic row and
+                // restates nothing, so the rollup already holds that figure.
+                if (String(p.originalRow?.specialCaseData?.rowKind || "").toLowerCase() === "gan") return;
                 if (commPriceIdx !== -1) {
                     if (p.isSpecialCase) totalCommission += parseMoneyValue(p.rawRow[commPriceIdx]);
                     else if (isReplaced(p)) totalCommission -= parseMoneyValue(p.rawRow[commPriceIdx]);
+                    if (p.isSpecialCase && folded) totalCommission -= parseMoneyValue(folded[commPriceIdx]);
                 }
                 // A special case can restate the sales price (Adjusted Sales
                 // Price), so apply the same add-new / remove-replaced delta.
                 if (salesIdx !== -1 && isBasicRow(p)) {
                     if (p.isSpecialCase) totalSales += parseMoneyValue(p.rawRow[salesIdx]);
                     else if (isReplaced(p)) totalSales -= parseMoneyValue(p.rawRow[salesIdx]);
+                    if (p.isSpecialCase && folded) totalSales -= parseMoneyValue(folded[salesIdx]);
                 }
             });
         } else {
@@ -3402,12 +3726,24 @@ modalPackageType.value = defaults.pkg || "-";
         // 1. Basic Commission
         if (commTypeLower.includes("basic commission")) {
             const milestones = getBasicMilestoneLines(row, headers, custName);
-            if (row.specialCaseData) {
+            // A Gan-only case leaves the Basic commission as it was, so it takes
+            // the ordinary hover below.
+            if (row.specialCaseData && String(row.specialCaseData.rowKind || "").toLowerCase() !== "gan") {
+                // The rate the case pays at: an "Adjusted Basic Commission Rate %"
+                // case's own rate overrides the row's assigned one, plus any
+                // profit sharing -- the same sum app.py's basic_comm uses.
+                const sc = row.specialCaseData;
+                const scRate = parseFloat(sc.rate);
+                const scSharing = parseFloat(sc.profitSharingPct) || 0;
+                const rateText = Number.isFinite(scRate)
+                    ? `${Math.round((scRate + scSharing) * 10000) / 10000}%` : "Rate";
+                const scSales = specialCaseRevisedSalesAmount(sc);
+                const usedSales = scSales != null ? scSales : sales;
                 return {
                     title: `Basic Commission — ${custName || "Special Case"}`,
                     preformula: milestones,
-                    formula: `Sales Price = Total Amount - EPP Effective`,
-                    subtext: `Basic Commission = Sales Price × Rate % = ${fmtNum(sales)} × Rate = ${commValStr}` + clickTip
+                    formula: `Original Price = Total Amount - EPP + Lucky Draw`,
+                    subtext: `Basic Commission = Original Price × Rate % = ${fmtNum(usedSales)} × ${rateText} = ${commValStr}` + clickTip
                 };
             }
             // The rate the agent was actually assigned, carried on the row.
@@ -3424,11 +3760,11 @@ modalPackageType.value = defaults.pkg || "-";
                 const hasEvAddon = /\+/.test(assignedRate) && /EV/i.test(assignedRate);
                 const formulaLine = hasEvAddon
                     ? `Basic Commission = solar Basic + EV items × EV rate (${assignedRate})${advanceStr} = ${commValStr}`
-                    : `Basic Commission = Sales Price × Rate % = ${fmtNum(sales)} × ${assignedRate}${advanceStr} = ${commValStr}`;
+                    : `Basic Commission = Original Price × Rate % = ${fmtNum(sales)} × ${assignedRate}${advanceStr} = ${commValStr}`;
                 return {
                     title: `Basic Commission — ${custName}`,
                     preformula: milestones,
-                    formula: `Sales Price = Total Amount - EPP Effective`,
+                    formula: `Original Price = Total Amount - EPP + Lucky Draw`,
                     subtext: formulaLine + clickTip
                 };
             }
@@ -3439,37 +3775,61 @@ modalPackageType.value = defaults.pkg || "-";
                 return {
                     title: `Basic Commission — ${custName}`,
                     preformula: milestones,
-                    formula: `Sales Price = Total Amount - EPP Effective`,
-                    subtext: `Basic Commission = Sales Price × Rate % = ${fmtNum(sales)} × ${ratePct}% = ${commValStr}` + clickTip
+                    formula: `Original Price = Total Amount - EPP + Lucky Draw`,
+                    subtext: `Basic Commission = Original Price × Rate % = ${fmtNum(sales)} × ${ratePct}% = ${commValStr}` + clickTip
                 };
             }
             return {
                 title: `Basic Commission — ${custName}`,
                 preformula: milestones,
-                formula: `Sales Price = Total Amount - EPP Effective`,
-                subtext: `Basic Commission = Sales Price × Rate % = ${commValStr || "Standard Rate"}` + clickTip
+                formula: `Original Price = Total Amount - EPP + Lucky Draw`,
+                subtext: `Basic Commission = Original Price × Rate % = ${commValStr || "Standard Rate"}` + clickTip
             };
         }
 
-        // 2. Net Floor Price Commission
+        // 2. Net Floor Price Commission = (Cash Price - Net Floor Price) x Rate
+        // (corrected 13 Oct 2026): 100% above the package price, 25% above the
+        // floor, 20% below it, where the gap is negative and so deducts.
         if (commTypeLower.includes("net floor price")) {
+            const nfpFormula = `Net Floor Price Commission = (Cash Price − Net Floor Price) × Rate`;
+            const rateLine = (cash, floor) => {
+                const pkg = packagePriceFor(custName);
+                if (pkg > 0 && cash > pkg && cash > floor) return { pct: 100, why: `Cash Price above package price (${fmtNum(pkg)})` };
+                if (cash > floor) return { pct: 25, why: `Cash Price above Net Floor Price (${fmtNum(floor)})` };
+                if (cash < floor) return { pct: 20, why: `Cash Price below Net Floor Price (${fmtNum(floor)}): deduction` };
+                return { pct: 0, why: `Cash Price equals the Net Floor Price` };
+            };
             if (row.specialCaseData) {
                 const sc = row.specialCaseData;
-                const scSales = specialCaseRevisedSalesAmount(sc);
+                const scCash = takesAdjustedCashPrice(sc.specialCaseType) ? Number(sc.adjustedCashPrice) : NaN;
+                const scSales = Number.isFinite(scCash) && scCash !== 0
+                    ? scCash : specialCaseRevisedSalesAmount(sc);
                 const scNfp = Number(sc.nfp);
                 const usedSales = scSales != null ? scSales : sales;
                 const usedNfp = Number.isFinite(scNfp) ? scNfp : nfp;
+                const typedPct = parseFloat(sc.nfpRatePct);
+                // The Cash Price rate types skip the floor altogether.
+                if (isCashRateType(sc.specialCaseType) && Number.isFinite(typedPct)) {
+                    return {
+                        title: `Net Floor Price Commission — ${custName || "Special Case"}`,
+                        formula: `Net Floor Price Commission = Cash Price × Rate`,
+                        subtext: `Special Case = ${fmtNum(usedSales)} × ${typedPct}% = ${commValStr}` + clickTip
+                    };
+                }
+                const r = sc.specialCaseType === "adjusted_nfp_rate" && Number.isFinite(typedPct)
+                    ? { why: `Adjusted rate ${typedPct}%` }
+                    : rateLine(usedSales, usedNfp);
                 return {
                     title: `Net Floor Price Commission — ${custName || "Special Case"}`,
-                    formula: `Net Floor Price Commission = (Sales Price - Net Floor Price) × Rate%`,
-                    subtext: `Special Case = (${fmtNum(usedSales)} − ${fmtNum(usedNfp)}) × Rate% = ${commValStr}` + clickTip
+                    formula: nfpFormula,
+                    subtext: `Special Case = (${fmtNum(usedSales)} − ${fmtNum(usedNfp)}) × Rate = ${commValStr}<br/>${r.why}` + clickTip
                 };
             }
 
             if (nfpStr.toLowerCase().includes("invoice before oct") || commValStr.toLowerCase().includes("invoice before oct")) {
                 return {
                     title: `Net Floor Price Commission — ${custName}`,
-                    formula: `Net Floor Price Commission = (Sales Price - Net Floor Price) × Rate%`,
+                    formula: nfpFormula,
                     subtext: `Invoice Date (${invDate || "pre-Oct 2025"}) < October 2025 → invoice before Oct 25` + clickTip
                 };
             }
@@ -3477,35 +3837,25 @@ modalPackageType.value = defaults.pkg || "-";
             if (nfpStr.toLowerCase().includes("jinkosolar package not included") || commValStr.toLowerCase().includes("jinkosolar package not included")) {
                 return {
                     title: `Net Floor Price Commission — ${custName}`,
-                    formula: `Net Floor Price Commission = (Sales Price - Net Floor Price) × Rate%`,
+                    formula: nfpFormula,
                     subtext: `Package (${pkgStr || "Standard"}) without 590W / 620W / 650W → JinkoSolar package not included` + clickTip
                 };
             }
 
             if (sales > 0 && nfp > 0) {
-                if (sales >= nfp) {
-                    const diff = sales - nfp;
-                    const commCalc = diff * 0.25;
-                    return {
-                        title: `Net Floor Price Commission — ${custName}`,
-                        formula: `Net Floor Price Commission = (Sales Price - Net Floor Price) × Rate%`,
-                        subtext: `= (${fmtNum(sales)} - ${fmtNum(nfp)}) × 25% = RM ${fmtNum(commCalc)}` + clickTip
-                    };
-                } else {
-                    const diff = sales - nfp;
-                    const commCalc = diff * 0.20;
-                    return {
-                        title: `Net Floor Price Commission — ${custName}`,
-                        formula: `Net Floor Price Commission = (Sales Price - Net Floor Price) × Rate%`,
-                        subtext: `= (${fmtNum(sales)} - ${fmtNum(nfp)}) × 20% = -RM ${fmtNum(Math.abs(commCalc))} (Deduction)` + clickTip
-                    };
-                }
+                const r = rateLine(sales, nfp);
+                const result = commValStr && /RM/i.test(commValStr) ? commValStr : formatRM((sales - nfp) * r.pct / 100);
+                return {
+                    title: `Net Floor Price Commission — ${custName}`,
+                    formula: nfpFormula,
+                    subtext: `= (${fmtNum(sales)} − ${fmtNum(nfp)}) × ${r.pct}% = ${result}<br/>${r.why}` + clickTip
+                };
             }
 
             return {
                 title: `Net Floor Price Commission — ${custName}`,
-                formula: `Net Floor Price Commission = (Sales Price - Net Floor Price) × Rate%`,
-                subtext: `= (${fmtNum(sales)} - ${fmtNum(nfp)}) × Rate% = ${commValStr || "-"}` + clickTip
+                formula: nfpFormula,
+                subtext: `= (${fmtNum(sales)} − Net Floor Price) × Rate = ${commValStr || "-"}` + clickTip
             };
         }
 
@@ -3515,7 +3865,7 @@ modalPackageType.value = defaults.pkg || "-";
     // ------------------------------------------------------------------
     // Agent Summary Inline Renderer
     // ------------------------------------------------------------------
-    function renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents, filteredAgentStats, agentRemarks) {
+    function renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents, filteredAgentStats) {
         const headers = agSummarySection.headers;
         const agentColIdx = headers.findIndex(h => h.toLowerCase().trim() === "agent");
         const totalInvColIdx = getCountColumnIdx(headers);
@@ -3597,9 +3947,6 @@ modalPackageType.value = defaults.pkg || "-";
             else if (isDateHeader(h)) th.classList.add("date");
             trHead.appendChild(th);
         });
-        const thRemark = document.createElement("th");
-        thRemark.textContent = "Remark";
-        trHead.appendChild(thRemark);
         const thAction = document.createElement("th");
         thAction.textContent = "Action";
         thAction.style.textAlign = "center";
@@ -3782,20 +4129,6 @@ modalPackageType.value = defaults.pkg || "-";
                 tr.appendChild(td);
             }
 
-            // Remark: the distinct Remarks this agent's detail rows carry, so
-            // it narrows with the same filters as the rest of the table. Merged
-            // per agent block like the Agent cell, since it is an agent-level
-            // roll-up rather than a per-row value.
-            if (agentVisible[ri]) {
-                const tdRemark = document.createElement("td");
-                if (agentSpans[ri] > 1) tdRemark.rowSpan = agentSpans[ri];
-                const remarks = agentRemarks
-                    ? agentRemarks.get(String(fullAgentNames[ri]).toLowerCase().trim())
-                    : null;
-                tdRemark.textContent = remarks && remarks.size ? [...remarks].join("; ") : "-";
-                tr.appendChild(tdRemark);
-            }
-
             // Action column cell for Monthly Commission Slip
             if (agentVisible[ri]) {
                 const tdAction = document.createElement("td");
@@ -3838,6 +4171,11 @@ modalPackageType.value = defaults.pkg || "-";
     // ------------------------------------------------------------------
     function renderActiveSection() {
         showLoader(false);
+        // Special cases restate their own row rather than adding one under it.
+        foldSpecialCaseRows();
+        // Lets the stylesheet draw the Basic & NFP tables' grid lines without
+        // touching the other sections' tables (styles.css).
+        document.body.classList.toggle("section-basic-nfp", state.activeSection === "basic_nfp");
         updateHeaders();
         updateNoteBox();
 
@@ -4071,23 +4409,6 @@ modalPackageType.value = defaults.pkg || "-";
         // An agent is in view if they still have detail rows, or if they earn
         // an override and their own name matches the search (an OGM owns no
         // detail rows at all, so only the credit keeps their row alive).
-        // Per-agent Remark roll-up for the summary table. Read off the payload's
-        // own headers rather than the local copy, which drops "Remarks" when no
-        // special case is present -- the row arrays keep the column either way.
-        const agentRemarks = new Map();
-        const payloadHeaders = state.rawData?.sections?.basic_nfp?.headers || headers;
-        const remarksIdx = payloadHeaders.findIndex(h => String(h).toLowerCase().trim() === "remarks");
-        if (remarksIdx !== -1) {
-            filteredProcessed.forEach(p => {
-                if (p.isTotalRow) return;
-                const text = String(p.rawRow[remarksIdx] || "").trim();
-                if (!text || text === "-") return;
-                const key = String(p.fullAgentName).toLowerCase().trim();
-                if (!agentRemarks.has(key)) agentRemarks.set(key, new Set());
-                agentRemarks.get(key).add(text);
-            });
-        }
-
         const agentsInView = new Set([...visibleAgents].map(a => String(a).toLowerCase().trim()));
         if (filteredAgentStats) {
             filteredAgentStats.forEach((s, name) => {
@@ -4124,6 +4445,13 @@ modalPackageType.value = defaults.pkg || "-";
         // left-to-right scan always finds the whole run, whatever survives.
         const OTHER_COMMISSION_GROUP_HEADERS = new Set(["override", "safwan (rm)", "gan lai soon"]);
         const isOtherCommissionHeader = (h) => OTHER_COMMISSION_GROUP_HEADERS.has(String(h).toLowerCase().trim());
+        // Referral Name and Referral Fee headers sit on a light orange fill (see
+        // .referral-header in styles.css) so the two hand-entered columns stand out.
+        const isReferralHeader = (h) => ["referral name", "referral fee"].includes(String(h).toLowerCase().trim());
+        // Commission (the type) and Commission Price headers sit on a light green fill
+        // (.commission-header). Exact names only: "Other Commission" is its own group.
+        const isCommissionHeader = (h) => ["commission", "commission type", "commission price"]
+            .includes(String(h).toLowerCase().trim());
         const useGroupedHeader = state.activeSection === "basic_nfp"
             && headers.some((h, ci) => !hiddenDetailCols.has(ci) && isOtherCommissionHeader(h));
 
@@ -4144,7 +4472,9 @@ modalPackageType.value = defaults.pkg || "-";
                     const groupTh = document.createElement("th");
                     groupTh.textContent = "Other Commission";
                     groupTh.colSpan = runCols.length;
-                    groupTh.classList.add("group-header");
+                    // The whole Other Commission block -- the merged heading and its
+                    // Override / Safwan / Gan Lai Soon sub-headers -- is light pink.
+                    groupTh.classList.add("group-header", "other-commission-header");
                     tableGroupHeaders.appendChild(groupTh);
                     runCols.forEach(rc => {
                         const subH = headers[rc];
@@ -4152,6 +4482,7 @@ modalPackageType.value = defaults.pkg || "-";
                         th.textContent = subH;
                         if (isNumericHeader(subH)) th.classList.add("numeric");
                         else if (isDateHeader(subH)) th.classList.add("date");
+                        th.classList.add("other-commission-header");
                         tableHeaders.appendChild(th);
                     });
                 } else {
@@ -4160,6 +4491,8 @@ modalPackageType.value = defaults.pkg || "-";
                     th.rowSpan = 2;
                     if (isNumericHeader(h)) th.classList.add("numeric");
                     else if (isDateHeader(h)) th.classList.add("date");
+                    if (isReferralHeader(h)) th.classList.add("referral-header");
+                    if (isCommissionHeader(h)) th.classList.add("commission-header");
                     tableGroupHeaders.appendChild(th);
                     ci++;
                 }
@@ -4172,6 +4505,8 @@ modalPackageType.value = defaults.pkg || "-";
                 th.textContent = basicNfpHeaderLabel(h);
                 if (isNumericHeader(h)) th.classList.add("numeric");
                 else if (isDateHeader(h)) th.classList.add("date");
+                if (isReferralHeader(h)) th.classList.add("referral-header");
+                if (isCommissionHeader(h)) th.classList.add("commission-header");
                 tableHeaders.appendChild(th);
             });
         }
@@ -4210,9 +4545,9 @@ modalPackageType.value = defaults.pkg || "-";
                 tableContainer.insertBefore(actionsTarget, dataTable);
                 actionsTarget.appendChild(actionsGroup);
 
-                if (hasAgentSummary) renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents, filteredAgentStats, agentRemarks);
+                if (hasAgentSummary) renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents, filteredAgentStats);
             } else {
-                if (hasAgentSummary) renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents, filteredAgentStats, agentRemarks);
+                if (hasAgentSummary) renderAgentSummaryInline(agSummarySection, isOutsource, visibleAgents, filteredAgentStats);
 
                 // These used to be tucked into the legend bar when it was on
                 // screen; with the legend gone they always get their own
@@ -4314,14 +4649,15 @@ modalPackageType.value = defaults.pkg || "-";
                 _nfpCol
             ].filter(c => c !== -1))];
 
-            // Columns that show "-" on the 2nd (NFP) row of each Basic+NFP pair
+            // Columns that show "-" on the 2nd (NFP) row of each Basic+NFP pair.
+            // Not the Sales Price column: the Basic row shows the Original Price
+            // and the NFP row its own Cash Price (invoice_price_basis.py).
             const nfpDashCols = [...new Set([
                 customerIdx,
                 headers.findIndex(h => h.toLowerCase().includes("invoice date")),
                 headers.findIndex(h => h.toLowerCase().includes("1st payment")),
                 headers.findIndex(h => h.toLowerCase().includes("full payment")),
-                headers.findIndex(h => h.toLowerCase().trim() === "system price"),
-                headers.findIndex(h => h.toLowerCase().trim() === "sales price" || h.toLowerCase().trim() === "total amount")
+                headers.findIndex(h => h.toLowerCase().trim() === "system price")
             ].filter(c => c !== -1))];
 
             let i = 0;
@@ -4416,8 +4752,9 @@ modalPackageType.value = defaults.pkg || "-";
                 headers.findIndex(h => h.toLowerCase().includes("75%") || h.toLowerCase().includes("75 %")),
                 headers.findIndex(h => h.toLowerCase().includes("package")),
                 systemPriceIdx,
-                nfpIdx,
-                salesPriceIdx
+                nfpIdx
+                // Sales Price is per row, not merged: Original Price on the
+                // Basic row, Cash Price on the NFP row.
             ].filter(c => c !== -1))];
 
             // effectiveCustomerNames defined above
@@ -4513,7 +4850,8 @@ modalPackageType.value = defaults.pkg || "-";
                 const nfpHandedToNewRow = isOriginalNfpRow && !!groupNewNfpRow;
                 const tr = document.createElement("tr");
                 if (rowClass) tr.className = rowClass;
-                if (isSpecialRow) tr.classList.add("special-case-row");
+                // A special case now reads as the invoice's own row: same label,
+                // same black text, the restated figures in place of the old.
                 const groupAnchorIndex = specialCaseGroupAnchorByRowIndex[ri];
                 const isGroupAnchor = groupAnchorIndex === ri;
                 const isGroupFollower = groupAnchorIndex !== ri;
@@ -4538,6 +4876,11 @@ modalPackageType.value = defaults.pkg || "-";
                         if (remainder !== parseMoneyValue(displayVal)) displayVal = formatRM(remainder);
                     }
                     td.innerHTML = displayVal;
+                    // The data keeps "New Basic Commission" (edit and delete
+                    // find the case by it); the table shows the plain name.
+                    if (isSpecialRow && ci === commissionIdx) {
+                        td.textContent = String(displayVal).replace(/^\s*new\s+/i, "");
+                    }
                     if (ci === agentIdx && displayVal !== "-") {
                         td.textContent = resolveAgentName(displayVal);
                         // The agent cell is merged down every row it owns, so
@@ -4601,59 +4944,37 @@ modalPackageType.value = defaults.pkg || "-";
                         }
                     }
 
+                    // A revised floor price or sales price shows on its own --
+                    // the old figure lives in the special case, not the table.
                     if (isGroupAnchor && ci === nfpIdx) {
                         const secondaryValue = specialCaseGroupNfpByAnchor.get(ri);
-                        if (secondaryValue && secondaryValue !== "-") {
-                            td.innerHTML = `
-                                <div class="special-case-merge-stack">
-                                    <span class="special-case-primary-value">${displayVal}</span>
-                                    <span class="special-case-secondary-value">${secondaryValue}</span>
-                                </div>
-                            `;
-                            td.classList.add("special-case-merge-cell");
-                        } else {
-                            td.innerHTML = displayVal;
-                        }
+                        td.innerHTML = (secondaryValue && secondaryValue !== "-") ? secondaryValue : displayVal;
                     }
 
                     if (isGroupAnchor && ci === salesPriceIdx) {
                         const secondarySales = specialCaseGroupSalesByAnchor.get(ri);
-                        const originalSalesAmt = parseMoneyValue(displayVal);
-                        const secondarySalesAmt = parseMoneyValue(secondarySales || "");
                         if (secondarySales && secondarySales !== "-"
-                            && secondarySalesAmt !== originalSalesAmt) {
-                            td.innerHTML = `
-                                <div class="special-case-merge-stack">
-                                    <span class="special-case-primary-value">${displayVal}</span>
-                                    <span class="special-case-secondary-value">${secondarySales}</span>
-                                </div>
-                            `;
-                            td.classList.add("special-case-merge-cell");
+                            && parseMoneyValue(secondarySales) !== parseMoneyValue(displayVal)
+                            && String(row[commissionIdx] || "").toLowerCase().includes("basic")) {
+                            td.innerHTML = secondarySales;
                         }
                     }
 
 
 
-                    // Item 4: Red remark TEXT for special case rows. The cell's
+                    // A special case's remark, in the row's normal text. The cell's
                     // background is left to the row — it used to be forced to
                     // the row's tier colour in JS, but with the tier tint gone
                     // there is nothing left to match, and inheriting keeps it
                     // level with its neighbours whether or not there's a remark.
                     if (isSpecialRow && remarksIdx !== -1 && ci === remarksIdx) {
                         td.textContent = (row.specialCaseData && row.specialCaseData.remarks) ? String(row.specialCaseData.remarks) : displayVal;
-                        td.classList.add("new-commission-value");
-                        td.classList.add("special-case-remarks");
                         td.classList.add("special-case-remarks-cell");
                         td.style.whiteSpace = "normal";
                     }
 
-                    if (isSpecialRow && referralFeeIdx !== -1 && ci === referralFeeIdx) {
-                        td.classList.add("special-case-referral-fee");
-                    }
-
-                    // Special row: red commission price value, edit on click
+                    // Special row: commission price opens the case on click
                     if (isSpecialRow && ci === commissionPriceIdx) {
-                        td.classList.add("new-commission-value");
                         if (userObj && !userObj.readOnly && state.activeSection === "basic_nfp" && isEditSpecialCaseEligible(rowCommType)) {
                             td.style.cursor = "pointer";
                             td.title = "Click to edit Special Case";
@@ -4662,9 +4983,8 @@ modalPackageType.value = defaults.pkg || "-";
                         }
                     }
 
-                    // Special row: red commission type label, edit on click
+                    // Special row: commission label opens the case on click
                     if (isSpecialRow && ci === commissionIdx && isEditSpecialCaseEligible(rowCommType)) {
-                        td.classList.add("new-commission-value");
                         if (userObj && !userObj.readOnly) {
                             td.style.cursor = "pointer";
                             td.title = "Click to edit Special Case";
@@ -4790,6 +5110,7 @@ modalPackageType.value = defaults.pkg || "-";
                         }
                     }
 
+                    if (ci === remarksIdx) markSpecialCaseWords(td);
                     tr.appendChild(td);
                 }
                 tableBody.appendChild(tr);
@@ -4865,6 +5186,7 @@ modalPackageType.value = defaults.pkg || "-";
                         }
                     }
 
+                    if (String(colHeader).toLowerCase().trim() === "remarks") markSpecialCaseWords(td);
                     tr.appendChild(td);
                 }
                 tableBody.appendChild(tr);
@@ -5921,6 +6243,31 @@ modalPackageType.value = defaults.pkg || "-";
         return t === "basic commission" || t.includes("net floor price");
     }
 
+    // Any "Special Case" typed into a remark shows in red, wherever the remark
+    // is drawn. Walks the text nodes so markup already in the cell survives.
+    function markSpecialCaseWords(el) {
+        if (!el || !/special\s+case/i.test(el.textContent || "")) return;
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        const nodes = [];
+        while (walker.nextNode()) nodes.push(walker.currentNode);
+        nodes.forEach(node => {
+            const parts = node.nodeValue.split(/(special\s+case)/i);
+            if (parts.length < 2) return;
+            const frag = document.createDocumentFragment();
+            parts.forEach((part, i) => {
+                if (i % 2 === 1) {
+                    const span = document.createElement("span");
+                    span.className = "remark-special-case";
+                    span.textContent = part;
+                    frag.appendChild(span);
+                } else if (part) {
+                    frag.appendChild(document.createTextNode(part));
+                }
+            });
+            node.parentNode.replaceChild(frag, node);
+        });
+    }
+
     function shouldHighlightSpecialCaseCell(cell, cellIdx, rowCommissionType, commissionPriceIdx, remarksIdx) {
         if (!cell.isSpecialCase) return false;
         if (remarksIdx !== -1 && cellIdx === remarksIdx) return true;
@@ -6049,8 +6396,8 @@ modalPackageType.value = defaults.pkg || "-";
             content = `
                 <b>Basic Commission Rules:</b>
                 <ul>
-                    <li>Total Amount - EPP Price (if applicable) = Sales Price</li>
-                    <li>Sales Price x Rate % = Basic Commission</li>
+                    <li>Total Amount - EPP Price (if applicable) + Lucky Draw = Original Price</li>
+                    <li>Original Price x Rate % = Basic Commission</li>
                     <li><b>Payout Condition:</b>
                         <ul>
                             <li><b>Jan–June:</b> Full Basic Commission payout once paid = 100%</li>
@@ -6065,9 +6412,11 @@ modalPackageType.value = defaults.pkg || "-";
                 <ul>
                     <li>NFP Commission payout once paid = 100%</li>
                     <li>NFP Commission effective for invoice starting OCT 1, 2025</li>
-                    <li><b>Sales above Net Floor Price:</b> (Sales Price - Net Floor Price) x 25% = NFP Commission</li>
-                    <li><b>Sales above System Price:</b> (System Price - Net Floor Price) x 100% = NFP Commission</li>
-                    <li><b>Sales below Net Floor Price:</b> (Sales Price - Net Floor Price) x bears 20% = NFP Commission</li>
+                    <li>Total Amount - Add-ons (battery, ATS, cable, hybrid upgrade, markup) = Cash Price</li>
+                    <li><b>NFP Commission = (Cash Price - Net Floor Price) x Rate</b> (invoices from 2026)</li>
+                    <li><b>Cash Price above package price:</b> Rate = 100%</li>
+                    <li><b>Cash Price above Net Floor Price:</b> Rate = 25%</li>
+                    <li><b>Cash Price below Net Floor Price:</b> Rate = 20%, deducted (the difference is negative)</li>
                 </ul>
             `;
         } else if (state.activeSection === "anp") {
@@ -6249,11 +6598,15 @@ modalPackageType.value = defaults.pkg || "-";
     const modalFeeWaiver = document.getElementById("modalFeeWaiver");
     const modalAdjustedSalesPrice = document.getElementById("modalAdjustedSalesPrice");
     const rowAdjustedSalesPrice = document.getElementById("rowAdjustedSalesPrice");
+    const modalAdjustedCashPrice = document.getElementById("modalAdjustedCashPrice");
+    const rowAdjustedCashPrice = document.getElementById("rowAdjustedCashPrice");
     const rowRevisedSalesPrice = document.getElementById("rowRevisedSalesPrice");
     const previewRevisedSalesPrice = document.getElementById("previewRevisedSalesPrice");
     const rowAdjustedNfp = document.getElementById("rowAdjustedNfp");
     const rowFeeWaiver = document.getElementById("rowFeeWaiver");
     const rowAdjustedRate = document.getElementById("rowAdjustedRate");
+    const rowAdjustedNfpRate = document.getElementById("rowAdjustedNfpRate");
+    const modalNfpRatePct = document.getElementById("modalNfpRatePct");
     const rowProfitSharing = document.getElementById("rowProfitSharing");
     const rowWaiverSummary = document.getElementById("rowWaiverSummary");
     const previewWaiverSummary = document.getElementById("previewWaiverSummary");
@@ -6424,7 +6777,11 @@ modalPackageType.value = defaults.pkg || "-";
     // calculations, so it belongs to each list.
     const SPECIAL_CASE_TYPE_LABELS = {
         adjusted_nfp: "Adjusted Net Floor Price",
+        adjusted_cash_price: "Adjusted Cash Price After Discount (RM)",
         fee_waiver: "Net Floor Price Commission Fee Waiver",
+        adjusted_nfp_rate: "Adjusted Net Floor Price Commission Rate %",
+        cash_price_rate: "Adjusted Rate on Cash Price %",
+        adjusted_cash_price_rate: "Adjusted Rate on Adjusted Cash Price %",
         adjusted_rate: "Adjusted Basic Commission Rate %",
         profit_sharing: "Profit Sharing",
         adjusted_sales_price: "New Sales Price"
@@ -6432,7 +6789,9 @@ modalPackageType.value = defaults.pkg || "-";
 
     const SPECIAL_CASE_TYPES_BY_ROW = {
         basic: ["adjusted_rate", "profit_sharing", "adjusted_sales_price"],
-        nfp: ["adjusted_nfp", "fee_waiver", "adjusted_sales_price"],
+        // New Sales Price is set on the Basic case only; the NFP form reuses it.
+        // Adjusted Cash Price is the NFP row's own price and lives here only.
+        nfp: ["adjusted_nfp", "adjusted_cash_price", "adjusted_nfp_rate", "cash_price_rate", "adjusted_cash_price_rate", "fee_waiver"],
         all: ["adjusted_nfp", "fee_waiver", "adjusted_rate", "profit_sharing", "adjusted_sales_price"]
     };
 
@@ -6560,14 +6919,17 @@ modalPackageType.value = defaults.pkg || "-";
 
     /** Rebuild the Type of Special Case list for a row kind. `preferred` (an
      *  already-saved type) is kept selectable even when it falls outside the
-     *  list, so editing an older case can never silently change its type. */
+     *  list, so editing an older case can never silently change its type.
+     *  A new case starts on the grey "Select Type of Special Case" prompt
+     *  rather than quietly on the first type; Save refuses it until one is
+     *  picked. */
     function setSpecialCaseTypeOptions(kind, preferred) {
         if (!modalCaseType) return;
         const keys = SPECIAL_CASE_TYPES_BY_ROW[kind] || SPECIAL_CASE_TYPES_BY_ROW.all;
         const list = (preferred && !keys.includes(preferred)) ? keys.concat(preferred) : keys;
-        modalCaseType.innerHTML = list.map(k =>
-            `<option value="${k}">${SPECIAL_CASE_TYPE_LABELS[k] || k}</option>`).join("");
-        modalCaseType.value = (preferred && list.includes(preferred)) ? preferred : list[0];
+        modalCaseType.innerHTML = `<option value="" disabled>Select Type of Special Case</option>`
+            + list.map(k => `<option value="${k}">${SPECIAL_CASE_TYPE_LABELS[k] || k}</option>`).join("");
+        modalCaseType.value = (preferred && list.includes(preferred)) ? preferred : "";
     }
 
     /** Modal heading for a standard (non-customer) special case, named after
@@ -6615,7 +6977,10 @@ modalPackageType.value = defaults.pkg || "-";
         const pkg = packageIdx !== -1 ? cellOf(packageIdx) : "";
         const sales = salesIdx !== -1 ? parseMoney(cellOf(salesIdx)) : 0;
         const system = systemIdx !== -1 ? parseMoney(cellOf(systemIdx)) : 0;
-        const origNfp = nfpIdx !== -1 ? parseMoney(cellOf(nfpIdx)) : 0;
+        // parseMoneyValue, not parseMoney: this cell can hold a note instead
+        // of a price ("invoice before Oct 25", "EV package"), and stripping the
+        // letters out of that read "25" as a floor price of RM 25.
+        const origNfp = nfpIdx !== -1 ? parseMoneyValue(cellOf(nfpIdx)) : 0;
         // Read the rate the report ALREADY computed for this exact invoice
         // (basic commission ÷ sales price) instead of recalculating it from
         // scratch — getDefaultBasicRateForPackage() is a simplified client-side
@@ -6629,23 +6994,26 @@ modalPackageType.value = defaults.pkg || "-";
         modalSystemPrice.value = system;
         modalSalesPrice.value = sales;
         modalNetFloorPrice.value = origNfp;
+        modalNetFloorPrice.dataset.original = String(origNfp);
         if (modalBaselineRate) modalBaselineRate.value = baseRate;
         if (modalRatePct) modalRatePct.value = String(baseRate);
 
         const origBasicCommVal = sales * (baseRate / 100);
         let origNfpCommVal = 0;
-        if (sales > origNfp) origNfpCommVal = (sales - origNfp) * 0.25;
-        if (sales < origNfp) origNfpCommVal = (sales - origNfp) * 0.20;
+        origNfpCommVal = nfpCommissionFor(sales, origNfp, packagePriceFor(customerName), nfpRatesFor(""));
 
         if (modalOrigBasicComm) modalOrigBasicComm.value = formatRM(origBasicCommVal);
         if (modalOrigNfpComm) modalOrigNfpComm.value = origNfp === 0 ? "TBC with Finance" : formatRM(origNfpCommVal);
+        setNfpBaselineRate(sales, origNfp, actualCommVal, customerName);
 
         state.specialCaseRowKind = getSpecialCaseRowKind(rowRef);
         setSpecialCaseTypeOptions(state.specialCaseRowKind);
         document.querySelector("#specialCaseModal h3").textContent = specialCaseTitleForKind(state.specialCaseRowKind);
         if (modalFeeWaiver) modalFeeWaiver.value = "0";
+        if (modalNfpRatePct) { modalNfpRatePct.value = ""; delete modalNfpRatePct.dataset.autoFor; }
         if (modalProfitSharingPct) modalProfitSharingPct.value = "0";
         if (modalAdjustedSalesPrice) modalAdjustedSalesPrice.value = "";
+        if (modalAdjustedCashPrice) modalAdjustedCashPrice.value = "";
         // Blank, not "0.75": a new case tracks the standard rate until someone
         // deliberately overrides it.
         if (modalGanOverridePct) modalGanOverridePct.value = "";
@@ -6696,8 +7064,10 @@ modalPackageType.value = defaults.pkg || "-";
         state.specialCaseRowKind = "all";
         setSpecialCaseTypeOptions("all");
         if (modalFeeWaiver) modalFeeWaiver.value = "0";
+        if (modalNfpRatePct) { modalNfpRatePct.value = ""; delete modalNfpRatePct.dataset.autoFor; }
         if (modalProfitSharingPct) modalProfitSharingPct.value = "0";
         if (modalAdjustedSalesPrice) modalAdjustedSalesPrice.value = "";
+        if (modalAdjustedCashPrice) modalAdjustedCashPrice.value = "";
         // Blank, not "0.75": a new case tracks the standard rate until someone
         // deliberately overrides it.
         if (modalGanOverridePct) modalGanOverridePct.value = "";
@@ -6751,6 +7121,35 @@ modalPackageType.value = defaults.pkg || "-";
         modalNetFloorPrice.value = data.nfp;
         if (modalBaselineRate) modalBaselineRate.value = data.rate;
         if (modalRatePct) modalRatePct.value = data.rate;
+        // The NFP Baseline Rate is the one the invoice's own row was paid at:
+        // the row this case replaced (foldSpecialCaseRows), else the case's
+        // own figures against the standard rates.
+        {
+            const hdrs = state.rawData?.sections?.basic_nfp?.headers || [];
+            const at = (n) => hdrs.findIndex(h => String(h).toLowerCase().trim() === n);
+            const orig = rowRef.replacedOriginal;
+            // "Original ... Commission" is the figure the report had before this
+            // case replaced it. Set on every open: left alone, it kept whatever
+            // the previous pop-up had shown.
+            {
+                const origPrice = orig ? (String(orig[at("commission price")] || "").trim() || "-") : "-";
+                const kindNow = getSpecialCaseRowKind(rowRef);
+                if (modalOrigNfpComm) modalOrigNfpComm.value = kindNow === "nfp" ? origPrice : "-";
+                if (modalOrigBasicComm) modalOrigBasicComm.value = kindNow === "basic" ? origPrice : "-";
+            }
+            // The invoice's own floor, which the box returns to when hidden.
+            modalNetFloorPrice.dataset.original = String(orig
+                ? parseMoneyValue(orig[at("net floor price")]) || (parseFloat(data.nfp) || 0)
+                : (parseFloat(data.nfp) || 0));
+            if (orig) {
+                setNfpBaselineRate(parseMoneyValue(orig[at("sales price")]),
+                                   parseMoneyValue(orig[at("net floor price")]),
+                                   parseMoneyValue(orig[at("commission price")]),
+                                   data.customer);
+            } else {
+                setNfpBaselineRate(parseFloat(data.sales) || 0, parseFloat(data.nfp) || 0, NaN, data.customer);
+            }
+        }
         // Re-opening an existing case shows the list its own row allows, with
         // the saved type preselected (and kept available even if it predates
         // this filtering). Cases saved before rowKind existed fall back to the
@@ -6784,6 +7183,8 @@ modalPackageType.value = defaults.pkg || "-";
                 : (data.specialCaseType || "adjusted_nfp")
         );
         if (modalFeeWaiver) modalFeeWaiver.value = data.feeWaiver ?? 0;
+        if (modalNfpRatePct) { modalNfpRatePct.value = data.nfpRatePct ?? ""; delete modalNfpRatePct.dataset.autoFor; }
+        if (modalAdjustedCashPrice) modalAdjustedCashPrice.value = data.adjustedCashPrice ?? "";
         if (modalProfitSharingPct) modalProfitSharingPct.value = data.profitSharingPct ?? 0;
         if (modalAdjustedSalesPrice) {
             // NFP form: New Sales Price always mirrors the Basic Commission
@@ -6816,11 +7217,15 @@ modalPackageType.value = defaults.pkg || "-";
 
     // Modal Input & Select Listeners
     [modalSalesPrice, modalRatePct, modalSystemPrice, modalNetFloorPrice, modalFeeWaiver,
-     modalAdjustedSalesPrice, modalGanOverridePct].forEach(input => {
+     modalAdjustedSalesPrice, modalAdjustedCashPrice, modalGanOverridePct, modalNfpRatePct].forEach(input => {
         if (input) {
             input.addEventListener("input", updateSpecialCasePreview);
         }
     });
+    // A rate typed by hand is the user's, not a pre-fill to clear on a type switch.
+    if (modalNfpRatePct) {
+        modalNfpRatePct.addEventListener("input", () => { delete modalNfpRatePct.dataset.autoFor; });
+    }
     if (modalProfitSharingPct) {
         modalProfitSharingPct.addEventListener("input", updateSpecialCasePreview);
     }
@@ -6919,15 +7324,38 @@ modalPackageType.value = defaults.pkg || "-";
             const sales = parseFloat(modalSalesPrice.value) || 0;
             const baselineRate = parseFloat(modalBaselineRate?.value) || parseFloat(modalRatePct.value) || 3.0;
             const specialCaseType = modalCaseType ? modalCaseType.value : "adjusted_nfp";
+            // A new case opens on the "Select Type of Special Case" prompt.
+            // Gan Lai Soon's override has no type (the selector is hidden).
+            if (!specialCaseType && !state.specialCaseGanMode) {
+                alert("Please select a Type of Special Case.");
+                if (modalCaseType) modalCaseType.focus();
+                return;
+            }
             const rate = specialCaseType === "adjusted_rate" ? (parseFloat(modalRatePct.value) || baselineRate) : baselineRate;
-            const feeWaiver = specialCaseType === "fee_waiver" ? (parseFloat(modalFeeWaiver.value) || 0) : 0;
+            let feeWaiver = 0;
             const remarks = modalRemarks.value.trim();
             const profitSharingPct = parseFloat(modalProfitSharingPct?.value) || 0;
             const adjSalesRaw = String(modalAdjustedSalesPrice?.value ?? "").trim();
             const adjustedSalesPrice = adjSalesRaw !== "" ? (parseFloat(adjSalesRaw) || 0) : null;
             // New NFP is always compared to this figure, not the original
             // invoice sales, when a new sales price was entered.
-            const salesForCalc = (adjustedSalesPrice != null) ? adjustedSalesPrice : sales;
+            // Adjusted Cash Price After Discount is the NFP row's own price: it
+            // replaces the invoice's Cash Price (and any mirrored New Sales
+            // Price) for the NFP commission and is saved on its own field.
+            const adjustedCashPrice = adjustedCashPriceFor(specialCaseType);
+            if (takesAdjustedCashPrice(specialCaseType) && adjustedCashPrice == null) {
+                alert("Please enter the Adjusted Cash Price After Discount (RM).");
+                if (modalAdjustedCashPrice) modalAdjustedCashPrice.focus();
+                return;
+            }
+            if (isCashRateType(specialCaseType)
+                && !Number.isFinite(parseFloat(modalNfpRatePct?.value))) {
+                alert("Please enter the rate (%).");
+                if (modalNfpRatePct) modalNfpRatePct.focus();
+                return;
+            }
+            const salesForCalc = adjustedCashPrice != null ? adjustedCashPrice
+                : (adjustedSalesPrice != null) ? adjustedSalesPrice : sales;
 
             if (state.specialCaseMode === "customer" && (!agent || !customer || customer === "(Unknown)")) {
                 alert("Please select both an agent and a customer from the database list first.");
@@ -6955,16 +7383,15 @@ modalPackageType.value = defaults.pkg || "-";
             const basicComm = salesForCalc * ((rate + profitSharingPct) / 100);
             let nfpComm = 0;
             if (specialCaseType === "fee_waiver") {
-                let origNfpComm = 0;
-                if (salesForCalc > nfp) origNfpComm = (salesForCalc - nfp) * 0.25;
-                if (salesForCalc < nfp) origNfpComm = (salesForCalc - nfp) * 0.20;
-                nfpComm = origNfpComm + feeWaiver;
+                // Waived to RM 0 (app.py does the same); feeWaiver keeps the
+                // amount that took it there, for the record.
+                const origNfpComm = nfpCommissionFor(salesForCalc, nfp, packagePriceFor(customer),
+                                                     nfpRatesFor(""));
+                feeWaiver = -origNfpComm;
+                nfpComm = 0;
             } else {
-                if (salesForCalc > nfp) {
-                    nfpComm = (salesForCalc - nfp) * 0.25;
-                } else if (salesForCalc < nfp) {
-                    nfpComm = (salesForCalc - nfp) * 0.20;
-                }
+                nfpComm = nfpCommissionFor(salesForCalc, nfp, packagePriceFor(customer),
+                                           nfpRatesFor(specialCaseType));
             }
 
             // OGM override: Gan Lai Soon takes a cut of the sales price on every
@@ -6985,7 +7412,9 @@ modalPackageType.value = defaults.pkg || "-";
             const basicCommStr = `RM ${basicComm.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
             
             let nfpCommStr = "-";
-            if (nfp === 0) {
+            if (specialCaseType === "fee_waiver") {
+                nfpCommStr = "RM 0.00";
+            } else if (nfp === 0) {
                 nfpCommStr = "TBC with Finance";
             } else if (nfpComm !== 0) {
                 nfpCommStr = `RM ${nfpComm.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
@@ -7066,16 +7495,19 @@ modalPackageType.value = defaults.pkg || "-";
             const dataObject = {
                 agent, customer, pkg, system, nfp, sales, rate, remarks,
                 profitSharingPct, specialCaseType, feeWaiver, adjustedSalesPrice,
+                adjustedCashPrice,
                 caseType: state.specialCaseMode, rowKind,
                 ganOverridePct: ganOverridePctRaw,
+                nfpRatePct: (specialCaseType === "adjusted_nfp_rate" || isCashRateType(specialCaseType))
+                    ? String(modalNfpRatePct?.value ?? "").trim() : "",
                 restatedTotal: restatedTotalVal || null,
                 linkedInvoiceNumber: linkedInvoiceNumberVal || null
             };
 
             // Gan-only: nothing is restated, so the row the user clicked keeps
-            // its own commissions and just gains the revised override, drawn as
-            // the old figure above the new one. Mirrors _annotate_gan_override()
-            // in app.py, which does the same on a fresh page load.
+            // its own commissions and just shows the revised override. Mirrors
+            // _annotate_gan_override() in app.py, which does the same on a fresh
+            // page load.
             if (ganOnly) {
                 const targetRow = state.pendingAddRowRef
                     || (state.editingPair && state.editingPair[0]);
@@ -7084,18 +7516,9 @@ modalPackageType.value = defaults.pkg || "-";
                     return n === "gan lai soon" || n === "gan lai soon (rm)";
                 });
                 if (targetRow && ganIdx !== -1) {
-                    const prev = String(targetRow[ganIdx] || "-");
-                    // Keep the first render's original: re-editing must not
-                    // promote a previously revised figure into the "was" slot.
-                    const originalMatch = prev.match(/special-case-primary-value">([^<]*)</);
-                    const original = originalMatch ? originalMatch[1] : prev;
-                    const newVal = ganLaiSoonStr;
-                    targetRow[ganIdx] = (original === newVal || newVal === "-")
-                        ? original
-                        : `<div class="special-case-merge-stack">`
-                          + `<span class="special-case-primary-value">${original}</span>`
-                          + `<span class="special-case-secondary-value">${newVal}</span>`
-                          + `</div>`;
+                    // The new figure replaces the cell outright; the old one
+                    // stays in the special case (same as _annotate_gan_override).
+                    if (ganLaiSoonStr !== "-") targetRow[ganIdx] = ganLaiSoonStr;
                     targetRow.specialCaseData = dataObject;
                 }
                 closeModal();
@@ -7170,6 +7593,9 @@ modalPackageType.value = defaults.pkg || "-";
                     if (existingNfpPair) {
                         existingNfpPair.forEach(rowRef => {
                             if (!rowRef) return;
+                            // An NFP case with its own Adjusted Cash Price keeps it:
+                            // the Basic case's New Sales Price does not override it.
+                            if (takesAdjustedCashPrice((rowRef.specialCaseData || {}).specialCaseType)) return;
                             setRowValues(rowRef, "New Net Floor Price Commission", nfpCommStr);
                             if (agentIdx !== -1) rowRef[agentIdx] = "";
                             rowRef.specialCaseData = Object.assign({}, rowRef.specialCaseData || {}, nfpData, {
@@ -7294,7 +7720,11 @@ modalPackageType.value = defaults.pkg || "-";
 
         pair.forEach(r => {
             const i = rows.indexOf(r);
-            if (i !== -1) rows.splice(i, 1);
+            // A folded case gives its place back to the row it restated.
+            if (i !== -1) {
+                if (r.replacedOriginal) rows.splice(i, 1, r.replacedOriginal);
+                else rows.splice(i, 1);
+            }
             state.specialCaseRowRefs.delete(r);
         });
 

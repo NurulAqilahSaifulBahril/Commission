@@ -81,6 +81,11 @@ def replaying():
             _replaying -= 1
 
 
+def is_replaying() -> bool:
+    """Whether a replay is running, i.e. this rebuild reuses the last download."""
+    return _replaying > 0
+
+
 def stats() -> dict:
     with _lock:
         return dict(_stats, entries=len(_store))

@@ -1353,7 +1353,14 @@ def get_basic_rate(agent_type: str, hierarchy: str, month: int, agent: str = Non
         
     # If not found (blank cell), check if it is "senior" and has override rule
     if hierarchy == "senior" and "from executive" in info["override_rule"].lower():
-        exec_rate = get_basic_rate(agent_type, "executive", month)
+        # The Executive rate for the SAME invoice month, year and property.
+        # Without them it looked up the current year's Executive rate for any
+        # property: a July 2025 Shop Lot invoice took the 8% 2026 row and paid a
+        # Senior 8.25% (Ching Zhe Hang / How Locksmith, 13 Oct 2026) instead of
+        # the default 3% + 0.25% = 3.25%.
+        exec_rate = get_basic_rate(agent_type, "executive", month, year=year,
+                                   property_type=property_type, job_type=job_type,
+                                   ev_type=ev_type)
         return exec_rate + Decimal("0.0025")
         
     # Otherwise fallback to the most recent month in chronological order

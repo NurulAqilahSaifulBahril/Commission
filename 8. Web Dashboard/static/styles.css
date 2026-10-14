@@ -608,6 +608,24 @@ body {
     border-bottom: 2px solid #000000;
 }
 
+/* Referral Name / Referral Fee headers on the Basic & NFP table: light orange, so
+   the two hand-entered referral columns read as a pair. Beats the transparent
+   report-page header above on specificity. */
+.report-page .dashboard-table th.referral-header {
+    background-color: #ffe0b2;
+}
+
+/* Commission / Commission Price headers on the same table: light green. */
+.report-page .dashboard-table th.commission-header {
+    background-color: #c8e6c9;
+}
+
+/* Other Commission group heading and its Override / Safwan / Gan Lai Soon
+   sub-headers on the same table: light pink. */
+.report-page .dashboard-table th.other-commission-header {
+    background-color: #f8bbd0;
+}
+
 /* "Other Commission" grouping row on the Basic & NFP detail table: the merged
    cell spans OVERRIDE / Safwan / Gan Lai Soon, so it reads best centered
    rather than left-aligned like every single-column header. */
@@ -1286,6 +1304,11 @@ body {
     color: #dc2626 !important;
     font-weight: 600;
     white-space: pre-wrap;
+}
+
+/* "Special Case" written into a remark. */
+.remark-special-case {
+    color: #dc2626;
 }
 
 .dashboard-table td.special-case-remarks-cell {
@@ -2543,4 +2566,80 @@ body {
 
 .referral-editable:hover {
     background: var(--bg-hover, #eef2ff);
+}
+
+/* Referral pop-up: the Name and Rate % boxes sit outside .form-row, so they
+   got the browser's default input -- a short box in ~11px type. Sized here to
+   hold a full name at a readable size. */
+#referralModal input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 11px 14px;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    font-size: 16px;
+    line-height: 1.3;
+    outline: none;
+    transition: var(--transition);
+}
+
+#referralModal input:focus {
+    border-color: var(--accent-blue);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+/* Special Case pop-up: wider, so Agent / Customer / Package Type and the three
+   prices each fit on one row, and as tall as the window allows before the
+   body scrolls. Overrides the generic .modal-content size above. */
+#specialCaseModal .modal-content {
+    width: 95%;
+    max-width: 1200px;
+    height: auto;
+    max-height: calc(100vh - 32px);
+    max-height: calc(100dvh - 32px);
+}
+
+/* Special Case pop-up field labels: one size up from the 11px used elsewhere,
+   and in the same black as the values beneath them rather than muted grey.
+   Labels that set their own colour inline (Type of Special Case, the small
+   grey hints) keep it. */
+#specialCaseModal .form-row label {
+    font-size: 12px;
+    color: #0f172a;
+}
+
+/* Type of Special Case before a type is chosen: the prompt reads grey, the
+   real types in the open list stay black. The select would otherwise inherit
+   the modal's muted text colour, so its chosen value is set black here. */
+#modalCaseType {
+    color: #0f172a;
+}
+#modalCaseType.is-placeholder {
+    color: #94a3b8;
+}
+#modalCaseType option {
+    color: #0f172a;
+}
+#modalCaseType option[value=""] {
+    color: #94a3b8;
+}
+
+/* Basic & NFP report: light grey grid lines between cells, in both its tables
+   (agent summary and customer detail). Other sections keep the borderless
+   look. The header keeps its black underline; only its sides are lined, so
+   the columns run straight from header to body. */
+.section-basic-nfp .dashboard-table td,
+.section-basic-nfp .agent-summary-inline-table td {
+    border: 1px solid #e2e8f0;
+}
+.section-basic-nfp.report-page .dashboard-table th,
+.section-basic-nfp .agent-summary-inline-table th {
+    border-left: 1px solid #e2e8f0;
+    border-right: 1px solid #e2e8f0;
+}
+
+/* Special Case preview: the "Revised ..." labels in the same blue as their
+   figures once the case has figures to show (app.js updateSpecialCasePreview). */
+.preview-row span.preview-revised-label {
+    color: var(--accent-blue);
 }

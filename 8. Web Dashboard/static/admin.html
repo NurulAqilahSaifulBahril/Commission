@@ -29,6 +29,17 @@
            one thing you went to that row to click -- Reactivate especially.
            Dimming them made the only live control look disabled. */
         tr.inactive-row td.row-actions { opacity: 1; }
+        .users-header-right { display: flex; align-items: center; gap: 12px; }
+        .show-inactive { font-size: 13px; color: var(--text-muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
+        /* Name: edited in place (Electron has no prompt()). The pencil stays
+           at full strength on an inactive row for the same reason as above. */
+        .name-cell { display: flex; align-items: center; gap: 8px; }
+        .name-cell .name-empty { color: var(--text-muted); }
+        .name-cell .name-edit { padding: 2px 8px; font-size: 12px; }
+        .name-cell input { padding: 6px 8px; font-size: 13px; border: 1px solid var(--accent-blue);
+            border-radius: 6px; outline: none; min-width: 160px; }
+        tr.inactive-row td.name-col { opacity: 1; }
+        tr.inactive-row td.name-col .name-text { opacity: 0.5; }
         .audit-filters { padding: 20px 24px 0; }
         .audit-filters select {
             background-color: #f8fafc; border: 1px solid var(--border-color); border-radius: 8px;
@@ -94,12 +105,22 @@
                 <section class="card table-card">
                     <div class="card-header">
                         <h3>Users</h3>
-                        <span class="row-count-badge" id="userCountBadge">0 users</span>
+                        <div class="users-header-right">
+                            <!-- Deactivated accounts are hidden, not deleted: they
+                                 keep their login and audit history, and can be
+                                 shown here to reactivate. -->
+                            <label class="show-inactive"><input type="checkbox" id="showInactive"> Show deactivated</label>
+                            <span class="row-count-badge" id="userCountBadge">0 users</span>
+                        </div>
                     </div>
                     <div class="add-user-form">
                         <div class="filter-group">
                             <label for="newUsername">Username</label>
                             <input type="text" id="newUsername" placeholder="e.g. Finance Executive">
+                        </div>
+                        <div class="filter-group">
+                            <label for="newName">Name</label>
+                            <input type="text" id="newName" placeholder="e.g. Nurul Aqilah">
                         </div>
                         <div class="filter-group">
                             <label for="newPassword">Password</label>
@@ -118,7 +139,7 @@
                     <div class="table-container">
                         <table class="dashboard-table" style="table-layout: auto;">
                             <thead>
-                                <tr><th>Username</th><th>Role</th><th>Status</th><th>Created</th><th>Actions</th></tr>
+                                <tr><th>Username</th><th>Name</th><th>Role</th><th>Status</th><th>Created</th><th>Actions</th></tr>
                             </thead>
                             <tbody id="usersBody"></tbody>
                         </table>
@@ -201,6 +222,7 @@
         </div>
     </div>
 
-    <script src="/static/admin.js?v=20260903-reactivate-setpassword"></script>
+    <script src="/static/admin.js?v=20261012-hide-inactive"></script>
+    <script src="/static/sidebar_toggle.js?v=20261014-2"></script>
 </body>
 </html>
