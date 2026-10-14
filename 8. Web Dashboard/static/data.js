@@ -1914,6 +1914,17 @@
                 const roleCellBg = r.agent_type === "Outsource" ? "#e0f2fe"
                     : r.agent_type === "Internal" ? "#ede9fe" : "";
                 const displayBranch = r.branch || "—";
+                // The Branch cell spans each run of this person's consecutive
+                // roles that share a branch, the way the name cell spans the
+                // whole person. A change of branch starts a new cell, so the
+                // person's branches stay visible.
+                const branchOf = (x) => x.branch || "—";
+                let branchCell = "";
+                if (gi === 0 || branchOf(group[gi - 1]) !== displayBranch) {
+                    let run = 1;
+                    while (gi + run < span && branchOf(group[gi + run]) === displayBranch) run++;
+                    branchCell = `<td class="sm-cell" rowspan="${run}">${escapeHtml(displayBranch)}</td>`;
+                }
 
                 // Kept, not deleted: the row holds an effective date somebody
                 // entered, and past months were priced with it.
@@ -1943,12 +1954,12 @@
                         ${isAdmin ? `<button class="btn btn-secondary row-edit-btn" title="${span > 1 ? `Edit ${span} roles` : "Edit agent details"}" style="padding:4px 8px; font-size:12px;">✏️ Edit</button>` : ""}
                     </td>` : "";
                 tr.innerHTML = `
+                    ${personCells}
                     <td class="sm-cell">${monthCell}</td>
                     <td class="sm-cell">${escapeHtml(displayAtype)}</td>
                     <td class="sm-cell"${roleCellBg ? ` style="background:${roleCellBg};"` : ""}>${escapeHtml(displayRole)}${mismatchHtml}</td>
                     <td class="sm-cell" title="${escapeHtml(rateCell.title)}">${rateCell.html}</td>
-                    ${personCells}
-                    <td class="sm-cell">${escapeHtml(displayBranch)}</td>
+                    ${branchCell}
                     ${editCell}
                 `;
 
