@@ -135,15 +135,31 @@ def _agent_names_module():
     return _AGENT_NAMES_MOD
 
 
+# The role and rate lookups compare every table row's name on every call, so a
+# single Excel export asked for the same few hundred keys about five million
+# times -- most of its run time. Keys are remembered per name map: when
+# agent_names reloads (reset_cache after a Data page save) its map is a new
+# object and the memo starts over.
+_CANON_MEMO: dict = {}
+_CANON_MEMO_MAP = None
+
+
 def _canon_agent_key(name) -> str:
     """Comparison key for an agent name, alias-folded via the roles page."""
+    global _CANON_MEMO, _CANON_MEMO_MAP
     text = str(name or "").strip()
     if not text:
         return ""
     mod = _agent_names_module()
     if mod:
         try:
-            return mod.normalize_key(mod.resolve(text))
+            name_map = mod._load_maps()[0]
+            if name_map is not _CANON_MEMO_MAP:
+                _CANON_MEMO, _CANON_MEMO_MAP = {}, name_map
+            key = _CANON_MEMO.get(text)
+            if key is None:
+                key = _CANON_MEMO[text] = mod.normalize_key(mod.resolve(text))
+            return key
         except Exception:
             pass
     return "".join(text.split()).casefold()
@@ -360,15 +376,26 @@ def classify_ev_invoice(row: dict):
     return is_ev_only, is_mixed, ev_amt
 
 
+# Shown in place of the rate when the Data page has none for the sale: the
+# rate is then 0 and the commission RM 0 (get_basic_rate), and this says why.
+MISSING_RATE_LABEL = "No rate on Data page"
+
+
+def _rate_label(rate) -> str:
+    if rate is not None and Decimal(str(rate)) == 0:
+        return MISSING_RATE_LABEL
+    return f"{float(rate) * 100:g}%"
+
+
 def format_basic_rate_display(solar_rate, ev_rate=None, *, is_mixed=False) -> str:
     """Basic Rate % label. Mixed invoices show both pieces so 4.5% + 8% is
     not mistaken for one combined rate."""
     if is_mixed and solar_rate is not None and ev_rate is not None:
-        return f"{float(solar_rate) * 100:g}% + {float(ev_rate) * 100:g}% EV"
+        return f"{_rate_label(solar_rate)} + {_rate_label(ev_rate)} EV"
     rate = ev_rate if solar_rate is None else solar_rate
     if rate is None:
         return ""
-    return f"{float(rate) * 100:g}%"
+    return _rate_label(rate)
 
 
 def basic_commission_for_row(row: dict, sales_price, rate_fn):
@@ -790,13 +817,29 @@ def policy_from_row(row) -> "PayoutPolicy | None":
 
 def get_payout_policy(agent_type: str, hierarchy: str, month: int, year: int = 2026,
                       agent: str = None, property_type: str = None,
-                      job_type: str = None):
+                      job_type: str = None, ev_type: str = None):
     """The payout condition governing this agent/role/property in this month, or
-    None when the Data page has nothing to say about it."""
+    None when the Data page has nothing to say about it.
+
+    An EV invoice reads the payment rule of its own EV row. Before 2026-10-20
+    the EV Type never reached this lookup, so an EV invoice found no EV row
+    (every agent's EV rows name a type -- Charger / Installation / both) and
+    fell back to the Solar row, taking its "Advance RM 300" although the EV
+    rows say "Pays at >= 100%". An EV invoice with no EV Type recorded takes any
+    of the agent's EV rows before the Solar one."""
     agent_type = str(agent_type or "").strip().lower()
     hierarchy = _normalize_hierarchy(hierarchy)
     best = _best_unified_row(agent_type, hierarchy, month, year=year, agent=agent,
-                             property_type=property_type, job_type=job_type)
+                             property_type=property_type, job_type=job_type,
+                             ev_type=ev_type)
+    if (normalize_job_type(job_type) == JOB_EV and not normalize_ev_type(ev_type)
+            and (best is None or _row_job_type(best[0]) != JOB_EV)):
+        for t in EV_TYPES:
+            hit = _scan_unified_rows(agent_type, hierarchy, month, year, agent,
+                                     property_type, JOB_EV, t)
+            if hit:
+                best = hit
+                break
     if not best:
         return None
     return policy_from_row(best[0])
@@ -964,7 +1007,7 @@ def default_payout_policy(month: int, year: int = 2026) -> "PayoutPolicy":
 
 def invoice_milestones(row: dict, agent_type: str, hierarchy: str, month: int,
                        year: int = 2026, agent: str = None, property_type: str = None,
-                       job_type: str = None):
+                       job_type: str = None, ev_type: str = None):
     """(policy, advance_date, balance_date, full_payment_date) for one invoice.
 
     The dates come back already chosen by the policy, so callers keep treating
@@ -975,8 +1018,12 @@ def invoice_milestones(row: dict, agent_type: str, hierarchy: str, month: int,
     """
     if job_type is None and isinstance(row, dict):
         job_type = row.get("job_type")
+    # An EV job's payment rule is on its EV row, found by EV Type.
+    if ev_type is None and isinstance(row, dict) and normalize_job_type(job_type) == JOB_EV:
+        ev_type = row.get("ev_type")
     policy = get_payout_policy(agent_type, hierarchy, month, year=year, agent=agent,
-                              property_type=property_type, job_type=job_type)
+                              property_type=property_type, job_type=job_type,
+                              ev_type=ev_type)
     if policy is None:
         policy = default_payout_policy(month, year=year)
     advance = milestone_date(row, policy.advance_trigger) if policy.is_multi_stage else ""
@@ -1037,8 +1084,124 @@ def _role_rows() -> list:
     return _DB_ROLES
 
 
+# A role row is a Solar or an EV role (its `package_type`), so one agent can
+# hold a Solar role and an EV role over the same months. Blank is Solar: every
+# row saved before the column existed was a solar role. An EV role may name one
+# EV Type ("EV Charger", ...) to cover only that service, like a rate row does.
+PACKAGE_SOLAR = "Solar"
+PACKAGE_EV = "EV"
+
+# A Role of "All" holds for every role, Internal and Outsource alike. It names
+# no role to price under: its own rates are saved with a blank Role and a blank
+# Agent Type, which every rate lookup already reads as "all".
+ROLE_ALL = "all"
+
+
+def role_package(value, ev_type=None) -> str:
+    """A role's package_type, or an invoice's job type (plus EV Type), as one of
+    PACKAGE_SOLAR, PACKAGE_EV or an EV_TYPES subtype. Anything starting "EV" is
+    EV; everything else -- blank included -- is Solar."""
+    v = str(value or "").strip()
+    if not v.lower().startswith("ev"):
+        return PACKAGE_SOLAR
+    return normalize_ev_type(v) or normalize_ev_type(ev_type) or PACKAGE_EV
+
+
+def invoice_role_package(row: dict) -> str:
+    """Which of the agent's roles an invoice is priced under. An EV-only invoice
+    reads the EV role; a mixed invoice (JinkoSolar plus EV line items) is a solar
+    sale first, so its Basic and payout read the Solar role -- its EV add-on is
+    priced separately by job type. Everything else is Solar."""
+    is_ev_only, is_mixed, _ = classify_ev_invoice(row)
+    if is_mixed:
+        return PACKAGE_SOLAR
+    return role_package(normalize_job_type(row.get("job_type")), row.get("ev_type"))
+
+
+def _package_fit(row_pkg: str, want: str) -> int:
+    """How well a role of package `row_pkg` fits an invoice of package `want`:
+    3 is the package itself. An EV invoice of one EV Type next takes a general
+    EV role (2), then -- as an agent with no EV role always has -- the Solar
+    role (1); an EV invoice of no known type takes an EV role of any type (2)
+    before the Solar one. Anything else (0) is only the last resort, so a lone
+    role of either package still governs every invoice, as it always has."""
+    if row_pkg == want:
+        return 3
+    if want == PACKAGE_SOLAR:
+        return 0
+    if row_pkg == PACKAGE_SOLAR:
+        return 1
+    if row_pkg == PACKAGE_EV or want == PACKAGE_EV:
+        return 2
+    return 0
+
+
+_ROLE_ROWS_BY_AGENT = (None, None, {})
+
+
+def _role_rows_by_agent() -> dict:
+    """{_canon_agent_key: [role rows]} in table order, rebuilt whenever the
+    roles table or the agent name map is reloaded. Role lookups run for every
+    invoice line and every override chain step; scanning the whole table each
+    time was most of an export's run time."""
+    global _ROLE_ROWS_BY_AGENT
+    rows = _role_rows()
+    mod = _agent_names_module()
+    name_map = mod._load_maps()[0] if mod else None
+    if _ROLE_ROWS_BY_AGENT[0] is rows and _ROLE_ROWS_BY_AGENT[1] is name_map:
+        return _ROLE_ROWS_BY_AGENT[2]
+    index = {}
+    for r in rows:
+        k = _canon_agent_key(r.get("agent", ""))
+        if k:
+            index.setdefault(k, []).append(r)
+    _ROLE_ROWS_BY_AGENT = (rows, name_map, index)
+    return index
+
+
+def _covering_role_rows(agent_name, month, year, agent_type, package):
+    """The agent's role rows covering the month, best first: by how well their
+    package fits (see _package_fit), and within that the latest start first.
+
+    Two rows of one package can start the same month and end differently (the
+    Data page allows "Jul 2026 to Sep 2026" beside "Jul 2026 to Present").
+    The one ending first wins while both cover the month: the bounded role is
+    the deliberate exception to the open-ended one, and once it ends the other
+    takes over by itself. Rows identical in all of that keep their table order,
+    so the first one stored still wins as it always has.
+
+    A Solar role of "All" only holds rates that apply whatever the role, like
+    Factory 2% across an agent's whole history (2026-10-20), so every other
+    row covering the month comes before it. Otherwise it wins wherever it fits
+    the package better -- a month whose only other roles are EV -- and hands
+    callers its blank Reports To and "All" as the seller's role, dropping the
+    overrides above them. EV roles of "All" are agents' actual EV roles and
+    keep their place."""
+    key = _canon_agent_key(agent_name)
+    if not key:
+        return []
+    want_type = str(agent_type or "").strip().lower()
+    want_pkg = role_package(package)
+    target = f"{year:04d}-{month:02d}"
+    hits = []
+    for r in _role_rows_by_agent().get(key, ()):
+        if want_type and str(r.get("agent_type", "") or "").strip().lower() != want_type:
+            continue
+        eff = str(r.get("effective_from", "") or "").strip()
+        if not effective_covers(eff, target):
+            continue
+        fit = _package_fit(role_package(r.get("package_type")), want_pkg)
+        real = 0 if (str(r.get("hierarchy", "") or "").strip().lower() == ROLE_ALL
+                     and role_package(r.get("package_type")) == PACKAGE_SOLAR) else 1
+        hits.append((fit, effective_start(eff), effective_end(eff), r, real))
+    # Python's sort is stable, so table order survives both passes.
+    hits.sort(key=lambda h: h[2])
+    hits.sort(key=lambda h: (h[4], h[0], h[1]), reverse=True)
+    return [h[3] for h in hits]
+
+
 def get_agent_role_row(agent_name: str, month: int, year: int = 2026,
-                       agent_type: str = None):
+                       agent_type: str = None, package: str = None):
     """The agent_roles row governing the month, or None. Matching is on the
     full name, case-insensitive — never on substrings, which is what made the
     old hardcoded mapping assign every 'J' name to the same senior.
@@ -1053,26 +1216,15 @@ def get_agent_role_row(agent_name: str, month: int, year: int = 2026,
     A row's effective month may be a closed range ("2026-01 to 2026-08"), in
     which case it governs those months only — after the end month the agent has
     no row here at all and the caller falls back to its own mapping, exactly as
-    it does for someone never entered."""
-    key = _canon_agent_key(agent_name)
-    if not key:
-        return None
-    want_type = str(agent_type or "").strip().lower()
-    target = f"{year:04d}-{month:02d}"
-    best = None
-    best_start = ""
-    for r in _role_rows():
-        if _canon_agent_key(r.get("agent", "")) != key:
-            continue
-        if want_type and str(r.get("agent_type", "") or "").strip().lower() != want_type:
-            continue
-        eff = str(r.get("effective_from", "") or "").strip()
-        if not effective_covers(eff, target):
-            continue
-        start = effective_start(eff)
-        if best is None or start > best_start:
-            best, best_start = r, start
-    return best
+    it does for someone never entered.
+
+    `package` (see role_package / invoice_role_package) picks between a Solar
+    and an EV role covering the same month. None means Solar -- NFP, Reports To
+    and anything else that is not an EV sale. A package with no role of its own
+    that month reads the closest other one (_package_fit), so an agent with a
+    single role reads it for every invoice, as before the column existed."""
+    rows = _covering_role_rows(agent_name, month, year, agent_type, package)
+    return rows[0] if rows else None
 
 
 def get_reporting_senior_from_table(agent_name: str, month: int, year: int = 2026):
@@ -1089,13 +1241,173 @@ def get_reporting_senior_from_table(agent_name: str, month: int, year: int = 202
 
 
 def get_agent_role(agent_name: str, month: int, year: int = 2026,
-                   agent_type: str = None):
+                   agent_type: str = None, package: str = None):
     """The agent's role (e.g. 'Senior', 'Executive'), or None. Pass agent_type
-    to ignore roles recorded against the other agent type."""
-    row = get_agent_role_row(agent_name, month, year=year, agent_type=agent_type)
-    if not row:
-        return None
-    return str(row.get("hierarchy", "") or "").strip() or None
+    to ignore roles recorded against the other agent type, and package to read
+    the Solar or EV role (see get_agent_role_row).
+
+    A Role of "All" is no role to price under, so it is passed over for the
+    next covering row -- the agent's role in the other package, if any -- and
+    with none left this returns None and the caller prices them the way it
+    prices an agent with no role. The "All" role's own rates still apply: they
+    are saved against the agent with a blank Role, and a row naming the agent
+    outranks any role-level row whatever role the lookup is made under."""
+    for row in _covering_role_rows(agent_name, month, year, agent_type, package):
+        role = str(row.get("hierarchy", "") or "").strip()
+        if role.lower() == ROLE_ALL:
+            continue
+        return role or None
+    return None
+
+
+# ── Overrides (Data page Override Rate % / From Role + Reports To) ───────────
+# Since 2026-10-20 every Basic override comes from the Data page. An agent's
+# own rate rows carry Override Rate % and From Role pairs ("0.5" / "OSA", or
+# several comma-joined: "0.5, 0.75" / "Sales Team Manager, Sales Consultant");
+# a From Role may name one person, stored as "Role (Name)". Whoever sells, the
+# people above them in the Reports To chain are checked in turn, and each one
+# whose override names the seller's role (or the seller by name, or no role
+# at all) earns that rate on the sale. Nobody else earns an override: the old
+# hardcoded 0.25% / 0.5% and the hardcoded tier map are gone.
+#
+# Gan Lai Soon's 0.75% OGM override, Safwan's 0.5% and the Factory split stay
+# hardcoded in the engines (user, 2026-10-20), so Gan Lai Soon is skipped here
+# rather than paid twice.
+
+_OVERRIDE_SKIP = {"gan lai soon"}
+_OVERRIDE_CHAIN_LIMIT = 8
+
+
+def _split_override_from(value: str) -> tuple[str, str]:
+    """("Role", "Person") for a From Role cell; "Role (Person)" names one
+    person, a plain "Role" names everyone holding it, blank names everyone."""
+    text = str(value or "").strip()
+    m = re.match(r"^(.*?)\s*\(([^()]*)\)\s*$", text)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return text, ""
+
+
+def _override_pairs(row) -> list:
+    """[(rate as a fraction, From Role cell)] for one rate row."""
+    pcts = [p.strip() for p in _cell(row, "override_rate_pct").split(",")]
+    froms = [f.strip() for f in str(row.get("override_from", "") or "").split(",")]
+    out = []
+    for i, p in enumerate(pcts):
+        if not p:
+            continue
+        try:
+            rate = Decimal(p.replace("%", "")) / Decimal("100")
+        except Exception:
+            continue
+        if rate <= 0:
+            continue
+        out.append((rate, froms[i] if i < len(froms) else ""))
+    return out
+
+
+def _override_row_for(agent_name: str, role_row, month: int, year: int,
+                      package: str, property_type: str = None):
+    """The Data page rate row whose overrides `agent_name` earns with in this
+    month: their own rows (naming them) before role-level rows for their role,
+    a row for the property before a general one, the latest start first. Only
+    rows that carry an override are considered, so an override-only line
+    counts as much as a full rate line."""
+    target = f"{year:04d}-{month:02d}"
+    agent_key = _canon_agent_key(agent_name)
+    role = _normalize_hierarchy(str((role_row or {}).get("hierarchy", "") or ""))
+    atype = str((role_row or {}).get("agent_type", "") or "").strip().lower()
+    want_job = JOB_EV if role_package(package) != PACKAGE_SOLAR else JOB_SOLAR
+    prop_key = str(property_type or "").strip().lower()
+    best = None
+    for r in _unified_rows():
+        if (_cell(r, "rate_type") or "Basic Commission") != "Basic Commission":
+            continue
+        if _cell(r, "remarks").lower() == "deleted":
+            continue
+        if not _cell(r, "override_rate_pct"):
+            continue
+        if not effective_covers(_cell(r, "effective_from"), target):
+            continue
+        row_agents = _row_agent_list(r)
+        if row_agents:
+            if agent_key not in {_canon_agent_key(a) for a in row_agents}:
+                continue
+        else:
+            row_role = _cell(r, "hierarchy")
+            if not role or (row_role and _normalize_hierarchy(row_role) != role):
+                continue
+            row_atype = _cell(r, "agent_type").lower()
+            if row_atype and atype and row_atype != atype:
+                continue
+        row_props = _row_property_list(r)
+        if row_props and prop_key and prop_key not in row_props:
+            continue
+        job_fit = 1 if _row_job_type(r) == want_job else 0
+        cand = ((2 if row_agents else 0), job_fit, (1 if row_props else 0),
+                effective_start(_cell(r, "effective_from")))
+        if best is None or cand > best[0]:
+            best = (cand, r)
+    return best[1] if best else None
+
+
+def override_name_map(names) -> dict:
+    """{comparison key: name} for the names a report already lists, so an
+    override lands on the same row as the recipient's own commission."""
+    out = {}
+    for n in names:
+        k = _canon_agent_key(n)
+        if k and k not in out:
+            out[k] = n
+    return out
+
+
+def get_data_page_overrides(agent_name: str, month: int, year: int = 2026,
+                            agent_type: str = None, package: str = None,
+                            property_type: str = None) -> list:
+    """[{"name", "key", "rate", "from_role"}] -- who earns an override on a
+    sale by `agent_name` dated in this month, at what rate, read only from the
+    Data page. "name" is the Reports To cell as typed and "key" its alias-folded
+    comparison key (_canon_agent_key), so callers can credit the override to
+    the same name the person's own sales are listed under. Empty when the
+    seller has no role, no one above them has an override naming them, or the
+    chain is not filled in."""
+    seller_row = get_agent_role_row(agent_name, month, year=year,
+                                    agent_type=agent_type, package=package)
+    if seller_row is None and agent_type:
+        seller_row = get_agent_role_row(agent_name, month, year=year, package=package)
+    if seller_row is None:
+        return []
+    seller_role = _normalize_hierarchy(str(seller_row.get("hierarchy", "") or ""))
+    seller_key = _canon_agent_key(agent_name)
+
+    out = []
+    seen = {seller_key}
+    current = seller_row
+    for _ in range(_OVERRIDE_CHAIN_LIMIT):
+        boss = str(current.get("reports_to", "") or "").strip()
+        boss_key = _canon_agent_key(boss)
+        if not boss or boss_key in seen:
+            break
+        seen.add(boss_key)
+        boss_row = get_agent_role_row(boss, month, year=year, package=package)
+        if boss_key not in {_canon_agent_key(s) for s in _OVERRIDE_SKIP}:
+            row = _override_row_for(boss, boss_row, month, year, package, property_type)
+            for rate, from_cell in (_override_pairs(row) if row else []):
+                from_role, from_person = _split_override_from(from_cell)
+                if from_person:
+                    hit = _canon_agent_key(from_person) == seller_key
+                else:
+                    hit = (not from_role or from_role.lower() == ROLE_ALL
+                           or _normalize_hierarchy(from_role) == seller_role)
+                if hit:
+                    out.append({"name": boss, "key": boss_key, "rate": rate,
+                                "from_role": from_cell})
+                    break
+        if boss_row is None:
+            break
+        current = boss_row
+    return out
 
 
 # ── Agent type routing (dashboard "agent_roles") ─────────────────────────────
@@ -1109,12 +1421,22 @@ def get_agent_role(agent_name: str, month: int, year: int = 2026,
 _ROUTABLE_AGENT_TYPES = {"internal": "internal", "outsource": "outsource"}
 
 
-def _routing_rows() -> list:
-    """Role rows that say something about routing. Tombstones (hidden) are rows
-    the roles grid deleted, and values like 'Sales' or blank are not a report,
-    so neither can override Postgres."""
-    out = []
-    for r in _role_rows():
+_ROUTING_INDEX = (None, {})
+
+
+def _routing_index() -> dict:
+    """{lower-cased agent name: [(effective_from, type)]} from the role rows
+    that say something about routing. Tombstones (hidden) are rows the roles
+    grid deleted, and values like 'Sales' or blank are not a report, so neither
+    can override Postgres. Built once per load of the roles table: it is asked
+    for every invoice line, and rescanning the whole table each time was a
+    large share of an export's run time."""
+    global _ROUTING_INDEX
+    rows = _role_rows()
+    if _ROUTING_INDEX[0] is rows:
+        return _ROUTING_INDEX[1]
+    index = {}
+    for r in rows:
         if r.get("hidden"):
             continue
         atype = _ROUTABLE_AGENT_TYPES.get(str(r.get("agent_type") or "").strip().lower())
@@ -1123,8 +1445,9 @@ def _routing_rows() -> list:
         name = str(r.get("agent") or "").strip().lower()
         eff = str(r.get("effective_from") or "").strip()
         if name and eff:
-            out.append((name, eff, atype))
-    return out
+            index.setdefault(name, []).append((eff, atype))
+    _ROUTING_INDEX = (rows, index)
+    return index
 
 
 def get_agent_type_override(agent_name: str, month: int = None, year: int = None):
@@ -1138,9 +1461,7 @@ def get_agent_type_override(agent_name: str, month: int = None, year: int = None
         return None
     target = f"{int(year or 2026):04d}-{int(month):02d}" if month else None
     best = None
-    for name, eff, atype in _routing_rows():
-        if name != key:
-            continue
+    for eff, atype in _routing_index().get(key, ()):
         # With no month to test against, "which type applies now" is the best
         # this can mean, so a row is only ranked, never filtered.
         if target and not effective_covers(eff, target):
@@ -1190,7 +1511,7 @@ def agent_type_override_names() -> list:
     filter on Postgres' agent_type inside SQL, which drops an overridden agent
     before Python ever sees the row; they widen that filter with this list and
     then let resolve_agent_type() make the real call per invoice."""
-    return sorted({name for name, _eff, _atype in _routing_rows()})
+    return sorted(_routing_index())
 
 
 def resolve_agent_type(agent_name: str, pg_agent_type: str, month: int = None,
@@ -1291,7 +1612,7 @@ def get_basic_rate_info(agent_type: str, hierarchy: str, month: int, agent: str 
     """(rate, source) naming which of the four sources actually answered:
       'unified' — a row entered on the dashboard Data page (the intended source)
       'legacy'  — a leftover basic_rates row (should be empty after the merge)
-      'sheet'   — the cached sheet CSV / hardcoded fallback
+      'missing' — nothing on the Data page covers it; the rate is 0 (since 2026-10-20)
     Keeping these apart is what makes "is my input wired in?" answerable."""
     rate, source, _eff = get_basic_rate_detail(agent_type, hierarchy, month,
                                                agent=agent, property_type=property_type)
@@ -1315,69 +1636,36 @@ def get_basic_rate_detail(agent_type: str, hierarchy: str, month: int, agent: st
                                property_type=property_type)
     if legacy is not None:
         return legacy, "legacy", ""
-    return get_basic_rate(agent_type, hierarchy, month), "sheet", ""
+    return Decimal("0"), "missing", ""
+
+
+def get_factory_base_rate(agent_type: str, hierarchy: str, month: int, year: int = 2026,
+                          agent: str = None) -> Decimal:
+    """The base rate of a Factory solar job: the agent's Factory rate on the
+    Data page (a Solar row with Property = Factory), or 0 when none covers the
+    month. The profit sharing negotiated on the panels is added on top by the
+    caller; it is still typed per customer on the report. Before 2026-10-20 the
+    base was a hardcoded 2% whatever the Data page said."""
+    return get_basic_rate(agent_type, hierarchy, month, agent=agent,
+                          property_type="Factory", year=year, job_type=JOB_SOLAR)
 
 
 def get_basic_rate(agent_type: str, hierarchy: str, month: int, agent: str = None,
                    property_type: str = None, year: int = 2026,
                    job_type: str = None, ev_type: str = None) -> Decimal:
-    """Resolve basic commission rate: dashboard Data page entries first,
-    then legacy cached sheet data, then hardcoded defaults."""
-    # Normalize inputs
+    """The basic commission rate entered on the dashboard Data page, or 0 when
+    nothing there covers the case.
+
+    Since 2026-10-20 the Data page is the only source (user's decision): the
+    cached sheet copy, the hardcoded 3% / 3.25% / 4.5% / 5% defaults and the
+    "Senior = Executive + 0.25%" rule no longer answer. A sale with no rate
+    entered pays RM 0 and the report flags it (MISSING_RATE_LABEL), so the gap
+    is seen and filled in rather than paid from a number nobody entered."""
     agent_type = agent_type.strip().lower()
     hierarchy = _normalize_hierarchy(hierarchy)
-
-    # System-entered rates (dashboard Data page) take priority
     db_rate = get_db_basic_rate(agent_type, hierarchy, month, year=year, agent=agent,
                                 property_type=property_type, job_type=job_type,
                                 ev_type=ev_type)
     if db_rate is not None:
         return db_rate
-
-    rates_data = load_rates_data()
-    key = (agent_type, hierarchy)
-    if not rates_data or key not in rates_data:
-        # Fallback to hardcoded defaults
-        if agent_type == "internal":
-            return Decimal("0.0325") if hierarchy == "senior" else Decimal("0.03")
-        else:
-            return Decimal("0.05") if hierarchy == "ogm" else Decimal("0.045")
-            
-    info = rates_data[key]
-    target_month_name = _MONTH_MAPPING.get(month, "mac")
-    
-    # Look up direct rate for target month name
-    rate = info["rates"].get(target_month_name)
-    if rate is not None:
-        return rate
-        
-    # If not found (blank cell), check if it is "senior" and has override rule
-    if hierarchy == "senior" and "from executive" in info["override_rule"].lower():
-        # The Executive rate for the SAME invoice month, year and property.
-        # Without them it looked up the current year's Executive rate for any
-        # property: a July 2025 Shop Lot invoice took the 8% 2026 row and paid a
-        # Senior 8.25% (Ching Zhe Hang / How Locksmith, 13 Oct 2026) instead of
-        # the default 3% + 0.25% = 3.25%.
-        exec_rate = get_basic_rate(agent_type, "executive", month, year=year,
-                                   property_type=property_type, job_type=job_type,
-                                   ev_type=ev_type)
-        return exec_rate + Decimal("0.0025")
-        
-    # Otherwise fallback to the most recent month in chronological order
-    month_order = ["jan", "feb", "mac", "jun", "jul"]
-    try:
-        target_idx = month_order.index(target_month_name)
-    except ValueError:
-        target_idx = len(month_order) - 1
-        
-    for idx in range(target_idx, -1, -1):
-        m_name = month_order[idx]
-        rate = info["rates"].get(m_name)
-        if rate is not None:
-            return rate
-            
-    # Default fallback if all fails
-    if agent_type == "internal":
-        return Decimal("0.0325") if hierarchy == "senior" else Decimal("0.03")
-    else:
-        return Decimal("0.05") if hierarchy == "ogm" else Decimal("0.045")
+    return Decimal("0")

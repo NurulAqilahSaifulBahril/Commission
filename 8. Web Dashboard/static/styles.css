@@ -707,6 +707,12 @@ body {
     font-weight: bold;
 }
 
+/* Basic & NFP: a customer's Net Floor Price Commission row is light blue,
+   over whatever tier tint the agent's rows carry (hover still wins). */
+.dashboard-table tr.nfp-commission-row td {
+    background-color: #DBEAFE !important;
+}
+
 /* "All Agents" view: colored by row origin (Internal/Outsource) instead of tier. */
 .all-internal-bg td {
     background-color: #E0F2FE !important;
@@ -1413,6 +1419,14 @@ body {
 .agent-summary-inline-table .consultant-bg td,
 .agent-summary-inline-table .executive-bg td { background-color: #F0F9FF !important; }
 .agent-summary-inline-table .unset-bg td { background-color: #FEF3C7 !important; }
+
+/* Basic & NFP: clicking an agent shows their customers in Summary Agent by
+   Customer below; the agent shown is highlighted. */
+.agent-summary-inline-table tr.summary-agent-clickable { cursor: pointer; }
+.agent-summary-inline-table tr.summary-agent-selected td {
+    background-color: #c7d2fe !important;
+    font-weight: 600;
+}
 .agent-summary-inline-table .ogm-bg td  { background-color: rgba(30, 58, 138, 0.28) !important; }
 .agent-summary-inline-table .oum-bg td  { background-color: rgba(30, 58, 138, 0.16) !important; }
 .agent-summary-inline-table .osa-bg td  { background-color: rgba(30, 58, 138, 0.07) !important; }

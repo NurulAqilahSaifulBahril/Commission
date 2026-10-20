@@ -175,7 +175,7 @@ def _agent_type_override_sql() -> str:
 
 def _internal_hierarchy(agent_name: str, month: int, year: int, property_type: str,
                         is_agent_senior: bool, job_type: str = None,
-                        ev_type: str = None) -> str:
+                        ev_type: str = None, package: str = None) -> str:
     """The role to price this invoice under. The Agent Roles & Hierarchy page is
     asked first, so Data page rows entered against an internal role like
     "Branch Sales Manager" can actually be reached — is_senior() only ever
@@ -186,12 +186,16 @@ def _internal_hierarchy(agent_name: str, month: int, year: int, property_type: s
     Senior/Executive answer rather than dropping through to the hardcoded
     default. Roles are renamed on that page more often than rates are entered
     (Executive -> "Sales Consultant" in 2026-07), and a rename must not quietly
-    cut an agent's rate."""
+    cut an agent's rate.
+
+    `package` reads the agent's Solar or EV role when they hold both (see
+    basic_commission_rates.get_agent_role_row); None is Solar."""
     bcr = _rates_module()
     fallback = "Senior" if is_agent_senior else "Executive"
     if bcr is None:
         return fallback
-    role = bcr.get_agent_role(agent_name, month, year=year, agent_type="Internal")
+    role = bcr.get_agent_role(agent_name, month, year=year, agent_type="Internal",
+                              package=package)
     if not role:
         return fallback
     _rate, source, _eff = bcr.get_basic_rate_detail(
@@ -311,6 +315,16 @@ def get_reporting_senior(agent_name: str, month: int | None = None) -> str | Non
         return "MARTIN HING"
         
     return None
+
+
+def _line_overrides(agent_name: str, month: int, year: int, package, property_type):
+    """[{"name", "rate", "from_role"}] -- who earns an override on this sale,
+    read only from the Data page (basic_commission_rates.get_data_page_overrides)."""
+    bcr = _rates_module()
+    if bcr is None:
+        return []
+    return bcr.get_data_page_overrides(agent_name, month, year=year, agent_type="Internal",
+                                       package=package, property_type=property_type)
 
 
 def _load_dotenv() -> None:
@@ -822,6 +836,9 @@ class InvoiceLine:
     ev_rate: Decimal | None = None
     ev_commission: Decimal = Decimal("0")
     rate_display: str = ""
+    # Solar or EV role the invoice was priced under -- which of the agent's
+    # roles (and so whose Reports To chain) its overrides follow.
+    role_package: str = ""
 
     @property
     def net_base(self) -> Decimal:
@@ -967,18 +984,23 @@ def _process_invoices(
         from basic_commission_rates import (
             classify_ev_invoice as _classify_ev,
             JOB_SOLAR as _JOB_SOLAR,
+            invoice_role_package as _role_pkg,
         )
         _is_ev_only, _is_mixed, _ = _classify_ev(row)
         _hier_job = _JOB_SOLAR if _is_mixed else row.get("job_type")
         _hier_ev = None if _is_mixed else row.get("ev_type")
+        # Solar or EV role, for an agent who holds both over these months.
+        _hier_pkg = _role_pkg(row)
         _hierarchy = _internal_hierarchy(agent_name, _inv_month, _inv_year,
                                          prop_type, is_agent_senior,
                                          job_type=_hier_job,
-                                         ev_type=_hier_ev)
+                                         ev_type=_hier_ev,
+                                         package=_hier_pkg)
         from basic_commission_rates import invoice_milestones as _milestones
         policy, pct5_str, pct75_str, pct100_str = _milestones(
             row, "Internal", _hierarchy, _inv_month, year=_inv_year,
-            agent=agent_name, property_type=prop_type, job_type=_hier_job)
+            agent=agent_name, property_type=prop_type, job_type=_hier_job,
+            ev_type=_hier_ev)
 
         NOT_FULLY_PAID_INVS = {'1008316', '1007905'}
         if invoice_num in NOT_FULLY_PAID_INVS:
@@ -1006,11 +1028,13 @@ def _process_invoices(
         is_ev_job = _norm_job(row.get("job_type")) == _JOB_EV
         # An EV charger job is priced by its Job Type, from the Data page, even
         # when the site is a factory. The Factory formula below is the solar
-        # one -- a 2% base plus the profit sharing negotiated on the panels --
-        # and it bypasses the Data page rate entirely. Towa Hardware's 11kW EV
-        # charger was being paid by it.
+        # one -- the agent's Factory rate from the Data page plus the profit
+        # sharing negotiated on the panels (typed per customer on the report).
+        # Towa Hardware's 11kW EV charger was being paid by it.
         if prop_type == "Factory" and not is_ev_job:
-            rate = Decimal("0.02")
+            from basic_commission_rates import get_factory_base_rate
+            rate = get_factory_base_rate("Internal", _hierarchy, _inv_month,
+                                         year=_inv_year, agent=agent_name)
             sharing_tuple = factory_rates.get(invoice_num, (Decimal("0"), Decimal("0")))
             if isinstance(sharing_tuple, tuple):
                 sharing = sharing_tuple[0]
@@ -1029,11 +1053,29 @@ def _process_invoices(
             # 2025-09" isn't matched against the wrong calendar year. The
             # hierarchy is the one the payout policy above already resolved, so
             # rate and payout condition can never come from different roles.
+            # The one exception is a mixed invoice's EV add-on, which reads the
+            # agent's EV role when they hold one alongside the Solar role.
             inv_month, inv_year, hierarchy = _inv_month, _inv_year, _hierarchy
+            from basic_commission_rates import role_package, get_agent_role_row
+
+            def _piece_hierarchy(job, ev):
+                pkg = role_package(job, ev)
+                if pkg == _hier_pkg:
+                    return hierarchy
+                # Only a different role row re-resolves; the same row keeps the
+                # invoice's hierarchy, so single-role agents are untouched.
+                if get_agent_role_row(agent_name, inv_month, year=inv_year,
+                                      agent_type="Internal", package=pkg) is                         get_agent_role_row(agent_name, inv_month, year=inv_year,
+                                           agent_type="Internal", package=_hier_pkg):
+                    return hierarchy
+                return _internal_hierarchy(agent_name, inv_month, inv_year,
+                                           prop_type, is_agent_senior,
+                                           job_type=job, ev_type=ev, package=pkg)
+
             comm, rate, ev_rate, ev_comm, ev_amt, rate_display = basic_commission_for_row(
                 row, sales_price,
                 lambda job, ev: get_basic_rate(
-                    "Internal", hierarchy, inv_month, agent=agent_name,
+                    "Internal", _piece_hierarchy(job, ev), inv_month, agent=agent_name,
                     property_type=prop_type, year=inv_year,
                     job_type=job, ev_type=ev,
                 ),
@@ -1058,11 +1100,11 @@ def _process_invoices(
         import agent_names as _names
         ref_name = _names.clean_referral_name(row.get("referral_name"))
 
-        # Calculate senior override per invoice (based on sales_price)
-        senior_ovr = sales_price * SENIOR_OVERRIDE_RATE
-        senior = get_reporting_senior(agent_name)
-        if senior:
-            senior_ovr = sales_price * SENIOR_OVERRIDE_RATE
+        # Overrides earned on this invoice, from the Data page (Override
+        # Rate % / From Role up the Reports To chain) -- since 2026-10-20 no
+        # hardcoded 0.25%.
+        senior_ovr = sum((sales_price * h["rate"] for h in _line_overrides(
+            agent_name, _inv_month, _inv_year, _hier_pkg, prop_type)), Decimal("0"))
 
         lines.append(
             InvoiceLine(
@@ -1093,6 +1135,7 @@ def _process_invoices(
                 ev_rate=ev_rate,
                 ev_commission=ev_comm,
                 rate_display=rate_display,
+                role_package=_hier_pkg,
             )
         )
         
@@ -1141,10 +1184,21 @@ def _table1_rows(lines: list[InvoiceLine]) -> tuple[int, list[list[str]]]:
         agent_own_commissions[ln.agent_name] += ln.basic_commission
         agent_sales[ln.agent_name] += ln.total_amount
         
-        # Calculate senior override if the agent is an executive under a senior
-        senior = get_reporting_senior(ln.agent_name)
-        if senior:
-            override_commissions[senior] += ln.sales_price * SENIOR_OVERRIDE_RATE
+        # Overrides from the Data page (see _line_overrides).
+        _dt = _parse_invoice_date(ln.invoice_date)
+        if _dt:
+            for h in _line_overrides(ln.agent_name, _dt.month, _dt.year,
+                                     ln.role_package or None, ln.package):
+                override_commissions[h["name"]] += ln.sales_price * h["rate"]
+
+    # Credit overrides under the name the recipient's own sales use.
+    bcr = _rates_module()
+    if bcr is not None:
+        names = bcr.override_name_map(list(agent_own_commissions.keys()))
+        merged: dict[str, Decimal] = defaultdict(Decimal)
+        for n, amt in override_commissions.items():
+            merged[names.get(bcr._canon_agent_key(n)) or n] += amt
+        override_commissions = merged
 
     all_payout_agents = set(agent_own_commissions.keys()) | set(override_commissions.keys())
     

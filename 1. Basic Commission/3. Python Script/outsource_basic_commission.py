@@ -552,7 +552,8 @@ def _normalize_outsource_role(role: str) -> str | None:
     return None
 
 
-def _outsource_hierarchy_for(info: dict[str, Any] | None, parsed_dt: Any = None) -> str:
+def _outsource_hierarchy_for(info: dict[str, Any] | None, parsed_dt: Any = None,
+                             package: str | None = None) -> str:
     """The Outsource role to price this invoice under.
 
     The Role set on the Agent Roles & Hierarchy page wins — it's effective-dated
@@ -564,6 +565,9 @@ def _outsource_hierarchy_for(info: dict[str, Any] | None, parsed_dt: Any = None)
 
     The rate and the payout condition both resolve through here, so they can
     never disagree about which role an invoice belongs to.
+
+    `package` ("Solar"/"EV", or a job type) reads the agent's Solar or EV role
+    when they hold both over the invoice month; None is Solar.
     """
     from basic_commission_rates import get_agent_role
     month = parsed_dt.month if parsed_dt else 5
@@ -576,7 +580,8 @@ def _outsource_hierarchy_for(info: dict[str, Any] | None, parsed_dt: Any = None)
     # manager"), which matches no Data page rate row, so the agent silently
     # dropped to the hardcoded 4.5% default instead of their entered rate.
     db_role = get_agent_role(canonical_name, month, year=year,
-                             agent_type="Outsource") if canonical_name else None
+                             agent_type="Outsource",
+                             package=package) if canonical_name else None
     if db_role and _normalize_outsource_role(db_role) is None:
         db_role = None
     if db_role:
@@ -597,6 +602,19 @@ def _invoice_milestones(row, *, hierarchy, month, year, agent, property_type,
                               job_type=job_type)
 
 
+def _line_overrides(agent_name: str, invoice_date: Any, row: dict, property_type: str) -> list:
+    """[{"name", "rate", "from_role"}] -- who earns an override on this sale,
+    read only from the Data page (basic_commission_rates.get_data_page_overrides)."""
+    from basic_commission_rates import get_data_page_overrides, invoice_role_package
+    parsed = _parse_invoice_date(invoice_date)
+    if not parsed:
+        return []
+    return get_data_page_overrides(agent_name, parsed.month, year=parsed.year,
+                                   agent_type="Outsource",
+                                   package=invoice_role_package(row),
+                                   property_type=property_type)
+
+
 def get_own_commission_rate(info: dict[str, Any], agent_comm_field: int | None, invoice_date: Any = None,
                             property_type: str | None = None,
                             job_type: str | None = None,
@@ -612,7 +630,11 @@ def get_own_commission_rate(info: dict[str, Any], agent_comm_field: int | None, 
             year = parsed_dt.year
 
     canonical_name = info.get("canonical_name") if info else None
-    hierarchy = _outsource_hierarchy_for(info, parsed_dt)
+    # Each piece of an invoice reads the role for its own job type: an EV job
+    # (or a mixed invoice's EV add-on) the agent's EV role when they hold one.
+    from basic_commission_rates import role_package
+    hierarchy = _outsource_hierarchy_for(info, parsed_dt,
+                                         package=role_package(job_type, ev_type))
 
     # property_type lets Data page rows scoped to certain property types match;
     # without it every scoped row is invisible to the engine. year matters
@@ -1259,9 +1281,11 @@ def main(argv: list[str]) -> int:
         # the Data page row that also set its rate — so pct5_str/pct75_str below
         # mean "advance due" and "balance due", whatever percentages back them.
         _inv_dt_parsed = _parse_invoice_date(r.get("invoice_date"))
+        from basic_commission_rates import invoice_role_package
         _policy, pct5_str, pct75_str, pct100_str = _invoice_milestones(
             r,
-            hierarchy=_outsource_hierarchy_for(info, _inv_dt_parsed),
+            hierarchy=_outsource_hierarchy_for(info, _inv_dt_parsed,
+                                               package=invoice_role_package(r)),
             month=_inv_dt_parsed.month if _inv_dt_parsed else 5,
             year=_inv_dt_parsed.year if _inv_dt_parsed else 2026,
             agent=canonical_name,
@@ -1299,11 +1323,16 @@ def main(argv: list[str]) -> int:
         is_ev_job = _norm_job(r.get("job_type")) == _JOB_EV
         # An EV charger job is priced by its Job Type, from the Data page, even
         # when the site is a factory. The Factory formula below is the solar
-        # one -- a 2% base plus the profit sharing negotiated on the panels --
-        # and it bypasses the Data page rate entirely. Towa Hardware's 11kW EV
-        # charger was being paid by it.
+        # one -- the agent's Factory rate from the Data page plus the profit
+        # sharing negotiated on the panels (typed per customer on the report).
+        # Towa Hardware's 11kW EV charger was being paid by it.
         if prop_type == "Factory" and not is_ev_job:
-            rate = Decimal("0.02")
+            from basic_commission_rates import get_factory_base_rate
+            _fdt = _parse_invoice_date(inv_dt)
+            rate = get_factory_base_rate(
+                "Outsource", _outsource_hierarchy_for(info, _fdt, package="Solar"),
+                _fdt.month if _fdt else 5, year=_fdt.year if _fdt else 2026,
+                agent=canonical_name)
             agent_sharing = factory_rates.get(invoice_num, Decimal("0"))
             safwan_sharing = factory_safwan_rates.get(invoice_num, Decimal("0"))
 
@@ -1429,19 +1458,11 @@ def main(argv: list[str]) -> int:
             ogm_comm = sales_price * ogm_rate
             override_commissions["Gan Lai Soon"] += ogm_comm
 
-            # Senior Override per invoice (based on sales_price)
-            senior_ovr = Decimal("0")
-            if tier == "OSA 1":
-                oum_p = info.get("oum_parent")
-                if oum_p:
-                    senior_ovr = sales_price * Decimal("0.005")
-            elif tier == "OSA":
-                oum_p = info.get("oum_parent")
-                internal_senior = info.get("internal_senior_parent")
-                if oum_p:
-                    senior_ovr += sales_price * Decimal("0.005")
-                if internal_senior:
-                    senior_ovr += sales_price * Decimal("0.005")
+            # Overrides earned on this invoice, from the Data page (Override
+            # Rate % / From Role up the Reports To chain) -- since 2026-10-20
+            # no hardcoded 0.5% and no hardcoded tier map.
+            line_overrides = _line_overrides(canonical_name, inv_dt, r, prop_type)
+            senior_ovr = sum((sales_price * h["rate"] for h in line_overrides), Decimal("0"))
 
             processed_outsource_invoices.append(
                 OutsourceInvoiceLine(
@@ -1481,18 +1502,16 @@ def main(argv: list[str]) -> int:
         # "Factory":` branch, and applying this flat 0.5% on top would
         # double-credit the same OUM.
         if prop_type != "Factory":
-            tier = info["tier"]
-            if tier == "OSA 1":
-                oum_p = info["oum_parent"]
-                if oum_p:
-                    override_commissions[oum_p] += sales_price * Decimal("0.005")
-            elif tier == "OSA":
-                oum_p = info["oum_parent"]
-                internal_senior = info.get("internal_senior_parent")
-                if oum_p:
-                    override_commissions[oum_p] += sales_price * Decimal("0.005")
-                if internal_senior:
-                    override_commissions[internal_senior] += sales_price * Decimal("0.005")
+            for h in _line_overrides(canonical_name, inv_dt, r, prop_type):
+                override_commissions[h["name"]] += sales_price * h["rate"]
+
+    # Credit Data page overrides under the name the recipient's own sales use.
+    from basic_commission_rates import override_name_map, _canon_agent_key
+    _names = override_name_map(list(agent_own_commissions.keys()))
+    _merged = defaultdict(Decimal)
+    for _n, _amt in override_commissions.items():
+        _merged[_names.get(_canon_agent_key(_n)) or _n] += _amt
+    override_commissions = _merged
 
     # ------------------ TABLE 1 ------------------
     # Final Commission Payout Summary by Agent

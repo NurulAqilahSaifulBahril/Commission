@@ -539,6 +539,7 @@ def init_db() -> None:
             ALTER TABLE agent_roles ADD COLUMN IF NOT EXISTS full_name TEXT;
             ALTER TABLE agent_roles ADD COLUMN IF NOT EXISTS pg_bubble_id TEXT;
             ALTER TABLE agent_roles ADD COLUMN IF NOT EXISTS hidden INTEGER;
+            ALTER TABLE agent_roles ADD COLUMN IF NOT EXISTS package_type TEXT;
             ALTER TABLE nfp_prices ALTER COLUMN final_price TYPE NUMERIC;
             ALTER TABLE nfp_prices ALTER COLUMN final_with_tng TYPE NUMERIC;
             ALTER TABLE nfp_prices ALTER COLUMN package_price TYPE NUMERIC;
@@ -995,7 +996,7 @@ def list_rule_settings() -> list[dict[str, Any]]:
     return _list_config_rows("rule_settings", "rule_key, effective_from")
 
 
-AGENT_ROLE_FIELDS = ["effective_from", "agent", "agent_type", "hierarchy",
+AGENT_ROLE_FIELDS = ["effective_from", "agent", "package_type", "agent_type", "hierarchy",
                      "reports_to", "branch", "remarks", "start_date", "ic_no",
                      "nick_name", "full_name", "pg_bubble_id", "hidden"]
 

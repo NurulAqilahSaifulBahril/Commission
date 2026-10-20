@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/styles.css?v=20261013-remark-special-case">
+    <link rel="stylesheet" href="/static/styles.css?v=20261020-nfp-blue">
 </head>
 <body class="report-page">
     <div class="app-container">
@@ -115,6 +115,8 @@
                 </div>
 
                 
+                <div class="header-right">
+                <div id="viewModeToggle"></div>
                 <div class="header-actions">
                     <button id="syncDataBtn" class="btn btn-secondary">
                         <span class="icon">🔄</span> Sync Data
@@ -125,6 +127,7 @@
                     <button id="downloadExcelBtn" class="btn btn-primary">
                         <span class="icon">📊</span> Download Excel
                     </button>
+                </div>
                 </div>
             </header>
 
@@ -180,8 +183,9 @@
 
             <!-- Table Block -->
             <section class="card table-card">
-                <div class="card-header" style="justify-content: flex-end;">
-                    <div class="table-actions">
+                <div class="card-header" style="justify-content: space-between;">
+                    <span id="tableHeaderHint" style="display:none; font-size:13px; color:var(--text-muted);"></span>
+                    <div class="table-actions" style="margin-left:auto;">
                         <span class="row-count-badge" id="rowCount">0 rows</span>
                     </div>
                 </div>
@@ -643,8 +647,9 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=20261014-no-summary-remark"></script>
+    <script src="/static/app.js?v=20261020-nfp-blue"></script>
     <script src="/static/updater.js?v=20260923-adminonly"></script>
     <script src="/static/sidebar_toggle.js?v=20261014-2"></script>
+    <script src="/static/view_mode.js?v=20261020-auto"></script>
 </body>
 </html>

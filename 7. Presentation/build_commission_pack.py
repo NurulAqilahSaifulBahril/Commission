@@ -300,6 +300,49 @@ def _basic_line_rate_label(ln) -> str:
     return rate_str
 
 
+def _invoice_role_package(row: dict) -> str:
+    """Solar or EV role an invoice is priced under (see
+    basic_commission_rates.invoice_role_package)."""
+    import basic_commission_rates as _bcr
+    return _bcr.invoice_role_package(row)
+
+
+def _basic_line_overrides(ln, agent_type: str, name_map: dict | None = None) -> list:
+    """[(recipient, amount)] -- the overrides earned on one Basic line, read
+    only from the Data page (basic_commission_rates.get_data_page_overrides):
+    each person up the seller's Reports To chain whose Override Rate % / From
+    Role names the seller's role earns that rate on the sales price. Since
+    2026-10-20 there is no hardcoded 0.25% / 0.5% and no hardcoded tier map.
+
+    `name_map` (basic_commission_rates.override_name_map over the names the
+    report lists) credits a recipient under the name their own sales use, so
+    "Sunny Tan" typed as "Sunny Tan Hong Mui" in Reports To is one row."""
+    import basic_commission_rates as _bcr
+    dt = None
+    raw = str(getattr(ln, "invoice_date", "") or "")[:10]
+    try:
+        dt = datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        return []
+    hits = _bcr.get_data_page_overrides(
+        ln.agent_name, dt.month, year=dt.year, agent_type=agent_type,
+        package=getattr(ln, "role_package", "") or None,
+        property_type=getattr(ln, "package", "") or None)
+    sales = float(getattr(ln, "sales_price", 0) or 0)
+    name_map = name_map or {}
+    return [(name_map.get(h["key"]) or to_title_case(h["name"]), sales * float(h["rate"]))
+            for h in hits]
+
+
+def advance_recognized_date(ln) -> str:
+    """The date that puts an invoice's Advance RM 300 in a month: the Created
+    at of the payment that reached the advance trigger -- when Finance entered
+    it -- not the payment date typed on it (user, 2026-10-20). A payment dated
+    19 Aug but entered 10 Sep pays its advance in September. Falls back to the
+    payment date for lines that carry no Created at."""
+    return str(getattr(ln, "pct5_created", "") or getattr(ln, "pct5_date", "") or "")[:10]
+
+
 def _expand_basic_lines_for_month(basic_lines: list, m: int) -> list:
     """
     July 2026 onwards, Basic Commission pays out in two milestones: a flat
@@ -338,7 +381,7 @@ def _expand_basic_lines_for_month(basic_lines: list, m: int) -> list:
                 result.append(ln)
             continue
 
-        pct5_str = getattr(ln, "pct5_date", "") or ""
+        pct5_str = advance_recognized_date(ln)
         pct75_str = getattr(ln, "pct75_date", "") or ""
         pct5_m = _parse_month(pct5_str) if pct5_str else None
         pct75_m = _parse_month(pct75_str) if pct75_str else None
@@ -461,134 +504,53 @@ def ensure_rm_prefix(val: Any) -> str:
     return s
 
 
+# Every agent table in the packs lists agents A to Z by the full name it
+# displays, as the dashboard's Commission Section pages do (user,
+# 2026-10-20). The tier-and-team order that used to live here is gone. Both
+# keys keep their old 4-tuple shape so callers' fallbacks still compare.
+def agent_name_sort_key(agent_name: str) -> tuple[int, str, int, str]:
+    return (0, "", 0, to_full_name(agent_name).lower())
+
+
 def internal_agent_sort_key(agent_name: str) -> tuple[int, str, int, str]:
-    name_lower = agent_name.lower().strip()
-    senior = _int_get_reporting_senior(agent_name)
-    
-    if name_lower == "sunny tan" or "sunny" in name_lower:
-        return (0, "", 0, name_lower)
-    elif name_lower == "teng kah kent" or "kent" in name_lower:
-        return (1, "", 0, name_lower)
-    elif name_lower == "ching zhe hang" or "zhe hang" in name_lower:
-        return (2, "", 0, name_lower)
-    elif name_lower == "martin hing" or "martin" in name_lower:
-        return (3, "", 0, name_lower)
-        
-    if senior:
-        senior_lower = senior.lower()
-        if "sunny" in senior_lower:
-            return (0, name_lower, 1, name_lower)
-        elif "kent" in senior_lower:
-            return (1, name_lower, 1, name_lower)
-        elif "zhe hang" in senior_lower:
-            return (2, name_lower, 1, name_lower)
-        elif "martin" in senior_lower:
-            return (3, name_lower, 1, name_lower)
-            
-    return (4, "", 0, name_lower)
+    return agent_name_sort_key(agent_name)
 
 
 def outsource_agent_sort_key(agent_name: str) -> tuple[int, str, int, str]:
-    n = agent_name.lower().strip()
-    if n == "gan lai soon":
-        return (0, "", 0, n)
-        
-    # Carol Siow group
-    if n == "carol siow":
-        return (1, "", 1, n)
-    if n in ("liew lee ching", "low chin chai", "chang soon huat", "lee seok yun", "lee hui wen", "see cheak ching"):
-        return (1, n, 2, n)
-    if "sue cherk" in n:
-        return (1, "liew lee ching", 3, n)
-    if "kim swee" in n:
-        return (1, "low chin chai", 3, n)
-    if "siong hing" in n:
-        return (1, "chang soon huat", 3, n)
-        
-    # Oliver Koh group
-    if n == "oliver koh":
-        return (2, "", 1, n)
-    if n in ("mohd azhar bin ibrahim", "koh yeong cherng", "ang kok xing", "tey zhi yun", "lim chin seng"):
-        return (2, n, 2, n)
-    if "hanis" in n and "marjian" in n:
-        return (2, "mohd azhar bin ibrahim", 3, n)
-        
-    # Dean Wai group
-    if n == "dean wai":
-        return (3, "", 1, n)
-    if n in ("lam wai leng", "tee kok kian"):
-        return (3, n, 2, n)
-        
-    # Chan Wing On group
-    if n == "chan wing on":
-        return (4, "", 1, n)
-    if n in ("kwong jun sheng", "lee yue peng", "too pok jen"):
-        return (4, n, 2, n)
-        
-    # Chan Jia Wei group
-    if n == "chan jia wei":
-        return (5, "", 1, n)
-    if n in ("tay hock xiang", "ho wen lin", "ng zhee hao"):
-        return (5, n, 2, n)
-        
-    # Caryn Dong group
-    if n == "caryn dong":
-        return (6, "", 1, n)
-    if n in ("lim kai zhe", "lee chun xun", "ling wei perng"):
-        return (6, n, 2, n)
-        
-    # Ling Liang Kang group
-    if n == "ling liang kang":
-        return (7, "", 1, n)
-    if n == "tan wei hung":
-        return (7, n, 2, n)
-        
-    # Loo Chew Yin group
-    if n == "loo chew yin":
-        return (8, "", 1, n)
-    if n == "lai ka kit":
-        return (8, "loo chew yin", 3, n)
-        
-    # Other OUMs
-    other_oums = ["gan lai hock", "phil moo", "kok shao hong", "wilson tan"]
-    for idx, oum in enumerate(other_oums):
-        if n == oum or oum in n:
-            return (9 + idx, "", 1, n)
-            
-    # Safwan
-    if n == "safwan":
-        return (20, "", 2, n)
-        
-    # Fallback / Independent OSAs
-    return (30, "", 2, n)
+    return agent_name_sort_key(agent_name)
+
+
+_TOTAL_ROW_RE = re.compile(r"^(grand\s+)?total\b|^summary$", re.IGNORECASE)
+
+
+def sort_rows_by_agent(rows: list[list[Any]], agent_index: int = 0) -> list[list[Any]]:
+    """Rows A to Z by agent full name. A table may name the agent on the
+    first row of their block only, so a block (that row and the blank-agent
+    rows under it) moves as one and keeps its own order; Total rows stay at
+    the bottom. Stable, so one agent's blocks keep the order they came in."""
+    if not rows:
+        return []
+    lead, blocks, totals = [], [], []
+    for r in rows:
+        cell = str(r[agent_index]).strip() if r and len(r) > agent_index else ""
+        if r and _TOTAL_ROW_RE.match(str(r[0]).strip()):
+            totals.append(r)
+        elif cell and cell != "-":
+            blocks.append((agent_name_sort_key(cell), [r]))
+        elif blocks:
+            blocks[-1][1].append(r)
+        else:
+            lead.append(r)
+    blocks.sort(key=lambda b: b[0])
+    return lead + [r for _, block in blocks for r in block] + totals
 
 
 def sort_internal_table_rows(rows: list[list[Any]], agent_index: int = 0) -> list[list[Any]]:
-    if not rows:
-        return []
-    data_rows = []
-    total_rows = []
-    for r in rows:
-        if r and str(r[agent_index]).strip().lower() in ("total", "grand total", "summary"):
-            total_rows.append(r)
-        else:
-            data_rows.append(r)
-    sorted_data = sorted(data_rows, key=lambda r: internal_agent_sort_key(str(r[agent_index])))
-    return sorted_data + total_rows
+    return sort_rows_by_agent(rows, agent_index)
 
 
 def sort_outsource_table_rows(rows: list[list[Any]], agent_index: int = 0) -> list[list[Any]]:
-    if not rows:
-        return []
-    data_rows = []
-    total_rows = []
-    for r in rows:
-        if r and str(r[agent_index]).strip().lower() in ("total", "grand total", "summary"):
-            total_rows.append(r)
-        else:
-            data_rows.append(r)
-    sorted_data = sorted(data_rows, key=lambda r: outsource_agent_sort_key(str(r[agent_index])))
-    return sorted_data + total_rows
+    return sort_rows_by_agent(rows, agent_index)
 
 
 def format_senior_override_cell(breakdown_dict: dict[str, float]) -> str:
@@ -1132,9 +1094,11 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
         # percentages those are is whatever the Data page row that priced this
         # invoice says — see basic_commission_rates.invoice_milestones.
         _inv_parsed = basic._parse_invoice_date(r.get("invoice_date"))
+        from basic_commission_rates import invoice_role_package as _role_pkg
         policy, pct5_str, pct75_str, pct100_str = basic._invoice_milestones(
             r,
-            hierarchy=basic._outsource_hierarchy_for(info, _inv_parsed),
+            hierarchy=basic._outsource_hierarchy_for(
+                info, _inv_parsed, package=_role_pkg(r)),
             month=_inv_parsed.month if _inv_parsed else 5,
             year=_inv_parsed.year if _inv_parsed else year,
             agent=canonical_name,
@@ -1173,11 +1137,16 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
             pass
         # An EV charger job is priced by its Job Type, from the Data page, even
         # when the site is a factory. The Factory formula below is the solar
-        # one -- a 2% base plus the profit sharing negotiated on the panels --
-        # and it bypasses the Data page rate entirely. Towa Hardware's 11kW EV
-        # charger was being paid by it.
+        # one -- the agent's Factory rate from the Data page plus the profit
+        # sharing negotiated on the panels (typed per customer on the report).
+        # Towa Hardware's 11kW EV charger was being paid by it.
         if prop_type == "Factory" and not is_ev_job:
-            base_rate = Decimal("0.02")
+            from basic_commission_rates import get_factory_base_rate
+            _fdt = basic._parse_invoice_date(inv_dt)
+            base_rate = get_factory_base_rate(
+                "Outsource", basic._outsource_hierarchy_for(info, _fdt, package="Solar"),
+                _fdt.month if _fdt else 5, year=_fdt.year if _fdt else year,
+                agent=canonical_name)
 
             # The dashboard saves a Factory rate under whatever month the
             # invoice was being viewed as, i.e. its recognition month
@@ -1197,7 +1166,7 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
             #   OSA -> no report:      OSA 70%, 30% unpaid
             #   agent is the OUM:      OUM 20%, 80% unpaid
             # Only applies once profit sharing is actually set (> 0); at 0%
-            # the agent keeps the flat 2% base alone, same as before.
+            # the agent keeps their Data page Factory base alone, as before.
             hier = basic.resolve_factory_split_hierarchy(canonical_name)
             factory_tier = hier["tier"]
 
@@ -1275,19 +1244,12 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
             agent_own_commissions[canonical_name] += own_comm
             agent_sales_totals[canonical_name] += total
 
-            # OUM override: 0.5% of total amount from OSA/OSA 1
-            tier = info["tier"]
-            if tier == "OSA 1":
-                oum_p = info.get("oum_parent")
-                if oum_p:
-                    override_commissions[oum_p] += total * Decimal("0.005")
-            elif tier == "OSA":
-                oum_p = info.get("oum_parent")
-                internal_senior = info.get("internal_senior_parent")
-                if oum_p:
-                    override_commissions[oum_p] += total * Decimal("0.005")
-                if internal_senior:
-                    override_commissions[internal_senior] += total * Decimal("0.005")
+            # Overrides, from the Data page -- see _basic_line_overrides().
+            _ovr_probe = SimpleNamespace(agent_name=canonical_name, invoice_date=inv_dt,
+                                         sales_price=sales_price, package=prop_type,
+                                         role_package=_invoice_role_package(r))
+            for _ovr_name, _ovr_amt in _basic_line_overrides(_ovr_probe, "Outsource"):
+                override_commissions[_ovr_name] += Decimal(str(_ovr_amt))
 
             obj = SimpleNamespace(
                 agent_name=canonical_name,
@@ -1313,10 +1275,19 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
                 ev_rate=float(ev_rate) if ev_rate is not None else None,
                 ev_commission=float(ev_comm or 0),
                 rate_display=rate_display,
+                role_package=_invoice_role_package(r),
             )
             processed_invoices.append(obj)
 
     all_lines = processed_invoices + processed_factory
+
+    # Credit overrides under the name the recipient's own sales use.
+    import basic_commission_rates as _bcr
+    _names = _bcr.override_name_map(list(agent_own_commissions.keys()))
+    _merged = defaultdict(Decimal)
+    for _n, _amt in override_commissions.items():
+        _merged[_names.get(_bcr._canon_agent_key(_n)) or _n] += _amt
+    override_commissions = _merged
 
     # Build summary table
     all_agents_set = set(agent_own_commissions.keys()) | set(override_commissions.keys())
@@ -2169,6 +2140,10 @@ def build_internal_summary_tables(
     for r in nfp_rows:
         r.agent_name = to_title_case(r.agent_name)
         r.customer_name = to_title_case(r.customer_name)
+    # Overrides are credited under the name the recipient's own rows use.
+    import basic_commission_rates as _bcr
+    _ovr_names = _bcr.override_name_map(
+        [ln.agent_name for ln in basic_lines] + [r.agent_name for r in nfp_rows])
     for r in anp_detail:
         if r.get("agent_name"):
             r["agent_name"] = to_title_case(r["agent_name"])
@@ -2223,12 +2198,10 @@ def build_internal_summary_tables(
             if getattr(ln, "_skip_override", False):
                 continue
 
-            # Senior override
-            senior = _int_get_reporting_senior(ln.agent_name)
-            if senior:
-                senior = to_title_case(senior)
-                override = float(ln.net_base) * 0.0025
-                exec_name = to_title_case(ln.agent_name)
+            # Overrides, from the Data page (Override Rate % / From Role up
+            # the Reports To chain) -- see _basic_line_overrides().
+            exec_name = to_title_case(ln.agent_name)
+            for senior, override in _basic_line_overrides(ln, "Internal", _ovr_names):
                 basic_override_breakdown[senior][exec_name] += override
                 basic_override_by_agent[senior] = basic_override_by_agent.get(senior, 0.0) + override
                 basic_override_by_customer[agent][customer][senior] += override
@@ -2606,7 +2579,10 @@ def build_internal_summary_tables(
                         nfp_nfp_cell,
                         _nfp_cash_cell(nfp_info, basic_info),
                         "Net Floor Price Commission", nfp_comm_val,
-                        "-", "-", "-", "-", "-", "-", "-"
+                        # Basic Rate % carries this row's NFP rate, for the
+                        # Excel's Commission Rate % (the page reads it on
+                        # Basic rows only).
+                        "-", "-", "-", "-", rate_nfp, "-", "-"
                     ])
                     customer_rows.append(nfp_row)
 
@@ -2708,6 +2684,10 @@ def build_outsource_summary_tables(
     for r in nfp_rows:
         r.agent_name = to_title_case(r.agent_name)
         r.customer_name = to_title_case(r.customer_name)
+    # Overrides are credited under the name the recipient's own rows use.
+    import basic_commission_rates as _bcr
+    _ovr_names = _bcr.override_name_map(
+        [ln.agent_name for ln in basic_lines] + [r.agent_name for r in nfp_rows])
 
     agent_summary_by_month = {}
     customer_summary_by_month = {}
@@ -2772,11 +2752,9 @@ def build_outsource_summary_tables(
                     out_override_breakdown[oum_name][agent] += oum_cut
                     out_override_by_customer[agent][customer][oum_name] += oum_cut
             else:
-                oum_parent = info.get("oum_parent")
-                if oum_parent:
-                    oum_parent = to_title_case(oum_parent)
-                    sales_price = float(ln.sales_price)
-                    oum_override = sales_price * 0.005
+                # Overrides, from the Data page (Override Rate % / From Role
+                # up the Reports To chain) -- see _basic_line_overrides().
+                for oum_parent, oum_override in _basic_line_overrides(ln, "Outsource", _ovr_names):
                     out_override_breakdown[oum_parent][agent] += oum_override
                     basic_override_by_agent[oum_parent] = basic_override_by_agent.get(oum_parent, 0.0) + oum_override
                     out_override_by_customer[agent][customer][oum_parent] += oum_override
@@ -3129,7 +3107,9 @@ def build_outsource_summary_tables(
                         nfp_nfp_cell,
                         _nfp_cash_cell(nfp_info, basic_info),
                         "Net Floor Price Commission", nfp_comm_val,
-                        "-", "-", "-", "-", "-", "-", "-", "-"
+                        # Basic Rate % carries this row's NFP rate (see the
+                        # internal table).
+                        "-", "-", "-", "-", "-", rate_nfp, "-", "-"
                     ])
                     customer_rows.append(nfp_row)
 
@@ -4911,7 +4891,7 @@ def build_commission_pdf(
     story.append(PageTracker("agent_summary", page_registry))
     _asc_sub = ""
     if report_overview is not None and report_overview.get("unified_current"):
-        _asc_sub = (f"All {len(report_overview['unified_current'])} agents, ranked by total commission "
+        _asc_sub = (f"All {len(report_overview['unified_current'])} agents, A to Z, total commission "
                    f"(Basic + NFP + ANP) &middot; {report_overview.get('period_label', '')}")
     story.append(_band_header("Commission Detail", "Summary Agent Commission", _asc_sub))
     _spacer(14)
@@ -4926,11 +4906,14 @@ def build_commission_pdf(
             Paragraph("ANP (RM)", ledger_hdr_right_style),
             Paragraph("TOTAL (RM)", ledger_hdr_right_style),
         ]]
-        for r in unified:
+        # A to Z by agent, Outsource before Internal for the same name. The
+        # list itself stays ranked: Top Performers and the rank changes read it.
+        for r in sorted(unified, key=lambda r: (agent_name_sort_key(r["agent"]),
+                                                0 if r["type"] == "Outsource" else 1)):
             tag_color = "#0B6350" if r["type"] == "Internal" else "#B54A1D"
             tag_label = "INT" if r["type"] == "Internal" else "OUT"
             det_rows.append([
-                Paragraph(f'<font color="{tag_color}"><b>[{tag_label}]</b></font>&nbsp;&nbsp;{r["agent"]}', ledger_row_style),
+                Paragraph(f'<font color="{tag_color}"><b>[{tag_label}]</b></font>&nbsp;&nbsp;{to_full_name(r["agent"])}', ledger_row_style),
                 Paragraph(f'{r["basic"]:,.2f}' if r["basic"] else "&ndash;", ledger_num_style),
                 Paragraph(f'{r["nfp"]:,.2f}' if r["nfp"] else "&ndash;", ledger_num_style),
                 Paragraph(f'{r["anp"]:,.2f}' if r["anp"] else "&ndash;", ledger_num_style),
@@ -4972,6 +4955,160 @@ def build_commission_pdf(
     return output_path
 
 
+# Which Excel sheets belong to each Commission Section of the dashboard, and
+# which data each section needs, so the Download Excel button can export just
+# the section on screen without computing the others.
+EXCEL_SECTION_SHEETS = {
+    # The section download splits by payout stage, Internal and Outsource in
+    # one table (user, 2026-10-20). The whole pack keeps the Int / Out sheets.
+    "basic_nfp": ("Advance RM 300", "Balance Payout"),
+    "anp": ("Int ANP Details",),
+    "ega_esa": ("Int EGA ESA Details", "Out EGA ESA Details"),
+    "production_bonus": ("Outsource Production Bonus",),
+    "monthly_contest": ("Team Championship", "Cases and Awards by Agent"),
+}
+
+# Basic & NFP customer rows, as build_internal_summary_tables() /
+# build_outsource_summary_tables() lay them out -- the dashboard's own header
+# lists (app.py). Months before July have no RM300 column and their payout
+# date column is the full payment date.
+_BASIC_NFP_ROW_HEADERS = {
+    "Internal": ["Agent", "Customer", "Invoice Date", "1st Payment Date",
+                 "Basic Commission (RM300)", "75% Payment Date", "Package Type",
+                 "System Price", "Net Floor Price", "Sales Price", "Commission",
+                 "Commission Price", "Override", "Safwan (RM)", "Referral Name",
+                 "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"],
+    "Outsource": ["Agent", "Customer", "Invoice Date", "1st Payment Date",
+                  "Basic Commission (RM300)", "75% Payment Date", "Package Type",
+                  "System Price", "Net Floor Price", "Sales Price", "Commission",
+                  "Commission Price", "Override", "Safwan (RM)", "Gan Lai Soon",
+                  "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted",
+                  "Advance Payment Date"],
+}
+_STAGE_SHEET_COLUMNS = ["Agent", "Customer", "Invoice Date", "1st Payment Date",
+                        "Basic Commission (RM300)", "75% Payment Date", "Package Type",
+                        "System Price", "Net Floor Price", "Sales Price", "Commission",
+                        "Commission Price", "Override", "Safwan (RM)", "Gan Lai Soon",
+                        "Referral Name", "Referral Fee", "Basic Rate %"]
+
+
+def _row_headers(agent_type: str, month: int) -> list:
+    hdrs = list(_BASIC_NFP_ROW_HEADERS[agent_type])
+    if month < 7:
+        hdrs.remove("Basic Commission (RM300)")
+        hdrs[hdrs.index("75% Payment Date")] = "Full Payment Date"
+    return hdrs
+
+
+def customer_balance_dates(basic_lines: list, year: int, month: int) -> dict:
+    """customer (lower case) -> the date its balance payout was reached, as the
+    report page reads it (app.py _build_payout_policies + payoutPolicyFor in
+    app.js): the customer's earliest-dated invoice, blank when the stage falls
+    after this month."""
+    as_at = as_at_ym(year, month)
+    best: dict = {}
+    for ln in basic_lines or []:
+        cust = str(getattr(ln, "customer_name", "") or "").strip().lower()
+        if not cust or getattr(ln, "payout_policy", None) is None:
+            continue
+        inv = str(getattr(ln, "invoice_date", "") or "")[:10]
+        bal = str(getattr(ln, "pct75_date", "") or "")[:10]
+        if bal and _is_after_month(bal, as_at):
+            bal = ""
+        if cust not in best or inv < best[cust][0]:
+            best[cust] = (inv, bal)
+    return {k: v[1] for k, v in best.items()}
+
+
+def _money(text) -> float:
+    """"RM 1,234.50" -> 1234.5; "-RM 158.00" -> -158.0; anything else -> 0."""
+    try:
+        return float(re.sub(r"\s+", "", str(text or "").replace("RM", "").replace(",", "")))
+    except ValueError:
+        return 0.0
+
+
+def basic_nfp_stage_rows(rows_by_type: dict, balance_dates: dict, year: int, month: int,
+                         stage: str) -> list:
+    """One Internal + Outsource table for a payout stage ("advance" or
+    "balance"), in _STAGE_SHEET_COLUMNS order, A to Z by agent (Outsource first
+    for a name in both), with the Agent cell on each block's first row.
+
+    The row tests and amounts are the report page's (rowPassesPayoutStage,
+    advanceOnlyPrice and balanceRemainderValue in app.js): the advance takes a
+    Basic row whose RM300 cell holds an amount, its Commission Price capped at
+    it; the balance takes Basic and NFP rows whose payout lands this month,
+    a Basic row net of an advance paid in the same month."""
+    blocks = []
+    for agent_type in ("Outsource", "Internal"):
+        hdrs = _row_headers(agent_type, month)
+        col = {h: i for i, h in enumerate(hdrs)}
+        rm300_i = col.get("Basic Commission (RM300)")
+        date_i = col.get("75% Payment Date", col.get("Full Payment Date"))
+        owner = ""
+        for r in rows_by_type.get(agent_type) or []:
+            r = list(r) + ["-"] * (len(hdrs) - len(r))
+            if str(r[0] or "").strip():
+                owner = str(r[0]).strip()
+            kind = str(r[col["Commission"]] or "").strip().lower()
+            is_basic = "basic" in kind
+            price = str(r[col["Commission Price"]] or "").strip()
+            rm300 = str(r[rm300_i] or "").strip() if rm300_i is not None else ""
+            rm300_l = rm300.lower()
+            advance = _money(rm300) if rm300_i is not None else 0.0
+            full = _money(price)
+            keep = False
+            if stage == "advance":
+                if rm300_i is not None and is_basic and rm300_l not in ("", "-", "pending", "invoice before july"):
+                    keep = True
+                    if advance and full and advance < full:
+                        price = rm300
+            else:
+                if rm300_i is None:
+                    keep = True
+                elif (not kind or is_basic or "net floor" in kind or "netfloor" in kind) and rm300_l != "pending":
+                    milestone = str(r[date_i] or "")
+                    if is_basic and rm300_l != "invoice before july":
+                        cust = str(r[col["Customer"]] or "").strip().lower()
+                        milestone = balance_dates.get(agent_type, {}).get(cust, "")
+                    m = re.match(r"^(\d{4})-(\d{2})-\d{2}$", milestone.strip())
+                    lands = bool(m) and int(m.group(1)) == int(year) and int(m.group(2)) == int(month)
+                    keep = lands and price not in ("", "-") and "pending" not in price.lower()
+                    if keep and is_basic and advance and full:
+                        # An advance covering the whole commission leaves no
+                        # balance (balanceRemainderValue in app.js).
+                        price = ensure_rm_prefix(f"{max(full - advance, 0.0):,.2f}")
+            if not keep:
+                continue
+            out = {h: r[col[h]] for h in hdrs if h in col}
+            out["Commission Price"] = price
+            out["Agent"] = owner
+            line = [out.get(h, "-") for h in _STAGE_SHEET_COLUMNS]
+            if blocks and blocks[-1][0] == owner and blocks[-1][1] == agent_type:
+                blocks[-1][2].append(line)
+            else:
+                blocks.append((owner, agent_type, [line]))
+    blocks.sort(key=lambda b: (agent_name_sort_key(b[0]), 0 if b[1] == "Outsource" else 1))
+    rows = []
+    for owner, _t, lines in blocks:
+        for k, line in enumerate(lines):
+            line[0] = owner if k == 0 else ""
+            rows.append(line)
+    return rows
+
+
+# ANP detail feeds the Basic & NFP customer tables too (agent list, date
+# fallbacks), and the ANP customer rows come out of the internal summary
+# builder, so both sections fetch the internal basic/NFP/ANP trio.
+_EXCEL_SECTION_FETCHES = {
+    "basic_nfp": {"dates", "int_basic", "int_anp", "int_nfp", "out_basic", "out_anp", "out_nfp"},
+    "anp": {"dates", "int_basic", "int_anp", "int_nfp"},
+    "ega_esa": {"dates", "int_ega", "out_ega"},
+    "production_bonus": {"prod"},
+    "monthly_contest": {"contest"},
+}
+
+
 def build_commission_excel(
     output_path: Path,
     year: int,
@@ -4997,27 +5134,55 @@ def build_commission_excel(
     contest_t1_headers=None, contest_t1_rows=None,
     contest_t2_headers=None, contest_t2_rows=None,
     contest_t3_headers=None, contest_t3_rows=None,
+    sections=None,
+    stage_balance_dates=None,
 ) -> Path:
+    """`sections` limits the workbook to those dashboard sections' sheets
+    (see EXCEL_SECTION_SHEETS); None writes every sheet."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
 
     wb = Workbook()
-    
-    font_name = "Segoe UI"
+
+    # Arial throughout; column headers bold with a black outline, on white
+    # except the coloured groups below; each agent's rows boxed (user, 2026-10-20).
+    font_name = "Arial"
     title_fill = PatternFill("solid", fgColor="1A365D")  # Navy
-    header_fill = PatternFill("solid", fgColor="2F5597")  # Lighter navy
     total_fill = PatternFill("solid", fgColor="F1F5F9")  # Soft gray-blue
-    
+    nfp_row_fill = PatternFill("solid", fgColor="DDEBF7")     # Light blue: NFP rows
+    _green = PatternFill("solid", fgColor="45D65A")
+    _pink = PatternFill("solid", fgColor="E49EDD")
+    _orange = PatternFill("solid", fgColor="E87331")
+    header_fills = {
+        "commission rate %": _green, "commission price": _green,
+        "override": _pink, "safwan (rm)": _pink, "gan lai soon": _pink,
+        "referral name": _orange, "referral fee": _orange,
+    }
+
     title_font = Font(name=font_name, size=11, bold=True, color="FFFFFF")
-    header_font = Font(name=font_name, size=9.5, bold=True, color="FFFFFF")
+    header_font = Font(name=font_name, size=9.5, bold=True, color="000000")
     data_font = Font(name=font_name, size=9.5, bold=False, color="000000")
     total_font = Font(name=font_name, size=9.5, bold=True, color="000000")
-    
+
     thin_border_side = Side(style="thin", color="CCCCCC")
     border_all = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
+    outline_side = Side(style="thin", color="000000")
+    header_border = Border(left=outline_side, right=outline_side, top=outline_side, bottom=outline_side)
     double_bottom_side = Side(style="double", color="000000")
     total_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=double_bottom_side)
+
+    def outline_range(ws, first_row, last_row, first_col, last_col):
+        """A black box round a block of cells, keeping their inner borders."""
+        for rr in range(first_row, last_row + 1):
+            for cc in range(first_col, last_col + 1):
+                cell = ws.cell(row=rr, column=cc)
+                b = cell.border
+                cell.border = Border(
+                    left=outline_side if cc == first_col else b.left,
+                    right=outline_side if cc == last_col else b.right,
+                    top=outline_side if rr == first_row else b.top,
+                    bottom=outline_side if rr == last_row else b.bottom)
 
     # Clean and Format Cell
     def clean_and_format_cell(cell, val, header_name, is_total_row=False):
@@ -5043,7 +5208,9 @@ def build_commission_excel(
 
         # 1. Parse currency or generic number strings
         if isinstance(val, str):
-            cleaned = val.replace("RM", "").replace(",", "").strip()
+            # No spaces either: a negative amount reads "-RM 158.00", which
+            # left a gap after the sign and was written out as text.
+            cleaned = re.sub(r"\s+", "", val.replace("RM", "").replace(",", ""))
             if re.match(r'^[-+]?\d+\.\d+$', cleaned):
                 try:
                     cell.value = float(cleaned)
@@ -5097,7 +5264,8 @@ def build_commission_excel(
         else:
             cell.alignment = Alignment(horizontal="left", vertical="center")
 
-    def write_block(ws, start_row, title, headers, rows):
+    def write_block(ws, start_row, title, headers, rows, row_fill=None):
+        """`row_fill(row)` may return a fill for a whole data row."""
         ws.row_dimensions[start_row].height = 24
         for col_idx in range(1, len(headers) + 1):
             c = ws.cell(row=start_row, column=col_idx)
@@ -5114,8 +5282,9 @@ def build_commission_excel(
         for col_idx, h in enumerate(headers, start=1):
             c = ws.cell(row=start_row, column=col_idx, value=h)
             c.font = header_font
-            c.fill = header_fill
-            c.border = border_all
+            c.border = header_border
+            if str(h).strip().lower() in header_fills:
+                c.fill = header_fills[str(h).strip().lower()]
             c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         start_row += 1
         
@@ -5142,26 +5311,57 @@ def build_commission_excel(
             sys_col = None
             nfp_col = None
 
+        agent_col = next((i for i, h in enumerate(headers) if is_agent_header(h)), None)
+        owner, owners = "", []   # (sheet row, agent) for every non-total row
+        first_data_row = start_row
         for r in rows:
             ws.row_dimensions[start_row].height = 18
             first_val = str(r[0]).strip().lower() if r and len(r) > 0 else ""
             is_total = "total" in first_val or "grand total" in first_val
-            
+
+            fill = row_fill(r) if (row_fill and not is_total) else None
             for col_idx, val in enumerate(r):
                 if col_idx < len(headers):
                     c = ws.cell(row=start_row, column=col_idx + 1)
                     clean_and_format_cell(c, val, headers[col_idx], is_total_row=is_total)
                     if headers[col_idx].strip().lower() == "gan lai soon":
                         c.alignment = Alignment(horizontal="center", vertical="center")
+                    if fill is not None:
+                        c.fill = fill
+                    if headers[col_idx].strip().lower() == "commission price":
+                        # Amounts and the words some of them hold ("pending
+                        # full payment") alike; the header stays centred.
+                        c.alignment = Alignment(horizontal="right", vertical="center")
+                        c.font = total_font   # bold, same size and colour
+                    elif headers[col_idx].strip().lower() == "commission rate %":
+                        c.alignment = Alignment(horizontal="right", vertical="center")
+            if agent_col is not None and not is_total:
+                cell_agent = str(r[agent_col] or "").strip() if len(r) > agent_col else ""
+                if cell_agent and cell_agent != "-":
+                    owner = cell_agent
+                owners.append((start_row, owner))
 
             if sys_col and nfp_col:
                 val1 = str(ws.cell(row=start_row, column=sys_col).value).strip()
                 val2 = str(ws.cell(row=start_row, column=nfp_col).value).strip()
                 if val1 == val2 and val1:
                     ws.merge_cells(start_row=start_row, start_column=sys_col, end_row=start_row, end_column=nfp_col)
-            
+
             start_row += 1
-        
+
+        # One box per agent: consecutive rows of the same agent.
+        k = 0
+        while k < len(owners):
+            j = k
+            while (j + 1 < len(owners) and owners[j + 1][1] == owners[k][1]
+                   and owners[j + 1][0] == owners[j][0] + 1):
+                j += 1
+            outline_range(ws, owners[k][0], owners[j][0], 1, len(headers))
+            k = j + 1
+        # And one down every column, Total row included.
+        for col_idx in range(1, len(headers) + 1):
+            outline_range(ws, first_data_row, start_row - 1, col_idx, col_idx)
+
         ws.row_dimensions[start_row].height = 18
         start_row += 1
         return start_row
@@ -5237,15 +5437,66 @@ def build_commission_excel(
         curr_row = write_block(ws, curr_row, "Summary Outsource Agent Commission by Customer", out_cust_headers, [])
     autofit_cols(ws)
 
+    # Basic & NFP by payout stage: the section download (see
+    # EXCEL_SECTION_SHEETS). Internal and Outsource share one table per stage.
+    if sections is not None and "basic_nfp" in sections:
+        for stage, title in (("advance", "Advance RM 300"), ("balance", "Balance Payout")):
+            ws = wb.create_sheet(title)
+            curr_row = 1
+            for m in months_to_export:
+                rows = basic_nfp_stage_rows(
+                    {"Internal": int_customer_summary_rows.get(m, []),
+                     "Outsource": out_customer_summary_rows.get(m, [])},
+                    stage_balance_dates or {}, year, m, stage)
+                # No., Customer, Agent, 1st Payment Date, Commission, Commission
+                # Price (user, 2026-10-20). With Customer leading, every row
+                # names its agent rather than only a block's first row. The
+                # Balance Payout sheet also keeps the price and the other
+                # commission columns.
+                src = {c: i for i, c in enumerate(_STAGE_SHEET_COLUMNS)}
+                if stage == "balance":
+                    picked = ["Customer", "Agent", "1st Payment Date", "System Price", "Net Floor Price",
+                              "Sales Price", "Commission", "Basic Rate %", "Commission Price", "Override",
+                              "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee"]
+                else:
+                    picked = ["Customer", "Agent", "1st Payment Date", "Commission", "Commission Price"]
+                # "Basic Rate %" holds the NFP rate on an NFP row, so it is one
+                # Commission Rate % column for both.
+                _labels = {"Sales Price": "Original Price/Cash Price after discount",
+                           "Basic Rate %": "Commission Rate %"}
+                headers_out = ["No."] + [_labels.get(c, c) for c in picked]
+                body, owner = [], ""
+                for n, r in enumerate(rows, start=1):
+                    owner = r[src["Agent"]] or owner
+                    line = [n] + [owner if c == "Agent" else r[src[c]] for c in picked]
+                    if "Basic Rate %" in picked:
+                        # An NFP sale below its floor "bears 20%": shown as the
+                        # plain 20% so it reads as a rate like the others.
+                        k = 1 + picked.index("Basic Rate %")
+                        line[k] = str(line[k] or "").replace("bears ", "") or line[k]
+                    body.append(line)
+                if body:
+                    price_i = headers_out.index("Commission Price")
+                    total = sum(_money(r[price_i]) for r in body)
+                    total_row = ["Total"] + [""] * (len(headers_out) - 1)
+                    total_row[price_i] = ensure_rm_prefix(f"{total:,.2f}")
+                    body.append(total_row)
+                label = "Advance RM 300" if stage == "advance" else "Balance Payout"
+                comm_i = headers_out.index("Commission")
+                curr_row = write_block(ws, curr_row, f"{MONTH_NAMES[m]} {year} - Basic & Net Floor Price Commission - {label}",
+                                       headers_out, body,
+                                       row_fill=lambda r: nfp_row_fill if "net floor" in str(r[comm_i]).lower() else None)
+            autofit_cols(ws)
+
     # 4. Int EGA ESA Details
     ws = wb.create_sheet("Int EGA ESA Details")
     curr_row = 1
-    curr_row = write_block(ws, curr_row, "Internal EGA / ESA Awards - Summary by Agent", int_ega_h1 or ["Agent", "EP Point Status", "Qualifying Status"], int_ega_t1)
+    curr_row = write_block(ws, curr_row, "Internal EGA / ESA Awards - Summary by Agent", int_ega_h1 or ["Agent", "EP Point Status", "Qualifying Status"], sort_rows_by_agent(int_ega_t1))
     _int_ega_all = (int_ega_t2 or []) + (int_ega_t3 or [])
     _int_ega_ytd_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package", "Sales Price", "Accumulated EP", "Eligibility"]
     _int_ega_ytd_rows = []
     if _int_ega_all:
-        for _er in sorted(_int_ega_all, key=lambda x: (str(x[0]).lower() if x else "", str(x[4]) if len(x) > 4 else "")):
+        for _er in sorted(_int_ega_all, key=lambda x: (agent_name_sort_key(x[0]) if x else (0, "", 0, ""), str(x[4]) if len(x) > 4 else "")):
             if len(_er) >= 8:
                 inv_key = str(_er[2]).strip()
                 dates = invoice_dates_map.get(inv_key) if invoice_dates_map else None
@@ -5267,12 +5518,12 @@ def build_commission_excel(
     # 5. Out EGA ESA Details
     ws = wb.create_sheet("Out EGA ESA Details")
     curr_row = 1
-    curr_row = write_block(ws, curr_row, "Outsource EGA / ESA Awards - Summary by Agent", out_ega_h1 or ["Agent", "EP Point Status", "Qualifying Status"], out_ega_t1)
+    curr_row = write_block(ws, curr_row, "Outsource EGA / ESA Awards - Summary by Agent", out_ega_h1 or ["Agent", "EP Point Status", "Qualifying Status"], sort_rows_by_agent(out_ega_t1))
     _out_ega_all = (out_ega_t2 or []) + (out_ega_t3 or [])
     _out_ega_ytd_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package", "Sales Price", "Accumulated EP", "Eligibility"]
     _out_ega_ytd_rows = []
     if _out_ega_all:
-        for _er in sorted(_out_ega_all, key=lambda x: (str(x[0]).lower() if x else "", str(x[4]) if len(x) > 4 else "")):
+        for _er in sorted(_out_ega_all, key=lambda x: (agent_name_sort_key(x[0]) if x else (0, "", 0, ""), str(x[4]) if len(x) > 4 else "")):
             if len(_er) >= 8:
                 inv_key = str(_er[2]).strip()
                 dates = invoice_dates_map.get(inv_key) if invoice_dates_map else None
@@ -5295,9 +5546,9 @@ def build_commission_excel(
     ws = wb.create_sheet("Outsource Production Bonus")
     curr_row = 1
     if out_prod_data:
-        oum_summary = out_prod_data.get("oum_summary", [])
-        ogm_summary = out_prod_data.get("ogm_summary", [])
-        team_detail = out_prod_data.get("team_detail", [])
+        oum_summary = sort_rows_by_agent(out_prod_data.get("oum_summary", []))
+        ogm_summary = sort_rows_by_agent(out_prod_data.get("ogm_summary", []))
+        team_detail = sort_rows_by_agent(out_prod_data.get("team_detail", []))
         pb_headers = out_prod_data.get("headers", {})
 
         curr_row = write_block(ws, curr_row, "Summary of OUM Bonus", pb_headers.get("oum", ["Agent", "Total Sales", "Status", "Bonus Amount"]), oum_summary)
@@ -5324,6 +5575,15 @@ def build_commission_excel(
                             contest_t3_rows or [])
     autofit_cols(ws)
 
+    if sections is not None:
+        keep = {title for s in sections for title in EXCEL_SECTION_SHEETS.get(s, ())}
+        for ws in list(wb.worksheets):
+            if ws.title not in keep:
+                wb.remove(ws)
+        if not wb.worksheets:
+            raise ValueError(f"No Excel sheets for section(s): {', '.join(sections)}")
+        wb.active = 0
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
     return output_path
@@ -5333,8 +5593,28 @@ def build_commission_excel(
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
-def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: bool = False) -> Path:
+def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: bool = False,
+              sections=None) -> Path:
+    """`sections` (Excel only) exports just those dashboard sections -- see
+    EXCEL_SECTION_SHEETS -- and skips fetching data none of them uses. None
+    builds the whole pack."""
     print(f"\nBuilding Commission PDF for year {year}...")
+    is_excel = str(output_path).lower().endswith(".xlsx")
+    if sections is not None:
+        if not is_excel:
+            raise ValueError("Section exports are Excel only")
+        sections = [s for s in sections if s in EXCEL_SECTION_SHEETS]
+        if not sections:
+            raise ValueError("Unknown commission section")
+        need = set().union(*(_EXCEL_SECTION_FETCHES[s] for s in sections))
+    else:
+        need = None
+
+    def _wanted(name):
+        return need is None or name in need
+
+    def _skipped_meta():
+        return {"agents": 0, "invoices": 0, "total_commission": Decimal("0"), "filter": "skipped"}
     # Resolve proxy credentials once, up front: _resolve_proxy_credentials()
     # pops/re-sets PG_PROXY_TOKEN in os.environ, so letting the concurrent
     # fetches below each resolve on their own thread can race and make one of
@@ -5354,18 +5634,50 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     from concurrent.futures import ThreadPoolExecutor
     ega_upto_month = month if month is not None else (5 if may_only else None)
 
+    # The invoice-dates lookup needs the Internal Basic module; load it here,
+    # on this thread, so it can join the concurrent fetches below instead of
+    # waiting for all of them to finish first.
+    basic_mod = sys.modules.get("int_basic_commission")
+    if not basic_mod:
+        basic_path = REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "full_internal_basic_commission.py"
+        basic_mod = _load_module("int_basic_commission", basic_path)
+
     print("\nFetching all commission data concurrently...")
-    with ThreadPoolExecutor(max_workers=10) as _executor:
-        _f_int_basic = _executor.submit(fetch_internal_basic, year, h1_only=h1_only)
-        _f_int_anp = _executor.submit(fetch_internal_anp, year, h1_only=h1_only)
-        _f_int_nfp = _executor.submit(fetch_internal_nfp, year, h1_only=h1_only)
-        _f_int_ega = _executor.submit(fetch_internal_ega_esa, year, upto_month=ega_upto_month)
-        _f_out_basic = _executor.submit(fetch_outsource_basic, year, h1_only=h1_only)
-        _f_out_anp = _executor.submit(fetch_outsource_anp, year, h1_only=h1_only)
-        _f_out_nfp = _executor.submit(fetch_outsource_nfp, year, h1_only=h1_only)
-        _f_out_ega = _executor.submit(fetch_outsource_ega_esa, year, upto_month=ega_upto_month)
-        _f_prod = _executor.submit(fetch_production_bonus, year)
-        _f_contest = _executor.submit(fetch_monthly_contest, month, year)
+    class _Done:
+        """Stands in for a fetch a section export does not need."""
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+    with ThreadPoolExecutor(max_workers=11) as _executor:
+        def _submit(name, skipped_value, fn, *args, **kwargs):
+            if not _wanted(name):
+                return _Done(skipped_value)
+            return _executor.submit(fn, *args, **kwargs)
+
+        _no_ega = ([], [], [], [], [], [])
+        _f_dates = _submit("dates", {}, fetch_invoice_dates, year, basic_mod)
+        _f_int_basic = _submit("int_basic", ([], [], [], [], _skipped_meta(), []),
+                               fetch_internal_basic, year, h1_only=h1_only)
+        _f_int_anp = _submit("int_anp", ([], [], _skipped_meta()),
+                             fetch_internal_anp, year, h1_only=h1_only)
+        _f_int_nfp = _submit("int_nfp", ([], [], _skipped_meta(), [], {}),
+                             fetch_internal_nfp, year, h1_only=h1_only)
+        _f_int_ega = _submit("int_ega", _no_ega,
+                             fetch_internal_ega_esa, year, upto_month=ega_upto_month)
+        _f_out_basic = _submit("out_basic", ([], [], [], _skipped_meta(), []),
+                               fetch_outsource_basic, year, h1_only=h1_only)
+        _f_out_anp = _submit("out_anp", ([], [], _skipped_meta()),
+                             fetch_outsource_anp, year, h1_only=h1_only)
+        _f_out_nfp = _submit("out_nfp", ([], [], _skipped_meta(), [], {}),
+                             fetch_outsource_nfp, year, h1_only=h1_only)
+        _f_out_ega = _submit("out_ega", _no_ega,
+                             fetch_outsource_ega_esa, year, upto_month=ega_upto_month)
+        _f_prod = _submit("prod", {}, fetch_production_bonus, year)
+        _f_contest = _submit("contest", (None, [], None, [], None, []),
+                             fetch_monthly_contest, month, year)
 
         print("  Fetching Basic Commission (Internal)...")
         int_basic_t1, int_basic_t2, int_basic_t3, int_basic_t4, int_basic_meta, int_basic_lines = _f_int_basic.result()
@@ -5428,6 +5740,11 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         print("  Fetching Monthly Contest...")
         (contest_t1_headers, contest_t1_rows, contest_t2_headers, contest_t2_rows,
          contest_t3_headers, contest_t3_rows) = _f_contest.result()
+        _c3_agent = next((i for i, h in enumerate(contest_t3_headers or []) if is_agent_header(h)), None)
+        if _c3_agent is not None:
+            contest_t3_rows = sort_rows_by_agent(contest_t3_rows, _c3_agent)
+
+        invoice_dates_map = _f_dates.result()
 
     # Build internal summary tables
     global invoice_package_map
@@ -5443,12 +5760,6 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         anp_mod = sys.modules["int_anp_commission"]
         if hasattr(anp_mod, "summary_table_rows"):
             int_anp_summary_for_table = anp_mod.summary_table_rows(int_anp_summary)
-
-    basic_mod = sys.modules.get("int_basic_commission")
-    if not basic_mod:
-        basic_path = REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "full_internal_basic_commission.py"
-        basic_mod = _load_module("int_basic_commission", basic_path)
-    invoice_dates_map = fetch_invoice_dates(year, basic_mod)
 
     # Full-year copy kept aside before the month filter below mutates
     # int_anp_detail -- the Top Performers "vs last month" comparison needs
@@ -5474,7 +5785,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
                         "invoices": len(_m_nfp),
                         "total_commission": Decimal(str(round(sum(float(r.nfp_commission) for r in _m_nfp), 2)))}
 
-    int_agent_summary_rows, int_customer_summary_rows, int_agent_anp_rows, int_customer_anp_rows, int_agent_totals_by_month = build_internal_summary_tables(
+    int_agent_summary_rows, int_customer_summary_rows, int_agent_anp_rows, int_customer_anp_rows, int_agent_totals_by_month = ({}, {}, {}, {}, {}) if not _wanted("int_basic") else build_internal_summary_tables(
         basic_t1=int_basic_t1,
         basic_lines=int_basic_lines,
         basic_t4=int_basic_t4,
@@ -5518,7 +5829,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     # Build outsource summary tables
 
     print("  Building outsource summary tables...")
-    out_agent_summary_rows, out_customer_summary_rows, out_customer_anp_rows, out_agent_totals_by_month = build_outsource_summary_tables(
+    out_agent_summary_rows, out_customer_summary_rows, out_customer_anp_rows, out_agent_totals_by_month = ({}, {}, {}, {}) if not _wanted("out_basic") else build_outsource_summary_tables(
         basic_t1=out_basic_t1,
         basic_lines=out_basic_lines,
         basic_meta=out_basic_meta,
@@ -5533,6 +5844,44 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     )
     print(f"    Agent summary: {len(out_agent_summary_rows)} rows")
     print(f"    Customer summary: {len(out_customer_summary_rows)} rows")
+
+    # The Excel file is the agent and customer tables plus EGA/ESA,
+    # Production Bonus and Contest -- none of the overview below (unified
+    # ranking, payout split, previous-month comparison), which only the PDF
+    # draws. Writing it here skips that work, including a full rebuild of
+    # both summary tables for the previous month.
+    if is_excel:
+        print(f"  Exporting commission pack to Excel: {output_path}")
+        return build_commission_excel(
+            output_path=output_path,
+            year=year,
+            month=month,
+            invoice_dates_map=invoice_dates_map,
+            int_agent_summary_rows=int_agent_summary_rows,
+            int_customer_summary_rows=int_customer_summary_rows,
+            int_customer_anp_rows=int_customer_anp_rows,
+            out_agent_summary_rows=out_agent_summary_rows,
+            out_customer_summary_rows=out_customer_summary_rows,
+            int_ega_t1=int_ega_t1,
+            int_ega_h1=int_ega_h1,
+            int_ega_t2=int_ega_t2,
+            int_ega_t3=int_ega_t3,
+            int_ega_h3=int_ega_h3,
+            out_ega_t1=out_ega_t1,
+            out_ega_h1=out_ega_h1,
+            out_ega_t2=out_ega_t2,
+            out_ega_t3=out_ega_t3,
+            out_ega_h3=out_ega_h3,
+            out_prod_data=out_prod_data,
+            contest_t1_headers=contest_t1_headers, contest_t1_rows=contest_t1_rows,
+            contest_t2_headers=contest_t2_headers, contest_t2_rows=contest_t2_rows,
+            contest_t3_headers=contest_t3_headers, contest_t3_rows=contest_t3_rows,
+            sections=sections,
+            stage_balance_dates={
+                "Internal": customer_balance_dates(int_basic_lines, year, month) if month else {},
+                "Outsource": customer_balance_dates(out_basic_lines, year, month) if month else {},
+            },
+        )
 
     # ----------------------------------------------------------------
     # Unified (Internal + Outsource combined) report overview: Executive
@@ -5664,35 +6013,6 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
           + (f", vs RM {overview_prev['total']:,.2f} last month" if overview_prev else "")
           + f"; bonus: prod RM {prod_bonus_total:,.2f}, team RM {team_bonus_total:,.2f}, "
           + f"EGA/ESA eligible: {ega_eligible}")
-
-    # --- Build Excel or PDF ---
-    if str(output_path).lower().endswith(".xlsx"):
-        print(f"  Exporting commission pack to Excel: {output_path}")
-        return build_commission_excel(
-            output_path=output_path,
-            year=year,
-            month=month,
-            invoice_dates_map=invoice_dates_map,
-            int_agent_summary_rows=int_agent_summary_rows,
-            int_customer_summary_rows=int_customer_summary_rows,
-            int_customer_anp_rows=int_customer_anp_rows,
-            out_agent_summary_rows=out_agent_summary_rows,
-            out_customer_summary_rows=out_customer_summary_rows,
-            int_ega_t1=int_ega_t1,
-            int_ega_h1=int_ega_h1,
-            int_ega_t2=int_ega_t2,
-            int_ega_t3=int_ega_t3,
-            int_ega_h3=int_ega_h3,
-            out_ega_t1=out_ega_t1,
-            out_ega_h1=out_ega_h1,
-            out_ega_t2=out_ega_t2,
-            out_ega_t3=out_ega_t3,
-            out_ega_h3=out_ega_h3,
-            out_prod_data=out_prod_data,
-            contest_t1_headers=contest_t1_headers, contest_t1_rows=contest_t1_rows,
-            contest_t2_headers=contest_t2_headers, contest_t2_rows=contest_t2_rows,
-            contest_t3_headers=contest_t3_headers, contest_t3_rows=contest_t3_rows,
-        )
 
     # --- Build PDF ---
     print(f"\nRendering PDF (Pass 1 - mapping page numbers)...")

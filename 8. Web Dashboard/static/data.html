@@ -302,8 +302,7 @@
             <div class="sidebar-group">
                 <label class="group-label">Data Section</label>
                 <ul class="nav-list" id="dataSectionList">
-                    <li data-section="roles" class="active"><span class="bullet"></span> Agent Roles & Hierarchy</li>
-                    <li data-section="basic"><span class="bullet"></span> Basic Commission</li>
+                    <li data-section="roles" class="active"><span class="bullet"></span> Basic Commission</li>
                     <li data-section="nfp"><span class="bullet"></span> Net Floor Price</li>
                     <li data-section="anp"><span class="bullet"></span> ANP Commission</li>
                     <li data-section="ega_esa"><span class="bullet"></span> EGA/ESA Award</li>
@@ -327,7 +326,7 @@
         <main class="main-content">
             <header class="content-header">
                 <div class="header-title">
-                    <h2 id="pageTitle" class="section-title-header">Agent Roles & Hierarchy</h2>
+                    <h2 id="pageTitle" class="section-title-header">Basic Commission</h2>
                     <p id="subHeader">System inputs for commission rates and calculation rules</p>
                 </div>
                 <div class="header-actions">
@@ -340,90 +339,6 @@
             </div>
 
             <div class="data-content">
-                <!-- ── VIEW MODE ───────────────────────────────────────────── -->
-                <section class="card table-card" id="viewCard">
-                    <div class="card-header">
-                        <h3>Basic Commission</h3>
-                        <div style="display:flex; gap:12px;">
-                            <button class="btn btn-primary" id="editModeBtn" style="display:none;">➕ Add entry</button>
-                        </div>
-                    </div>
-                    <div class="section-hint">
-                        <strong>Variables:</strong>
-                        a = Total Amount &nbsp;·&nbsp; b = EPP Effective &nbsp;·&nbsp;
-                        c = Sales Price (a − b) &nbsp;·&nbsp; d = Net Floor Price &nbsp;·&nbsp; z = Rate %
-                        &nbsp;&nbsp;|&nbsp;&nbsp; <strong>Basic Commission</strong> = c × z
-                    </div>
-                    <div class="data-toolbar" style="flex-wrap:wrap; gap:16px; align-items:center;">
-                        <div style="display:flex; align-items:center; gap:8px;">
-                            <label for="previewMonthYearSearch" style="font-weight:600;">Search Month/Year</label>
-                            <!-- Replaces separate Year/Month dropdowns with one free-text
-                                 search: type a month name ("July"/"Jul"), a month number
-                                 ("07"), a year ("2026"), or both together ("July 2026" /
-                                 "2026-07") -- parseMonthYearSearch() in data.js reads
-                                 whichever of the two it can find and leaves the other
-                                 blank ("all"). -->
-                            <input type="text" id="previewMonthYearSearch" placeholder="e.g. July, 2026, or July 2026"
-                                   style="padding:6px 10px; border-radius:6px; border:1px solid var(--border-color); min-width:220px;">
-                        </div>
-                        <div style="display:flex; align-items:center; gap:8px;">
-                            <label for="previewAgentRoleSearch" style="font-weight:600;">Search Agent Type/Role</label>
-                            <!-- Replaces separate Agent Type/Role dropdowns with one
-                                 free-text search: type "Internal"/"Outsource", a role
-                                 name ("Sales Consultant", "OUM", ...), or both together
-                                 ("Internal Sales Consultant") -- parseAgentTypeRoleSearch()
-                                 in data.js reads whichever of the two it can find and
-                                 leaves the other blank ("all"). -->
-                            <input type="text" id="previewAgentRoleSearch" placeholder="e.g. Internal, OUM, or Internal Sales Consultant"
-                                   style="padding:6px 10px; border-radius:6px; border:1px solid var(--border-color); min-width:260px;">
-                        </div>
-                        <div style="display:flex; align-items:center; gap:8px;">
-                            <label for="previewAgentName" style="font-weight:600;">Agent Name</label>
-                            <select id="previewAgentName" style="padding:6px 10px; border-radius:6px; border:1px solid var(--border-color); max-width:200px;">
-                                <option value="">All Agents</option>
-                            </select>
-                        </div>
-                        <div style="display:flex; align-items:center; gap:8px;">
-                            <label for="previewPropertyType" style="font-weight:600;">Property Type</label>
-                            <select id="previewPropertyType" style="padding:6px 10px; border-radius:6px; border:1px solid var(--border-color);">
-                                <option value="">All Property Types</option>
-                                <option value="Residential">Residential</option>
-                                <option value="Commercial">Commercial</option>
-                                <option value="Factory">Factory</option>
-                                <option value="NGO">NGO</option>
-                                <option value="Government">Government</option>
-                            </select>
-                        </div>
-                    </div>
-                    <!-- Payout mechanics apply to the whole scheme, not to any one
-                         rate row, so they are stated once here instead of being
-                         repeated against every entry. -->
-                    <div id="payoutPanel" style="display:none;"></div>
-                    <div class="table-container">
-                        <table class="dashboard-table aligned-table">
-                            <colgroup>
-                                <col style="width:12%"><col style="width:8%"><col style="width:8%"><col style="width:12%">
-                                <col style="width:11%"><col style="width:8%"><col style="width:7%"><col style="width:13%">
-                                <col style="width:9%"><col style="width:7%"><col style="width:5%">
-                            </colgroup>
-                            <thead>
-                                <tr><th>Commission Type</th><th>Invoice Date</th><th>Agent Type</th><th>Role</th><th>Property Type</th><th>Job Type</th><th>Rate %</th><th>Condition</th><th>Formula</th><th>Source</th><th></th></tr>
-                            </thead>
-                            <tbody id="previewBody"></tbody>
-                        </table>
-                    </div>
-                    <!-- Pagination -->
-                    <div id="previewPagination" style="display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:8px 0;"></div>
-                    <div class="section-hint" style="padding-bottom:16px;">
-                        <strong>Invoice Date</strong> is the month (or range) the value takes effect from, not
-                        the month selected above — a rate entered for Jan 2025 still governs July 2026 until
-                        something later replaces it.
-                        &nbsp;·&nbsp; <strong>Source:</strong> "Data page" = entered here.
-                        "Legacy table" / "Sheet fallback" / "Built-in default" = nothing has been
-                        entered for that row yet, so a fallback is supplying the number.
-                    </div>
-                </section>
-
                 <!-- ── NET FLOOR PRICE (own section) ───────────────────────── -->
                 <!-- Split out of the old "Basic & Net Floor Price Commission"
                      section so the tier rates have a page of their own instead
@@ -560,27 +475,9 @@
 
                 <section class="card table-card" id="rolesCard">
                     <div class="card-header">
-                        <h3>Agent Roles &amp; Hierarchy</h3>
+                        <h3>Basic Commission</h3>
                         <span class="row-count-badge" id="rolesCount">0 agents</span>
                     </div>
-                    <div class="section-hint">
-                        Who holds which role, and at what rate. <strong>Only the Agent Name is pulled
-                        from eeAdmin</strong>, so a newly tagged agent appears here by itself; Agent Type,
-                        Role, Branch, IC No and Nick Name are entered and kept on this page and are
-                        never changed by eeAdmin. (Reports To, which decides who earns the override, is
-                        kept as saved but no longer shown or edited here.)
-                        <strong>One entry per agent, with a line per role.</strong> A promotion or
-                        transfer is a new role with its own Invoice Date range (use <em>Edit</em>
-                        then <em>+ Add role</em>), not an overwrite, so every role is kept with
-                        the period it actually applied to.
-                        A new name arrives marked "⚠ Set effective date". Until you enter that
-                        month the row is not saved and no commission calculation uses it. Once
-                        dated it behaves like the rates: recalculating an old month uses the
-                        hierarchy as it stood then. An agent who leaves or is blocked in eeAdmin
-                        keeps their rows here until you delete them. Until an agent is listed
-                        here the calculation falls back to the old hardcoded name matching.
-                    </div>
-
                     <!-- Needs-review summary: only shown when something is flagged -->
                     <div id="rolesReviewBanner" style="display:none; margin:0 24px 0; padding:8px 14px; border-radius:8px; background:#fffbeb; border:1px solid #fde68a; color:#92400e; font-size:13px; font-weight:600; align-items:center; gap:8px;">
                         <span id="rolesReviewBannerText"></span>
@@ -625,7 +522,7 @@
                     <div class="table-container">
                         <table class="dashboard-table" id="rolesTable" style="table-layout:auto;">
                             <thead>
-                                <tr><th>Full Name</th><th>Invoice Date</th><th>Agent Type</th><th>Role</th><th>Rate</th><th>Branch</th><th></th></tr>
+                                <tr><th>Full Name</th><th>Invoice Date</th><th>Agent Type</th><th>Role</th><th>Package Type</th><th>Rate</th><th>Payment Rules</th><th>Override Rate</th><th>From Role</th><th>Branch</th><th></th></tr>
                             </thead>
                             <tbody id="rolesBody"></tbody>
                         </table>
@@ -654,6 +551,7 @@
                             </table>
                         </div>
                     </div>
+
                 </section>
 
                 <!-- ── MONTHLY CONTEST ─────────────────────────────────────── -->
@@ -842,7 +740,7 @@
                     </div>
                     <div class="contest-warn" id="pbStageWarn" style="display:none;"></div>
                     <p class="section-hint" style="padding:8px 24px 20px;">
-                        OSA earns no production bonus. Each agent's role comes from Agent Roles &amp; Hierarchy, not from this page.
+                        OSA earns no production bonus. Each agent's role comes from Basic Commission, not from this page.
                     </p>
                 </section>
 
@@ -1254,13 +1152,13 @@
     </div>
 
     <!-- Agent Role Edit Modal Pop-Up -->
-    <div id="agentRoleModal" class="modal hidden">
+    <div id="agentRoleModal" class="modal hidden" style="padding: 8px;">
         <div class="modal-content card" style="width: 100%; max-width: none; max-height: 96vh;">
             <div class="modal-header">
                 <h3 id="agentRoleModalTitle">Edit Agent Details</h3>
                 <button id="closeAgentRoleModalBtn" class="btn-close">&times;</button>
             </div>
-            <div class="modal-body" style="padding: 16px 18px; gap: 16px; overflow-y: auto; overflow-x: hidden;">
+            <div class="modal-body" style="padding: 16px 12px; gap: 16px; overflow-y: auto; overflow-x: hidden;">
                 <!-- Agent Name. Read-only when editing an existing row — the
                      name is eeAdmin's, and Full Name / Nick Name are there to
                      change what is displayed. Typeable only when adding, where
@@ -1332,7 +1230,7 @@
         </div>
     </div>
 
-    <script src="/static/data.js?v=20261014-name-first"></script>
+    <script src="/static/data.js?v=20261020-basic-rename"></script>
     <script src="/static/sidebar_toggle.js?v=20261014-2"></script>
 </body>
 </html>

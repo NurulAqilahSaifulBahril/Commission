@@ -2250,7 +2250,11 @@ def _build_payout_policies(basic_lines, as_at: str = "") -> dict:
             "balance_pct": _pct_text(policy.balance_trigger),
             # pct75_date/pct5_date on a line are named for the 2026 defaults
             # but hold whatever milestones this policy names.
-            "advance_date": _as_at_date(getattr(ln, "pct5_date", ""), as_at) if multi else "",
+            # The advance counts from its payment's Created at (see
+            # advance_recognized_date), so it reads as pending until then.
+            "advance_date": (str(getattr(ln, "pct5_date", "") or "")[:10]
+                             if multi and _as_at_date(build_commission_pack.advance_recognized_date(ln), as_at)
+                             else ""),
             # A stage the invoice only reached after this month reads as
             # pending here: the report is the month as it stood.
             "balance_date": _as_at_date(getattr(ln, "pct75_date", ""), as_at),
@@ -2347,7 +2351,9 @@ def _agent_roles_for_month(year: int, month: int) -> dict[str, dict]:
 
     One row per agent wins -- the latest effective_from among the rows whose
     range actually covers the month, which is the same "latest row wins" rule
-    basic_commission_rates uses to price them. Keyed on the same normalised
+    basic_commission_rates uses to price them. An agent holding a Solar and an
+    EV role at once is shown by the Solar one, the role a package-blind lookup
+    (NFP, Reports To) reads there too. Keyed on the same normalised
     form agent_names.resolve() uses so the browser can match a displayed name
     (which may be a nickname or full name) back to its role.
     """
@@ -2355,11 +2361,11 @@ def _agent_roles_for_month(year: int, month: int) -> dict[str, dict]:
         rates_dir = str(REPO_ROOT / "1. Basic Commission" / "3. Python Script")
         if rates_dir not in sys.path:
             sys.path.append(rates_dir)
-        from basic_commission_rates import split_effective_range
+        from basic_commission_rates import split_effective_range, role_package, PACKAGE_SOLAR
         target = f"{year}-{month:02d}"
         ic_map = agent_names.get_ic_map()
 
-        best: dict[str, tuple[str, dict]] = {}
+        best: dict[str, tuple[tuple, dict]] = {}
         for r in db.list_agent_roles():
             if r.get("hidden"):
                 continue
@@ -2371,14 +2377,21 @@ def _agent_roles_for_month(year: int, month: int) -> dict[str, dict]:
                 continue
             display = agent_names.resolve(agent)
             key = agent_names.normalize_key(display)
+            # Same start, different ends: the one ending first wins while both
+            # cover the month -- basic_commission_rates._covering_role_rows().
+            # A Solar role of "All" only holds role-independent rates (Factory
+            # 2%), so any other row covering the month is shown before it.
+            is_solar = role_package(r.get("package_type")) == PACKAGE_SOLAR
+            rate_holder = is_solar and str(r.get("hierarchy") or "").strip().lower() == "all"
+            rank = (not rate_holder, is_solar, start)
             prev = best.get(key)
-            if prev is None or start > prev[0]:
+            if prev is None or rank > prev[0][:3] or (rank == prev[0][:3] and end < prev[0][3]):
                 ic_no = (
                     ic_map.get(key)
                     or ic_map.get(agent_names.normalize_key(agent))
                     or str(r.get("ic_no") or "").strip()
                 )
-                best[key] = (start, {
+                best[key] = (rank + (end,), {
                     "agent": display,
                     "role": str(r.get("hierarchy") or "").strip(),
                     "agent_type": str(r.get("agent_type") or "").strip(),
@@ -2392,8 +2405,9 @@ def _agent_roles_for_month(year: int, month: int) -> dict[str, dict]:
 
 
 def _agent_role_history() -> dict[str, list[dict]]:
-    """{normalised agent name: [{"role", "agent_type", "start", "end"}, ...]},
-    every effective range on file, latest start first.
+    """{normalised agent name: [{"role", "agent_type", "package", "start", "end"}, ...]},
+    every effective range on file, latest start first. `package` is "Solar" or
+    "EV" -- an agent can hold one of each over the same months.
 
     _agent_roles_for_month() collapses this to a single role as at the *report*
     month, which misstates any row whose invoice predates a role change: an
@@ -2407,7 +2421,7 @@ def _agent_role_history() -> dict[str, list[dict]]:
         rates_dir = str(REPO_ROOT / "1. Basic Commission" / "3. Python Script")
         if rates_dir not in sys.path:
             sys.path.append(rates_dir)
-        from basic_commission_rates import split_effective_range
+        from basic_commission_rates import split_effective_range, role_package
 
         history: dict[str, list[dict]] = {}
         for r in db.list_agent_roles():
@@ -2424,6 +2438,7 @@ def _agent_role_history() -> dict[str, list[dict]]:
                 "agent": display,
                 "role": str(r.get("hierarchy") or "").strip(),
                 "agent_type": str(r.get("agent_type") or "").strip(),
+                "package": role_package(r.get("package_type")),
                 "start": start,
                 "end": end,
             })
@@ -6328,24 +6343,57 @@ def download_pdf():
         return jsonify({"error": str(e)}), 500
 
 
+_EXCEL_SECTION_FILE_NAMES = {
+    "basic_nfp": "Basic_NFP_Commission",
+    "anp": "ANP_Commission",
+    "ega_esa": "EGA_ESA_Award",
+    "production_bonus": "Production_Bonus",
+    "monthly_contest": "Monthly_Contest",
+}
+
+
 @app.route("/api/download/excel")
 @login_required
 def download_excel():
     year = request.args.get("year", 2026, type=int)
     month = request.args.get("month", 5, type=int)
-    
+    # The Commission Section on screen; the file then holds that section's
+    # sheets only. No section (or an unknown one) keeps the full pack.
+    section = (request.args.get("section") or "").strip().lower()
+    if section not in _EXCEL_SECTION_FILE_NAMES:
+        section = ""
+
     try:
         dashboard_data_dir = CURRENT_DIR / "data"
         dashboard_data_dir.mkdir(parents=True, exist_ok=True)
-        file_path = dashboard_data_dir / f"Commission_Pack_{year}_{month}.xlsx"
-        
-        build_commission_pack.build_pdf(year, file_path, month=month)
-        
+        file_stem = (f"{_EXCEL_SECTION_FILE_NAMES[section]}_{year}_{month}" if section
+                     else f"Commission_Pack_{year}_{month}")
+        file_path = dashboard_data_dir / f"{file_stem}.xlsx"
+
+        # The pack asks the database the same questions the dashboard's last
+        # refresh did. Answering those from that refresh's record
+        # (query_replay.py) skips downloading every invoice again, so the
+        # file carries exactly the figures on screen; a question the refresh
+        # never asked still goes to the database.
+        import contextlib
+        replay = bool(_data_cache.get("sql_replay"))
+        if replay:
+            try:
+                query_replay.restore(_data_cache["sql_replay"])
+            except Exception:
+                replay = False
+        with (query_replay.replaying() if replay else contextlib.nullcontext()):
+            build_commission_pack.build_pdf(year, file_path, month=month,
+                                            sections=[section] if section else None)
+        if replay:
+            _log(f"[EXCEL] {year}-{month:02d} {section or 'full pack'} built from the dashboard's "
+                 f"last refresh (query record: {query_replay.stats()}).")
+
         return send_file(
             str(file_path),
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             as_attachment=True,
-            download_name=f"Commission_Pack_{year}_{month}.xlsx"
+            download_name=f"{file_stem}.xlsx"
         )
     except Exception as e:
         import traceback
