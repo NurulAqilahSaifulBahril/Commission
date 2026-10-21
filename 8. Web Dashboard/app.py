@@ -2338,7 +2338,65 @@ def _build_payout_policies(basic_lines, as_at: str = "") -> dict:
             bucket.append(entry)
     for entries in out.values():
         entries.sort(key=lambda e: e.get("invoice_date") or "")
+    _add_advance_reached_pct(out)
     return out
+
+
+def _add_advance_reached_pct(policies: dict) -> None:
+    """Give each advanced invoice its "advance_reached_pct": the share of the
+    invoice actually paid by the payment that reached the advance trigger, so
+    the Commission Price hover can say "Advance Commission = RM 300 as achieved
+    5%" (Lim Ai Lian paid 5% on 23 Sep 2026) rather than restate the 4.5%
+    trigger. One query for all of them; on any failure the hover keeps the
+    trigger. Same payment exclusions as the milestone SQL."""
+    want = {}
+    for entries in policies.values():
+        for e in entries:
+            if e.get("multi_stage") and e.get("advance_date") and e.get("invoice"):
+                want.setdefault(e["invoice"].strip(), []).append(e)
+    if not want:
+        return
+    try:
+        from basic_commission_rates import MILESTONE_PAYMENT_EXCLUSIONS as _excl
+    except Exception:
+        _excl = "101334, 104412, 101333, 104413, 4899"
+    inv_list = ", ".join("'" + inv.replace("'", "''") + "'" for inv in want)
+    try:
+        rows = _pg_query(f"""
+            SELECT TRIM(i.invoice_number) AS inv, i.bubble_id, i.total_amount,
+                   p.payment_date, p.id, p.amount
+            FROM payment p
+            JOIN invoice i ON i.bubble_id = p.linked_invoice
+            WHERE TRIM(i.invoice_number) IN ({inv_list})
+              AND p.id NOT IN ({_excl})
+            ORDER BY i.bubble_id, p.payment_date, p.id
+        """)
+    except Exception as e:
+        _log(f"[ADVANCE %] could not read payments: {e}")
+        return
+    from collections import defaultdict as _dd
+    by_bubble = _dd(list)
+    for r in rows or []:
+        by_bubble[(str(r.get("inv") or ""), str(r.get("bubble_id") or ""))].append(r)
+    for (inv, _bid), pays in by_bubble.items():
+        for e in want.get(inv, []):
+            if e.get("advance_reached_pct"):
+                continue
+            try:
+                total = float(pays[0].get("total_amount") or 0)
+                trigger = float(e.get("advance_pct") or 0) / 100.0
+            except (TypeError, ValueError):
+                continue
+            if total <= 0:
+                continue
+            running = 0.0
+            for r in pays:
+                running += float(r.get("amount") or 0)
+                if running >= total * trigger - 1e-9:
+                    # The invoice version whose crossing date is the advance date.
+                    if str(r.get("payment_date") or "")[:10] == e["advance_date"]:
+                        e["advance_reached_pct"] = _pct_text(round(running / total * 100, 2))
+                    break
 
 
 def _build_system_details(nfp_by_inv_all: dict) -> dict:

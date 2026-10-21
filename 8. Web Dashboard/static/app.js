@@ -3841,10 +3841,16 @@ modalPackageType.value = defaults.pkg || "-";
             if (isAdvanceLine) {
                 const policy = payoutPolicyFor(custName);
                 const advancePct = (policy && policy.multi_stage && policy.advance_pct) || "5";
+                // The share the customer had actually paid when the advance was
+                // reached (app.py _add_advance_reached_pct), e.g. 5% where the
+                // trigger is 4.5%; the trigger stands in when it is unknown.
+                const reached = (policy && policy.advance_reached_pct) || "";
                 return {
                     title: `Basic Commission — ${custName}`,
                     preformula: milestones,
-                    formula: `Basic Commission = RM ${fmtNum(advanceAmt)} at ${advancePct}% payment`,
+                    formula: reached
+                        ? `Advance Commission = RM ${fmtNum(advanceAmt)} as achieved ${reached}%`
+                        : `Advance Commission = RM ${fmtNum(advanceAmt)} as achieved ${advancePct}% payment`,
                     subtext: clickTip
                 };
             }

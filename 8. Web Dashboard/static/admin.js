@@ -309,25 +309,6 @@
         });
     }
 
-    async function loadLoginLog() {
-        const res = await api("/api/admin/login-log");
-        const entries = await res.json();
-        document.getElementById("loginCountBadge").textContent = `${entries.length} entr${entries.length === 1 ? "y" : "ies"}`;
-        const tbody = document.getElementById("loginLogBody");
-        tbody.innerHTML = "";
-        entries.forEach((entry) => {
-            const tr = document.createElement("tr");
-            tr.innerHTML = `
-                <td>${fmtDate(entry.created_at)}</td>
-                <td>${escapeHtml(entry.username)}</td>
-                <td>${escapeHtml(entry.role || "-")}</td>
-                <td>${escapeHtml(entry.host || "-")}</td>
-                <td>${escapeHtml(entry.ip_address || "-")}</td>
-            `;
-            tbody.appendChild(tr);
-        });
-    }
-
     function escapeHtml(str) {
         return String(str)
             .replace(/&/g, "&amp;")
@@ -363,7 +344,6 @@
 
     loadMe().then(() => {
         loadUsers();
-        loadLoginLog();
         loadAudit();
     }).catch(() => {});
 })();
