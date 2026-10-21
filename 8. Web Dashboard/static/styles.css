@@ -74,6 +74,24 @@ body {
     letter-spacing: -0.5px;
 }
 
+/* "Hi Name!" under Commission Portal (greeting.js), centred across the
+   sidebar. */
+.sidebar-greeting {
+    display: block;
+    align-self: stretch;
+    text-align: center;
+    font-family: 'Outfit', sans-serif;
+    font-size: 15px;
+    font-weight: 600;
+    color: #e2e8f0;
+    margin-top: 2px;
+    overflow-wrap: anywhere;
+}
+
+.sidebar-greeting[hidden] {
+    display: none;
+}
+
 .portal-eyebrow.neon-white {
     display: block;
     font-family: 'Outfit', sans-serif;

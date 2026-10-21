@@ -65,6 +65,7 @@ def _account(user_id: int) -> dict | None:
     account = None
     if row and int(row.get("is_active") or 0) == 1:
         account = {"username": row["username"], "role": row["role"],
+                   "name": str(row.get("name") or "").strip(),
                    "mark": _password_mark(row["password_hash"])}
     with _checked_lock:
         _checked[user_id] = (now, account)
@@ -88,7 +89,8 @@ def current_user() -> dict | None:
         # The users table is unreachable. Signing everyone out whenever the
         # proxy has a bad minute would be worse than trusting a signed cookie
         # for that minute, and nobody can sign in meanwhile either.
-        return {"id": user_id, "username": session.get("username"), "role": session.get("role")}
+        return {"id": user_id, "username": session.get("username"), "role": session.get("role"),
+                "name": session.get("name") or ""}
 
     if account is None:
         session.clear()
@@ -107,7 +109,10 @@ def current_user() -> dict | None:
     # takes effect without waiting for them to sign in again.
     session["username"] = account["username"]
     session["role"] = account["role"]
-    return {"id": user_id, "username": account["username"], "role": account["role"]}
+    # The Name from the Admin page, for the sidebar's "Hi Name!".
+    session["name"] = account.get("name") or ""
+    return {"id": user_id, "username": account["username"], "role": account["role"],
+            "name": account.get("name") or ""}
 
 
 def login_user(user: dict) -> None:

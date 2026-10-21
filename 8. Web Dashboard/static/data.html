@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v=20261021-greeting">
     <style>
         /* Small additions specific to the data page, layered on top of styles.css */
         .data-content { display: flex; flex-direction: column; gap: 24px; }
@@ -297,6 +297,7 @@
             <div class="sidebar-header">
                 <img src="/static/logo.jpg" alt="Eternalgy" class="sidebar-logo">
                 <span class="portal-eyebrow neon-white">Commission Portal</span>
+                <span class="sidebar-greeting" id="sidebarGreeting" hidden></span>
             </div>
 
             <div class="sidebar-group">
@@ -1232,5 +1233,6 @@
 
     <script src="/static/data.js?v=20261020-basic-rename"></script>
     <script src="/static/sidebar_toggle.js?v=20261014-2"></script>
+    <script src="/static/greeting.js"></script>
 </body>
 </html>
