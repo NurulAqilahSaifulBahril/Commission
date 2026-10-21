@@ -77,6 +77,8 @@ document.addEventListener("DOMContentLoaded", () => {
         // customers the Summary Agent by Customer table shows ("" = none).
         selectedSummaryAgent: "",
         detailAgentKey: "",
+        // ANP: the agent clicked in its Summary Agent Commission ("" = none).
+        selectedAnpAgent: "",
         filters: {
             search: "",
             // "all" | "advance" (RM300 tranche payable this month) | "balance"
@@ -879,6 +881,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     async function applyCommissionPayload(data, { persistCache = false } = {}) {
+        ensureSummaryReferralFee(data);
         sortSectionsByAgentName(data);
         state.rawData = data;
         if (data && data.agent_ics && typeof data.agent_ics === "object") {
@@ -1072,6 +1075,18 @@ document.addEventListener("DOMContentLoaded", () => {
             if (fee) map.set(nameLower, (map.get(nameLower) || 0) + fee);
         });
         return map;
+    }
+
+    // Summary Agent Commission shows a Referral Fee column after Other
+    // Commission in every view (2026-10-21). The All view's merge adds it
+    // already; a single Internal or Outsource payload gets it here, from the
+    // same detail rows. Idempotent, so a cached payload is left as it is.
+    function ensureSummaryReferralFee(data) {
+        const sections = data && data.sections;
+        const summary = sections && sections.agent_summary;
+        if (!summary || !Array.isArray(summary.headers) || !Array.isArray(summary.rows)) return;
+        if (summary.headers.some(h => String(h).toLowerCase().trim() === "referral fee")) return;
+        sections.agent_summary = addReferralFeeColumn(summary, computeReferralFeeByAgent(sections.basic_nfp));
     }
 
     // Appends a "Referral Fee" column to agent_summary, placing each agent's
@@ -1343,6 +1358,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 },
             });
             noDataView.classList.add("hidden");
+            ensureSummaryReferralFee(data);
             sortSectionsByAgentName(data);
             state.rawData = data;
             await loadFactoryRates();
@@ -2844,12 +2860,13 @@ modalPackageType.value = defaults.pkg || "-";
         const idx = payoutStageIndexes(headers);
         const otherIdx = headers.findIndex(h => h.toLowerCase().trim() === "override");
         const overrideCols = overrideColumnsByAgent(headers);
+        const referralIdx = headers.findIndex(h => h.toLowerCase().trim() === "referral fee");
         const isReplaced = makeIsReplacedPredicate(visibleProcessed, idx.comm);
         const stats = new Map();
         const entryFor = (key) => {
             if (!stats.has(key)) {
                 stats.set(key, { commission: 0, basic: 0, nfp: 0, other: 0, otherBy: new Map(),
-                                 customers: new Set(), ownRows: 0 });
+                                 customers: new Set(), ownRows: 0, referral: 0 });
             }
             return stats.get(key);
         };
@@ -2867,6 +2884,9 @@ modalPackageType.value = defaults.pkg || "-";
             if (cust && cust !== "-" && !custLower.includes("total") && !custLower.includes("summary")) {
                 entry.customers.add(custLower);
             }
+            // The seller's referral fees on the rows in view, for the
+            // summary's Referral Fee column (computeReferralFeeByAgent).
+            if (referralIdx !== -1 && !isReplaced(p)) entry.referral += parseMoneyValue(p.rawRow[referralIdx]);
 
             if (isReplaced(p) || idx.price === -1) return;
             let val = parseMoneyValue(p.rawRow[idx.price]);
@@ -4029,6 +4049,11 @@ modalPackageType.value = defaults.pkg || "-";
             th.textContent = basicNfpHeaderLabel(h);
             if (isNumericHeader(h)) th.classList.add("numeric");
             else if (isDateHeader(h)) th.classList.add("date");
+            // Same colours as the customer table below (styles.css).
+            const hl = String(h).toLowerCase().trim();
+            if (hl === "commission price") th.classList.add("commission-header");
+            else if (hl === "other commission") th.classList.add("other-commission-header");
+            else if (hl === "referral fee") th.classList.add("referral-header");
             trHead.appendChild(th);
         });
         const thAction = document.createElement("th");
@@ -4104,6 +4129,9 @@ modalPackageType.value = defaults.pkg || "-";
                 }
                 if (agentStats && ci === otherCommColIdx) {
                     return { value: formatOtherCommissionBreakdown(agentStats), rowspan: 1, visible: true };
+                }
+                if (agentStats && ci === referralFeeColIdx) {
+                    return { value: agentStats.referral ? formatRM(agentStats.referral) : "-", rowspan: 1, visible: true };
                 }
                 return {
                     value: val === null || val === undefined || String(val).trim() === "" ? "-" : String(val),
@@ -4654,6 +4682,7 @@ modalPackageType.value = defaults.pkg || "-";
                 else if (isDateHeader(h)) th.classList.add("date");
                 if (isReferralHeader(h)) th.classList.add("referral-header");
                 if (isCommissionHeader(h)) th.classList.add("commission-header");
+                if (isAnpHighlightHeader(h)) th.classList.add("anp-highlight-header");
                 tableHeaders.appendChild(th);
             });
         }
@@ -5303,6 +5332,10 @@ modalPackageType.value = defaults.pkg || "-";
             rowCount.textContent = N + " rows";
 
         } else {
+            // ANP: only the agent clicked in the summary has customer rows
+            // shown; null on every other section (no filtering).
+            const anpAgentKey = state.activeSection === "anp"
+                ? renderAnpAgentSummary(rows, headers, agentIdx, customerIdx, isOutsource) : null;
             let displayedRows = 0;
             let currentAgentName = "";
             rows.forEach(row => {
@@ -5311,6 +5344,7 @@ modalPackageType.value = defaults.pkg || "-";
                 const agentName = currentAgentName;
                 const custName  = customerIdx !== -1 && row[customerIdx] ? String(row[customerIdx]).trim() : "";
                 if (!matchesSearch(agentName, custName)) return;
+                if (anpAgentKey !== null && agentName.toLowerCase().trim() !== anpAgentKey) return;
                 
                 // Single agent filtering
                 if (userObj && userObj.filterAgentName !== null) {
@@ -5379,6 +5413,132 @@ modalPackageType.value = defaults.pkg || "-";
             });
             rowCount.textContent = displayedRows + " rows";
         }
+    }
+
+    /** ANP page: "Summary Agent Commission" -- one row per agent, totalled from
+     *  the customer rows below it (Total Amount and EP Point added up, the
+     *  agent's Commission Price as the customer table states it once) -- and
+     *  the "Summary Agent Commission by Customer" title over that table. Same
+     *  search and agent filter as the customer rows, so the two always agree.
+     *  Both use the classes the per-render cleanup removes.
+     *
+     *  The customer table shows one agent at a time: the one clicked here
+     *  (clicking them again hides it), or the only agent left when a filter
+     *  narrows it to one. Returns that agent's key (lower-case raw name), or
+     *  "" when nobody is picked -- then the customer table and its title stay
+     *  off the page. */
+    /** ANP page: the EP Point and Commission Price headers, shaded #45d65a in
+     *  both ANP tables (styles.css .anp-highlight-header). */
+    function isAnpHighlightHeader(h) {
+        if (state.activeSection !== "anp") return false;
+        const n = String(h).toLowerCase().trim();
+        return n === "ep point" || n === "commission price";
+    }
+
+    function renderAnpAgentSummary(rows, headers, agentIdx, customerIdx, isOutsource) {
+        const userObj = USER_ROLES[state.currentUser];
+        const lower = headers.map(h => String(h).toLowerCase().trim());
+        const totIdx = lower.indexOf("total amount");
+        const epIdx = lower.indexOf("ep point");
+        const commIdx = lower.indexOf("commission price");
+        const byAgent = new Map();
+        let cur = "";
+        rows.forEach(row => {
+            const raw = agentIdx !== -1 && row[agentIdx] ? String(row[agentIdx]).trim() : "";
+            if (raw) cur = raw;
+            const cust = customerIdx !== -1 && row[customerIdx] ? String(row[customerIdx]).trim() : "";
+            if (!cur || /total|grand/i.test(cur)) return;
+            if (!matchesSearch(cur, cust)) return;
+            if (userObj && userObj.filterAgentName !== null
+                && cur.toLowerCase().trim() !== userObj.filterAgentName.toLowerCase().trim()) return;
+            const a = byAgent.get(cur) || { total: 0, ep: 0, comm: 0 };
+            if (totIdx !== -1) a.total += parseMoneyValue(row[totIdx]);
+            if (epIdx !== -1) a.ep += parseMoneyValue(row[epIdx]);
+            if (commIdx !== -1) a.comm = Math.max(a.comm, parseMoneyValue(row[commIdx]));
+            byAgent.set(cur, a);
+        });
+
+        const wrapper = document.createElement("div");
+        wrapper.className = "agent-summary-inline-wrapper";
+        const headerDiv = document.createElement("div");
+        headerDiv.className = "agent-summary-inline-header";
+        const h4 = document.createElement("h4");
+        h4.textContent = "Summary Agent Commission";
+        headerDiv.appendChild(h4);
+        const badge = document.createElement("span");
+        badge.className = "agent-summary-inline-badge";
+        badge.textContent = byAgent.size + " rows";
+        headerDiv.appendChild(badge);
+        wrapper.appendChild(headerDiv);
+
+        const keys = [...byAgent.keys()].map(a => a.toLowerCase().trim());
+        const picked = String(state.selectedAnpAgent || "").toLowerCase().trim();
+        let shownKey = picked && keys.includes(picked) ? picked : "";
+        if (!shownKey && keys.length === 1) shownKey = keys[0];
+
+        const fmtPoints = (n) => n ? n.toLocaleString("en-MY", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "-";
+        const table = document.createElement("table");
+        table.className = "agent-summary-inline-table";
+        table.innerHTML = `<thead><tr>
+            <th>Agent</th><th class="numeric">Total Amount</th>
+            <th class="numeric anp-highlight-header">EP Point</th>
+            <th class="numeric anp-highlight-header">Commission Price</th>
+        </tr></thead>`;
+        const tbody = document.createElement("tbody");
+        byAgent.forEach((a, agent) => {
+            const tr = document.createElement("tr");
+            const rc = getRowClass(agent, isOutsource);
+            if (rc) tr.className = rc;
+            const key = agent.toLowerCase().trim();
+            tr.classList.add("summary-agent-clickable");
+            if (key === shownKey) tr.classList.add("summary-agent-selected");
+            tr.title = key === shownKey ? "Click to hide this agent's customers" : "Click to show this agent's customers below";
+            tr.addEventListener("click", () => {
+                const opening = key !== shownKey;
+                state.selectedAnpAgent = opening ? key : "";
+                renderActiveSection();
+                if (opening) {
+                    const t = tableContainer.querySelector(".customer-detail-title");
+                    if (t && t.scrollIntoView) t.scrollIntoView({ behavior: "smooth", block: "start" });
+                }
+            });
+            const tdAgent = document.createElement("td");
+            tdAgent.textContent = resolveAgentName(agent);
+            tr.appendChild(tdAgent);
+            [a.total ? formatRM(a.total) : "-", fmtPoints(a.ep), a.comm ? formatRM(a.comm) : "-"].forEach(v => {
+                const td = document.createElement("td");
+                td.className = "numeric";
+                td.textContent = v;
+                tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        wrapper.appendChild(table);
+        const hr = document.createElement("hr");
+        hr.className = "agent-summary-inline-divider";
+        wrapper.appendChild(hr);
+        tableContainer.insertBefore(wrapper, dataTable);
+
+        const hint = document.getElementById("tableHeaderHint");
+        if (hint && byAgent.size) {
+            hint.textContent = "Click an agent in Summary Agent Commission below to see their customers.";
+            hint.style.display = "";
+        }
+        if (!shownKey) {
+            dataTable.style.display = "none";
+            return "";
+        }
+        const shownName = [...byAgent.keys()].find(a => a.toLowerCase().trim() === shownKey) || "";
+        const title = document.createElement("div");
+        title.className = "customer-detail-title";
+        title.style.cssText = "margin-top:20px;margin-bottom:12px";
+        const th4 = document.createElement("h4");
+        th4.style.cssText = "font-family:'Outfit',sans-serif;font-size:20px;font-weight:700;color:var(--text-main);margin-bottom:4px";
+        th4.textContent = `Summary Agent Commission by Customer — ${resolveAgentName(shownName)}`;
+        title.appendChild(th4);
+        tableContainer.insertBefore(title, dataTable);
+        return shownKey;
     }
 
     // -------------------------------------------------------------
@@ -6320,6 +6480,8 @@ modalPackageType.value = defaults.pkg || "-";
         // against every other amount. Matching the name covers the
         // "Gan Lai Soon (RM)" spelling as well as the bare one.
         if (h.includes("gan lai soon") || h.includes("safwan")) return true;
+        // ANP's EP Point (singular) is a figure too.
+        if (h === "ep point") return true;
         return h.includes("price") || h.includes("fee") || h.includes("commission") || h.includes("amount") || h.includes("sales") || h.includes("points") || h.includes("clawback") || h.includes("total");
     }
 
@@ -6597,7 +6759,7 @@ modalPackageType.value = defaults.pkg || "-";
                 <ul>
                     <li>NFP Commission payout once paid = 100%</li>
                     <li>NFP Commission effective for invoice starting OCT 1, 2025</li>
-                    <li>Total Amount - Add-ons (battery, ATS, cable, hybrid upgrade, markup) = Cash Price</li>
+                    <li>Total Amount - Add-ons (battery, ATS, cable, hybrid upgrade, markup) - EPP Price (if applicable) = Cash Price</li>
                     <li><b>NFP Commission = (Cash Price - Net Floor Price) x Rate</b> (invoices from 2026)</li>
                     <li><b>Cash Price above package price:</b> Rate = 100%</li>
                     <li><b>Cash Price above Net Floor Price:</b> Rate = 25%</li>

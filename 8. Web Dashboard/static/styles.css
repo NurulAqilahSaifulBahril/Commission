@@ -608,22 +608,33 @@ body {
     border-bottom: 2px solid #000000;
 }
 
-/* Referral Name / Referral Fee headers on the Basic & NFP table: light orange, so
-   the two hand-entered referral columns read as a pair. Beats the transparent
-   report-page header above on specificity. */
-.report-page .dashboard-table th.referral-header {
-    background-color: #ffe0b2;
+/* Referral Name / Referral Fee headers on the Basic & NFP table: orange
+   (#e87331, 2026-10-21), so the two hand-entered referral columns read as a
+   pair. Beats the transparent report-page header above on specificity. */
+.report-page .dashboard-table th.referral-header,
+.report-page .agent-summary-inline-table th.referral-header {
+    background-color: #e87331;
 }
 
-/* Commission / Commission Price headers on the same table: light green. */
-.report-page .dashboard-table th.commission-header {
-    background-color: #c8e6c9;
+/* Commission / Commission Price headers: green (#45d65a, 2026-10-21) -- the
+   customer table's two, and Commission Price on Summary Agent Commission. */
+.report-page .dashboard-table th.commission-header,
+.report-page .agent-summary-inline-table th.commission-header {
+    background-color: #45d65a;
+}
+
+/* ANP page, both tables: EP Point and Commission Price headers in #45d65a. */
+.report-page .dashboard-table th.anp-highlight-header,
+.report-page .agent-summary-inline-table th.anp-highlight-header {
+    background-color: #45d65a;
 }
 
 /* Other Commission group heading and its Override / Safwan / Gan Lai Soon
-   sub-headers on the same table: light pink. */
-.report-page .dashboard-table th.other-commission-header {
-    background-color: #f8bbd0;
+   sub-headers, and Other Commission on Summary Agent Commission: pink
+   (#e49edd, 2026-10-21). */
+.report-page .dashboard-table th.other-commission-header,
+.report-page .agent-summary-inline-table th.other-commission-header {
+    background-color: #e49edd;
 }
 
 /* "Other Commission" grouping row on the Basic & NFP detail table: the merged
@@ -1355,7 +1366,9 @@ body {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 20px 24px 10px 24px;
+    /* No side padding: the title starts at the table edge, level with the
+       "... by Customer" title under it. */
+    padding: 20px 0 10px 0;
 }
 
 .agent-summary-inline-header h4 {

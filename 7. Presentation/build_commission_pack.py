@@ -902,6 +902,21 @@ def _anp_script_path() -> Path:
     raise FileNotFoundError(f"ANP script not found under {REPO_ROOT / '3. ANP Commission'}")
 
 
+# Set by the dashboard: year -> (invoice dict -> EP or None). The ANP tier is
+# measured in EP points; without it the ANP script falls back to the total.
+ANP_EP_LOOKUP_FACTORY = None
+
+
+def _anp_ep_lookup(year: int):
+    if ANP_EP_LOOKUP_FACTORY is None:
+        return None
+    try:
+        return ANP_EP_LOOKUP_FACTORY(year)
+    except Exception as e:
+        print(f"[ANP] EP lookup unavailable ({e}); tiers fall back to total amount.")
+        return None
+
+
 def fetch_internal_anp(year: int, h1_only: bool = True):
     """Returns (summary_rows, detail_rows, meta)."""
     anp_path = _anp_script_path()
@@ -927,7 +942,8 @@ def fetch_internal_anp(year: int, h1_only: bool = True):
     period_end = date(year, 6, 30) if h1_only else date(year, 12, 31)
     payout_label = f"invoice-year-{year}-h1" if h1_only else f"invoice-year-{year}"
     detail_rows, summary_rows = anp.build_report_rows(
-        agents, invoices, planning, customers, period_start, period_end, payout_label
+        agents, invoices, planning, customers, period_start, period_end, payout_label,
+        ep_lookup=_anp_ep_lookup(year),
     )
     total_comm = sum(Decimal(str(r.get("anp_commission", 0))) for r in summary_rows)
     meta = {
@@ -1388,7 +1404,8 @@ def fetch_outsource_anp(year: int, h1_only: bool = True):
     period_end = date(year, 6, 30) if h1_only else date(year, 12, 31)
     payout_label = f"invoice-year-{year}-h1" if h1_only else f"invoice-year-{year}"
     detail_rows, summary_rows = anp.build_report_rows(
-        agents, invoices, planning, customers, period_start, period_end, payout_label
+        agents, invoices, planning, customers, period_start, period_end, payout_label,
+        ep_lookup=_anp_ep_lookup(year),
     )
     total_comm = sum(Decimal(str(r.get("anp_commission", 0))) for r in summary_rows)
     meta = {

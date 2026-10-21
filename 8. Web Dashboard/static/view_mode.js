@@ -124,11 +124,11 @@
         body.phone-mode .agent-summary-inline-table td.numeric { white-space: nowrap; }
         body.phone-mode .dashboard-table td *,
         body.phone-mode .agent-summary-inline-table td * { font-size: inherit; }
-        body.phone-mode .agent-summary-inline-header { flex-wrap: wrap; gap: 6px; padding: 10px 10px 6px; }
+        body.phone-mode .agent-summary-inline-header { flex-wrap: wrap; gap: 6px; padding: 10px 0 6px; }
         body.phone-mode .agent-summary-inline-header h4,
         body.phone-mode .customer-detail-title h4,
         body.phone-mode .dynamic-bonus-table-wrapper h4 { font-size: 14px !important; margin: 0 !important; }
-        body.phone-mode .customer-detail-title { margin: 12px 10px 6px !important; }
+        body.phone-mode .customer-detail-title { margin: 12px 0 6px !important; }
         body.phone-mode .agent-summary-inline-badge,
         body.phone-mode .row-count-badge { font-size: 10px; padding: 2px 7px; }
         body.phone-mode #tableHeaderHint { font-size: 11px !important; }

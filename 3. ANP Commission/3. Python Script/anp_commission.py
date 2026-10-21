@@ -796,12 +796,31 @@ def build_report_rows(
     period_start: date | None,
     period_end: date | None,
     payout_label: str,
+    ep_lookup=None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The tier is measured in EP points, as the ANP rules state: `ep_lookup`
+    (invoice dict -> Decimal EP, or None) gives each invoice's EP -- the
+    dashboard passes the EGA/ESA EP, so a commercial job counts its first
+    RM40,000 at 100% and the rest at 40% (since 2026-10-20; Chan Jia Wei's
+    September was paid on RM 391,340 of sales instead of 221,540 EP). Without a
+    lookup, or for an invoice it does not know, EP is the invoice total."""
     agent_by_id = {str(a["bubble_id"]): a for a in agents}
+
+    def _points(inv: dict[str, Any]) -> Decimal:
+        total = to_decimal(inv.get("total_amount") or inv.get("amount"))
+        if ep_lookup is None:
+            return total
+        try:
+            ep = ep_lookup(inv)
+        except Exception:
+            ep = None
+        return total if ep is None else to_decimal(ep)
+
     detail_rows: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
 
     buckets: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
+    person_id: dict[str, str] = {}
 
     for inv in invoices:
         if not invoice_in_period(inv, period_start, period_end):
@@ -823,12 +842,20 @@ def build_report_rows(
         agent_id = str(inv.get("linked_agent") or "")
         if agent_id not in agent_by_id:
             continue
-        key = (agent_id, inv_date.year, inv_date.month)
+        # One person, one tier. Most internal agents exist twice in eeAdmin (an
+        # agent row and a user row, two bubble ids), and invoices link to
+        # either; grouping by id split a month in two, so Lim Chin Seng's July
+        # (82,605 EP over two ids) paid RM 0 instead of RM 500. Group by the
+        # person's name, keeping the first id seen for the row.
+        person = " ".join(str(agent_by_id[agent_id].get("name") or agent_id).split()).lower()
+        person_id.setdefault(person, agent_id)
+        key = (person, inv_date.year, inv_date.month)
         buckets.setdefault(key, []).append(inv)
 
-    for (agent_id, inv_year, inv_month), inv_list in sorted(
+    for (person, inv_year, inv_month), inv_list in sorted(
         buckets.items(), key=lambda k: (k[0][0], k[0][1], k[0][2])
     ):
+        agent_id = person_id[person]
         agent = agent_by_id[agent_id]
         # Kept as the raw Postgres/eeAdmin name here (not the Agent Roles
         # "Full Name" override) — this is the key build_commission_pack.py's
@@ -848,8 +875,8 @@ def build_report_rows(
         active_invs = [inv for inv in sorted_invs if not is_cancelled_or_rejected(inv)]
         cancelled_invs = [inv for inv in sorted_invs if is_cancelled_or_rejected(inv)]
 
-        original_total = sum(to_decimal(inv.get("total_amount") or inv.get("amount")) for inv in sorted_invs)
-        active_total = sum(to_decimal(inv.get("total_amount") or inv.get("amount")) for inv in active_invs)
+        original_total = sum(_points(inv) for inv in sorted_invs)
+        active_total = sum(_points(inv) for inv in active_invs)
 
         original_commission = anp_commission(original_total)
         active_commission = anp_commission(active_total)
@@ -863,11 +890,12 @@ def build_report_rows(
         for inv in sorted_invs:
             inv_date = parse_date(inv.get("invoice_date"))
             total = to_decimal(inv.get("total_amount") or inv.get("amount"))
+            points = _points(inv)
             prop_type = classify_property_type(inv)
 
             cancelled = is_cancelled_or_rejected(inv)
             if not cancelled:
-                running_active_amount += total
+                running_active_amount += points
                 line_clawback = Decimal("0")
                 line_accumulated = running_active_amount
                 line_comm = anp_commission(running_active_amount)
@@ -888,7 +916,7 @@ def build_report_rows(
                     "invoice_date": inv_date,
                     "first_payment_date": parse_date(inv.get("1st_payment_date")),
                     "invoice_total_amount": total,
-                    "ep_points": Decimal("0") if cancelled else total,
+                    "ep_points": Decimal("0") if cancelled else points,
                     "accumulated_ep_points": line_accumulated,
                     "anp_commission_accumulated_tier": line_comm,
                     "clawback": line_clawback,

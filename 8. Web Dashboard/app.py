@@ -1615,6 +1615,74 @@ def _setup_gate():
                               error=escape(SETUP_ERROR)), 503
 
 # Load disk cache and start pre-fetch if empty or missing main data keys
+# Registered before the startup prefetch below, which may run the ANP
+# calculation straight away from the saved query record.
+def _ega_row_ep(r: dict, ega_mod):
+    """EGA/ESA EP of one ega_raw invoice row: the figure set by hand in
+    SALES_REPORT_EP_OVERRIDES, else sales price (total - EPP) through the
+    award module's calc_ep_points(). None when it cannot be worked out."""
+    from decimal import Decimal as _D, ROUND_HALF_UP as _RH
+    inv = str(r.get("invoice_number") or "").strip()
+    bid = str(r.get("bubble_id") or "").strip()
+    hand = SALES_REPORT_EP_OVERRIDES.get(bid) or SALES_REPORT_EP_OVERRIDES.get(inv)
+    try:
+        if hand is not None:
+            return _D(str(hand))
+        if ega_mod is None:
+            return None
+        sales = _D(str(r.get("total_amount") or 0)) - _D(str(r.get("epp_interest") or 0))
+        ep = ega_mod.calc_ep_points(sales, ega_mod.classify_property_type(r),
+                                    r.get("invoice_date"), int(r.get("panel_qty") or 0))
+        return ep.quantize(_D("0.01"), rounding=_RH)
+    except Exception:
+        return None
+
+
+def _ega_ep_by_invoice(ega_raw, ega_mod) -> dict:
+    """{invoice_number: EP} over ega_raw rows (see _ega_row_ep)."""
+    out = {}
+    for r in ega_raw or []:
+        inv = str(r.get("invoice_number") or "").strip()
+        if not inv:
+            continue
+        ep = _ega_row_ep(r, ega_mod)
+        if ep is not None:
+            out[inv] = ep
+    return out
+
+
+_ANP_EP_CACHE: dict = {}
+_ANP_EP_CACHE_SECONDS = 300
+
+
+def _anp_ep_lookup_factory(year: int):
+    """The per-invoice EP the ANP tier is measured in (build_commission_pack
+    ANP_EP_LOOKUP_FACTORY): the same EGA/ESA EP the ANP table's EP Point
+    column shows, keyed on invoice number, for internal and outsource alike.
+    Built at most once every few minutes per year, since the internal and
+    outsource ANP runs ask for it back to back."""
+    now = time.time()
+    hit = _ANP_EP_CACHE.get(year)
+    if hit and now - hit[0] < _ANP_EP_CACHE_SECONDS:
+        ep_map = hit[1]
+    else:
+        ep_map = {}
+        for fetch, mod_name in ((build_commission_pack.fetch_internal_ega_raw, "int_ega_esa"),
+                                (build_commission_pack.fetch_outsource_ega_raw, "out_ega_esa")):
+            try:
+                ep_map.update(_ega_ep_by_invoice(fetch(year), sys.modules.get(mod_name)))
+            except Exception as e:
+                _log(f"[ANP EP] could not read {mod_name} invoices for {year}: {e}")
+        _ANP_EP_CACHE[year] = (now, ep_map)
+
+    def lookup(inv: dict):
+        return ep_map.get(str(inv.get("invoice_number") or "").strip())
+    return lookup
+
+
+build_commission_pack.ANP_EP_LOOKUP_FACTORY = _anp_ep_lookup_factory
+
+
 load_disk_cache()
 with _disk_cache_lock:
     has_main_keys = (2026, 'internal') in _data_cache and (2026, 'outsource') in _data_cache
@@ -5843,8 +5911,16 @@ def _build_commission_payload(year: int, month: int, agent_type: str):
             basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
 
         # Extract ANP rows before column removal
-        anp_rows = _apply_anp_agent_display_names(int_customer_anp.get(month, []))
-        anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Accumulated Total Amount", "Commission Price", "Clawback"]
+        _int_ega_raw_for_ep = cached.get('ega_raw') if (cached and 'ega_raw' in cached) else None
+        if not _int_ega_raw_for_ep:
+            _int_ega_raw_for_ep = build_commission_pack.fetch_internal_ega_raw(year)
+            if cached:
+                cached['ega_raw'] = _int_ega_raw_for_ep
+                save_disk_cache()
+        anp_rows = _apply_anp_agent_display_names(_anp_rows_with_ep(
+            int_customer_anp.get(month, []), int_anp_detail_filtered, _int_ega_raw_for_ep,
+            sys.modules.get("int_ega_esa"), has_accumulated=False))
+        anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "EP Point", "Commission Price", "Clawback"]
 
         basic_nfp_rows = remove_agent_block(int_customer_summary.get(month, []), "Safwan")
         for r in basic_nfp_rows:
@@ -6059,13 +6135,21 @@ def _build_commission_payload(year: int, month: int, agent_type: str):
         else:
             basic_nfp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "OVERRIDE", "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"]
 
-        out_anp_rows = _apply_anp_agent_display_names(build_anp_customer_rows_custom(
-            anp_summary=out_anp_summary,
-            anp_detail=out_anp_detail_filtered,
-            invoice_dates_map=invoice_dates_map,
-            month=month,
-            is_internal=False
-        ))
+        _out_ega_raw_for_ep = cached.get('ega_raw') if (cached and 'ega_raw' in cached) else None
+        if not _out_ega_raw_for_ep:
+            _out_ega_raw_for_ep = build_commission_pack.fetch_outsource_ega_raw(year)
+            if cached:
+                cached['ega_raw'] = _out_ega_raw_for_ep
+                save_disk_cache()
+        out_anp_rows = _apply_anp_agent_display_names(_anp_rows_with_ep(
+            build_anp_customer_rows_custom(
+                anp_summary=out_anp_summary,
+                anp_detail=out_anp_detail_filtered,
+                invoice_dates_map=invoice_dates_map,
+                month=month,
+                is_internal=False
+            ), out_anp_detail_filtered, _out_ega_raw_for_ep,
+            sys.modules.get("out_ega_esa"), has_accumulated=True))
 
         basic_nfp_rows = remove_agent_block(out_customer_summary.get(month, []), "Safwan")
         for r in basic_nfp_rows:
@@ -6099,7 +6183,7 @@ def _build_commission_payload(year: int, month: int, agent_type: str):
                 if len(r) > safwan_idx:
                     r.pop(safwan_idx)
 
-        anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "Accumulated Total Amount", "Commission Price", "Clawback"]
+        anp_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Package Type", "Total Amount", "EP Point", "Commission Price", "Clawback"]
 
         from decimal import Decimal
         # Get raw outsource EGA ESA invoices
@@ -6768,6 +6852,48 @@ def _rates_module():
             sys.path.append(rates_dir)
         import basic_commission_rates as mod
     return mod
+
+
+def _anp_rows_with_ep(rows: list, anp_detail: list, ega_raw, ega_mod,
+                      has_accumulated: bool) -> list:
+    """ANP customer rows as Agent, Customer, Invoice Date, 1st Payment Date,
+    Package Type, Total Amount, EP Point, Commission Price, Clawback.
+
+    EP Point is the EGA/ESA EP of the customer's invoices that month: sales
+    price (total - EPP) through the award module's calc_ep_points(), or the
+    figure set by hand in SALES_REPORT_EP_OVERRIDES -- the same per-invoice EP
+    the EGA/ESA page and Sales Report use (without the campaign bonus, which is
+    not an invoice's). The internal rows come from build_commission_pack with
+    no Accumulated Total column (commission, then clawback); the outsource rows
+    carry one before the commission, which is dropped (has_accumulated)."""
+    from collections import defaultdict as _dd
+    from decimal import Decimal as _D, ROUND_HALF_UP as _RH
+    title = build_commission_pack.to_title_case
+
+    ep_by_inv = _ega_ep_by_invoice(ega_raw, ega_mod)
+
+    invs_by_cust: dict = _dd(list)
+    for d in anp_detail or []:
+        key = (title(str(d.get("agent_name") or "").strip()).lower(),
+               title(str(d.get("customer_name") or "").strip()).lower())
+        inv = str(d.get("invoice_number") or "").strip()
+        if inv and inv not in invs_by_cust[key]:
+            invs_by_cust[key].append(inv)
+
+    out, agent = [], ""
+    for row in rows:
+        if not row:
+            out.append(row)
+            continue
+        row = list(row)
+        if str(row[0] or "").strip():
+            agent = str(row[0]).strip()
+        key = (title(agent).lower(), title(str(row[1] or "").strip()).lower())
+        eps = [ep_by_inv[i] for i in invs_by_cust.get(key, []) if i in ep_by_inv]
+        ep_str = f"{sum(eps, _D('0')):,.2f}" if eps else "-"
+        tail = row[7:9] if has_accumulated else row[6:8]
+        out.append(row[:6] + [ep_str] + tail)
+    return out
 
 
 def _apply_anp_agent_display_names(rows: list) -> list:

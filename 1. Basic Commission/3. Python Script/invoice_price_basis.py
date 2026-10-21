@@ -5,7 +5,7 @@
       Basic Commission = Original Price x Rate %
 
   Cash Price  (Net Floor Price Commission row)
-      = Total Amount - every add-on line
+      = Total Amount - every add-on line - EPP interest  (EPP from 20 Oct 2026)
       NFP Commission = (Cash Price - Net Floor Price) x Rate  (see nfp_commission())
 
 Until this split both rows used one Sales Price, Total Amount - EPP interest.
@@ -28,7 +28,8 @@ Add-on: any invoice line with a positive amount other than the package, e.g.
 battery, ATS, extra cable, string-to-hybrid inverter upgrade, markup. Lines at
 RM 0 or below (discounts, vouchers, FOC notes) are left alone. Two kinds of
 positive line are not add-ons:
-  * EPP interest and the bank's EPP processing fee -- Cash Price keeps EPP in.
+  * EPP interest and the bank's EPP processing fee -- the EPP comes off
+    separately, as the same EPP interest figure the Original Price deducts.
   * The main system written as a plain line instead of a package line
     ("16X 650W JinkoSolar TIGER NEO ... | 1X SAJ ... Inverter"). It is the
     system itself; deducting it would leave a Cash Price of next to nothing.
@@ -226,7 +227,12 @@ def nfp_commission(cash: Decimal, package_price: Decimal, net_floor: Decimal,
 def cash_price(total: Any, epp: Any, invoice_date: Any,
                price_items: Any) -> Decimal:
     """The Net Floor Price Commission row's price. Before PRICE_BASIS_FROM it is
-    the old Sales Price, so `epp` is only used for those invoices."""
+    the old Sales Price, Total Amount - EPP interest.
+
+    From 2026 it also takes the add-ons off, and since 20 Oct 2026 the EPP
+    interest too (user; it had been kept in since 12 Oct): the same `epp`
+    figure the Original Price deducts. Applied as at that date it lowered 76
+    invoices' NFP commission by RM 31,746.55 over Mar-Oct 2026."""
     if not applies(invoice_date):
         return _dec(total) - _dec(epp)
-    return _dec(total) - addon_total(price_items)
+    return _dec(total) - addon_total(price_items) - _dec(epp)
