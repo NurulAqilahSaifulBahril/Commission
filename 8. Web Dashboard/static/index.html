@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/styles.css?v=20261021-greeting">
+    <link rel="stylesheet" href="/static/styles.css?v=20261022-confirm-box">
 </head>
 <body class="report-page">
     <div class="app-container">
@@ -177,6 +177,7 @@
                         <option value="all" selected>All Payouts</option>
                         <option value="advance">Advance RM 300</option>
                         <option value="balance">Balance Payout</option>
+                        <option value="special_case">Special Case</option>
                     </select>
                 </div>
                 <button id="clearFiltersBtn" class="btn-clear" title="Clear search filter">Clear</button>
@@ -562,6 +563,7 @@
                                 <th style="width: 170px;">Client Name</th>
                                 <th style="width: 100px;">System Price</th>
                                 <th style="width: 100px;">Sales Price</th>
+                                <th style="width: 95px;">Commission Type</th>
                                 <th style="width: 80px;">Commission Rate %</th>
                                 <th style="width: 115px;">Commission Amount (RM)</th>
                                 <th style="width: 120px;">Referral Person</th>
@@ -648,7 +650,27 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=20261021-advance-reached"></script>
+    <div id="payoutApprovalModal" class="modal" style="display:none;">
+        <div class="modal-content" style="max-width:880px; height:auto;">
+            <div class="modal-header">
+                <h2 id="payoutApprovalTitle">Approve Special Case Payout</h2>
+                <button class="modal-close" id="payoutApprovalClose">&times;</button>
+            </div>
+            <div class="modal-body" style="padding:20px;">
+                <div id="payoutApprovalSummary"></div>
+                <div id="payoutApprovalConfirmStep" style="display:none; margin-top:16px;">
+                    <p class="status-text" id="payoutApprovalConfirmText" style="margin:0 0 8px;"></p>
+                    <input type="text" id="payoutApprovalConfirmInput" autocomplete="off" style="width:100%;">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="payoutApprovalActionBtn" class="btn btn-primary">Approve</button>
+                <button id="payoutApprovalCancelBtn" class="btn btn-secondary">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=20261022-advance-bullets"></script>
     <script src="/static/updater.js?v=20260923-adminonly"></script>
     <script src="/static/sidebar_toggle.js?v=20261014-2"></script>
     <script src="/static/view_mode.js?v=20261021-title-align"></script>

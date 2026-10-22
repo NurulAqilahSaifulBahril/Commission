@@ -2688,3 +2688,43 @@ body {
 .preview-row span.preview-revised-label {
     color: var(--accent-blue);
 }
+
+/* Approve Special Case Payout popup: an outlined table, every cell boxed. */
+#payoutApprovalSummary table {
+    border-collapse: collapse;
+    border: 1px solid #cbd5e1;
+}
+#payoutApprovalSummary th,
+#payoutApprovalSummary td {
+    border: 1px solid #cbd5e1;
+    padding: 6px 8px;
+    vertical-align: top;
+}
+
+/* Approve Special Case Payout: the second confirmation, made larger so the
+   step that actually saves the approval cannot be missed. */
+#payoutApprovalConfirmStep {
+    padding: 16px 18px;
+    border: 2px solid #cbd5e1;
+    border-radius: 8px;
+    background: #f8fafc;
+}
+#payoutApprovalConfirmText {
+    font-size: 14px;
+    line-height: 1.5;
+}
+#payoutApprovalConfirmInput {
+    height: 48px;
+    padding: 8px 14px;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    border: 2px solid #94a3b8;
+    border-radius: 6px;
+    box-sizing: border-box;
+}
+#payoutApprovalConfirmInput:focus {
+    border-color: var(--accent-blue, #2563eb);
+    outline: none;
+}

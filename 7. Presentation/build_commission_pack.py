@@ -2121,6 +2121,204 @@ def apply_referral_overrides(lines: list, year) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Special Case payouts approved on the dashboard's Basic & NFP table
+# ---------------------------------------------------------------------------
+
+_PAYOUT_APPROVAL_CACHE: dict[str, dict] = {}
+
+
+def _payout_approval_sets(agent_type: str) -> dict:
+    """The dashboard's payout approvals for one agent type, read once and
+    cached until clear_payout_approvals(): {"full": {inv: (year, month)},
+    "advance": {...}, "info_full": {inv: {"by", "at"}}, "info_advance": {...}}.
+
+    Any failure reads as "no approvals": every invoice then pays on its own
+    milestones, exactly as before approvals existed."""
+    key = str(agent_type or "").lower()
+    hit = _PAYOUT_APPROVAL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = {"full": {}, "advance": {}, "info_full": {}, "info_advance": {}}
+    try:
+        dashboard_dir = REPO_ROOT / "8. Web Dashboard"
+        if str(dashboard_dir) not in sys.path:
+            sys.path.insert(0, str(dashboard_dir))
+        import db as _dashboard_db
+        for r in _dashboard_db.list_payout_approvals(key):
+            inv = str(r.get("invoice_number") or "").strip()
+            kind = "advance" if str(r.get("kind") or "").lower() == "advance" else "full"
+            try:
+                out[kind][inv] = (int(r.get("year")), int(r.get("month")))
+            except (TypeError, ValueError):
+                continue
+            out["info_" + kind][inv] = {"by": str(r.get("approved_by") or ""),
+                                        "at": str(r.get("approved_at") or "")}
+    except Exception as exc:
+        print(f"[Payout approvals] Warning: could not read approvals for {key} "
+              f"({exc}); every invoice pays on its own milestones.", file=sys.stderr)
+        out = {"full": {}, "advance": {}, "info_full": {}, "info_advance": {}}
+    _PAYOUT_APPROVAL_CACHE[key] = out
+    return out
+
+
+def payout_approvals(agent_type: str) -> dict:
+    """invoice_number -> (year, month) its full Special Case payout was
+    approved for."""
+    return _payout_approval_sets(agent_type)["full"]
+
+
+def payout_advance_approvals(agent_type: str) -> dict:
+    """invoice_number -> (year, month) its advance alone was approved for: a
+    deposit below the advance trigger, its RM 300 released early."""
+    return _payout_approval_sets(agent_type)["advance"]
+
+
+def payout_approval_info(agent_type: str, kind: str = "full") -> dict:
+    """invoice_number -> {"by", "at"}: who approved it and when (UTC ISO)."""
+    return _payout_approval_sets(agent_type)["info_advance" if kind == "advance" else "info_full"]
+
+
+def clear_payout_approvals() -> None:
+    _PAYOUT_APPROVAL_CACHE.clear()
+
+
+def apply_payout_approvals(basic_lines: list, nfp_rows: list, nfp_by_inv_all: dict,
+                           year: int, agent_type: str, approvals: dict | None = None,
+                           advance_approvals: dict | None = None):
+    """Move each approved Special Case invoice's payout into its approval month.
+
+    An approved invoice has paid a deposit but not reached its balance
+    milestone, and an admin released its commission early. It is paid as a
+    balance in the approval month -- Basic less its advance, plus NFP in full
+    -- and never again. An advance reached by the end of the approval month
+    stays an advance: paid earlier, it is simply deducted; reached in that
+    same month, it stays in that month's Advance run and the approval adds the
+    remainder to Balance Payout (Rabihah Binti Ismail, Sep 2026: RM 300.00
+    advance + RM 844.00 balance). With no advance reached, the whole
+    commission is one balance line. Its milestones are
+    re-dated to the last day of that month, so the month split in
+    _expand_basic_lines_for_month() and the NFP bucketing put it there and
+    nowhere later. An invoice approved in an earlier year is dropped outright.
+
+    An advance-only approval (a deposit below the advance trigger) dates the
+    invoice's advance to the last day of its approval month, unless the real
+    advance came first: the RM 300 is then paid in that month's Advance run
+    and the existing two-stage split nets it off the balance, whenever that is
+    paid -- at the real milestone or by a later full approval.
+
+    Returns new (basic_lines, nfp_rows, nfp_by_inv_all); the inputs, which are
+    the cached year bundles, are not touched, so withdrawing an approval only
+    needs the next build. `approvals` defaults to payout_approvals(agent_type),
+    `advance_approvals` to payout_advance_approvals(agent_type).
+    """
+    import calendar
+    approvals = payout_approvals(agent_type) if approvals is None else approvals
+    advance_approvals = (payout_advance_approvals(agent_type)
+                         if advance_approvals is None else advance_approvals)
+    if not approvals and not advance_approvals:
+        return basic_lines, nfp_rows, nfp_by_inv_all
+    year = int(year)
+
+    def month_end(y: int, m: int) -> str:
+        return f"{y:04d}-{m:02d}-{calendar.monthrange(y, m)[1]:02d}"
+
+    def approval_for(inv) -> tuple | None:
+        return approvals.get(str(inv or "").strip())
+
+    new_lines = []
+    for ln in basic_lines or []:
+        adv = advance_approvals.get(str(getattr(ln, "invoice_number", "") or "").strip())
+        if adv is not None and adv[0] == year and _is_new_policy_line(ln):
+            adv_on = month_end(*adv)
+            natural = advance_recognized_date(ln)
+            if not natural or natural > adv_on:
+                ln = _replace_line(ln, pct5_date=adv_on, pct5_created=adv_on)
+                ln._advance_approved = adv
+        hit = approval_for(getattr(ln, "invoice_number", ""))
+        if hit is None or hit[0] > year:
+            new_lines.append(ln)
+            continue
+        if hit[0] < year:
+            continue                      # paid in full in an earlier year
+        a_month = hit[1]
+        paid_on = month_end(year, a_month)
+        changes = {"pct75_date": paid_on, "pct75_created": paid_on, "pct100_date": paid_on}
+        # Internal lines cap their commission at the advance until the balance
+        # milestone is reached; the approval releases the whole of it.
+        full = getattr(ln, "full_commission", None)
+        if full is not None:
+            changes["basic_commission"] = full
+        advance_on = advance_recognized_date(ln)
+        # Reached by the end of the approval month: earlier, it was paid then;
+        # in the same month, the line's two milestones now share that month and
+        # _expand_basic_lines_for_month() keeps it as one combined line whose
+        # RM300 cell the Advance run pays and the Balance run nets off.
+        advance_reached = bool(advance_on) and advance_on <= paid_on
+        multi = _is_new_policy_line(ln)
+        if multi and not advance_reached:
+            # No advance reached, so none is deducted and none is paid
+            # separately later: the whole commission lands as one balance
+            # line in the approval month.
+            changes["pct5_date"] = paid_on
+            changes["pct5_created"] = paid_on
+        new_ln = _replace_line(ln, **changes)
+        if multi and not advance_reached:
+            # The RM300 cell reads "-" rather than an advance amount, so the
+            # report lists it under Balance Payout only, at the full figure.
+            new_ln._show_rm300 = False
+        new_ln._payout_approved = hit
+        new_lines.append(new_ln)
+
+    new_nfp_all = dict(nfp_by_inv_all or {})
+    moved = {}
+    for inv, hit in approvals.items():
+        if hit[0] != year:
+            continue
+        src = new_nfp_all.get(inv)
+        if src is None:
+            src = next((r for r in nfp_rows or [] if str(r.invoice_number or "").strip() == inv), None)
+        if src is None:
+            continue
+        paid_on = month_end(year, hit[1])
+        moved[inv] = _replace_line(src, payout_date=paid_on, full_payment_date=paid_on)
+        new_nfp_all[inv] = moved[inv]
+    new_nfp_rows = []
+    for r in nfp_rows or []:
+        inv = str(getattr(r, "invoice_number", "") or "").strip()
+        hit = approval_for(inv)
+        if hit is not None and hit[0] < year:
+            continue
+        if inv in moved:
+            continue                      # replaced below by its re-dated copy
+        new_nfp_rows.append(r)
+    new_nfp_rows.extend(moved.values())
+    return new_lines, new_nfp_rows, new_nfp_all
+
+
+def apply_payout_approval_dates(invoice_dates_map: dict, year: int, agent_type: str,
+                                approvals: dict | None = None) -> dict:
+    """invoice_dates_map with each approved invoice's full payment date set to
+    its approval date (the last day of the approval month).
+
+    The NFP row's payment-date cell reads this map, and the Balance Payout
+    filter reads that cell: without it an approved invoice, not yet paid in
+    full, shows "-" there and its NFP drops out of the balance run. A copy;
+    the cached map is not touched."""
+    import calendar
+    approvals = payout_approvals(agent_type) if approvals is None else approvals
+    if not approvals or not invoice_dates_map:
+        return invoice_dates_map
+    out = dict(invoice_dates_map)
+    for inv, (a_year, a_month) in approvals.items():
+        if a_year != int(year) or inv not in out:
+            continue
+        inv_date, first_pay, _full = out[inv]
+        out[inv] = (inv_date, first_pay,
+                    f"{a_year:04d}-{a_month:02d}-{calendar.monthrange(a_year, a_month)[1]:02d}")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Build the two summary tables for internal
 # ---------------------------------------------------------------------------
 
@@ -2145,6 +2343,9 @@ def build_internal_summary_tables(
       agent_totals_by_month - dict of month -> {agent: {"basic","nfp","anp","sales","invoices"}}
     """
     nfp_by_inv_all = nfp_by_inv_all or {}
+    basic_lines, nfp_rows, nfp_by_inv_all = apply_payout_approvals(
+        basic_lines, nfp_rows, nfp_by_inv_all, year, "internal")
+    invoice_dates_map = apply_payout_approval_dates(invoice_dates_map, year, "internal")
     basic_path = REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "full_internal_basic_commission.py"
     basic = _load_module("int_basic_commission", basic_path)
 
@@ -2691,6 +2892,9 @@ def build_outsource_summary_tables(
       agent_totals_by_month - dict of month -> {agent: {"basic","nfp","anp","sales","invoices"}} (anp always 0 here -- outsource ANP is aggregated separately from anp_detail)
     """
     nfp_by_inv_all = nfp_by_inv_all or {}
+    basic_lines, nfp_rows, nfp_by_inv_all = apply_payout_approvals(
+        basic_lines, nfp_rows, nfp_by_inv_all, year, "outsource")
+    invoice_dates_map = apply_payout_approval_dates(invoice_dates_map, year, "outsource")
     out_path = REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "outsource_basic_commission.py"
     basic = _load_module("out_basic_commission", out_path)
 

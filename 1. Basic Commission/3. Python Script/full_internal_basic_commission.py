@@ -839,6 +839,10 @@ class InvoiceLine:
     # Solar or EV role the invoice was priced under -- which of the agent's
     # roles (and so whose Reports To chain) its overrides follow.
     role_package: str = ""
+    # The whole Basic Commission before an advance-only cap. Equal to
+    # basic_commission except while the invoice sits between its advance and
+    # balance milestones; the dashboard's Special Case list shows this figure.
+    full_commission: Decimal | None = None
 
     @property
     def net_base(self) -> Decimal:
@@ -1024,6 +1028,7 @@ def _process_invoices(
         ev_comm = Decimal("0")
         ev_amt = Decimal("0")
         rate_display = ""
+        full_comm = None
         from basic_commission_rates import normalize_job_type as _norm_job, JOB_EV as _JOB_EV
         is_ev_job = _norm_job(row.get("job_type")) == _JOB_EV
         # An EV charger job is priced by its Job Type, from the Data page, even
@@ -1085,6 +1090,7 @@ def _process_invoices(
             # advance amount. That amount comes from the Data page row's own
             # Amount (RM) column, falling back to the legacy
             # 'basic_commission_cap' rule and then to RM 300.
+            full_comm = comm
             if not pct75_str and pct5_str:
                 cap = (policy.advance_amount if policy.advance_amount is not None
                        else get_rule_amount("basic_commission_cap", inv_month,
@@ -1136,6 +1142,7 @@ def _process_invoices(
                 ev_commission=ev_comm,
                 rate_display=rate_display,
                 role_package=_hier_pkg,
+                full_commission=full_comm if full_comm is not None else comm,
             )
         )
         

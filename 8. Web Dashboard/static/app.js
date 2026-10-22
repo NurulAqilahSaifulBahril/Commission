@@ -689,6 +689,10 @@ document.addEventListener("DOMContentLoaded", () => {
         if (referralModal) {
             document.getElementById("referralModalClose").addEventListener("click", closeReferralModal);
             document.getElementById("referralCancelBtn").addEventListener("click", closeReferralModal);
+            document.getElementById("payoutApprovalClose").addEventListener("click", closePayoutApprovalModal);
+            document.getElementById("payoutApprovalCancelBtn").addEventListener("click", closePayoutApprovalModal);
+            document.getElementById("payoutApprovalActionBtn").addEventListener("click", payoutApprovalAction);
+            document.getElementById("payoutApprovalConfirmInput").addEventListener("input", payoutApprovalConfirmReady);
             document.getElementById("referralSaveBtn").addEventListener("click", saveReferralModal);
             referralModal.addEventListener("click", (e) => {
                 if (e.target.id === "referralModal") closeReferralModal();
@@ -1200,6 +1204,13 @@ document.addEventListener("DOMContentLoaded", () => {
             internalData?.sections?.basic_nfp?.payout_policies,
             outsourceData?.sections?.basic_nfp?.payout_policies
         );
+        basicNfp.special_case = unionMergeSections(
+            internalData?.sections?.basic_nfp?.special_case,
+            outsourceData?.sections?.basic_nfp?.special_case
+        );
+        basicNfp.special_case.customers = Object.assign({},
+            internalData?.sections?.basic_nfp?.special_case?.customers,
+            outsourceData?.sections?.basic_nfp?.special_case?.customers);
         const agentSummaryMerged = unionMergeSections(internalData?.sections?.agent_summary, outsourceData?.sections?.agent_summary, agentSummaryHeaderAlias);
         const referralFeeByAgent = computeReferralFeeByAgent(basicNfp);
         return {
@@ -2634,6 +2645,9 @@ modalPackageType.value = defaults.pkg || "-";
     }
 
     function rowPassesPayoutStage(rawRow, idx, stage) {
+        // The Special Case stage swaps in its own rows (basicNfpSectionInView),
+        // each already chosen server side, so every one of them passes.
+        if (stage === "special_case") return true;
         if (idx.rm300 === -1) return true;
         const rm300v = String(rawRow[idx.rm300] || "").trim().toLowerCase();
         if (stage === "advance") {
@@ -2943,13 +2957,372 @@ modalPackageType.value = defaults.pkg || "-";
         return parts.length ? parts.join("<br/>") : formatRM(agentStats.other);
     }
 
+    // Payout Stage "Special Case": customers who have paid a deposit but not
+    // yet 100% as at the month's end. They are not in the month's own rows
+    // (those hold only invoices whose milestone lands in the month), so the
+    // server sends them as a separate list and this swaps it in.
+    function specialCaseStageOn() {
+        return state.activeSection === "basic_nfp"
+            && state.filters.payoutStage === "special_case"
+            && parseInt(state.activeMonth) >= 7;
+    }
+
+    function basicNfpSectionInView() {
+        const sec = state.rawData?.sections?.basic_nfp;
+        if (!sec || !specialCaseStageOn()) return sec;
+        const sc = sec.special_case || {};
+        return { ...sec, headers: sc.headers || sec.headers, rows: sc.rows || [], error: sc.error };
+    }
+
+    /** A Special Case customer's invoices and approval state, as the server
+     *  lists them for the tick: {agent, customer, agent_type, invoices,
+     *  approved, approved_later}. Null for anything not on the list. */
+    function specialCaseCustomerEntry(agent, customer) {
+        const map = state.rawData?.sections?.basic_nfp?.special_case?.customers;
+        if (!map) return null;
+        const key = `${String(agent || "").trim().toLowerCase()}||${String(customer || "").trim().toLowerCase()}`;
+        return map[key] || null;
+    }
+
+    function monthName(m) {
+        return new Date(2000, parseInt(m, 10) - 1, 1).toLocaleString("en", { month: "long" });
+    }
+
+    /** "September 2026" for "2026-09-01"; the text itself if it is not a date. */
+    function monthYearOf(dateText) {
+        const m = /^(\d{4})-(\d{2})/.exec(String(dateText || ""));
+        return m ? `${monthName(m[2])} ${m[1]}` : String(dateText || "");
+    }
+
+    // Under Special Case, the Basic hover names the advance an invoice has
+    // already earned -- "Advance RM 300.00 on September 2026" -- just above
+    // the Original Price line, since the Basic Commission shown is net of it.
+    // Nothing for a customer who has not reached the advance trigger.
+    function specialCaseAdvanceNote(agentName, custName) {
+        if (!specialCaseStageOn()) return "";
+        const entry = specialCaseCustomerEntry(agentName, custName);
+        return (entry?.items || [])
+            .filter(it => Number(it.advance) > 0)
+            .map(it => {
+                // "RM300" as the advance is spoken of; cents only when it has them.
+                const amt = Number(it.advance);
+                const rm = Number.isInteger(amt) ? `RM${amt}` : `RM${amt.toFixed(2)}`;
+                const early = it.advance_early ? " (approved early)" : "";
+                return `<div style="margin-top:6px;"><strong style="font-weight:700;">Advance ${rm} on ${escapeHtml(monthYearOf(it.advance_on))}${early}</strong></div>`;
+            })
+            .join("");
+    }
+
+    // The approval popup. Clicking a Special Case customer's row (admins only)
+    // opens it with what approving would pay this month. Approving -- and
+    // withdrawing -- takes two steps by the same person: the action, then a
+    // second confirmation where the word APPROVE / WITHDRAW has to be typed.
+    // Nothing is saved, and nothing is left pending, until that second step.
+    //
+    // A customer whose deposit is still below the advance trigger is offered a
+    // choice first: the RM 300 advance alone (paid in the Advance run; the rest
+    // waits), or the full Basic Commission (paid in Balance Payout).
+    let payoutApprovalEntry = null;
+    let payoutApprovalStep = 1;
+    let payoutApprovalKind = null;     // "full" | "advance" | null (not chosen yet)
+
+    function payoutApprovalPeriod() {
+        return `${monthName(state.activeMonth)} ${state.activeYear}`;
+    }
+
+    /** What the popup is for: "withdraw-full", "withdraw-advance", "view"
+     *  (approved for a later month), or "approve". */
+    function payoutApprovalMode(entry) {
+        if (entry.approved) return "withdraw-full";
+        if (entry.approved_later || entry.advance_approved_later) return "view";
+        if (entry.advance_approved) return "withdraw-advance";
+        return "approve";
+    }
+
+    function payoutApprovalOffersChoice(entry) {
+        return payoutApprovalMode(entry) === "approve" && (entry.advance_invoices || []).length > 0;
+    }
+
+    // What approving pays, split three ways: the agent's own commission, the
+    // overrides up the chain, and the referral fee. A full approval pays all
+    // three with the balance; the advance alone pays only the advance.
+    function payoutApprovalParts(entry, kind) {
+        const sum = (fn) => (entry.items || []).reduce((s, it) => s + (Number(fn(it)) || 0), 0);
+        if (kind === "advance") {
+            const advance = sum(it => it.advance_option);
+            return { agent: advance, override: 0, referral: 0, total: advance };
+        }
+        const agent = sum(it => it.payable);
+        const override = sum(it => (it.overrides || []).reduce((s, o) => s + (Number(o.amount) || 0), 0));
+        const referral = sum(it => it.referral_fee);
+        return { agent, override, referral, total: agent + override + referral };
+    }
+
+    function payoutApprovalTotal(entry) {
+        return payoutApprovalParts(entry, payoutApprovalKind).total;
+    }
+
+    function payoutApprovalWord(entry) {
+        return payoutApprovalMode(entry).startsWith("withdraw") ? "WITHDRAW" : "APPROVE";
+    }
+
+    function formatApprovedAt(at) {
+        const d = new Date(at);
+        return isNaN(d) ? String(at || "") : d.toLocaleString("en-MY", {
+            day: "numeric", month: "short", year: "numeric", hour: "numeric", minute: "2-digit" });
+    }
+
+    function openPayoutApprovalModal(entry) {
+        const modal = document.getElementById("payoutApprovalModal");
+        if (!modal) return;
+        payoutApprovalEntry = entry;
+        payoutApprovalStep = 1;
+        const mode = payoutApprovalMode(entry);
+        payoutApprovalKind = mode === "withdraw-advance" ? "advance"
+            : payoutApprovalOffersChoice(entry) ? null : "full";
+        document.getElementById("payoutApprovalTitle").textContent =
+            mode === "withdraw-full" ? "Special Case Payout - Approved"
+            : mode === "withdraw-advance" ? "Special Case Payout - Advance Approved"
+            : mode === "view" ? "Special Case Payout" : "Approve Special Case Payout";
+        renderPayoutApprovalSummary();
+
+        document.getElementById("payoutApprovalConfirmStep").style.display = "none";
+        const action = document.getElementById("payoutApprovalActionBtn");
+        action.style.display = mode === "view" ? "none" : "";
+        action.textContent = mode === "withdraw-full" ? "Withdraw approval"
+            : mode === "withdraw-advance" ? "Withdraw advance approval" : "Approve";
+        action.className = mode.startsWith("withdraw") ? "btn btn-secondary" : "btn btn-primary";
+        // With a choice on offer, nothing can be approved until one is picked.
+        action.disabled = mode === "approve" && !payoutApprovalKind;
+        document.getElementById("payoutApprovalCancelBtn").textContent = mode === "view" ? "Close" : "Cancel";
+        modal.style.display = "flex";
+    }
+
+    function renderPayoutApprovalSummary() {
+        const entry = payoutApprovalEntry;
+        if (!entry) return;
+        const mode = payoutApprovalMode(entry);
+        const kind = payoutApprovalKind;
+        const period = payoutApprovalPeriod();
+        const parts = payoutApprovalParts(entry, kind || "full");
+
+        // Current payment is the latest -- everything received up to today, as
+        // on the Basic Commission hover -- falling back to what had been paid
+        // by the month's end for a payload built before that figure existed.
+        const latestPayments = state.rawData?.sections?.basic_nfp?.payout_policies
+            ?.[String(entry.customer || "").toLowerCase().trim()] || [];
+        const muted = (text) => `<br><span style="color:var(--text-muted);font-size:11px;">${text}</span>`;
+        const itemRows = (entry.items || []).map(it => {
+            const now = latestPayments.find(e => e.invoice === it.invoice && e.paid_pct) || it;
+            // Basic is what a full approval pays: the whole commission less
+            // the advance (paid earlier, or in this month's Advance run).
+            const basicNow = (Number(it.basic) || 0) - (Number(it.advance) || 0);
+            // How the figure is reached, as bullets under it:
+            //   • Basic Commission RM 1,144.00
+            //   • Less Advance RM 300.00 on September 2026
+            const advanceNote = it.advance
+                ? `<ul style="margin:4px 0 0; padding-left:16px; text-align:left; font-size:11px; color:var(--text-muted);">
+                       <li>Basic Commission ${formatRM(it.basic)}</li>
+                       <li>Less Advance ${formatRM(it.advance)} on ${escapeHtml(monthYearOf(it.advance_on))}${it.advance_early ? " (approved early)" : ""}</li>
+                   </ul>`
+                : "";
+            return `
+            <tr>
+                <td>${escapeHtml(it.invoice)}</td>
+                <td>${escapeHtml(entry.customer)}</td>
+                <td>${escapeHtml(resolveAgentName(entry.agent))}</td>
+                <td class="numeric"><strong>${formatRM(basicNow)}</strong>${advanceNote}</td>
+                <td class="numeric"><strong>${formatRM(it.nfp)}</strong></td>
+                <td class="numeric">${(it.overrides || []).length
+                    ? it.overrides.map(o => `<strong>${formatRM(o.amount)}</strong>${muted(escapeHtml(resolveAgentName(o.name)))}`).join("<br>")
+                    : "-"}</td>
+                <td class="numeric">${Number(it.referral_fee)
+                    ? `<strong>${formatRM(it.referral_fee)}</strong>${muted(escapeHtml(it.referral_name))}` : "-"}</td>
+                <td class="numeric"><strong>${escapeHtml(now.paid_pct)}%</strong>${muted(`${formatRM(now.paid)} of ${formatRM(now.total)}`)}</td>
+            </tr>`;
+        }).join("");
+
+        // The choice, for a deposit still below the advance trigger.
+        let choice = "";
+        if (payoutApprovalOffersChoice(entry)) {
+            const advanceAmt = payoutApprovalParts(entry, "advance").total;
+            const fullAmt = payoutApprovalParts(entry, "full").total;
+            const option = (value, title, detail) => `
+                <label style="display:flex;gap:8px;align-items:flex-start;padding:8px 10px;margin:0 0 6px;
+                    border:1px solid ${kind === value ? "var(--accent-blue, #2563eb)" : "#cbd5e1"};border-radius:6px;cursor:pointer;">
+                    <input type="radio" name="payoutApprovalKind" value="${value}" ${kind === value ? "checked" : ""} style="margin-top:2px;">
+                    <span><strong>${title}</strong><br><span style="font-size:11.5px;color:var(--text-muted);">${detail}</span></span>
+                </label>`;
+            choice = `
+                <p class="status-text" style="margin:0 0 8px;font-weight:600;">
+                    This customer's deposit has not reached the advance yet. What do you want to approve?</p>
+                ${option("advance", `Advance RM300 only - ${formatRM(advanceAmt)}`,
+                    `Paid in ${escapeHtml(period)} under Advance RM 300. The rest of the Basic Commission, the Net Floor Price commission, override and referral fee wait for the balance.`)}
+                ${option("full", `Full Basic Commission - ${formatRM(fullAmt)}`,
+                    `Basic + Net Floor Price commission, override and referral fee, paid in ${escapeHtml(period)} under Balance Payout. Not paid again at 75% or 100%.`)}
+                <div style="height:8px;"></div>`;
+        }
+
+        let status;
+        if (mode === "withdraw-full") {
+            status = `<p class="status-text" style="margin:14px 0 0;color:var(--success, #15803d);font-weight:600;">
+                Approved for ${escapeHtml(period)} by ${escapeHtml(entry.approved_by || "-")} on ${escapeHtml(formatApprovedAt(entry.approved_at))}.</p>
+                <p class="status-text" style="margin:6px 0 0;font-size:11.5px;color:var(--text-muted);">
+                Withdrawing takes it out of All Payouts and Balance Payout for ${escapeHtml(period)} and puts the customer back in Special Case.</p>`;
+        } else if (mode === "withdraw-advance") {
+            status = `<p class="status-text" style="margin:14px 0 0;color:var(--success, #15803d);font-weight:600;">
+                Advance approved for ${escapeHtml(period)} by ${escapeHtml(entry.advance_approved_by || "-")} on ${escapeHtml(formatApprovedAt(entry.advance_approved_at))}.</p>
+                <p class="status-text" style="margin:6px 0 0;font-size:11.5px;color:var(--text-muted);">
+                Withdrawing takes the advance out of Advance RM 300 for ${escapeHtml(period)}. The balance can be approved from Special Case in a later month.</p>`;
+        } else if (mode === "view") {
+            const later = entry.approved_later
+                ? `Already approved for ${escapeHtml(entry.approved_later)} by ${escapeHtml(entry.approved_by || "-")}.`
+                : `Advance already approved for ${escapeHtml(entry.advance_approved_later)} by ${escapeHtml(entry.advance_approved_by || "-")}.`;
+            status = `<p class="status-text" style="margin:14px 0 0;color:var(--text-muted);font-weight:600;">
+                ${later} Open ${escapeHtml(entry.approved_later || entry.advance_approved_later)} to withdraw it.</p>`;
+        } else if (kind === "advance") {
+            status = `<p class="status-text" style="margin:8px 0 0;font-size:11.5px;color:var(--text-muted);">
+                The customer stays in Special Case, showing the balance after the advance.</p>`;
+        } else {
+            status = `<p class="status-text" style="margin:8px 0 0;font-size:11.5px;color:var(--text-muted);">
+                Approving moves the customer to All Payouts and Balance Payout for ${escapeHtml(period)},
+                and they are not paid again when they reach 75% or 100%.</p>`;
+        }
+
+        // The total follows the choice; with none made yet it waits for one.
+        let totals = "";
+        if (mode === "withdraw-advance" || kind === "advance") {
+            const amt = payoutApprovalParts(entry, "advance").total
+                || (entry.items || []).reduce((s, it) => s + (Number(it.advance) || 0), 0);
+            totals = `<p class="status-text" style="margin:12px 0 0;font-size:14px;">
+                Advance payable in ${escapeHtml(period)}: <strong>${formatRM(amt)}</strong></p>`;
+        } else if (kind === "full" || mode !== "approve") {
+            totals = `<p class="status-text" style="margin:12px 0 0;font-size:12px;color:var(--text-muted);">
+                Agent commission ${formatRM(parts.agent)} &middot; Override ${formatRM(parts.override)}
+                &middot; Referral fee ${formatRM(parts.referral)}</p>
+                <p class="status-text" style="margin:4px 0 0;font-size:14px;">
+                Total payable in ${escapeHtml(period)}: <strong>${formatRM(parts.total)}</strong></p>`;
+        }
+
+        const summary = document.getElementById("payoutApprovalSummary");
+        summary.innerHTML = `
+            ${choice}
+            <div style="overflow-x:auto;">
+            <table class="data-table" style="width:100%;font-size:12px;">
+                <thead><tr><th>Invoice</th><th>Customer</th><th>Agent</th><th>Basic Commission</th>
+                    <th>Net Floor Price Commission</th><th>Override</th><th>Referral Fee</th>
+                    <th>Current Payment</th></tr></thead>
+                <tbody>${itemRows}</tbody>
+            </table></div>
+            ${totals}
+            ${status}`;
+        summary.querySelectorAll('input[name="payoutApprovalKind"]').forEach(radio => {
+            radio.addEventListener("change", () => {
+                payoutApprovalKind = radio.value;
+                // A new choice starts the confirmation again.
+                payoutApprovalStep = 1;
+                document.getElementById("payoutApprovalConfirmStep").style.display = "none";
+                const action = document.getElementById("payoutApprovalActionBtn");
+                action.textContent = "Approve";
+                action.disabled = false;
+                renderPayoutApprovalSummary();
+            });
+        });
+    }
+
+    function closePayoutApprovalModal() {
+        const modal = document.getElementById("payoutApprovalModal");
+        if (modal) modal.style.display = "none";
+        payoutApprovalEntry = null;
+        payoutApprovalStep = 1;
+        payoutApprovalKind = null;
+    }
+
+    function payoutApprovalConfirmReady() {
+        const input = document.getElementById("payoutApprovalConfirmInput");
+        const action = document.getElementById("payoutApprovalActionBtn");
+        if (!payoutApprovalEntry || !input || !action || payoutApprovalStep !== 2) return;
+        action.disabled = input.value.trim().toUpperCase() !== payoutApprovalWord(payoutApprovalEntry);
+    }
+
+    async function payoutApprovalAction() {
+        const entry = payoutApprovalEntry;
+        if (!entry) return;
+        const mode = payoutApprovalMode(entry);
+        if (mode === "view" || !payoutApprovalKind) return;
+        const kind = payoutApprovalKind;
+        const action = document.getElementById("payoutApprovalActionBtn");
+        const approving = mode === "approve";
+        const word = payoutApprovalWord(entry);
+        const period = payoutApprovalPeriod();
+        const what = kind === "advance" ? "the advance" : "the payout";
+        const doneLabel = approving ? "Confirm approval" : "Confirm withdrawal";
+
+        if (payoutApprovalStep === 1) {
+            // Second verification: same person, straight away, never pending.
+            payoutApprovalStep = 2;
+            document.getElementById("payoutApprovalConfirmText").innerHTML = approving
+                ? `Second confirmation: approve ${kind === "advance" ? "<strong>Advance RM300</strong> of" : ""}
+                   <strong>${formatRM(payoutApprovalTotal(entry))}</strong> for
+                   <strong>${escapeHtml(entry.customer)}</strong> in <strong>${escapeHtml(period)}</strong>?
+                   Type <strong>${word}</strong> to confirm.`
+                : `Second confirmation: withdraw the ${escapeHtml(period)} approval of ${what} for
+                   <strong>${escapeHtml(entry.customer)}</strong>? Type <strong>${word}</strong> to confirm.`;
+            const input = document.getElementById("payoutApprovalConfirmInput");
+            input.value = "";
+            input.placeholder = word;
+            document.getElementById("payoutApprovalConfirmStep").style.display = "";
+            action.textContent = doneLabel;
+            action.disabled = true;
+            input.focus();
+            return;
+        }
+
+        if (document.getElementById("payoutApprovalConfirmInput").value.trim().toUpperCase() !== word) return;
+        action.disabled = true;
+        action.textContent = "Saving…";
+        try {
+            const res = await fetch("/api/payout-approvals", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    agent_type: entry.agent_type,
+                    year: state.activeYear,
+                    month: state.activeMonth,
+                    // The advance goes only on the invoices still short of it.
+                    invoices: approving && kind === "advance" ? entry.advance_invoices : entry.invoices,
+                    agent: entry.agent,
+                    customer: entry.customer,
+                    approved: approving,
+                    kind,
+                }),
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                alert(body.error || "Could not save the approval.");
+                action.disabled = false;
+                action.textContent = doneLabel;
+                return;
+            }
+            closePayoutApprovalModal();
+            // Every month's payout depends on the approval, so the figures
+            // come back from the server rather than being patched here.
+            await fetchData();
+        } catch (err) {
+            console.error("Failed to save the payout approval:", err);
+            alert("Could not save the approval: " + err.message);
+            action.disabled = false;
+            action.textContent = doneLabel;
+        }
+    }
+
     // The three commission totals are a whole-month figure, not a property of
     // whichever table is on screen, so every section shows the same cards. They
     // are rebuilt from the basic_nfp payload rather than the active section's
     // rows, which carry no commission columns of their own. Headers are used
     // exactly as the payload gives them, so column indexes stay aligned.
     function buildBasicNfpProcessed() {
-        const sec = state.rawData?.sections?.basic_nfp;
+        const sec = basicNfpSectionInView();
         if (!sec || !sec.headers || !sec.rows) return null;
         const headers = sec.headers;
         const agentIdx = headers.findIndex(h => h.toLowerCase().trim() === "agent");
@@ -3072,6 +3445,9 @@ modalPackageType.value = defaults.pkg || "-";
                 if (p.isTotalRow) return;
                 if (isReplaced(p)) return;
                 if (!isVisible(p)) return;
+                // An approved Special Case customer is paid this month, so it
+                // is no longer part of the "not yet payable" figure.
+                if (specialCaseStageOn() && specialCaseCustomerEntry(p.fullAgentName, p.customerName)?.approved) return;
                 if (commPriceIdx !== -1) {
                     let val = parseMoneyValue(p.rawRow[commPriceIdx]);
                     if (payoutStageOn && state.filters.payoutStage === "advance") val = advanceCappedValue(p.rawRow, stageIdx, val);
@@ -3109,7 +3485,10 @@ modalPackageType.value = defaults.pkg || "-";
         }
 
         rateCardsContainer.appendChild(makeTotalCard("Total Sales (RM)", totalSales));
-        rateCardsContainer.appendChild(makeTotalCard("Total Commission (RM)", totalCommission));
+        // Special Case customers have not paid in full, so nothing listed
+        // there is owed yet -- the card must not read as this month's payout.
+        rateCardsContainer.appendChild(makeTotalCard(specialCaseStageOn()
+            ? "Potential Commission (RM) - not yet payable" : "Total Commission (RM)", totalCommission));
         rateCardsContainer.appendChild(makeTotalCard("Total Other Commission (RM)", totalOtherCommission));
         rateCardsContainer.appendChild(makeTotalCard("Total Referral Fee (RM)", totalReferralFee));
     }
@@ -3683,7 +4062,18 @@ modalPackageType.value = defaults.pkg || "-";
                 ${dateCell(createdAt)}
             </div>`;
 
-        const out = [heading];
+        // The customer's latest payment -- everything received up to today,
+        // whichever month is on screen -- one line per invoice, above the
+        // stages. Rabihah Binti Ismail: 80% (RM 22,880.00 of RM 28,600.00).
+        const payments = (state.rawData?.sections?.basic_nfp?.payout_policies
+            ?.[String(custName || "").toLowerCase().trim()] || []).filter(e => e.paid_pct);
+        const current = payments.map(e => `
+            <div style="display:flex; align-items:baseline; gap:12px; margin-bottom:6px;">
+                <span style="flex:1;">Current payment${payments.length > 1 ? ` (${escapeHtml(e.invoice)})` : ""}:</span>
+                <strong>${escapeHtml(e.paid_pct)}% (${formatRM(e.paid)} of ${formatRM(e.total)})</strong>
+            </div>`).join("");
+
+        const out = [current, heading];
         if (policy) {
             if (policy.multi_stage) {
                 out.push(stage(`Advance RM ${policy.advance_rm || "300"} (${policy.advance_pct}% Payment)`,
@@ -3804,7 +4194,8 @@ modalPackageType.value = defaults.pkg || "-";
 
         // 1. Basic Commission
         if (commTypeLower.includes("basic commission")) {
-            const milestones = getBasicMilestoneLines(row, headers, custName);
+            const milestones = getBasicMilestoneLines(row, headers, custName)
+                + specialCaseAdvanceNote(agentName, custName);
             // A Gan-only case leaves the Basic commission as it was, so it takes
             // the ordinary hover below.
             if (row.specialCaseData && String(row.specialCaseData.rowKind || "").toLowerCase() !== "gan") {
@@ -4409,7 +4800,9 @@ modalPackageType.value = defaults.pkg || "-";
             return;
         }
 
-        const sectionData = state.rawData.sections[state.activeSection];
+        const sectionData = state.activeSection === "basic_nfp"
+            ? basicNfpSectionInView()
+            : state.rawData.sections[state.activeSection];
 
         if (sectionData && sectionData.error) {
             dataTable.classList.add("hidden");
@@ -4455,7 +4848,8 @@ modalPackageType.value = defaults.pkg || "-";
         }
 
         let headers = [...sectionData.headers];
-        if (state.activeSection === "basic_nfp" && state.specialCaseRowRefs.size === 0) {
+        // The Special Case payout stage has no remarks of its own to show.
+        if (state.activeSection === "basic_nfp" && (state.specialCaseRowRefs.size === 0 || specialCaseStageOn())) {
             headers = headers.filter(h => h !== "Remarks");
         }
 
@@ -4533,7 +4927,8 @@ modalPackageType.value = defaults.pkg || "-";
         });
 
         let activeAgents = null;
-        if (state.activeSection === "basic_nfp" && state.rawData.sections.agent_summary) {
+        // An agent owed nothing this month is still listed under Special Case.
+        if (state.activeSection === "basic_nfp" && state.rawData.sections.agent_summary && !specialCaseStageOn()) {
             activeAgents = new Set();
             const agRows = state.rawData.sections.agent_summary.rows || [];
             let cag = "";
@@ -4697,7 +5092,11 @@ modalPackageType.value = defaults.pkg || "-";
 
         if (state.activeSection === "basic_nfp") {
             const agSummarySection = state.rawData.sections.agent_summary;
-            const hasAgentSummary = agSummarySection && agSummarySection.headers && agSummarySection.rows && agSummarySection.rows.length > 0;
+            // Under Special Case the agents need not be in the month's
+            // Summary Agent Commission at all, so their customers are listed
+            // directly instead of behind a click on that table.
+            const hasAgentSummary = !specialCaseStageOn() && agSummarySection && agSummarySection.headers
+                && agSummarySection.rows && agSummarySection.rows.length > 0;
 
             // Summary Agent by Customer shows one agent at a time: the one
             // clicked in Summary Agent Commission, or the only agent left
@@ -5065,6 +5464,24 @@ modalPackageType.value = defaults.pkg || "-";
                 const nfpHandedToNewRow = isOriginalNfpRow && !!groupNewNfpRow;
                 const tr = document.createElement("tr");
                 if (rowClass) tr.className = rowClass;
+                if (specialCaseStageOn() && state.isAdmin && !isTotalRow) {
+                    const approvalEntry = specialCaseCustomerEntry(agentName, effectiveCustomerNames[ri]);
+                    if (approvalEntry) {
+                        tr.style.cursor = "pointer";
+                        tr.title = approvalEntry.approved || approvalEntry.advance_approved
+                            ? "Approved - click to view or withdraw the approval"
+                            : approvalEntry.approved_later ? `Approved for ${approvalEntry.approved_later}`
+                            : approvalEntry.advance_approved_later ? `Advance approved for ${approvalEntry.advance_approved_later}`
+                            : "Click to approve this customer's payout";
+                        tr.addEventListener("click", (e) => {
+                            // The Commission and Commission Price cells carry
+                            // the calculation hover; clicking them does not
+                            // open the approval.
+                            if (e.target.closest("td[data-no-approval]")) return;
+                            openPayoutApprovalModal(approvalEntry);
+                        });
+                    }
+                }
                 // Net Floor Price Commission rows sit on light blue so they read
                 // apart from the customer's Basic Commission row above them.
                 if (rowCommLower.includes("net floor") || rowCommLower.includes("netfloor")) {
@@ -5084,6 +5501,11 @@ modalPackageType.value = defaults.pkg || "-";
                     if (colsToMerge.includes(ci) && !cellGrid[ri][ci].visible) continue;
                     if (isGroupFollower && specialCaseMergeCols.includes(ci)) continue;
                     const td = document.createElement("td");
+                    if (specialCaseStageOn() && (ci === commissionIdx || ci === commissionPriceIdx)) {
+                        td.dataset.noApproval = "1";
+                        td.style.cursor = "default";
+                        td.setAttribute("title", "");   // not the row's "Click to approve" tip
+                    }
                     let displayVal = cellGrid[ri][ci] ? cellGrid[ri][ci].value : (cellVal === null || cellVal === undefined ? "-" : String(cellVal));
                     if (payoutStageActive && state.filters.payoutStage === "advance" && ci === commissionPriceIdx) {
                         displayVal = advanceOnlyPrice(row, displayVal);
@@ -5133,6 +5555,22 @@ modalPackageType.value = defaults.pkg || "-";
                             td.addEventListener("mousemove", (e) => moveCommCalcTooltip(e));
                             td.addEventListener("mouseleave", hideCommCalcTooltip);
                         }
+                        // Under Special Case an approved customer says so under
+                        // its name (Basic row only; the NFP row's cell is "-").
+                        if (specialCaseStageOn() && displayVal !== "-") {
+                            const entry = specialCaseCustomerEntry(agentName, custName);
+                            const note = entry && (entry.approved ? "Approved"
+                                : entry.approved_later ? `Approved for ${entry.approved_later}`
+                                : entry.advance_approved ? "Advance approved"
+                                : entry.advance_approved_later ? `Advance approved for ${entry.advance_approved_later}` : "");
+                            if (note) {
+                                const tag = document.createElement("div");
+                                tag.textContent = note;
+                                tag.style.cssText = "font-size:11px;font-weight:600;margin-top:2px;color:"
+                                    + (entry.approved || entry.advance_approved ? "var(--success, #15803d)" : "var(--text-muted)");
+                                td.appendChild(tag);
+                            }
+                        }
                     }
 
                     // Referral name and fee are hand-entered: the ERP names a
@@ -5140,7 +5578,7 @@ modalPackageType.value = defaults.pkg || "-";
                     // editor rather than being read-only. Basic rows only --
                     // the fee is charged on the customer's basic sales, and the
                     // NFP line of the same customer would double it.
-                    if ((ci === referralNameIdx || ci === referralFeeIdx)
+                    if ((ci === referralNameIdx || ci === referralFeeIdx) && !specialCaseStageOn()
                         && !isTotalRow && custName && custName !== "-"
                         && rowCommType.toLowerCase().includes("basic")) {
                         td.classList.add("referral-editable");
@@ -5214,7 +5652,7 @@ modalPackageType.value = defaults.pkg || "-";
                     }
 
                     // Factory: brick-orange Insert Profit Sharing / clickable commission price
-                    if (!isTotalRow && !isSpecialRow && ci === commissionPriceIdx && isFactoryBasicCommission(row, headers, agentName, custName)) {
+                    if (!isTotalRow && !isSpecialRow && !specialCaseStageOn() && ci === commissionPriceIdx && isFactoryBasicCommission(row, headers, agentName, custName)) {
                         const factoryDisplay = getFactoryCellDisplay(row, headers, agentName, custName, "agent");
                         if (factoryDisplay) td.innerHTML = factoryDisplay;
                         if (userObj && !userObj.readOnly) {
@@ -5230,7 +5668,7 @@ modalPackageType.value = defaults.pkg || "-";
                     // no Safwan figure baked into the case, so it must fall
                     // back to the same clickable rate-entry flow as an organic
                     // factory row rather than showing a dead "-".
-                    if (!isTotalRow && safwanColIdx !== -1 && ci === safwanColIdx && isFactoryBasicCommission(row, headers, agentName, custName)) {
+                    if (!isTotalRow && !specialCaseStageOn() && safwanColIdx !== -1 && ci === safwanColIdx && isFactoryBasicCommission(row, headers, agentName, custName)) {
                         const safwanDisplay = getFactoryCellDisplay(row, headers, agentName, custName, "safwan");
                         if (safwanDisplay) td.innerHTML = safwanDisplay;
                         if (userObj && !userObj.readOnly) {
@@ -8508,7 +8946,7 @@ modalPackageType.value = defaults.pkg || "-";
 
         const section = state.rawData?.sections?.basic_nfp;
         if (!section || !section.rows || !section.headers) {
-            tableBody.innerHTML = `<tr><td colspan="10" style="text-align:center; padding:20px; color:#64748b;">No data loaded for ${escapeHtml(resolvedName)}.</td></tr>`;
+            tableBody.innerHTML = `<tr><td colspan="11" style="text-align:center; padding:20px; color:#64748b;">No data loaded for ${escapeHtml(resolvedName)}.</td></tr>`;
             return;
         }
 
@@ -8598,7 +9036,7 @@ modalPackageType.value = defaults.pkg || "-";
         // column on other agents' invoices -- so "no customers" is only really
         // an empty slip when there are no credits to them either.
         if (customerGroups.size === 0 && otherCommCredits.length === 0) {
-            tableBody.innerHTML = `<tr><td colspan="10" style="text-align:center; padding:20px; color:#64748b; font-style:italic;">No customer transactions found for ${escapeHtml(resolvedName)} in ${getMonthName(state.activeMonth)} ${state.activeYear}.</td></tr>`;
+            tableBody.innerHTML = `<tr><td colspan="11" style="text-align:center; padding:20px; color:#64748b; font-style:italic;">No customer transactions found for ${escapeHtml(resolvedName)} in ${getMonthName(state.activeMonth)} ${state.activeYear}.</td></tr>`;
             document.getElementById("slipTotalComm").textContent = "RM 0.00";
             document.getElementById("slipAmountPayable").textContent = "RM 0.00";
             return;
@@ -8648,6 +9086,7 @@ modalPackageType.value = defaults.pkg || "-";
                 <td><b>${escapeHtml(customerName)}</b></td>
                 <td class="numeric">${sysPrice > 0 ? formatRM(sysPrice) : "-"}</td>
                 <td class="numeric">${salesPrice > 0 ? formatRM(salesPrice) : "-"}</td>
+                <td style="text-align: center;">${isAdvanceLine ? "Advance" : "Basic"}</td>
                 <td style="text-align: center;">${isAdvanceLine ? "-" : basicRate.toFixed(2) + "%"}</td>
                 <td class="numeric" style="font-weight: 700;">${formatRM(basicCommVal)}</td>
                 <td style="text-align: center;">${escapeHtml(refPerson)}</td>
@@ -8657,9 +9096,14 @@ modalPackageType.value = defaults.pkg || "-";
             `;
             tableBody.appendChild(tr1);
 
-            if (nfpRow) {
+            const nfpCommVal = nfpRow && priceIdx !== -1 ? parseVal(nfpRow[priceIdx]) : 0;
+            // An advance pays no Net Floor Price commission -- NFP is earned
+            // at the balance -- so an advance line has no NFP line under it.
+            // Kept only if it does carry an amount: a commission no bigger than
+            // the advance reads as an advance line even when the invoice
+            // cleared both stages this month, and its NFP is then owed.
+            if (nfpRow && !(isAdvanceLine && nfpCommVal === 0)) {
                 const nfpVal = nfpIdx !== -1 ? parseVal(nfpRow[nfpIdx]) : 0;
-                const nfpCommVal = priceIdx !== -1 ? parseVal(nfpRow[priceIdx]) : 0;
                 totalCommSum += nfpCommVal;
 
                 let nfpRateStr = "25.0%";
@@ -8669,9 +9113,10 @@ modalPackageType.value = defaults.pkg || "-";
                 tr2.style.backgroundColor = "#f8fafc";
                 tr2.innerHTML = `
                     <td style="text-align: center;"></td>
-                    <td style="padding-left: 16px; color: #475569; font-style: italic;">Net Floor Price</td>
+                    <td></td>
                     <td class="numeric">${nfpVal > 0 ? formatRM(nfpVal) : "-"}</td>
                     <td class="numeric">${nfpVal > 0 ? formatRM(nfpVal) : "-"}</td>
+                    <td style="text-align: center;">Net Floor Price</td>
                     <td style="text-align: center;">${nfpRateStr}</td>
                     <td class="numeric" style="font-weight: 700; color: ${nfpCommVal < 0 ? '#dc2626' : '#0f172a'};">${formatRM(nfpCommVal)}</td>
                     <td style="text-align: center;">-</td>
@@ -8695,9 +9140,10 @@ modalPackageType.value = defaults.pkg || "-";
             const tr = document.createElement("tr");
             tr.innerHTML = `
                 <td style="text-align: center;">${itemNo}</td>
-                <td><b>${escapeHtml(c.customer)}</b><br/><span style="color:#475569; font-style:italic; font-size:11px;">Override from ${escapeHtml(resolveAgentName(c.fromAgent))}</span></td>
+                <td><b>${escapeHtml(c.customer)}</b></td>
                 <td class="numeric">-</td>
                 <td class="numeric">-</td>
+                <td style="text-align: center;">Override from ${escapeHtml(resolveAgentName(c.fromAgent))}</td>
                 <td style="text-align: center;">-</td>
                 <td class="numeric">-</td>
                 <td style="text-align: center;">-</td>

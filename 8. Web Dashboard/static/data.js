@@ -1682,6 +1682,41 @@
         return ev ? -1 : 0;
     }
 
+    /** A role row's own share of the agent's rates when the agent has two or
+     *  more identical role rows (same dates, package, Agent Type and Role --
+     *  a second "Branch Sales Manager" row added for a Factory rate). Their
+     *  own rates are dealt out the way the Edit Agent Details popup deals them
+     *  (loadAgentOwnRates): each to a row that has none yet, in table order.
+     *  Without this every such row read every rate, and the main table showed
+     *  the 4.75% Residential rate on both rows, the 2% Factory one on neither.
+     *  Returns {mine, shared}: the rates this row keeps and all the rates the
+     *  identical rows split; null when the row has no identical sibling. */
+    function identicalRowShare(r) {
+        const who = String(r.agent || "").trim().toLowerCase();
+        const keyOf = (x) => JSON.stringify([String(x.agent || "").trim().toLowerCase(),
+            normEffText(x.effective_from), cardJob(x), String(x.agent_type || "").trim().toLowerCase(),
+            canonRole(rateRoleOf(x))]);
+        const key = keyOf(r);
+        const siblings = rolesList.filter((x) => !x.hidden && !x.needs_date && keyOf(x) === key);
+        if (siblings.length < 2) return null;
+        const owners = new Map(siblings.map((x) => [x, []]));
+        const shared = new Set();
+        roleRateRows.forEach((row) => {
+            if ((row.rate_type || "Basic Commission") !== "Basic Commission") return;
+            if (String(row.remarks || "").trim().toLowerCase() === "deleted") return;
+            const agents = String(row.agent || "").split(",").map((a) => a.trim().toLowerCase()).filter(Boolean);
+            if (agents.length !== 1 || agents[0] !== who) return;
+            if (canonRole(row.hierarchy) !== canonRole(rateRoleOf(r))) return;
+            if (!rowFitsCardJob(row, r)) return;
+            if (row.agent_type && String(row.agent_type).toLowerCase() !== String(r.agent_type || "").toLowerCase()) return;
+            if (normEffText(row.effective_from) !== normEffText(r.effective_from)) return;
+            shared.add(row);
+            const to = siblings.find((x) => !owners.get(x).length) || siblings[0];
+            owners.get(to).push(row);
+        });
+        return { mine: new Set(owners.get(r)), shared };
+    }
+
     /** {html, title} for a role row's Rate cell. */
     function roleRateCell(r) {
         if (r.needs_date || !String(r.effective_from || "").trim()) return { html: "—", title: "" };
@@ -1703,9 +1738,11 @@
         const who = String(r.agent || "").trim().toLowerCase();
         const props = PROPERTY_TYPES.filter(Boolean);
         const best = {};
+        const share = identicalRowShare(r);
         roleRateRows.forEach((row) => {
             if ((row.rate_type || "Basic Commission") !== "Basic Commission") return;
             if (String(row.remarks || "").trim().toLowerCase() === "deleted") return;
+            if (share && share.shared.has(row) && !share.mine.has(row)) return;
             const fit = rolePackageFit(row, r);
             if (fit < 0) return;
             const rate = parseFloat(String(row.rate_pct || "").replace("%", ""));
@@ -1824,9 +1861,11 @@
         const who = String(r.agent || "").trim().toLowerCase();
         let top = null;
         let picks = [];
+        const share = identicalRowShare(r);
         roleRateRows.forEach((row) => {
             if ((row.rate_type || "Basic Commission") !== "Basic Commission") return;
             if (String(row.remarks || "").trim().toLowerCase() === "deleted") return;
+            if (share && share.shared.has(row) && !share.mine.has(row)) return;
             const fit = rolePackageFit(row, r);
             if (fit < 0) return;
             const pcts = String(row.override_rate_pct || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -3052,22 +3091,48 @@
         rolePeriods.forEach((p) => { p.rates = p.rates.filter((line) => !isBlankLine(line)); });
         const managed = [];
         const others = [];
+        // A rate's role: the same package and Agent Type over exactly the same
+        // dates -- what saveAgentOwnRates() writes for that card -- and the
+        // same Role. Two cards can match alike (a second "Sales Team Manager"
+        // row added for a Factory rate), so each rate goes to a matching card
+        // that holds no rate yet before doubling up on one. A rate whose Role
+        // no card has any more (the card's Role was changed but its rates were
+        // never re-saved, as when a rates save failed on 2026-10-21) still
+        // shows on a card of its dates and package rather than vanishing from
+        // the card into the read-only list; saving then files it under that
+        // card's Role.
+        const sameSlot = (q, r) => q.from
+            && rowFitsCardJob(r, q)
+            && (!r.agent_type || String(q.agent_type).toLowerCase() === String(r.agent_type).toLowerCase())
+            && normEffText(periodEff(q)) === normEffText(r.effective_from);
+        const pickCard = (cards) => cards.find((q) => !q.rates.length) || cards[0];
+        const ownRows = [];
         all.forEach((r) => {
             if (!isLiveBasicRow(r) || !rateRowAgents(r).includes(key)) return;
-            // Its role: the same role, package and Agent Type over exactly the
-            // same dates -- what saveAgentOwnRates() writes for that card.
-            const p = isOwnRateRow(r, key) && rolePeriods.find((q) => q.from
-                && canonRole(rateRoleOf(q)) === canonRole(r.hierarchy)
-                && rowFitsCardJob(r, q)
-                && (!r.agent_type || String(q.agent_type).toLowerCase() === String(r.agent_type).toLowerCase())
-                && normEffText(periodEff(q)) === normEffText(r.effective_from));
-            if (!p) { others.push(r); return; }
+            if (!isOwnRateRow(r, key)) { others.push(r); return; }
+            ownRows.push(r);
+        });
+        const orphans = [];
+        ownRows.forEach((r) => {
+            const exact = rolePeriods.filter((q) => sameSlot(q, r)
+                && canonRole(rateRoleOf(q)) === canonRole(r.hierarchy));
+            if (!exact.length) { orphans.push(r); return; }
             managed.push(r);
-            p.rates.push(ownRateLine(r));
+            pickCard(exact).rates.push(ownRateLine(r));
+        });
+        orphans.forEach((r) => {
+            const near = rolePeriods.filter((q) => sameSlot(q, r));
+            if (!near.length) { others.push(r); return; }
+            managed.push(r);
+            const line = ownRateLine(r);
+            line.roleMoved = true;      // saved under its card's Role next time
+            pickCard(near).rates.push(line);
         });
         // What each loaded rate looked like, so an untouched one is saved as is.
         rolePeriods.forEach((p) => p.rates.forEach((line) => {
-            if (line.src) line.srcState = ownLineState(line, p);
+            // A rate shown under a card whose Role it does not carry counts as
+            // changed, so Save files it under that Role.
+            if (line.src) line.srcState = line.roleMoved ? "" : ownLineState(line, p);
         }));
         agentRateLoad = { managed, others };
         renderRolePeriods();
@@ -3222,6 +3287,8 @@
         if (!res.ok) {
             status.className = "save-status err";
             status.textContent = "Roles saved, but the rates could not be loaded to save.";
+            alert("The roles were saved, but this agent's rates were NOT saved (the rates could not be loaded).\n\n"
+                + "Open the agent again, check the rates and press Save Changes once more.");
             return;
         }
         const fresh = (await res.json()).map(rateRowFromApi);
@@ -3245,6 +3312,11 @@
             const d = await saveRes.json().catch(() => ({}));
             status.className = "save-status err";
             status.textContent = "Roles saved, but the rates failed: " + (d.error || `HTTP ${saveRes.status}`);
+            // The modal has already closed, so a line under the table is easy
+            // to miss -- and a role saved without its rates comes back empty.
+            alert("The roles were saved, but this agent's rates were NOT saved:\n"
+                + (d.error || `HTTP ${saveRes.status}`)
+                + "\n\nOpen the agent again, check the rates and press Save Changes once more.");
             return;
         }
         status.className = "save-status ok";

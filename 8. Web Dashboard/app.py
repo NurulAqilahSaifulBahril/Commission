@@ -2339,7 +2339,57 @@ def _build_payout_policies(basic_lines, as_at: str = "") -> dict:
     for entries in out.values():
         entries.sort(key=lambda e: e.get("invoice_date") or "")
     _add_advance_reached_pct(out)
+    _add_current_payment(out)
     return out
+
+
+def _add_current_payment(policies: dict) -> None:
+    """Give each invoice its latest payment: "paid", "total" and "paid_pct",
+    counting every payment received up to now -- not as at the month being
+    reported -- for the "Current payment" line on the Basic Commission hover
+    (Rabihah Binti Ismail: 80%, RM 22,880.00 of RM 28,600.00). One query for
+    all of them, same payment exclusions as the milestone SQL; where an
+    invoice number has several versions, the one with the most paid on it is
+    used. On any failure the hover simply leaves the line out."""
+    want = {}
+    for entries in policies.values():
+        for e in entries:
+            if e.get("invoice"):
+                want.setdefault(e["invoice"].strip(), []).append(e)
+    if not want:
+        return
+    try:
+        from basic_commission_rates import MILESTONE_PAYMENT_EXCLUSIONS as _excl
+    except Exception:
+        _excl = "101334, 104412, 101333, 104413, 4899"
+    inv_list = ", ".join("'" + inv.replace("'", "''") + "'" for inv in want)
+    try:
+        rows = _pg_query(f"""
+            SELECT TRIM(i.invoice_number) AS inv, i.bubble_id, i.total_amount,
+                   COALESCE(SUM(p.amount), 0) AS paid
+            FROM invoice i
+            JOIN payment p ON p.linked_invoice = i.bubble_id
+            WHERE TRIM(i.invoice_number) IN ({inv_list})
+              AND p.id NOT IN ({_excl})
+            GROUP BY TRIM(i.invoice_number), i.bubble_id, i.total_amount
+        """)
+    except Exception as e:
+        _log(f"[CURRENT PAYMENT] could not read payments: {e}")
+        return
+    best: dict = {}
+    for r in rows or []:
+        inv = str(r.get("inv") or "")
+        try:
+            total, paid = float(r.get("total_amount") or 0), float(r.get("paid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if total > 0 and (inv not in best or paid > best[inv][1]):
+            best[inv] = (total, paid)
+    for inv, (total, paid) in best.items():
+        for e in want.get(inv, []):
+            e["paid"] = round(paid, 2)
+            e["total"] = round(total, 2)
+            e["paid_pct"] = _pct_text(round(paid / total * 100, 2))
 
 
 def _add_advance_reached_pct(policies: dict) -> None:
@@ -2451,6 +2501,337 @@ def _build_system_details(nfp_by_inv_all: dict) -> dict:
     for rows in details.values():
         rows.sort(key=lambda e: e.get("invoice_date") or "")
     return details
+
+
+def _build_special_case_stage(headers: list, basic_lines, nfp_by_inv_all: dict,
+                              year: int, month: int, agent_type: str = "internal") -> dict:
+    """The "Special Case" Payout Stage: every customer who, as at the end of
+    the month being reported, has paid something on their invoice but not yet
+    100% -- whenever that first payment was made.
+
+    The month's own rows cannot supply this list. They hold only the invoices
+    whose advance or balance milestone lands in that month, so a customer who
+    paid a deposit in May and still owes the balance in October is in neither.
+    Built here from every Basic line instead, with the commission each invoice
+    WOULD pay, laid out in the month table's own columns so the page can show
+    it with the same renderer. Nothing on it is payable until an admin ticks
+    it: the approval (build_commission_pack.apply_payout_approvals) pays it as
+    a balance in this month. An approved customer stays listed here, ticked,
+    in its approval month so the tick can be undone; it is listed untickable in
+    the months before that and not at all in the months after.
+
+    `customers` maps "agent||customer" (lower case) to that customer's
+    invoices and approval, for the tick.
+    """
+    import calendar
+    month_end = f"{int(year):04d}-{int(month):02d}-{calendar.monthrange(int(year), int(month))[1]:02d}"
+    approvals = build_commission_pack.payout_approvals(agent_type)
+    approval_info = build_commission_pack.payout_approval_info(agent_type)
+    advance_approvals = build_commission_pack.payout_advance_approvals(agent_type)
+    advance_info = build_commission_pack.payout_approval_info(agent_type, "advance")
+    this_month = (int(year), int(month))
+    # An advance approved early is the invoice's advance from its month on, so
+    # the lines are read with those re-dated (full approvals are not applied:
+    # this list shows what a full approval WOULD pay).
+    basic_lines = build_commission_pack.apply_payout_approvals(
+        basic_lines, [], {}, year, agent_type, approvals={})[0]
+
+    # One line per invoice and agent. Safwan's own block is dropped from the
+    # month table (remove_agent_block), so it is dropped here too.
+    candidates: dict = {}
+    for ln in basic_lines or []:
+        inv = str(getattr(ln, "invoice_number", "") or "").strip()
+        agent = str(getattr(ln, "agent_name", "") or "").strip()
+        first_pay = str(getattr(ln, "first_payment_date", "") or "")[:10]
+        if not inv or not agent or "safwan" in agent.lower():
+            continue
+        if not first_pay or first_pay > month_end:
+            continue
+        approved_for = approvals.get(inv)
+        if approved_for is not None and approved_for < this_month:
+            continue      # already paid out, in an earlier month
+        candidates.setdefault((inv, agent.lower()), ln)
+    if not candidates:
+        return {"headers": list(headers), "rows": [], "customers": {}}
+
+    # What each invoice had been paid by the month's end, not today: the line's
+    # paid_amount is the current figure, which would hide a customer who paid
+    # in full after the month closed. Same payment exclusions as the milestone
+    # SQL. Several versions of one invoice number can exist, so payments are
+    # summed per version and the version matching the line's total is used.
+    # The invoice total comes from this query too: outsource lines are
+    # SimpleNamespaces that carry no total_amount.
+    try:
+        from basic_commission_rates import MILESTONE_PAYMENT_EXCLUSIONS as _excl
+    except Exception:
+        _excl = "101334, 104412, 101333, 104413, 4899"
+    invs = sorted({inv for inv, _ in candidates})
+    inv_list = ", ".join("'" + inv.replace("'", "''") + "'" for inv in invs)
+    try:
+        pay_rows = _pg_query(f"""
+            SELECT TRIM(i.invoice_number) AS inv, i.bubble_id, i.total_amount,
+                   COALESCE(SUM(p.amount), 0) AS paid
+            FROM invoice i
+            JOIN payment p ON p.linked_invoice = i.bubble_id
+            WHERE TRIM(i.invoice_number) IN ({inv_list})
+              AND p.id NOT IN ({_excl})
+              AND p.payment_date::date <= DATE '{month_end}'
+            GROUP BY TRIM(i.invoice_number), i.bubble_id, i.total_amount
+        """)
+    except Exception as e:
+        _log(f"[SPECIAL CASE STAGE] could not read payments: {e}")
+        return {"headers": list(headers), "rows": [], "customers": {},
+                "error": "Payments could not be read."}
+    paid_by_inv: dict = {}
+    for r in pay_rows or []:
+        paid_by_inv.setdefault(str(r.get("inv") or ""), []).append(
+            (float(r.get("total_amount") or 0), float(r.get("paid") or 0)))
+
+    def idx(*names) -> int:
+        for name in names:
+            for i, h in enumerate(headers):
+                if str(h).lower().strip() == name.lower():
+                    return i
+        return -1
+
+    cols = {
+        "agent": idx("Agent"), "customer": idx("Customer"),
+        "inv_date": idx("Invoice Date"), "first_pay": idx("1st Payment Date"),
+        "rm300": idx("Basic Commission (RM300)"),
+        "milestone": idx("75% Payment Date", "Full Payment Date"),
+        "pkg": idx("Package Type"), "system": idx("System Price"),
+        "nfp": idx("Net Floor Price"), "sales": idx("Sales Price"),
+        "comm": idx("Commission"), "price": idx("Commission Price"),
+        "rate": idx("Basic Rate %"),
+        "override": idx("OVERRIDE"), "safwan": idx("Safwan (RM)"),
+        "gan": idx("Gan Lai Soon", "Gan Lai Soon (RM)"),
+        "ref_name": idx("Referral Name"), "ref_fee": idx("Referral Fee"),
+        "adv_deducted": idx("Advance Deducted"), "adv_date": idx("Advance Payment Date"),
+    }
+
+    def rm(value) -> str:
+        v = float(value or 0)
+        return f"RM {v:,.2f}" if v else "-"
+
+    # Overrides and referral fees are recognised with the balance, so they are
+    # what approving would pay on top of the agent's own commission. Worked
+    # out by the same rules the month rows use (build_*_summary_tables):
+    # Data-page overrides up the Reports To chain, an outsource factory
+    # invoice's Safwan / OUM split and Gan Lai Soon's OGM cut, and the
+    # referral named on the invoice or typed on the dashboard.
+    import basic_commission_rates as _bcr
+    is_out = str(agent_type).lower() == "outsource"
+    ovr_names = _bcr.override_name_map(
+        [build_commission_pack.to_title_case(ln.agent_name) for ln in basic_lines or []])
+    ref_overrides = build_commission_pack.referral_overrides(year)
+    basic_mod = None if is_out else build_commission_pack._load_module(
+        "int_basic_commission",
+        REPO_ROOT / "1. Basic Commission" / "3. Python Script" / "full_internal_basic_commission.py")
+    # Safwan's own commission on an internal factory invoice, by invoice.
+    safwan_by_inv: dict = {}
+    for ln in basic_lines or []:
+        if str(getattr(ln, "agent_name", "") or "").strip().lower() == "safwan":
+            full = getattr(ln, "full_commission", None)
+            inv = str(ln.invoice_number or "").strip()
+            safwan_by_inv[inv] = safwan_by_inv.get(inv, 0.0) + float(
+                full if full is not None else ln.basic_commission or 0)
+
+    def line_overrides(ln) -> dict:
+        out: dict = {}
+        if is_out and (getattr(ln, "is_factory", False) or getattr(ln, "package", "") == "Factory"):
+            safwan_cut = float(getattr(ln, "safwan_override", 0) or 0)
+            if safwan_cut:
+                out["Safwan"] = out.get("Safwan", 0.0) + safwan_cut
+            oum_cut = float(getattr(ln, "senior_override", 0) or 0)
+            oum_name = getattr(ln, "senior_override_name", None)
+            if oum_name and oum_cut:
+                out[oum_name] = out.get(oum_name, 0.0) + oum_cut
+        else:
+            for name, amount in build_commission_pack._basic_line_overrides(
+                    ln, "Outsource" if is_out else "Internal", ovr_names):
+                out[name] = out.get(name, 0.0) + float(amount)
+        return out
+
+    def line_referral(ln, agent_title: str, customer_title: str) -> tuple:
+        hit = ref_overrides.get((agent_title.strip().lower(), customer_title.strip().lower()))
+        if is_out:
+            if not (hit and hit["name"]):
+                return "-", 0.0
+            rate = float(hit["rate"]) if hit["rate"] is not None else 0.02
+            return build_commission_pack.to_title_case(hit["name"]), float(ln.sales_price or 0) * rate
+        name = hit["name"] if hit and hit["name"] else getattr(ln, "referral_name", None)
+        if not basic_mod._is_valid_referral(name):
+            return "-", 0.0
+        rate = float(hit["rate"] if hit and hit["rate"] is not None
+                     else basic_mod._referral_rate(ln.invoice_date))
+        return build_commission_pack.to_title_case(str(name).strip()), float(ln.sales_price or 0) * rate
+
+    rows = []
+    customers: dict = {}
+    last_agent = None
+    for (inv, _agent_key), ln in sorted(
+            candidates.items(),
+            key=lambda kv: (str(kv[1].agent_name).lower(), str(kv[1].customer_name).lower(), kv[0][0])):
+        line_total = float(getattr(ln, "total_amount", 0) or 0)
+        versions = paid_by_inv.get(inv) or []
+        match = [v for v in versions if line_total and abs(v[0] - line_total) < 0.01]
+        if not (match or versions):
+            continue
+        total, paid = max(match or versions, key=lambda v: v[1])
+        if total <= 0 or paid <= 0 or paid >= total - 0.005:
+            continue
+        nfp_row = (nfp_by_inv_all or {}).get(inv)
+        agent_title = build_commission_pack.to_title_case(ln.agent_name)
+        customer_title = build_commission_pack.to_title_case(ln.customer_name)
+        entry = customers.setdefault(f"{agent_title.lower()}||{customer_title.lower()}", {
+            "agent": agent_title, "customer": customer_title, "agent_type": agent_type,
+            "invoices": [], "items": [], "approved": False, "approved_later": "",
+            "approved_by": "", "approved_at": "",
+            # Advance-only approvals, and which invoices may still take one.
+            "advance_approved": False, "advance_approved_later": "",
+            "advance_approved_by": "", "advance_approved_at": "",
+            "advance_invoices": [],
+        })
+        entry["invoices"].append(inv)
+        approved_for = approvals.get(inv)
+        if approved_for is not None:
+            info = approval_info.get(inv) or {}
+            entry["approved_by"] = info.get("by", "")
+            entry["approved_at"] = info.get("at", "")
+        if approved_for == this_month:
+            entry["approved"] = True
+        elif approved_for is not None:
+            entry["approved_later"] = f"{calendar.month_name[approved_for[1]]} {approved_for[0]}"
+        # What approving would pay this month, worked out the way
+        # apply_payout_approvals() pays it: the whole Basic Commission less an
+        # advance already paid in an earlier month, plus the NFP in full.
+        full = getattr(ln, "full_commission", None)
+        basic_full = float(full if full is not None else ln.basic_commission or 0)
+        # The advance counts if it was reached by the month's end: paid in an
+        # earlier month, or paid in this month's Advance run. Either way the
+        # approval only adds what is left (Rabihah, Sep 2026: RM 844.00).
+        multi = build_commission_pack._is_new_policy_line(ln)
+        advance_on = build_commission_pack.advance_recognized_date(ln)
+        advance = 0.0
+        if multi and advance_on and advance_on <= month_end:
+            advance = min(basic_full, build_commission_pack._line_advance_amount(ln))
+        # Advance approved on its own: in this month (can be withdrawn here),
+        # or in a later one. An earlier one already shows as `advance` above.
+        adv_for = advance_approvals.get(inv)
+        if adv_for is not None and adv_for >= this_month:
+            ainfo = advance_info.get(inv) or {}
+            entry["advance_approved_by"] = ainfo.get("by", "")
+            entry["advance_approved_at"] = ainfo.get("at", "")
+            if adv_for == this_month:
+                entry["advance_approved"] = True
+            else:
+                entry["advance_approved_later"] = (
+                    f"{calendar.month_name[adv_for[1]]} {adv_for[0]}")
+        # The choice between the advance alone and the full Basic Commission:
+        # a two-stage invoice whose deposit is still below the advance trigger
+        # at the month's end, with nothing approved for it yet.
+        advance_option = 0.0
+        if multi and not advance and adv_for is None and approved_for is None:
+            advance_option = min(basic_full, build_commission_pack._line_advance_amount(ln))
+            entry["advance_invoices"].append(inv)
+        nfp_amt =float(getattr(nfp_row, "nfp_commission", 0) or 0) if nfp_row else 0.0
+        # Paid to other people with the balance: overrides up the chain (plus
+        # Gan Lai Soon's OGM cut on outsource, Safwan's own commission on an
+        # internal factory invoice) and the referral fee. Each counted once --
+        # an outsource factory row repeats Safwan's cut in its own column.
+        overrides = line_overrides(ln)
+        if is_out:
+            gls = float(getattr(ln, "gan_lai_soon", 0) or 0)
+            if gls:
+                overrides["Gan Lai Soon"] = overrides.get("Gan Lai Soon", 0.0) + gls
+        elif safwan_by_inv.get(inv):
+            overrides["Safwan"] = overrides.get("Safwan", 0.0) + safwan_by_inv[inv]
+        ref_name, ref_fee = line_referral(ln, agent_title, customer_title)
+        entry["items"].append({
+            "invoice": inv, "paid": round(paid, 2), "total": round(total, 2),
+            "paid_pct": _pct_text(round(paid / total * 100, 2)),
+            "basic": round(basic_full, 2), "advance": round(advance, 2),
+            "advance_on": advance_on if advance else "",
+            "nfp": round(nfp_amt, 2), "payable": round(basic_full - advance + nfp_amt, 2),
+            "overrides": [{"name": n, "amount": round(a, 2)}
+                          for n, a in sorted(overrides.items()) if round(a, 2)],
+            "referral_name": ref_name if ref_fee else "",
+            "referral_fee": round(ref_fee, 2),
+            # What "Advance RM300 only" would pay; 0 where it is not offered.
+            "advance_option": round(advance_option, 2),
+            # The advance shown was released by an advance-only approval (not
+            # the real one, which wins when it came first).
+            "advance_early": bool(advance) and getattr(ln, "_advance_approved", None) is not None,
+        })
+        for kind in ("Basic Commission", "Net Floor Price Commission"):
+            row = ["-"] * len(headers)
+
+            def put(key, value):
+                if cols[key] != -1:
+                    row[cols[key]] = value
+
+            # Shaped like the month's own rows: the agent only on the first row
+            # of their block, the customer on both of its rows. The page groups
+            # a customer's rows by that cell, so a blank one on the NFP row
+            # split it from its Basic row and threw every merged cell out.
+            put("agent", agent_title if agent_title != last_agent else "")
+            last_agent = agent_title
+            put("customer", customer_title)
+            if kind == "Basic Commission":
+                # The whole commission, not the advance-only cap an internal
+                # line carries between its two milestones (full_commission).
+                # The balance approving would pay: the advance comes off, and
+                # the hover shows it ("Original Price x Rate % - 300.00").
+                put("price", rm(basic_full - advance))
+                put("rate", build_commission_pack._basic_line_rate_label(ln) or "-")
+                put("adv_deducted", f"{advance:,.2f}" if advance else "-")
+                # Payment at for the Advance stage: the date the payment that
+                # reached the trigger carries (Created at comes from the policy).
+                put("adv_date", str(getattr(ln, "pct5_date", "") or "")[:10] if advance else "-")
+                put("rm300", "invoice before july" if not multi
+                    else ("-" if advance else "pending"))
+                # Override, Safwan, Gan Lai Soon and referral sit on the Basic
+                # row only, as on the month rows.
+                put("override", build_commission_pack.format_other_commission_for_customer(
+                    line_overrides(ln)))
+                if not is_out:
+                    put("safwan", rm(safwan_by_inv.get(inv, 0.0)))
+                else:
+                    # An outsource row shows Safwan's factory cut in its own
+                    # column as well as under OVERRIDE, as the month rows do.
+                    put("safwan", rm(getattr(ln, "safwan_override", 0) or 0))
+                    put("gan", rm(getattr(ln, "gan_lai_soon", 0) or 0))
+                put("ref_name", ref_name)
+                put("ref_fee", rm(ref_fee))
+            else:
+                put("price", rm(getattr(nfp_row, "nfp_commission", 0) if nfp_row else 0))
+            put("inv_date", str(ln.invoice_date or "")[:10] or "-")
+            put("first_pay", str(ln.first_payment_date or "")[:10] or "-")
+            if kind != "Basic Commission":
+                put("rm300", "-")
+            put("milestone", "pending")
+            put("pkg", str(getattr(ln, "package", "") or "-"))
+            put("system", rm(total))
+            put("nfp", rm(getattr(nfp_row, "net_floor_price", 0) if nfp_row else 0))
+            put("sales", rm(ln.sales_price))
+            put("comm", kind)
+            rows.append(row)
+    return {"headers": list(headers), "rows": rows, "customers": customers}
+
+
+def _special_case_stage_or_empty(headers, basic_lines, nfp_by_inv_all, year, month,
+                                 agent_type) -> dict:
+    """_build_special_case_stage, for the months that have a Payout Stage
+    filter (July 2026 on). A failure empties the stage rather than the page."""
+    if int(month) < 7:
+        return {"headers": list(headers), "rows": [], "customers": {}}
+    try:
+        return _build_special_case_stage(headers, basic_lines, nfp_by_inv_all, year, month,
+                                         agent_type)
+    except Exception:
+        _log("[SPECIAL CASE STAGE ERROR]\n" + traceback.format_exc())
+        return {"headers": list(headers), "rows": [], "customers": {},
+                "error": "Special Case list could not be built."}
 
 
 def _refresh_system_details(payload: dict, year: int, agent_type: str) -> None:
@@ -6106,8 +6487,16 @@ def _build_commission_payload(year: int, month: int, agent_type: str):
                 "rows": basic_nfp_rows,
                 # Customer-column hover: panel and phase per invoice.
                 "system_details": _build_system_details(int_nfp_by_inv_all),
+                # Read off the lines as the payout approvals re-date them,
+                # so an approved invoice tests as a balance in its month.
                 "payout_policies": _build_payout_policies(
-                    int_basic_lines, build_commission_pack.as_at_ym(year, month)),
+                    build_commission_pack.apply_payout_approvals(
+                        int_basic_lines, [], {}, year, "internal")[0],
+                    build_commission_pack.as_at_ym(year, month)),
+                # Payout Stage "Special Case": deposit paid, not yet 100%.
+                "special_case": _special_case_stage_or_empty(
+                    basic_nfp_headers, int_basic_lines, int_nfp_by_inv_all, year, month,
+                    "internal"),
             },
             "agent_summary": {"headers": agent_summary_headers, "rows": agent_summary_rows},
             "anp": {"headers": anp_headers, "rows": anp_rows},
@@ -6353,8 +6742,16 @@ def _build_commission_payload(year: int, month: int, agent_type: str):
                 "rows": basic_nfp_rows,
                 # Customer-column hover: panel and phase per invoice.
                 "system_details": _build_system_details(out_nfp_by_inv_all),
+                # Read off the lines as the payout approvals re-date them,
+                # so an approved invoice tests as a balance in its month.
                 "payout_policies": _build_payout_policies(
-                    out_basic_lines, build_commission_pack.as_at_ym(year, month)),
+                    build_commission_pack.apply_payout_approvals(
+                        out_basic_lines, [], {}, year, "outsource")[0],
+                    build_commission_pack.as_at_ym(year, month)),
+                # Payout Stage "Special Case": deposit paid, not yet 100%.
+                "special_case": _special_case_stage_or_empty(
+                    basic_nfp_headers, out_basic_lines, out_nfp_by_inv_all, year, month,
+                    "outsource"),
             },
             "agent_summary": {"headers": agent_summary_headers, "rows": agent_summary_rows},
             "anp": {"headers": anp_headers, "rows": out_anp_rows},
@@ -6855,6 +7252,47 @@ def referral_overrides_api():
     except Exception as e:
         _log("[REFERRAL OVERRIDE SAVE ERROR]\n" + traceback.format_exc())
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/payout-approvals", methods=["POST"])
+@admin_required
+def payout_approvals_api():
+    """Tick (or untick) a Special Case customer on the Basic & NFP report.
+
+    Ticking approves the customer's invoices for the month on screen: their
+    commission is paid there as a balance and never again at 75% or 100%
+    (build_commission_pack.apply_payout_approvals). Every month's figures
+    depend on that, so the whole commission cache is rebuilt.
+    """
+    req = request.json or {}
+    agent_type = str(req.get("agent_type") or "").strip().lower()
+    invoices = [str(i).strip() for i in (req.get("invoices") or []) if str(i).strip()]
+    try:
+        year, month = int(req.get("year")), int(req.get("month"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "year and month are required"}), 400
+    if agent_type not in ("internal", "outsource") or not invoices:
+        return jsonify({"error": "agent_type and invoices are required"}), 400
+    approved = bool(req.get("approved"))
+    # "full" (the whole commission) or "advance" (the RM 300 advance alone,
+    # for a deposit still below the advance trigger).
+    kind = str(req.get("kind") or "full").strip().lower()
+    if kind not in ("full", "advance"):
+        return jsonify({"error": "kind must be 'full' or 'advance'"}), 400
+    try:
+        for inv in invoices:
+            db.set_payout_approval(agent_type, inv, str(req.get("agent") or ""),
+                                   str(req.get("customer") or ""), str(year), str(month),
+                                   approved, auth.current_user()["username"], kind=kind)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        _log("[PAYOUT APPROVAL SAVE ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+    finally:
+        build_commission_pack.clear_payout_approvals()
+        clear_commission_cache()
+    return jsonify({"status": "success", "approved": approved, "invoices": invoices})
 
 
 @app.route("/api/factory-rates", methods=["GET", "POST"])
