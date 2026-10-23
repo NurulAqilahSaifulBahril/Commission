@@ -456,6 +456,10 @@ document.addEventListener("DOMContentLoaded", () => {
             if (excelBtn) {
                 excelBtn.classList.toggle("role-hidden", user.filterAgentName !== null);
             }
+            const tablesPdfBtn = document.getElementById("downloadTablesPdfBtn");
+            if (tablesPdfBtn) {
+                tablesPdfBtn.classList.toggle("role-hidden", user.filterAgentName !== null);
+            }
             
             return true;
         }
@@ -488,7 +492,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const syncDataBtn = document.getElementById("syncDataBtn");
     const downloadPdfBtn = document.getElementById("downloadPdfBtn");
     const downloadExcelBtn = document.getElementById("downloadExcelBtn");
-    
+    const downloadTablesPdfBtn = document.getElementById("downloadTablesPdfBtn");
+
     const dataTable = document.getElementById("dataTable");
     const tableHeaders = document.getElementById("tableHeaders");
     // Grouping row for the Basic & NFP detail table only ("Other Commission"
@@ -673,6 +678,8 @@ document.addEventListener("DOMContentLoaded", () => {
         // Download actions
         downloadPdfBtn.addEventListener("click", () => showPdfModal());
         downloadExcelBtn.addEventListener("click", () => triggerDownload("excel"));
+        // Download PDF: the Excel file as a PDF (user, 2026-10-23).
+        if (downloadTablesPdfBtn) downloadTablesPdfBtn.addEventListener("click", () => triggerDownload("excel-pdf"));
 
         // PDF Modal handlers
         document.getElementById("pdfModalClose").addEventListener("click", closePdfModal);
@@ -2487,8 +2494,9 @@ modalPackageType.value = defaults.pkg || "-";
 
     function triggerDownload(format) {
         let url = `/api/download/${format}?year=${state.activeYear}&month=${state.activeMonth}`;
-        // Excel holds only the Commission Section on screen.
-        if (format === "excel" && state.activeSection) {
+        // Excel holds only the Commission Section on screen, and so does its
+        // PDF copy ("excel-pdf", the Download PDF button).
+        if ((format === "excel" || format === "excel-pdf") && state.activeSection) {
             url += `&section=${encodeURIComponent(state.activeSection)}`;
         }
         window.location.href = url;
@@ -5167,6 +5175,14 @@ modalPackageType.value = defaults.pkg || "-";
             const headerHint = document.getElementById("tableHeaderHint");
             if (headerHint && hasAgentSummary) {
                 headerHint.textContent = "Click an agent in Summary Agent Commission below to see their customers.";
+                headerHint.style.display = "";
+            }
+            // What the Special Case stage lists (user, 2026-10-23).
+            if (headerHint && specialCaseStageOn()) {
+                headerHint.innerHTML = "<strong>Special Case:</strong> invoices not yet 4.5% paid (Advance RM 300)"
+                    + " or not yet 100% paid (full Basic Commission). Each can be approved early for the"
+                    + " Advance RM 300 or the full Basic Commission."
+                    + (hasAgentSummary ? "<br/>Click an agent in Summary Agent Commission below to see their customers." : "");
                 headerHint.style.display = "";
             }
 

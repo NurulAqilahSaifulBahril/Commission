@@ -6923,6 +6923,74 @@ _EXCEL_SECTION_FILE_NAMES = {
 }
 
 
+def _build_excel_download(year: int, month: int, section: str):
+    """Write the Download Excel file and return (path, file stem)."""
+    dashboard_data_dir = CURRENT_DIR / "data"
+    dashboard_data_dir.mkdir(parents=True, exist_ok=True)
+    file_stem = (f"{_EXCEL_SECTION_FILE_NAMES[section]}_{year}_{month}" if section
+                 else f"Commission_Pack_{year}_{month}")
+    file_path = dashboard_data_dir / f"{file_stem}.xlsx"
+
+    # The pack asks the database the same questions the dashboard's last
+    # refresh did. Answering those from that refresh's record
+    # (query_replay.py) skips downloading every invoice again, so the
+    # file carries exactly the figures on screen; a question the refresh
+    # never asked still goes to the database.
+    import contextlib
+    replay = bool(_data_cache.get("sql_replay"))
+    if replay:
+        try:
+            query_replay.restore(_data_cache["sql_replay"])
+        except Exception:
+            replay = False
+    with (query_replay.replaying() if replay else contextlib.nullcontext()):
+        build_commission_pack.build_pdf(year, file_path, month=month,
+                                        sections=[section] if section else None)
+    if replay:
+        _log(f"[EXCEL] {year}-{month:02d} {section or 'full pack'} built from the dashboard's "
+             f"last refresh (query record: {query_replay.stats()}).")
+    return file_path, file_stem
+
+
+@app.route("/api/download/excel-pdf")
+@login_required
+def download_excel_pdf():
+    """Download PDF: the Download Excel file, page for page, as a PDF
+    (user, 2026-10-23). Download Report stays the summary report."""
+    year = request.args.get("year", 2026, type=int)
+    month = request.args.get("month", 5, type=int)
+    section = (request.args.get("section") or "").strip().lower()
+    if section not in _EXCEL_SECTION_FILE_NAMES:
+        section = ""
+    try:
+        import io
+        import uuid
+        xlsx_path, file_stem = _build_excel_download(year, month, section)
+        pdf_path = xlsx_path.with_name(f"{file_stem}_{uuid.uuid4().hex[:8]}.pdf")
+        import calendar
+        month_name = calendar.month_name[month]
+        section_name = _EXCEL_SECTION_FILE_NAMES.get(section, "Commission_Pack").replace("_", " ")
+        if section == "basic_nfp":
+            section_name = "Basic & Net Floor Price Commission"
+        try:
+            build_commission_pack.xlsx_to_pdf(xlsx_path, pdf_path, f"{month_name} {year} - {section_name}")
+            data = pdf_path.read_bytes()
+        finally:
+            try:
+                pdf_path.unlink()
+            except OSError:
+                pass
+        return send_file(io.BytesIO(data), mimetype="application/pdf",
+                         as_attachment=True, download_name=f"{file_stem}.pdf")
+    except Exception as e:
+        import traceback
+        try:
+            traceback.print_exc()
+        except Exception:
+            pass
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/download/excel")
 @login_required
 def download_excel():
@@ -6935,30 +7003,7 @@ def download_excel():
         section = ""
 
     try:
-        dashboard_data_dir = CURRENT_DIR / "data"
-        dashboard_data_dir.mkdir(parents=True, exist_ok=True)
-        file_stem = (f"{_EXCEL_SECTION_FILE_NAMES[section]}_{year}_{month}" if section
-                     else f"Commission_Pack_{year}_{month}")
-        file_path = dashboard_data_dir / f"{file_stem}.xlsx"
-
-        # The pack asks the database the same questions the dashboard's last
-        # refresh did. Answering those from that refresh's record
-        # (query_replay.py) skips downloading every invoice again, so the
-        # file carries exactly the figures on screen; a question the refresh
-        # never asked still goes to the database.
-        import contextlib
-        replay = bool(_data_cache.get("sql_replay"))
-        if replay:
-            try:
-                query_replay.restore(_data_cache["sql_replay"])
-            except Exception:
-                replay = False
-        with (query_replay.replaying() if replay else contextlib.nullcontext()):
-            build_commission_pack.build_pdf(year, file_path, month=month,
-                                            sections=[section] if section else None)
-        if replay:
-            _log(f"[EXCEL] {year}-{month:02d} {section or 'full pack'} built from the dashboard's "
-                 f"last refresh (query record: {query_replay.stats()}).")
+        file_path, file_stem = _build_excel_download(year, month, section)
 
         return send_file(
             str(file_path),

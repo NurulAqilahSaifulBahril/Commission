@@ -6747,6 +6747,170 @@ def build_basic_nfp_pdf(output_path: Path, year: int, month: int, cur: dict,
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
+def xlsx_to_pdf(xlsx_path: Path, pdf_path: Path, heading: str = "") -> None:
+    """The Excel download as a PDF (user, 2026-10-23): every sheet laid out
+    as it is in the workbook -- values as formatted there, merged cells,
+    fills, bold, alignment and each cell's own borders -- landscape, scaled
+    to the page width, each table's header rows repeated on every page.
+    Built from the saved file, so the PDF and the Excel cannot drift apart."""
+    from html import escape
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A3, A4, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
+
+    wb = load_workbook(xlsx_path)
+    margin = 10 * mm
+
+    def _widths(ws):
+        # Excel character widths, capped so one long-name column cannot
+        # squeeze the rest; text wraps instead.
+        return [min(ws.column_dimensions[get_column_letter(c)].width or 10, 40)
+                for c in range(1, ws.max_column + 1)]
+
+    # Wide sheets go on A3 so the long names still have room.
+    sheets = [ws for ws in wb.worksheets if ws.max_row > 0]
+    widest = max((sum(_widths(ws)) * 5.2 for ws in sheets), default=0.0)
+    page = landscape(A3 if widest > landscape(A4)[0] * 1.35 else A4)
+    avail = page[0] - 2 * margin
+
+    title_style = ParagraphStyle("xp_title", fontName=FONT_BOLD, fontSize=12, leading=15, spaceAfter=2)
+    sub_style = ParagraphStyle("xp_sub", fontName=FONT_REGULAR, fontSize=8, leading=10,
+                               textColor=colors.HexColor("#555555"), spaceAfter=6)
+    story = []
+    for si, ws in enumerate(sheets):
+        if si:
+            story.append(PageBreak())
+        story.append(Paragraph(escape(ws.title), title_style))
+        if heading:
+            story.append(Paragraph(escape(heading), sub_style))
+
+        raw = _widths(ws)
+        col_widths = [w / sum(raw) * avail for w in raw]
+
+        # One table per block on the sheet -- each starts at a "No." header
+        # row -- so a page carries the header of the table it shows.
+        nrow = ws.max_row
+        starts = [r for r in range(1, nrow + 1)
+                  if str(ws.cell(row=r, column=1).value or "").strip() == "No."]
+        if not starts or starts[0] != 1:
+            starts = [1] + starts
+        for i, r0 in enumerate(starts):
+            r1 = starts[i + 1] - 1 if i + 1 < len(starts) else nrow
+            story.append(_xlsx_block_table(ws, r0, r1, col_widths, f"xp{si}"))
+            story.append(Spacer(1, 4))
+
+    doc = SimpleDocTemplate(str(pdf_path), pagesize=page, leftMargin=margin, rightMargin=margin,
+                            topMargin=margin, bottomMargin=margin, title=heading or "Commission")
+
+    def _footer(canvas, doc_):
+        canvas.saveState()
+        canvas.setFont(FONT_REGULAR, 7)
+        canvas.setFillColor(colors.HexColor("#777777"))
+        canvas.drawRightString(page[0] - margin, margin / 2, f"Page {doc_.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+
+
+def _xlsx_block_table(ws, r0: int, r1: int, col_widths: list[float], key: str):
+    """Rows r0..r1 of sheet `ws` as one reportlab Table (see xlsx_to_pdf)."""
+    from html import escape
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import Paragraph, Table, TableStyle
+
+    font_size = 6.5
+    align_of = {"left": TA_LEFT, "center": TA_CENTER, "centerContinuous": TA_CENTER, "right": TA_RIGHT}
+    side_width = {"thin": 0.4, "hair": 0.25, "dotted": 0.4, "dashed": 0.4, "medium": 1.1,
+                  "thick": 1.6, "double": 1.1, "mediumDashed": 1.1}
+
+    def _hex(c, default=None):
+        rgb = getattr(c, "rgb", None)
+        if isinstance(rgb, str) and len(rgb) >= 6 and rgb != "00000000":
+            return colors.HexColor("#" + rgb[-6:])
+        return default
+
+    def _text(cell):
+        v = cell.value
+        if v is None:
+            return ""
+        fmt = cell.number_format or "General"
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            if "%" in fmt:
+                return f"{v * 100:,.2f}%"
+            if "0.00" in fmt:
+                return f"{v:,.2f}"
+            if "#,##0" in fmt:
+                return f"{v:,.0f}"
+            return f"{int(v)}" if float(v).is_integer() else f"{v}"
+        return str(v)
+
+    ncol = len(col_widths)
+    merged, covered = {}, set()
+    for rng in ws.merged_cells.ranges:
+        if rng.min_row < r0 or rng.min_row > r1:
+            continue
+        merged[(rng.min_row, rng.min_col)] = rng
+        for r in range(rng.min_row, min(rng.max_row, r1) + 1):
+            for c in range(rng.min_col, rng.max_col + 1):
+                if (r, c) != (rng.min_row, rng.min_col):
+                    covered.add((r, c))
+
+    data, cmds = [], [("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                      ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                      ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5)]
+    for r in range(r0, r1 + 1):
+        line = []
+        for c in range(1, ncol + 1):
+            cell = ws.cell(row=r, column=c)
+            x, y = c - 1, r - r0
+            if (r, c) in covered:
+                line.append("")
+            else:
+                txt = _text(cell)
+                is_num = isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool)
+                h = cell.alignment.horizontal if cell.alignment else None
+                style = ParagraphStyle(
+                    f"{key}_{r}_{c}", fontName=FONT_BOLD if (cell.font and cell.font.b) else FONT_REGULAR,
+                    fontSize=font_size, leading=font_size + 1.5,
+                    alignment=align_of.get(h, TA_RIGHT if is_num else TA_LEFT),
+                    textColor=_hex(cell.font.color, colors.black) if cell.font and cell.font.color else colors.black)
+                line.append(Paragraph(escape(txt).replace("\n", "<br/>"), style) if txt else "")
+                rng = merged.get((r, c))
+                x2, y2 = (rng.max_col - 1, min(rng.max_row, r1) - r0) if rng else (x, y)
+                if rng:
+                    cmds.append(("SPAN", (x, y), (x2, y2)))
+                if cell.fill is not None and cell.fill.fill_type == "solid":
+                    bg = _hex(cell.fill.fgColor)
+                    if bg is not None:
+                        cmds.append(("BACKGROUND", (x, y), (x2, y2), bg))
+            # Each cell's own borders, merged cells included.
+            b = cell.border
+            for side, op in (("top", "LINEABOVE"), ("bottom", "LINEBELOW"),
+                             ("left", "LINEBEFORE"), ("right", "LINEAFTER")):
+                s = getattr(b, side, None) if b else None
+                if s is not None and s.style:
+                    cmds.append((op, (x, y), (x, y), side_width.get(s.style, 0.4),
+                                 _hex(s.color, colors.black) or colors.black))
+        data.append(line)
+
+    # Header rows repeat on each page: the block's rows above its first
+    # numbered row (No. 1), at most three.
+    repeat = 0
+    for r in range(r0, min(r1, r0 + 3) + 1):
+        if isinstance(ws.cell(row=r, column=1).value, (int, float)):
+            break
+        repeat = r - r0 + 1
+    table = Table(data, colWidths=col_widths, repeatRows=min(repeat, 3))
+    table.setStyle(TableStyle(cmds))
+    return table
+
+
 def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: bool = False,
               sections=None) -> Path:
     """`sections` (Excel only) exports just those dashboard sections -- see
