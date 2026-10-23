@@ -1632,7 +1632,8 @@ def _balance_payment_display(cust_basic_lines: list, dates: tuple, as_at: str = 
     return "pending" if inv_date and inv_date != "-" else _full_payment_display(dates)
 
 
-def _nfp_payment_display(cust_basic_lines: list, nfp_dates: tuple, as_at: str = "") -> str:
+def _nfp_payment_display(cust_basic_lines: list, nfp_dates: tuple, as_at: str = "",
+                         nfp_payouts=None) -> str:
     """The payment-date cell on a Net Floor Price row.
 
     NFP is earned at 100% payment, so that milestone is the date this column
@@ -1640,7 +1641,16 @@ def _nfp_payment_display(cust_basic_lines: list, nfp_dates: tuple, as_at: str = 
     day whenever a settled invoice is topped up again -- Liew Chan Sang's
     August row carried 2026-09-25, a date that had not happened when August
     was reported, for a commission August had already paid.
+
+    `nfp_payouts` are the dates the NFP engine pays this customer's NFP on
+    this month, and win when present. Without them a customer whose Basic
+    was paid in another month and whose invoice carries no full-payment date
+    read "-", and the Balance Payout filter (which tests this column) dropped
+    a payout the month makes: Lee Fang Teen's -RM 2,515.80 in Oct 2026.
     """
+    payouts = sorted(d for d in (nfp_payouts or ()) if d and not _is_after_month(d, as_at))
+    if payouts:
+        return "<br/>".join(payouts)
     raw = str((nfp_dates[2] if nfp_dates and len(nfp_dates) > 2 else "") or "").strip()
     if raw and not _is_after_month(raw, as_at):
         return raw
@@ -2618,10 +2628,15 @@ def build_internal_summary_tables(
             rate_str = _basic_line_rate_label(ln)
             basic_by_cust[key]["rate"].add(rate_str)
 
-        nfp_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False})
+        nfp_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False, "payouts": set()})
         for r in month_nfp_rows:
             key = (r.agent_name.strip(), r.customer_name.strip())
             nfp_by_cust[key]["comm"] += float(r.nfp_commission)
+            # The date the engine pays this NFP on -- what the row's payment
+            # date column must show (_nfp_payment_display).
+            _po = str(_nfp_payout_date(r) or "").strip()[:10]
+            if _po:
+                nfp_by_cust[key]["payouts"].add(_po)
             nfp_by_cust[key]["sales"] += float(r.sales_price)
             nfp_by_cust[key]["rate"].add(determine_nfp_rate([r]))
             nfp_by_cust[key]["system_price"] += float(r.total_amount)
@@ -2791,7 +2806,8 @@ def build_internal_summary_tables(
                     if m >= 7:
                         nfp_row.append("-")
                     nfp_row.extend([
-                        _nfp_payment_display(cust_basic_lines, nfp_dates, as_at_ym(year, m)),
+                        _nfp_payment_display(cust_basic_lines, nfp_dates, as_at_ym(year, m),
+                                             nfp_info.get("payouts")),
                         cust_nfp_pkg_str,
                         ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
                         nfp_nfp_cell,
@@ -3135,10 +3151,15 @@ def build_outsource_summary_tables(
             rate_str = _basic_line_rate_label(ln)
             basic_by_cust[key]["rate"].add(rate_str)
 
-        nfp_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False})
+        nfp_by_cust = defaultdict(lambda: {"comm": 0.0, "rate": set(), "sales": 0.0, "system_price": 0.0, "net_floor_price": 0.0, "is_cleaning_service": False, "payouts": set()})
         for r in month_nfp_rows:
             key = (r.agent_name.strip(), r.customer_name.strip())
             nfp_by_cust[key]["comm"] += float(r.nfp_commission)
+            # The date the engine pays this NFP on -- what the row's payment
+            # date column must show (_nfp_payment_display).
+            _po = str(_nfp_payout_date(r) or "").strip()[:10]
+            if _po:
+                nfp_by_cust[key]["payouts"].add(_po)
             nfp_by_cust[key]["sales"] += float(r.sales_price)
             nfp_by_cust[key]["rate"].add(determine_nfp_rate([r]))
             nfp_by_cust[key]["system_price"] += float(r.total_amount)
@@ -3322,7 +3343,8 @@ def build_outsource_summary_tables(
                     if m >= 7:
                         nfp_row.append("-")
                     nfp_row.extend([
-                        _nfp_payment_display(cust_basic_lines, nfp_dates, as_at_ym(year, m)),
+                        _nfp_payment_display(cust_basic_lines, nfp_dates, as_at_ym(year, m),
+                                             nfp_info.get("payouts")),
                         cust_nfp_pkg_str,
                         ensure_rm_prefix(f"{nfp_info['system_price']:,.2f}" if nfp_info['system_price'] != 0 else "-"),
                         nfp_nfp_cell,
@@ -5362,6 +5384,7 @@ def build_commission_excel(
     (see EXCEL_SECTION_SHEETS); None writes every sheet."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.cell.cell import MergedCell
     from openpyxl.utils import get_column_letter
 
     wb = Workbook()
@@ -5371,7 +5394,8 @@ def build_commission_excel(
     font_name = "Arial"
     title_fill = PatternFill("solid", fgColor="1A365D")  # Navy
     total_fill = PatternFill("solid", fgColor="F1F5F9")  # Soft gray-blue
-    nfp_row_fill = PatternFill("solid", fgColor="DDEBF7")     # Light blue: NFP rows
+    nfp_row_fill = PatternFill("solid", fgColor="94DCF8")     # Blue: NFP rows (user, 2026-10-23)
+    advance_total_fill = PatternFill("solid", fgColor="FFFF00")  # Yellow: Advance RM 300 Total
     _green = PatternFill("solid", fgColor="45D65A")
     _pink = PatternFill("solid", fgColor="E49EDD")
     _orange = PatternFill("solid", fgColor="E87331")
@@ -5379,6 +5403,9 @@ def build_commission_excel(
         "commission rate %": _green, "commission price": _green,
         "override": _pink, "safwan (rm)": _pink, "gan lai soon": _pink,
         "referral name": _orange, "referral fee": _orange,
+        # The referral table under Balance Payout (user, 2026-10-23).
+        "referral fee (rm)": _orange, "commission price (rm)": _green,
+        "other commission (rm)": _pink,
     }
 
     title_font = Font(name=font_name, size=11, bold=True, color="FFFFFF")
@@ -5388,7 +5415,7 @@ def build_commission_excel(
 
     thin_border_side = Side(style="thin", color="CCCCCC")
     border_all = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
-    outline_side = Side(style="thin", color="000000")
+    outline_side = Side(style="medium", color="000000")   # thicker box lines (user, 2026-10-23)
     header_border = Border(left=outline_side, right=outline_side, top=outline_side, bottom=outline_side)
     double_bottom_side = Side(style="double", color="000000")
     total_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=double_bottom_side)
@@ -5485,20 +5512,45 @@ def build_commission_excel(
         else:
             cell.alignment = Alignment(horizontal="left", vertical="center")
 
-    def write_block(ws, start_row, title, headers, rows, row_fill=None):
-        """`row_fill(row)` may return a fill for a whole data row."""
-        ws.row_dimensions[start_row].height = 24
-        for col_idx in range(1, len(headers) + 1):
-            c = ws.cell(row=start_row, column=col_idx)
-            c.border = border_all
-            c.fill = title_fill
-            if col_idx == 1:
-                c.value = title
-                c.font = title_font
-                c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-        ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=len(headers))
-        start_row += 1
-        
+    def write_block(ws, start_row, title, headers, rows, row_fill=None, total_row_fill=None,
+                    group_headers=None):
+        """`row_fill(row)` may return a fill for a whole data row;
+        `total_row_fill`, when given, fills the Total row instead of the usual
+        grey-blue. A title of None writes no title row: the block starts with
+        its headers. `group_headers` -- (label, first header, last header,
+        fill) -- adds a row over the headers with each label spanning its
+        columns; every other header then fills both rows."""
+        if title is not None:
+            ws.row_dimensions[start_row].height = 24
+            for col_idx in range(1, len(headers) + 1):
+                c = ws.cell(row=start_row, column=col_idx)
+                c.border = border_all
+                c.fill = title_fill
+                if col_idx == 1:
+                    c.value = title
+                    c.font = title_font
+                    c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+            ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=len(headers))
+            start_row += 1
+
+        grouped = set()
+        if group_headers:
+            ws.row_dimensions[start_row].height = 20
+            for label, first_h, last_h, gfill in group_headers:
+                a, b = headers.index(first_h) + 1, headers.index(last_h) + 1
+                for col_idx in range(a, b + 1):
+                    c = ws.cell(row=start_row, column=col_idx)
+                    c.border = header_border
+                    if gfill is not None:
+                        c.fill = gfill
+                    grouped.add(col_idx)
+                c = ws.cell(row=start_row, column=a, value=label)
+                c.font = header_font
+                c.alignment = Alignment(horizontal="center", vertical="center")
+                if b > a:
+                    ws.merge_cells(start_row=start_row, start_column=a, end_row=start_row, end_column=b)
+            start_row += 1
+
         ws.row_dimensions[start_row].height = 20
         for col_idx, h in enumerate(headers, start=1):
             c = ws.cell(row=start_row, column=col_idx, value=h)
@@ -5507,6 +5559,21 @@ def build_commission_excel(
             if str(h).strip().lower() in header_fills:
                 c.fill = header_fills[str(h).strip().lower()]
             c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        if group_headers:
+            # An ungrouped header is written in the top row and runs down
+            # through the second.
+            for col_idx in range(1, len(headers) + 1):
+                if col_idx in grouped:
+                    continue
+                low = ws.cell(row=start_row, column=col_idx)
+                top = ws.cell(row=start_row - 1, column=col_idx, value=low.value)
+                top.font, top.border = _copy.copy(low.font), _copy.copy(low.border)
+                top.alignment = _copy.copy(low.alignment)
+                if low.fill is not None and low.fill.fill_type:
+                    top.fill = _copy.copy(low.fill)
+                low.value = None
+                ws.merge_cells(start_row=start_row - 1, start_column=col_idx,
+                               end_row=start_row, end_column=col_idx)
         start_row += 1
         
         if not rows:
@@ -5541,6 +5608,8 @@ def build_commission_excel(
             is_total = "total" in first_val or "grand total" in first_val
 
             fill = row_fill(r) if (row_fill and not is_total) else None
+            if is_total and total_row_fill is not None:
+                fill = total_row_fill
             for col_idx, val in enumerate(r):
                 if col_idx < len(headers):
                     c = ws.cell(row=start_row, column=col_idx + 1)
@@ -5587,12 +5656,15 @@ def build_commission_excel(
         start_row += 1
         return start_row
 
-    def autofit_cols(ws):
+    def autofit_cols(ws, skip_rows=()):
+        """Rows in `skip_rows` do not count toward a column's width."""
         ws.views.sheetView[0].showGridLines = True
         for col in ws.columns:
             max_len = 0
             col_letter = get_column_letter(col[0].column)
             for cell in col:
+                if cell.row in skip_rows:
+                    continue
                 val_str = str(cell.value or '')
                 val_str = re.sub(r'<[^>]*>', '', val_str)
                 if len(val_str) > 50:
@@ -5669,44 +5741,188 @@ def build_commission_excel(
                     {"Internal": int_customer_summary_rows.get(m, []),
                      "Outsource": out_customer_summary_rows.get(m, [])},
                     stage_balance_dates or {}, year, m, stage)
-                # No., Customer, Agent, 1st Payment Date, Commission, Commission
+                # No., Customer, 1st Payment Date, Agent, Commission, Commission
                 # Price (user, 2026-10-20). With Customer leading, every row
                 # names its agent rather than only a block's first row. The
                 # Balance Payout sheet also keeps the price and the other
                 # commission columns.
                 src = {c: i for i, c in enumerate(_STAGE_SHEET_COLUMNS)}
                 if stage == "balance":
-                    picked = ["Customer", "Agent", "1st Payment Date", "System Price", "Net Floor Price",
-                              "Sales Price", "Commission", "Basic Rate %", "Commission Price", "Override",
-                              "Safwan (RM)", "Gan Lai Soon", "Referral Name", "Referral Fee"]
+                    picked = ["Customer", "1st Payment Date", "System Price", "Net Floor Price",
+                              "Sales Price", "Agent", "Commission", "Basic Rate %", "Commission Price", "Override",
+                              "Gan Lai Soon", "Safwan (RM)", "Referral Name", "Referral Fee"]
                 else:
-                    picked = ["Customer", "Agent", "1st Payment Date", "Commission", "Commission Price"]
+                    picked = ["Customer", "1st Payment Date", "Agent", "Commission", "Commission Price"]
                 # "Basic Rate %" holds the NFP rate on an NFP row, so it is one
                 # Commission Rate % column for both.
                 _labels = {"Sales Price": "Original Price/Cash Price after discount",
                            "Basic Rate %": "Commission Rate %"}
                 headers_out = ["No."] + [_labels.get(c, c) for c in picked]
                 body, owner = [], ""
-                for n, r in enumerate(rows, start=1):
+                for r in rows:
                     owner = r[src["Agent"]] or owner
-                    line = [n] + [owner if c == "Agent" else r[src[c]] for c in picked]
+                    line = [0] + [owner if c == "Agent" else r[src[c]] for c in picked]
                     if "Basic Rate %" in picked:
                         # An NFP sale below its floor "bears 20%": shown as the
                         # plain 20% so it reads as a rate like the others.
                         k = 1 + picked.index("Basic Rate %")
                         line[k] = str(line[k] or "").replace("bears ", "") or line[k]
                     body.append(line)
+                # One customer, one entry: consecutive rows of the same
+                # customer and agent (the Basic and NFP rows of a sale, or
+                # several invoices under one name) share a number, and their
+                # No., Customer, Agent and 1st Payment Date cells are merged
+                # below once the block is written (user, 2026-10-23).
+                cust_i, agent_i = headers_out.index("Customer"), headers_out.index("Agent")
+                groups = []
+                for k, line in enumerate(body):
+                    if groups and (body[groups[-1][0]][cust_i], body[groups[-1][0]][agent_i]) == (line[cust_i], line[agent_i])                             and str(line[cust_i] or "").strip():
+                        groups[-1][1] = k
+                    else:
+                        groups.append([k, k])
+                for no, (a, b) in enumerate(groups, start=1):
+                    for k in range(a, b + 1):
+                        body[k][0] = no
+                if stage == "balance" and groups:
+                    # A blank row after each customer on Balance Payout, so
+                    # customers read apart (user, 2026-10-23).
+                    spaced, new_groups = [], []
+                    for a, b in groups:
+                        new_groups.append([len(spaced), len(spaced) + (b - a)])
+                        spaced.extend(body[a:b + 1])
+                        spaced.append([""] * len(headers_out))
+                    body, groups = spaced, new_groups
                 if body:
                     price_i = headers_out.index("Commission Price")
                     total = sum(_money(r[price_i]) for r in body)
                     total_row = ["Total"] + [""] * (len(headers_out) - 1)
                     total_row[price_i] = ensure_rm_prefix(f"{total:,.2f}")
+                    if stage == "balance":
+                        # Referral Fee's total, and one Other Commission total
+                        # -- Override, Safwan and Gan Lai Soon together -- in
+                        # the Override cell, merged across the three below
+                        # (user, 2026-10-23). An Override cell can name several
+                        # people, so every amount in it counts.
+                        fee_i = headers_out.index("Referral Fee")
+                        total_row[fee_i] = ensure_rm_prefix(f"{sum(_money(r[fee_i]) for r in body):,.2f}")
+                        ovr_i = headers_out.index("Override")
+                        other = 0.0
+                        for r in body:
+                            other += sum(_money(a) for a in re.findall(r"-?RM\s*-?[\d,]+(?:\.\d+)?", str(r[ovr_i] or "")))
+                            other += _money(r[headers_out.index("Safwan (RM)")]) + _money(r[headers_out.index("Gan Lai Soon")])
+                        total_row[ovr_i] = ensure_rm_prefix(f"{other:,.2f}")
                     body.append(total_row)
                 label = "Advance RM 300" if stage == "advance" else "Balance Payout"
                 comm_i = headers_out.index("Commission")
-                curr_row = write_block(ws, curr_row, f"{MONTH_NAMES[m]} {year} - Basic & Net Floor Price Commission - {label}",
+                block_start = curr_row
+                # No title row over a one-month file -- the sheet starts with
+                # its headers (user, 2026-10-23); a file of several months keeps
+                # one per month so they can be told apart.
+                block_title = (f"{MONTH_NAMES[m]} {year} - Basic & Net Floor Price Commission - {label}"
+                               if len(months_to_export) > 1 else None)
+                # "Other Commission" over Override, Gan Lai Soon and Safwan on
+                # Balance Payout (user, 2026-10-23).
+                groups_hdr = ([("Other Commission", "Override", "Safwan (RM)", _pink)]
+                              if stage == "balance" else None)
+                curr_row = write_block(ws, curr_row, block_title,
                                        headers_out, body,
-                                       row_fill=lambda r: nfp_row_fill if "net floor" in str(r[comm_i]).lower() else None)
+                                       row_fill=lambda r: nfp_row_fill if "net floor" in str(r[comm_i]).lower() else None,
+                                       # The Total row in yellow on both sheets (user, 2026-10-23).
+                                       total_row_fill=advance_total_fill,
+                                       group_headers=groups_hdr)
+                # Data rows start under the header row(s) (and the title, if any).
+                first = (block_start + (2 if block_title is not None else 1)
+                         + (1 if groups_hdr else 0))
+                # The money headers read "(RM)", like Safwan (RM) (user,
+                # 2026-10-23). Only the written text changes: the columns are
+                # found by their plain names above.
+                rm_labels = {"Commission Price": "Commission Price (RM)",
+                             "Other Commission": "Other Commission (RM)",
+                             "Referral Fee": "Referral Fee (RM)",
+                             "Override": "Override (RM)",
+                             "Gan Lai Soon": "Gan Lai Soon (RM)"}
+                for hr in range(first - (2 if groups_hdr else 1), first):
+                    for col_idx in range(1, len(headers_out) + 1):
+                        c = ws.cell(row=hr, column=col_idx)
+                        if not isinstance(c, MergedCell) and c.value in rm_labels:
+                            c.value = rm_labels[c.value]
+                if stage == "balance" and body:
+                    # The Other Commission total spans Override to Safwan;
+                    # the top-left cell carries the box's outer edges.
+                    tr_row = first + len(body) - 1
+                    c0, c1 = headers_out.index("Override") + 1, headers_out.index("Safwan (RM)") + 1
+                    tl = ws.cell(row=tr_row, column=c0)
+                    tl.border = Border(left=tl.border.left, right=ws.cell(row=tr_row, column=c1).border.right,
+                                       top=tl.border.top, bottom=tl.border.bottom)
+                    tl.alignment = Alignment(horizontal="center", vertical="center")
+                    ws.merge_cells(start_row=tr_row, start_column=c0, end_row=tr_row, end_column=c1)
+                date_i = headers_out.index("1st Payment Date")
+                for a, b in groups:
+                    if b == a:
+                        continue
+                    # The Agent cell is not merged: every row names its agent
+                    # (user, 2026-10-23).
+                    cols = [0, cust_i]
+                    if len({str(body[k][date_i]) for k in range(a, b + 1)}) == 1:
+                        cols.append(date_i)
+                    for ci in cols:
+                        ws.merge_cells(start_row=first + a, start_column=ci + 1,
+                                       end_row=first + b, end_column=ci + 1)
+                        ws.cell(row=first + a, column=ci + 1).alignment = Alignment(
+                            horizontal="center" if ci == 0 else "left", vertical="center", wrap_text=True)
+                if stage == "balance":
+                    # Three independent lists under the table, side by side,
+                    # each with its own total (user, 2026-10-23): referral
+                    # persons and their fees; every agent and their
+                    # Commission Price; everyone earning an Other Commission
+                    # (Override, Gan Lai Soon, Safwan) and its amount. Each
+                    # Remarks is one empty column, to be filled in.
+                    owner, fees, earned, others = "", {}, {}, {}
+                    for r in rows:
+                        owner = r[src["Agent"]] or owner
+                        if owner:
+                            earned[owner] = earned.get(owner, 0.0) + _money(r[src["Commission Price"]])
+                        for amt, who in re.findall(r"(-?RM\s*-?[\d,]+(?:\.\d+)?)\s*\(([^)]+)\)",
+                                                   str(r[src["Override"]] or "")):
+                            others[who.strip()] = others.get(who.strip(), 0.0) + _money(amt)
+                        for col, who in (("Safwan (RM)", "Safwan"), ("Gan Lai Soon", "Gan Lai Soon")):
+                            amt = _money(r[src[col]])
+                            if amt:
+                                others[who] = others.get(who, 0.0) + amt
+                        name = str(r[src["Referral Name"]] or "").strip()
+                        fee = _money(r[src["Referral Fee"]])
+                        if name and name != "-" and fee:
+                            fees[name] = fees.get(name, 0.0) + fee
+                    ref_list = sorted(fees.items(), key=lambda kv: str(kv[0]).lower())
+                    agent_list = sorted(earned.items(), key=lambda kv: agent_name_sort_key(kv[0]))
+                    # Safwan and Gan Lai Soon are always listed, "-" in a
+                    # month they earn nothing (user, 2026-10-23).
+                    for who in ("Safwan", "Gan Lai Soon"):
+                        others.setdefault(who, 0.0)
+                    other_list = sorted(others.items(), key=lambda kv: agent_name_sort_key(kv[0]))
+                    n = max(len(ref_list), len(agent_list), len(other_list))
+                    ref_body = []
+                    for k in range(n):
+                        line = [""] * 10
+                        if k < len(ref_list):
+                            line[0:3] = [k + 1, ref_list[k][0], f"{ref_list[k][1]:,.2f}"]
+                        if k < len(agent_list):
+                            line[4:6] = [agent_list[k][0], f"{agent_list[k][1]:,.2f}"]
+                        if k < len(other_list):
+                            line[7:9] = [other_list[k][0], f"{other_list[k][1]:,.2f}" if other_list[k][1] else "-"]
+                        ref_body.append(line)
+                    if ref_body:
+                        total = ["Total"] + [""] * 9
+                        total[2] = f"{sum(fees.values()):,.2f}"
+                        total[5] = f"{sum(earned.values()):,.2f}"
+                        total[8] = f"{sum(others.values()):,.2f}"
+                        ref_body.append(total)
+                    curr_row = write_block(ws, curr_row, None,
+                                           ["No.", "Referral Person", "Referral Fee (RM)", "Remarks",
+                                            "Agent", "Commission Price (RM)", "Remarks",
+                                            "Agent", "Other Commission (RM)", "Remarks"], ref_body,
+                                           # Its Total row in yellow too (user, 2026-10-23).
+                                           total_row_fill=advance_total_fill)
             autofit_cols(ws)
 
     # 4. Int EGA ESA Details
@@ -5810,6 +6026,723 @@ def build_commission_excel(
     return output_path
 
 
+def nfp_held_back(customer_rows_by_type: dict, month: int) -> set:
+    """(agent, customer) keys -- full name and title-cased customer, lower case
+    -- whose NFP row the report page shows without an amount: "TBC with
+    Finance", "EV package", "invoice before Oct 25", "JinkoSolar package not
+    included", "pending full payment". The engine still prices those
+    invoices; the page and the Excel pay nothing on them this month."""
+    held = set()
+    for agent_type, rows in (customer_rows_by_type or {}).items():
+        hdrs = _row_headers(agent_type, month)
+        col = {h: i for i, h in enumerate(hdrs)}
+        owner = ""
+        for r in rows or []:
+            r = list(r) + ["-"] * (len(hdrs) - len(r))
+            if str(r[col["Agent"]] or "").strip():
+                owner = str(r[col["Agent"]]).strip()
+            if "net floor" not in str(r[col["Commission"]] or "").lower():
+                continue
+            price = str(r[col["Commission Price"]] or "").strip()
+            if price and price != "-" and re.search(r"[A-Za-z]", price.replace("RM", "")):
+                held.add((to_full_name(owner).lower(), to_title_case(r[col["Customer"]]).strip().lower()))
+    return held
+
+
+def basic_nfp_metrics(basic_lines_by_type: dict, nfp_rows_by_type: dict, year: int,
+                      month: int, held_back: set | None = None) -> dict:
+    """The Basic & NFP report's figures for one month, from the commission
+    lines themselves (the same month bucketing the page and Excel use).
+
+    Basic: every Basic line paid this month (_expand_basic_lines_for_month) --
+    commission paid, split into Advance RM 300 and Balance; net sales are the
+    Original Price of each invoice paid on, counted once.
+    NFP: every NFP invoice whose payout lands this month, by tier: above the
+    package (system) price (100%), above the Net Floor Price (25%), or below
+    it (20%, a deduction)."""
+    from collections import defaultdict
+    agents = defaultdict(lambda: {"type": "", "basic": 0.0, "advance": 0.0, "balance": 0.0,
+                                  "sales": 0.0, "invoices": set(), "nfp": 0.0,
+                                  "above_floor": 0.0, "below_floor": 0.0,
+                                  "n_above": 0, "n_below": 0, "n_system": 0,
+                                  "sys_over_floor": 0.0, "sys_over_package": 0.0, "sys_nfp": 0.0})
+    basic = {"paid": 0.0, "advance": 0.0, "balance": 0.0, "sales": 0.0, "invoices": 0,
+             "by_type": {"Internal": 0.0, "Outsource": 0.0}}
+    seen = set()
+    for agent_type, lines in (basic_lines_by_type or {}).items():
+        for ln in _expand_basic_lines_for_month(lines or [], month):
+            name = to_full_name(ln.agent_name)
+            a = agents[(name, agent_type)]
+            a["type"] = agent_type
+            paid = float(ln.basic_commission or 0)
+            pol = getattr(ln, "payout_policy", None)
+            if pol is None or not pol.is_multi_stage:
+                adv = 0.0
+            elif getattr(ln, "_skip_override", False):
+                adv = paid                       # the advance alone
+            elif getattr(ln, "_advance_deducted", None) is not None:
+                adv = 0.0                        # the balance alone
+            else:                                # both stages this month
+                adv = min(paid, float(pol.advance_amount or 300))
+            a["basic"] += paid; a["advance"] += adv; a["balance"] += paid - adv
+            basic["paid"] += paid; basic["advance"] += adv; basic["balance"] += paid - adv
+            basic["by_type"][agent_type] = basic["by_type"].get(agent_type, 0.0) + paid
+            key = (agent_type, str(ln.invoice_number))
+            if key not in seen:
+                seen.add(key)
+                sales = float(ln.sales_price or 0)
+                a["sales"] += sales; a["invoices"].add(str(ln.invoice_number))
+                basic["sales"] += sales; basic["invoices"] += 1
+
+    # Tiers from the prices themselves, not the commission parts (older
+    # invoices fill those differently): Cash Price against the Net Floor
+    # Price and the package (system) price. No floor on file (TBC, EV
+    # packages) is its own group.
+    tiers = {k: {"n": 0, "cash": 0.0, "floor": 0.0, "gap": 0.0, "commission": 0.0, "agents": set()}
+             for k in ("system", "above", "below", "at", "nofloor")}
+    for agent_type, rows in (nfp_rows_by_type or {}).items():
+        for r in rows or []:
+            if _year_month(_nfp_payout_date(r)) != (int(year), int(month)):
+                continue
+            cash = float(getattr(r, "sales_price", 0) or 0)
+            floor = float(getattr(r, "net_floor_price", 0) or 0)
+            package = float(getattr(r, "system_price", 0) or 0)
+            comm = float(getattr(r, "nfp_commission", 0) or 0)
+            held = (to_full_name(r.agent_name).lower(),
+                    to_title_case(r.customer_name).strip().lower()) in (held_back or ())
+            if held or floor <= 0:
+                # Not priced: the page shows no amount (TBC with Finance, EV
+                # package, ...) or there is no floor to compare with.
+                tier, comm = "nofloor", 0.0
+            elif cash > floor and package > 0 and cash > package:
+                tier = "system"
+            elif cash > floor:
+                tier = "above"
+            elif cash < floor:
+                tier = "below"
+            else:
+                tier = "at"
+            t = tiers[tier]
+            name = to_full_name(r.agent_name)
+            t["n"] += 1; t["cash"] += cash; t["floor"] += floor
+            t["gap"] += (cash - floor) if tier != "nofloor" else 0.0
+            t["commission"] += comm; t["agents"].add(name)
+            a = agents[(name, agent_type)]
+            a["type"] = agent_type
+            a["nfp"] += comm
+            # Above the package price and above the floor are separate
+            # groups, as on the NFP page's cards and table.
+            if tier == "system":
+                a["n_system"] += 1
+                a["sys_over_floor"] += cash - floor
+                a["sys_over_package"] += cash - package
+                a["sys_nfp"] += comm
+            elif tier == "above":
+                a["above_floor"] += cash - floor; a["n_above"] += 1
+            elif tier == "below":
+                a["below_floor"] += floor - cash; a["n_below"] += 1
+    nfp = {"paid": sum(t["commission"] for t in tiers.values()),
+           "invoices": sum(t["n"] for t in tiers.values()), "tiers": tiers}
+    active = [dict(v, name=k[0]) for k, v in agents.items() if v["basic"] or v["nfp"] or v["invoices"]]
+    for a in active:
+        a["total"] = a["basic"] + a["nfp"]
+    return {"basic": basic, "nfp": nfp, "agents": active,
+            "agent_count": len({a["name"] for a in active if a["basic"] or a["invoices"]})}
+
+
+def build_basic_nfp_pdf(output_path: Path, year: int, month: int, cur: dict,
+                        prev: dict | None = None) -> Path:
+    """The Basic & Net Floor Price Commission page's Download Report (user,
+    2026-10-23): a management summary in the style of a consulting deck, not
+    a copy of the tables. Cover and contents as the company-wide pack has
+    them, then an Executive Summary, Basic Commission (paid, net sales, agents,
+    top performers), Net Floor Price (sold above the package price, above the
+    floor, below the floor), NFP by agent, and the definitions. Every page
+    title states its finding. `cur` / `prev` are basic_nfp_metrics() for the
+    month and the one before (None when there is none)."""
+    from datetime import datetime as _dt
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import inch
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_RIGHT, TA_CENTER
+    from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer,
+                                    Table, TableStyle, PageBreak, KeepTogether)
+
+    MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August",
+              "September", "October", "November", "December"]
+    period = f"{MONTHS[month - 1]} {year}"
+    prev_label = f"{MONTHS[month - 2]} {year}" if prev is not None and month > 1 else None
+    # <b> inside a paragraph needs the font registered as a family, or the
+    # bold lead-ins of the takeaways come out regular.
+    try:
+        from reportlab.lib.fonts import addMapping
+        addMapping(FONT_REGULAR, 0, 0, FONT_REGULAR)
+        addMapping(FONT_REGULAR, 1, 0, FONT_BOLD)
+        addMapping(FONT_REGULAR, 0, 1, FONT_REGULAR)
+        addMapping(FONT_REGULAR, 1, 1, FONT_BOLD)
+    except Exception:
+        pass
+    PAGE_W, PAGE_H = landscape(A4)
+    MARGIN = int(0.55 * inch)
+    CONTENT_W = PAGE_W - 2 * MARGIN
+    LOGO_PATH = Path(__file__).resolve().parent.parent / "9. assets" / "eternalgy_logo.png"
+
+    BAND_BG, BAND_INK, BAND_MUTED = "#0F1922", "#EAF3EF", "#8FB3A8"
+    INK, MUTED, FAINT, RULE = "#141A1F", "#576270", "#8B95A3", "#E7EBEF"
+    GREEN, CORAL, RED, TEAL = "#0E7C66", "#FF7A45", "#C6432E", "#2C7A7B"
+    TIER_COLOR = {"system": "#0B5D4D", "above": "#45D65A", "below": "#E8735A", "nofloor": "#CBD5E0"}
+
+    def st(name, **kw):
+        base = dict(fontName=FONT_REGULAR, fontSize=9.5, leading=13, textColor=_rl_color(INK))
+        base.update(kw)
+        if "textColor" in kw and isinstance(kw["textColor"], str):
+            base["textColor"] = _rl_color(kw["textColor"])
+        return ParagraphStyle(name, **base)
+
+    s_cover_title = st("BnCoverT", fontName=FONT_BOLD, fontSize=38, leading=43, textColor=BAND_INK)
+    s_cover_sub = st("BnCoverS", fontSize=13, leading=17, textColor=BAND_MUTED)
+    s_cover_meta = st("BnCoverM", fontSize=10, leading=15, textColor=BAND_MUTED)
+    s_pill = st("BnPill", fontName=FONT_BOLD, fontSize=10.5, leading=13, textColor="#1A365D")
+    s_eyebrow = st("BnEye", fontName=FONT_BOLD, fontSize=9, leading=11, textColor=BAND_MUTED, spaceAfter=3)
+    s_band_title = st("BnBandT", fontName=FONT_BOLD, fontSize=17, leading=21, textColor=BAND_INK)
+    s_band_sub = st("BnBandS", fontSize=9.5, leading=12.5, textColor=BAND_MUTED, spaceBefore=4)
+    s_plain_title = st("BnPlainT", fontName=FONT_BOLD, fontSize=20, leading=24, textColor=INK)
+    s_plain_title_long = st("BnPlainTL", fontName=FONT_BOLD, fontSize=16, leading=20, textColor=INK)
+    s_plain_sub = st("BnPlainS", fontSize=9.5, leading=12.5, textColor=MUTED, spaceBefore=3)
+    s_body = st("BnBody", fontSize=9.5, leading=14, textColor="#2D3748")
+    s_small = st("BnSmall", fontSize=7.8, leading=10, textColor=MUTED)
+    s_h2 = st("BnH2", fontName=FONT_BOLD, fontSize=10.5, leading=13, textColor=INK, spaceAfter=6)
+    s_kpi_label = st("BnKpiL", fontName=FONT_BOLD, fontSize=7.8, leading=10, textColor=MUTED)
+    s_kpi_value = st("BnKpiV", fontName=FONT_BOLD, fontSize=19, leading=23, textColor=INK)
+    s_kpi_sub = st("BnKpiS", fontSize=7.8, leading=10, textColor=FAINT)
+    s_delta = st("BnDelta", fontName=FONT_BOLD, fontSize=8, leading=10)
+    s_cell = st("BnCell", fontSize=8.6, leading=11)
+    s_cell_r = st("BnCellR", fontSize=8.6, leading=11, alignment=TA_RIGHT)
+    s_cell_b = st("BnCellB", fontName=FONT_BOLD, fontSize=8.6, leading=11)
+    s_cell_br = st("BnCellBR", fontName=FONT_BOLD, fontSize=8.6, leading=11, alignment=TA_RIGHT)
+    s_hdr = st("BnHdr", fontName=FONT_BOLD, fontSize=7.5, leading=9, textColor=FAINT)
+    s_hdr_r = st("BnHdrR", fontName=FONT_BOLD, fontSize=7.5, leading=9, textColor=FAINT, alignment=TA_RIGHT)
+    s_take_n = st("BnTakeN", fontName=FONT_BOLD, fontSize=15, leading=18, textColor=GREEN)
+    s_take = st("BnTake", fontSize=10, leading=14.5, textColor="#2D3748")
+    s_toc_grp = st("BnTocG", fontName=FONT_BOLD, fontSize=9.5, leading=12, textColor="#095A4A", spaceBefore=10, spaceAfter=4)
+    s_toc_num = st("BnTocN", fontName=FONT_BOLD, fontSize=9, leading=12, textColor=FAINT)
+    s_toc_title = st("BnTocT", fontName=FONT_BOLD, fontSize=11, leading=14, textColor=INK)
+    s_toc_pg = st("BnTocP", fontSize=10, leading=13, textColor=MUTED, alignment=TA_RIGHT)
+    s_center_small = st("BnCS", fontSize=7.5, leading=9, textColor=MUTED, alignment=TA_CENTER)
+
+    def rm(v: float, dp: int = 2) -> str:
+        sign = "-" if v < 0 else ""
+        return f"{sign}RM {abs(v):,.{dp}f}"
+
+    def rm_short(v: float) -> str:
+        sign = "-" if v < 0 else ""
+        a = abs(v)
+        if a >= 1_000_000:
+            return f"{sign}RM {a / 1_000_000:.2f}M"
+        if a >= 10_000:
+            return f"{sign}RM {a / 1_000:.1f}k"
+        return f"{sign}RM {a:,.0f}"
+
+    def pct(part: float, whole: float) -> float:
+        return (part / whole * 100.0) if whole else 0.0
+
+    def delta(curv: float, prevv, mode: str = "pct", up_is_good: bool = True) -> str:
+        if prevv is None:
+            return f'<font color="{FAINT}">No prior month for comparison</font>'
+        diff = curv - prevv
+        if mode == "count":
+            label = f"{abs(diff):,.0f}"
+        elif mode == "rm":
+            label = rm_short(abs(diff))
+        elif mode == "points":
+            label = f"{abs(diff):.2f} pts"
+        else:
+            if not prevv:
+                return f'<font color="{FAINT}">Nothing last month to compare</font>'
+            label = f"{abs(diff / abs(prevv) * 100.0):.1f}%"
+        if abs(diff) < 1e-9:
+            return f'<font color="{FAINT}">No change vs {prev_label}</font>'
+        color = "#1F8A4C" if (diff > 0) == up_is_good else RED
+        return f'<font color="{color}">{"+" if diff > 0 else "-"}{label} vs {prev_label}</font>'
+
+    def band(eyebrow: str, title_txt: str, sub_txt: str = "", plain: bool = False) -> Table:
+        """The page header: a dark band, or with `plain` dark text on white
+        over a rule (the Executive Summary, 2026-10-23)."""
+        if plain:
+            # A finding sentence takes a smaller size than a short page name,
+            # so it stays on one line.
+            cell = [Paragraph(title_txt, s_plain_title if len(title_txt) <= 40 else s_plain_title_long)]
+            if sub_txt:
+                cell.append(Paragraph(sub_txt, s_plain_sub))
+            t = Table([[cell]], colWidths=[CONTENT_W])
+            t.setStyle(TableStyle([
+                ("LINEBELOW", (0, 0), (-1, -1), 1.2, _rl_color(INK)),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
+            return t
+        cell = [Paragraph(eyebrow.upper(), s_eyebrow), Paragraph(title_txt, s_band_title)]
+        if sub_txt:
+            cell.append(Paragraph(sub_txt, s_band_sub))
+        t = Table([[cell]], colWidths=[CONTENT_W])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), _rl_color(BAND_BG)),
+            ("LEFTPADDING", (0, 0), (-1, -1), 18), ("RIGHTPADDING", (0, 0), (-1, -1), 18),
+            ("TOPPADDING", (0, 0), (-1, -1), 12), ("BOTTOMPADDING", (0, 0), (-1, -1), 12)]))
+        return t
+
+    def kpi_tiles(items: list, fill: str | None = None) -> Table:
+        """items: (label, value, sub/delta html). One row of equal tiles;
+        `fill` gives each its own background card with a gap between."""
+        if fill:
+            gap = 10
+            w = (CONTENT_W - gap * (len(items) - 1)) / len(items)
+            cells, widths = [], []
+            for i, (lbl, val, sub_txt) in enumerate(items):
+                if i:
+                    cells.append(""); widths.append(gap)
+                cells.append([Paragraph(lbl.upper(), s_kpi_label), Spacer(1, 3), Paragraph(val, s_kpi_value),
+                              Spacer(1, 2), Paragraph(sub_txt, s_delta)])
+                widths.append(w)
+            t = Table([cells], colWidths=widths)
+            cmds = [("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 12), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                    ("TOPPADDING", (0, 0), (-1, -1), 11), ("BOTTOMPADDING", (0, 0), (-1, -1), 10)]
+            for i in range(0, len(cells), 2):
+                cmds.append(("BACKGROUND", (i, 0), (i, 0), _rl_color(fill)))
+            t.setStyle(TableStyle(cmds))
+            return t
+        w = CONTENT_W / len(items)
+        cells = [[Paragraph(lbl.upper(), s_kpi_label), Spacer(1, 3), Paragraph(val, s_kpi_value),
+                  Spacer(1, 2), Paragraph(sub_txt, s_delta)] for lbl, val, sub_txt in items]
+        t = Table([cells], colWidths=[w] * len(items))
+        t.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LINEABOVE", (0, 0), (-1, 0), 2.2, _rl_color(INK)),
+            ("LINEBEFORE", (1, 0), (-1, 0), 0.5, _rl_color(RULE)),
+            ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 9), ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
+        return t
+
+    def bar(frac: float, width: float, color: str, height: float = 7) -> Table:
+        frac = max(0.0, min(1.0, frac))
+        filled = max(1.5, width * frac)
+        cols = [filled, max(0.1, width - filled)]
+        t = Table([["", ""]], colWidths=cols, rowHeights=[height])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (0, 0), _rl_color(color)),
+            ("BACKGROUND", (1, 0), (1, 0), _rl_color("#EDF2F7")),
+            ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+        return t
+
+    def stacked(segments: list, width: float, height: float = 22) -> Table:
+        """segments: (value, color, label). A single 100% bar, labels inside."""
+        total = sum(max(v, 0) for v, _, _ in segments) or 1.0
+        parts = [(max(v, 0) / total * width, c, l) for v, c, l in segments if v > 0] or [(width, "#E7EBEF", "")]
+        t = Table([[Paragraph(f'<font color="#FFFFFF"><b>{l}</b></font>' if w > 48 else "", s_center_small)
+                    for w, _, l in parts]], colWidths=[w for w, _, _ in parts], rowHeights=[height])
+        cmds = [("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2)]
+        for i, (_, c, _) in enumerate(parts):
+            cmds.append(("BACKGROUND", (i, 0), (i, 0), _rl_color(c)))
+        t.setStyle(TableStyle(cmds))
+        return t
+
+    def ledger(headers: list, rows: list, widths: list, right_cols: set, total_row=None,
+               pad: float = 5) -> Table:
+        data = [[Paragraph(h, s_hdr_r if i in right_cols else s_hdr) for i, h in enumerate(headers)]]
+        for r in rows:
+            data.append([c if not isinstance(c, str) else
+                         Paragraph(c, s_cell_r if i in right_cols else s_cell) for i, c in enumerate(r)])
+        if total_row:
+            data.append([Paragraph(c, s_cell_br if i in right_cols else s_cell_b) for i, c in enumerate(total_row)])
+        t = Table(data, colWidths=widths, repeatRows=1)
+        cmds = [("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LINEBELOW", (0, 0), (-1, 0), 1.2, _rl_color(INK)),
+                ("LINEBELOW", (0, 1), (-1, -1), 0.4, _rl_color(RULE)),
+                ("TOPPADDING", (0, 0), (-1, -1), pad), ("BOTTOMPADDING", (0, 0), (-1, -1), pad),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4)]
+        if total_row:
+            cmds.append(("LINEABOVE", (0, -1), (-1, -1), 1.2, _rl_color(INK)))
+        t.setStyle(TableStyle(cmds))
+        return t
+
+    def source(note: str) -> Paragraph:
+        return Paragraph(f"<b>Source:</b> {note}", s_small)
+
+    def tag(agent_type: str) -> str:
+        return ('<font color="#B54A1D"><b>OUT</b></font>' if agent_type == "Outsource"
+                else '<font color="#0B6350"><b>INT</b></font>')
+
+    # ---- figures -----------------------------------------------------------
+    B, N = cur["basic"], cur["nfp"]
+    PB = prev["basic"] if prev else None
+    PN = prev["nfp"] if prev else None
+    tiers = N["tiers"]
+    sys_t, above_t, below_t, nof_t = tiers["system"], tiers["above"], tiers["below"], tiers["nofloor"]
+    priced_n = sys_t["n"] + above_t["n"] + below_t["n"] + tiers["at"]["n"]
+    # Shares are of the sales that have a floor to compare with; say so when
+    # some have none, or the headline and the all-sales bar disagree.
+    with_floor = " that were priced" if nof_t["n"] else ""
+    above_n = sys_t["n"] + above_t["n"]
+    premium = sys_t["gap"] + above_t["gap"]          # sold above the floor, RM
+    shortfall = -below_t["gap"]                       # sold below the floor, RM
+    eff_rate = pct(B["paid"], B["sales"])
+    prev_eff = pct(PB["paid"], PB["sales"]) if PB else None
+    basic_agents = sorted([a for a in cur["agents"] if a["basic"]], key=lambda a: -a["basic"])
+    top = basic_agents[:10]
+    top5_share = pct(sum(a["basic"] for a in basic_agents[:5]), B["paid"])
+    leader = basic_agents[0] if basic_agents else None
+    total_paid = B["paid"] + N["paid"]
+    prev_total = (PB["paid"] + PN["paid"]) if PB else None
+
+    # ---- pages ---------------------------------------------------------------
+    logo = None
+    try:
+        from reportlab.lib.utils import ImageReader
+        if LOGO_PATH.exists():
+            logo = ImageReader(str(LOGO_PATH))
+    except Exception:
+        pass
+
+    def on_page(canvas, doc):
+        canvas.saveState()
+        if doc.page == 1:
+            canvas.setFillColor(_rl_color(BAND_BG))
+            canvas.rect(0, 0, PAGE_W, PAGE_H, fill=1, stroke=0)
+            if logo is not None:
+                canvas.drawImage(logo, MARGIN, PAGE_H - 0.22 * inch - 0.55 * inch,
+                                 width=1.8 * inch, height=0.55 * inch,
+                                 preserveAspectRatio=True, mask="auto")
+        canvas.setFont(FONT_REGULAR, 8)
+        canvas.setFillColor(_rl_color(BAND_MUTED if doc.page == 1 else "#4A5568"))
+        if doc.page > 1:
+            canvas.drawString(MARGIN, 0.35 * inch, f"Basic & Net Floor Price Commission Report · {period}")
+        canvas.drawRightString(PAGE_W - MARGIN, 0.35 * inch, str(doc.page))
+        canvas.restoreState()
+
+    def render(page_nums: dict, registry: dict) -> None:
+        doc = BaseDocTemplate(str(output_path), pagesize=landscape(A4), leftMargin=MARGIN,
+                              rightMargin=MARGIN, topMargin=30, bottomMargin=24)
+        frame = Frame(MARGIN, int(0.55 * inch), CONTENT_W, PAGE_H - MARGIN - int(0.55 * inch),
+                      leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)
+        doc.addPageTemplates([PageTemplate(id="p", frames=[frame], onPage=on_page)])
+        story = []
+        add = story.append
+
+        # Cover, as the company-wide pack has it.
+        add(Spacer(1, int(0.9 * inch)))
+        add(Paragraph("Basic &amp; Net Floor Price<br/>Commission Report", s_cover_title))
+        add(Spacer(1, 8))
+        add(Paragraph("All Agents &mdash; Internal &amp; Outsource, Combined", s_cover_sub))
+        pill = Table([[Paragraph(period.upper(), s_pill)]], colWidths=[len(period) * 8.2 + 26])
+        pill.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), _rl_color("#C3DAF2")),
+                                  ("LEFTPADDING", (0, 0), (-1, -1), 12), ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+                                  ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+        pill.hAlign = "LEFT"
+        add(Spacer(1, 10)); add(pill); add(Spacer(1, int(0.45 * inch)))
+        add(Paragraph(f'<font color="{BAND_INK}"><b>Generated by</b></font> &nbsp;Sales &amp; Commission System', s_cover_meta))
+        add(Paragraph(f'<font color="{BAND_INK}"><b>Generated on</b></font> &nbsp;{_dt.now().strftime("%d %B %Y")}', s_cover_meta))
+        add(PageBreak())
+
+        # Contents, as the company-wide pack has it.
+        add(band("Contents", "Table of Contents"))
+        add(Spacer(1, 10))
+        add(Paragraph(
+            f"<b>About this document.</b> A management summary of {period}'s Basic and Net Floor "
+            "Price commission for every agent, Internal and Outsource.", s_body))
+        add(Spacer(1, int(0.15 * inch)))
+
+        def toc_row(idx, title_txt, key):
+            row = Table([[Paragraph(f"{idx:02d}", s_toc_num), Paragraph(title_txt, s_toc_title),
+                          Paragraph(f"Pg {page_nums.get(key, '-')}", s_toc_pg)]],
+                        colWidths=[26, CONTENT_W - 26 - 60, 60])
+            row.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                                     ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                                     ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                                     ("LINEBELOW", (0, 0), (-1, -1), 0.5, _rl_color(RULE))]))
+            return row
+
+        add(Paragraph("OVERVIEW", s_toc_grp)); add(toc_row(1, "Executive Summary", "exec"))
+        add(Paragraph("BASIC COMMISSION", s_toc_grp)); add(toc_row(2, "Basic Commission at a Glance", "basic"))
+        add(Paragraph("NET FLOOR PRICE COMMISSION", s_toc_grp))
+        add(toc_row(3, "Pricing Against the Net Floor Price", "nfp"))
+        add(toc_row(4, "Net Floor Price by Agent", "nfp_agents"))
+        add(Paragraph("APPENDIX", s_toc_grp)); add(toc_row(5, "Notes &amp; Definitions", "notes"))
+        add(PageBreak())
+
+        # ---- 01 Executive Summary -------------------------------------------
+        add(PageTracker("exec", registry))
+        add(band("Executive Summary", "Executive Summary",
+                 f"All agents &middot; {period}" + (f" &middot; compared against {prev_label}" if prev_label else ""),
+                 plain=True))
+        add(Spacer(1, 12))
+        add(kpi_tiles([
+            ("Total commission paid", rm(total_paid), delta(total_paid, prev_total)),
+            ("Basic Commission", rm(B["paid"]), delta(B["paid"], PB["paid"] if PB else None)),
+            ("Net Floor Price Commission", rm(N["paid"]), delta(N["paid"], PN["paid"] if PN else None, "rm")),
+            ("Agents paid", f"{cur['agent_count']}", delta(cur["agent_count"], prev["agent_count"] if prev else None, "count")),
+        ], fill="#E3EDFA"))
+        add(Spacer(1, 10))
+        add(Paragraph("Key takeaways", s_h2))
+        # A bold headline, then the plain explanation on the line below it.
+        takeaways = [
+            (f"<b>{rm(B['paid'])} Basic Commission on {rm_short(B['sales'])} net sales.</b><br/>"
+             f"{B['invoices']} invoices were paid on, an effective rate of {eff_rate:.2f}% of sales; "
+             f"{rm_short(B['advance'])} of it was the RM 300 advance and {rm_short(B['balance'])} the balance."),
+            ((f"<b>{leader['name']} led with {rm(leader['basic'])} ({pct(leader['basic'], B['paid']):.1f}% of Basic).</b><br/>"
+              f"The top five agents earned {top5_share:.0f}% of the month's Basic Commission.") if leader else
+             "<b>No Basic Commission was paid this month.</b>"),
+            (f"<b>{above_n} of {priced_n} NFP sales{with_floor} ({pct(above_n, priced_n):.0f}%) closed above the Net Floor "
+             f"Price.</b><br/>Together they sold {rm_short(premium)} over the floor; "
+             + (f"{sys_t['n']} of them above the package (system) price." if sys_t["n"]
+                else "none above the package (system) price.")
+             if priced_n else "<b>No Net Floor Price commission was paid this month.</b>"),
+            (f"<b>{below_t['n']} sales below the floor gave up {rm_short(shortfall)}.</b><br/>"
+             f"That is a deduction of {rm_short(abs(below_t['commission']))}, leaving NFP at {rm(N['paid'])} for the month."
+             if below_t["n"] else "<b>No sale closed below the Net Floor Price.</b>"),
+        ]
+        rows = [[Paragraph(f"{i + 1}", s_take_n), Paragraph(txt, s_take)] for i, txt in enumerate(takeaways)]
+        tk = Table(rows, colWidths=[30, CONTENT_W - 30])
+        tk.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                ("LINEBELOW", (0, 0), (-1, -1), 0.5, _rl_color(RULE)),
+                                ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                                ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+        add(tk)
+        add(Spacer(1, 9))
+        add(Paragraph("Month at a glance", s_h2))
+        def glance(label, curv, prevv, fmt, mode="pct", up_is_good=True):
+            return [label, fmt(curv), fmt(prevv) if prevv is not None else "-",
+                    delta(curv, prevv, mode, up_is_good)]
+        g_rows = [
+            glance("Net sales", B["sales"], PB["sales"] if PB else None, lambda v: rm(v, 0)),
+            glance("Invoices paid on (Basic)", B["invoices"], PB["invoices"] if PB else None, lambda v: f"{v:,}", "count"),
+            glance("Basic Commission paid", B["paid"], PB["paid"] if PB else None, rm),
+            glance("Net Floor Price Commission", N["paid"], PN["paid"] if PN else None, rm, "rm"),
+        ]
+        add(ledger(["Measure", period, prev_label or "Previous month", "Change"], g_rows,
+                   [CONTENT_W - 3 * 150, 150, 150, 150], {1, 2, 3}, pad=3))
+        add(Spacer(1, 10))
+        add(source("commission engine, Basic and NFP lines paid in the month (advance and balance). "
+                   "Special cases are not applied. See Notes &amp; Definitions."))
+        add(PageBreak())
+
+        # ---- 02 Basic Commission ---------------------------------------------
+        add(PageTracker("basic", registry))
+        add(band("Basic Commission", "Basic Commission",
+                 f"{period} &middot; Internal and Outsource agents", plain=True))
+        add(Spacer(1, 12))
+        add(kpi_tiles([
+            ("Total commission paid", rm(B["paid"]), delta(B["paid"], PB["paid"] if PB else None)),
+            ("Total net sales", rm(B["sales"], 0), delta(B["sales"], PB["sales"] if PB else None)),
+            ("Effective rate", f"{eff_rate:.2f}%", delta(eff_rate, prev_eff, "points")),
+            ("Agents paid", f"{len({a['name'] for a in basic_agents})}",
+             delta(len({a['name'] for a in basic_agents}),
+                   len({a["name"] for a in prev["agents"] if a["basic"]}) if prev else None, "count")),
+        ], fill="#E3EDFA"))
+        add(Spacer(1, 14))
+        # One column (2026-10-23): payout stage, agent type, then the top
+        # performers below them, all full width.
+        full_w = CONTENT_W
+        mix_rows = [
+            [Paragraph("<b>By payout stage</b>", s_cell)],
+            [stacked([(B["advance"], "#2C7A7B", f"Advance {pct(B['advance'], B['paid']):.0f}%"),
+                      (B["balance"], "#0E7C66", f"Balance {pct(B['balance'], B['paid']):.0f}%")], full_w)],
+            [Paragraph(f"Advance RM 300: <b>{rm(B['advance'])}</b> &nbsp;·&nbsp; Balance: <b>{rm(B['balance'])}</b>", s_small)],
+            [Spacer(1, 8)],
+            [Paragraph("<b>By agent type</b>", s_cell)],
+            [stacked([(B["by_type"].get("Outsource", 0), "#B54A1D", f"Outsource {pct(B['by_type'].get('Outsource', 0), B['paid']):.0f}%"),
+                      (B["by_type"].get("Internal", 0), "#0B6350", f"Internal {pct(B['by_type'].get('Internal', 0), B['paid']):.0f}%")], full_w)],
+            [Paragraph(f"Outsource: <b>{rm(B['by_type'].get('Outsource', 0))}</b> &nbsp;·&nbsp; "
+                       f"Internal: <b>{rm(B['by_type'].get('Internal', 0))}</b>", s_small)],
+        ]
+        mix = Table(mix_rows, colWidths=[full_w])
+        mix.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                                 ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
+        add(mix)
+        add(Spacer(1, 12))
+        top_rows = []
+        for i, a in enumerate(top, start=1):
+            top_rows.append([f"{i}", f"{a['name']} {tag(a['type'])}",
+                             rm(a["basic"]), f"{pct(a['basic'], B['paid']):.1f}%"])
+        add(ledger(["#", "Top performers", "Basic (RM)", "Share"], top_rows,
+                   [26, full_w - 26 - 130 - 80, 130, 80], {2, 3}, pad=3.5))
+        add(PageBreak())
+
+        # ---- 03 Net Floor Price ----------------------------------------------
+        add(PageTracker("nfp", registry))
+        add(band("Net Floor Price Commission", "Net Floor Price Commission",
+                 f"{period} &middot; {N['invoices']} NFP invoices paid &middot; NFP Commission {rm(N['paid'])}",
+                 plain=True))
+        add(Spacer(1, 12))
+        add(kpi_tiles([
+            ("Sold above Net Floor Price", f"{above_t['n']}",
+             f'<font color="{MUTED}">{rm(above_t["gap"])} over the floor &middot; earned {rm(above_t["commission"])}</font>'),
+            ("Sold below Net Floor Price", f"{below_t['n']}",
+             f'<font color="{RED}">{rm(shortfall)} under the floor &middot; deducted {rm(abs(below_t["commission"]))}</font>'),
+            ("Sold above system price", f"{sys_t['n']}",
+             f'<font color="{MUTED}">{rm(sys_t["gap"])} over the floor &middot; earned {rm(sys_t["commission"])}</font>'),
+            ("NFP Commission paid", rm(N["paid"]), delta(N["paid"], PN["paid"] if PN else None, "rm")),
+        ], fill="#E3EDFA"))
+        add(Spacer(1, 14))
+        add(Paragraph("Percentage of NFP sales by price position", s_h2))
+        # Orange tones, darkest for the best price position (2026-10-23).
+        add(stacked([(sys_t["n"], "#C2410C", f"Above system {pct(sys_t['n'], N['invoices']):.0f}%"),
+                     (above_t["n"], "#EA580C", f"Above NFP {pct(above_t['n'], N['invoices']):.0f}%"),
+                     (below_t["n"], "#F97316", f"Below NFP {pct(below_t['n'], N['invoices']):.0f}%"),
+                     (nof_t["n"], "#FB923C", f"No NFP {pct(nof_t['n'], N['invoices']):.0f}%")], CONTENT_W, 24))
+        add(Spacer(1, 12))
+        tier_rows = []
+        for key, label in (("above", "Above Net Floor Price"),
+                           ("below", "Below Net Floor Price"),
+                           ("system", "Above system price"),
+                           ("nofloor", "No NFP &ndash; invoice before OCT 25 and EV package")):
+            t = tiers[key]
+            if key == "nofloor" and not t["n"]:
+                continue
+            tier_rows.append([label, f"{t['n']}", f"{len(t['agents'])}",
+                              rm(t["cash"]), rm(t["floor"]) if key != "nofloor" else "-",
+                              rm(t["gap"]) if key != "nofloor" else "-", rm(t["commission"])])
+        gap_total = sys_t["gap"] + above_t["gap"] + below_t["gap"]
+        add(ledger(["Price position", "Invoices", "Agents", "Cash Price", "Net Floor Price",
+                    "Above / (below) floor", "NFP Commission"], tier_rows,
+                   [CONTENT_W - 2 * 46 - 4 * 94, 46, 46, 94, 94, 94, 94], {1, 2, 3, 4, 5, 6},
+                   ["Total", f"{N['invoices']}", "", rm(sum(t['cash'] for t in tiers.values())),
+                    rm(sum(t['floor'] for k, t in tiers.items() if k != "nofloor")), rm(gap_total), rm(N["paid"])]))
+        add(PageBreak())
+
+        # ---- 04 NFP by agent ---------------------------------------------------
+        add(PageTracker("nfp_agents", registry))
+        sellers_above = sorted([a for a in cur["agents"] if a["n_above"]], key=lambda a: -a["above_floor"])
+        sellers_below = sorted([a for a in cur["agents"] if a["n_below"]], key=lambda a: -a["below_floor"])
+        add(band("Net Floor Price by Agent", "Net Floor Price by Agent",
+                 f"{period} &middot; Internal and Outsource agents, largest first", plain=True))
+        add(Spacer(1, 12))
+        # One column, top five each (2026-10-23): above the floor, below it,
+        # and -- only when someone did -- above the package (system) price.
+        full_w = CONTENT_W
+        sellers_system = sorted([a for a in cur["agents"] if a["n_system"]], key=lambda a: -a["sys_over_package"])
+
+        def top_note(n: int, what: str) -> str:
+            who = f"agent{'' if n == 1 else 's'}"
+            return (f"Top 5 of {n} {who} by {what}." if n > 5 else f"All {n} {who} by {what}.")
+
+        def agent_table(title_txt: str, note: str, headers: list, rows: list, widths: list):
+            add(Paragraph(title_txt, s_h2))
+            add(Paragraph(note, s_small))
+            add(Spacer(1, 4))
+            add(ledger(headers, rows or [["-"] + [""] * (len(headers) - 1)], widths, set(range(1, len(headers)))))
+
+        agent_table("Selling above the floor",
+                    top_note(len(sellers_above), "RM sold over the Net Floor Price"),
+                    ["Agent", "Sales", "Over floor (RM)", "Net NFP (RM)"],
+                    [[f"{a['name']} {tag(a['type'])}", f"{a['n_above']}", rm(a["above_floor"]), rm(a["nfp"])]
+                     for a in sellers_above[:5]],
+                    [full_w - 70 - 130 - 130, 70, 130, 130])
+        add(Spacer(1, 16))
+        agent_table("Selling below the floor",
+                    top_note(len(sellers_below), "RM sold under the Net Floor Price"),
+                    ["Agent", "Sales", "Under floor (RM)", "Net NFP (RM)"],
+                    [[f"{a['name']} {tag(a['type'])}", f"{a['n_below']}", rm(a["below_floor"]), rm(a["nfp"])]
+                     for a in sellers_below[:5]],
+                    [full_w - 70 - 130 - 130, 70, 130, 130])
+        if sellers_system:
+            add(Spacer(1, 16))
+            agent_table("Selling above system price",
+                        top_note(len(sellers_system), "RM sold over the package (system) price"),
+                        ["Agent", "Sales", "Over system price (RM)", "Over floor (RM)", "NFP earned (RM)"],
+                        [[f"{a['name']} {tag(a['type'])}", f"{a['n_system']}", rm(a["sys_over_package"]),
+                          rm(a["sys_over_floor"]), rm(a["sys_nfp"])] for a in sellers_system[:5]],
+                        [full_w - 70 - 140 - 120 - 120, 70, 140, 120, 120])
+        add(PageBreak())
+
+        # ---- 05 Notes & Definitions -------------------------------------------
+        add(PageTracker("notes", registry))
+        add(band("Appendix", "Notes &amp; Definitions"))
+        add(Spacer(1, 12))
+        # Each term in bold, its meaning in short sub-bullets (2026-10-23).
+        notes = [
+            ("Basic Commission paid", [
+                "All Basic Commission paid next month: the RM 300 advance and the balance.",
+                "For example, September's commission is paid out by HR in October.",
+                "Excludes overrides, referral fees, Safwan and Gan Lai Soon."]),
+            ("Net sales", [
+                "Original Price = Total Amount &minus; EPP interest + lucky draw.",
+                "Each invoice paid on this month, counted once."]),
+            ("Effective rate", ["Basic Commission paid &divide; net sales."]),
+            ("Top performer", ["The agent with the highest Basic Commission this month."]),
+            ("Cash Price", [
+                "Total Amount &minus; add-ons (battery, separate micro inverter, ATS, cable) &minus; EPP interest."]),
+            ("Above Net Floor Price", [
+                "Cash Price is above the floor, but not above the package price.",
+                "The agent earns 25% of the amount above the floor."]),
+            ("Below Net Floor Price", [
+                "Cash Price is below the floor.",
+                "20% of the shortfall is deducted from the agent."]),
+            ("Above system price", [
+                "Cash Price is above the package (system) price.",
+                "The agent earns 100% of the amount above the floor."]),
+            ("No NFP", [
+                "No NFP is paid: invoice before Oct 2025, EV package, non-JinkoSolar package or floor price TBC.",
+                "Counted as a sale, with no NFP commission."]),
+            ("NFP month", ["The month the invoice reaches full payment."]),
+            ("Special cases", ["Not applied, as in the Excel download."]),
+        ]
+        # How each commission is worked out, ahead of the terms (2026-10-23).
+        calcs = [
+            ("Basic Commission calculation", [
+                ("Original Price = Total Amount &minus; EPP interest + lucky draw", []),
+                ("Basic Commission = Original Price &times; agent's rate", [
+                    "Rate from the agent's role on the Data page, by package type and invoice date.",
+                    "No rate on the Data page: RM 0, flagged on the report."]),
+                ("Paid by the payment rule on the agent's Data page row", [
+                    "Advance: the advance amount (RM 300) once the advance % is paid, capped at the commission.",
+                    "Balance: commission &minus; advance, once the payout % is paid.",
+                    "A rule with no advance, or both reached in one month: paid in full at the payout %."]),
+                ("Example", ["RM 30,000 &times; 3% = RM 900: RM 300 advance + RM 600 balance."]),
+            ]),
+            ("Net Floor Price Commission calculation", [
+                ("Cash Price = Total Amount &minus; add-ons &minus; EPP interest", []),
+                ("Net Floor Price = price list floor for the package", [
+                    "Only rebates the invoice actually has are taken off."]),
+                ("NFP Commission = (Cash Price &minus; Net Floor Price) &times; rate", [
+                    "Above system price: 100%.",
+                    "Above Net Floor Price: 25%.",
+                    "Below Net Floor Price: 20%, deducted from the agent."]),
+                ("Paid once", ["In the Balance Payout of the month the invoice reaches 100% paid."]),
+                ("Example", [
+                    "Cash RM 32,000, floor RM 30,000: RM 2,000 &times; 25% = RM 500.",
+                    "Cash RM 29,000, floor RM 30,000: &minus;RM 1,000 &times; 20% = &minus;RM 200."]),
+            ]),
+        ]
+        s_term = st("BnTerm", fontName=FONT_BOLD, fontSize=10, leading=13.5, textColor=INK,
+                    leftIndent=14, bulletIndent=2, spaceBefore=6)
+        s_sub = st("BnSub", fontSize=9.3, leading=13, textColor="#2D3748",
+                   leftIndent=30, bulletIndent=18, spaceAfter=1)
+
+        def bullets(items):
+            for term, subs in items:
+                add(Paragraph(term, s_term, bulletText="•"))
+                for line in subs:
+                    add(Paragraph(line, s_sub, bulletText="–"))
+
+        for heading, items in calcs:
+            add(Paragraph(f"<u>{heading}</u>", s_h2))
+            bullets(items)
+            add(Spacer(1, 12))
+        # The calculations fill a page; the terms start on the next one.
+        add(PageBreak())
+        add(Paragraph("Definitions", s_h2))
+        bullets(notes)
+        doc.build(story)
+
+    registry = {}
+    render({}, registry)              # pass 1: find each section's page
+    render(dict(registry), {})        # pass 2: contents with the page numbers
+    return output_path
+
+
 # ---------------------------------------------------------------------------
 # Main orchestrator
 # ---------------------------------------------------------------------------
@@ -5822,8 +6755,10 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     print(f"\nBuilding Commission PDF for year {year}...")
     is_excel = str(output_path).lower().endswith(".xlsx")
     if sections is not None:
-        if not is_excel:
-            raise ValueError("Section exports are Excel only")
+        # A section PDF exists for Basic & NFP only (build_basic_nfp_pdf),
+        # and only for one month.
+        if not is_excel and (list(sections) != ["basic_nfp"] or month is None):
+            raise ValueError("A section PDF is only built for Basic & NFP, for one month")
         sections = [s for s in sections if s in EXCEL_SECTION_SHEETS]
         if not sections:
             raise ValueError("Unknown commission section")
@@ -6071,6 +7006,36 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     # ranking, payout split, previous-month comparison), which only the PDF
     # draws. Writing it here skips that work, including a full rebuild of
     # both summary tables for the previous month.
+    if not is_excel and sections is not None:
+        print(f"  Exporting Basic & NFP report to PDF: {output_path}")
+        _lines = {"Internal": int_basic_lines, "Outsource": out_basic_lines}
+        _nfp = {"Internal": int_nfp_rows, "Outsource": out_nfp_rows}
+        def _held(m):
+            if m == month:
+                rows = {"Internal": int_customer_summary_rows.get(m, []),
+                        "Outsource": out_customer_summary_rows.get(m, [])}
+            else:
+                # The tables above were built for this month only; last
+                # month's are built here so its NFP holds back the same rows.
+                _, ic, _, _, _ = build_internal_summary_tables(
+                    basic_t1=int_basic_t1, basic_lines=int_basic_lines, basic_t4=int_basic_t4,
+                    nfp_agent_rows=int_nfp_agent, nfp_rows=int_nfp_rows,
+                    nfp_by_inv_all=int_nfp_by_inv_all, anp_summary_rows=int_anp_summary_for_table,
+                    anp_detail=[r for r in int_anp_detail_full if _parse_month(r.get("invoice_date")) == m],
+                    year=year, invoice_dates_map=invoice_dates_map, month=m)
+                _, oc, _, _ = build_outsource_summary_tables(
+                    basic_t1=out_basic_t1, basic_lines=out_basic_lines, basic_meta=out_basic_meta,
+                    nfp_agent_rows=out_nfp_agent, nfp_rows=out_nfp_rows,
+                    nfp_by_inv_all=out_nfp_by_inv_all, anp_summary_rows=[],
+                    anp_detail=[r for r in out_anp_detail_full if _parse_month(r.get("invoice_date")) == m],
+                    year=year, invoice_dates_map=invoice_dates_map, month=m)
+                rows = {"Internal": ic.get(m, []), "Outsource": oc.get(m, [])}
+            return nfp_held_back(rows, m)
+        return build_basic_nfp_pdf(
+            output_path, year, month,
+            basic_nfp_metrics(_lines, _nfp, year, month, _held(month)),
+            basic_nfp_metrics(_lines, _nfp, year, month - 1, _held(month - 1)) if month > 1 else None)
+
     if is_excel:
         print(f"  Exporting commission pack to Excel: {output_path}")
         return build_commission_excel(

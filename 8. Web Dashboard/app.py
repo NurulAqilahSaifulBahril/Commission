@@ -6861,17 +6861,49 @@ def download_pdf():
     month = request.args.get("month", 5, type=int)
     
     try:
+        import contextlib
+        import io
+        import uuid
         dashboard_data_dir = CURRENT_DIR / "data"
         dashboard_data_dir.mkdir(parents=True, exist_ok=True)
-        file_path = dashboard_data_dir / f"Commission_Pack_{year}_{month}.pdf"
-        
-        build_commission_pack.build_pdf(year, file_path, month=month)
-        
+        # One file per request: two people opening the same month at once
+        # used to write the same Commission_Pack_<y>_<m>.pdf over each other.
+        # The Basic & NFP page asks for its own report (build_basic_nfp_pdf);
+        # every other page still gets the company-wide pack.
+        section = (request.args.get("section") or "").strip().lower()
+        section = "basic_nfp" if section == "basic_nfp" else ""
+        stem = f"Basic_NFP_Commission_{year}_{month}" if section else f"Commission_Pack_{year}_{month}"
+        file_path = dashboard_data_dir / f"{stem}_{uuid.uuid4().hex[:8]}.pdf"
+
+        # Built from the dashboard's last refresh, as Download Excel is
+        # (query_replay.py): the figures match the screen, and it takes ~7s
+        # instead of ~33s (minutes when the database is busy) re-downloading
+        # every invoice. A question the refresh never asked still goes live.
+        replay = bool(_data_cache.get("sql_replay"))
+        if replay:
+            try:
+                query_replay.restore(_data_cache["sql_replay"])
+            except Exception:
+                replay = False
+        started = time.time()
+        try:
+            with (query_replay.replaying() if replay else contextlib.nullcontext()):
+                build_commission_pack.build_pdf(year, file_path, month=month,
+                                                sections=[section] if section else None)
+            data = file_path.read_bytes()
+        finally:
+            try:
+                file_path.unlink()
+            except OSError:
+                pass
+        _log(f"[PDF] {year}-{month:02d} {section or 'full pack'} built in {time.time() - started:.1f}s"
+             + (f" from the dashboard's last refresh (query record: {query_replay.stats()})." if replay else " (live)."))
+
         return send_file(
-            str(file_path),
+            io.BytesIO(data),
             mimetype="application/pdf",
             as_attachment=True,
-            download_name=f"Commission_Pack_{year}_{month}.pdf"
+            download_name=f"{stem}.pdf"
         )
     except Exception as e:
         import traceback

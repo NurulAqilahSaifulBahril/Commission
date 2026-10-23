@@ -884,7 +884,41 @@ document.addEventListener("DOMContentLoaded", () => {
         foldSpecialCaseRows();
     }
 
+    // Safwan (RM) shows after Gan Lai Soon (user, 2026-10-23). The server
+    // keeps its own order -- its code reads these rows by position -- so the
+    // swap is made here, once, on every table carrying both columns, before
+    // anything looks a column up by name. Only a table still in the server's
+    // order is swapped, so a cached, already-swapped payload is left alone; a
+    // row shared between two tables is moved only once.
+    function moveSafwanAfterGanLaiSoon(data) {
+        const done = new WeakSet();
+        const walk = (o) => {
+            if (!o || typeof o !== "object") return;
+            if (Array.isArray(o)) { o.forEach(walk); return; }
+            if (Array.isArray(o.headers) && Array.isArray(o.rows)) {
+                const si = o.headers.indexOf("Safwan (RM)");
+                const gi = o.headers.indexOf("Gan Lai Soon");
+                if (si !== -1 && gi !== -1 && si < gi) {
+                    const order = o.headers.map((_, i) => i);
+                    order.splice(si, 1);
+                    order.splice(order.indexOf(gi) + 1, 0, si);
+                    const reorder = (arr) => order.map(i => arr[i]).concat(arr.slice(o.headers.length));
+                    o.rows.forEach(r => {
+                        if (!Array.isArray(r) || done.has(r)) return;
+                        const moved = reorder(r);
+                        moved.forEach((v, i) => { r[i] = v; });
+                        done.add(r);
+                    });
+                    o.headers = reorder(o.headers);
+                }
+            }
+            Object.keys(o).forEach(k => { if (k !== "rows" && k !== "headers") walk(o[k]); });
+        };
+        walk(data && data.sections);
+    }
+
     async function applyCommissionPayload(data, { persistCache = false } = {}) {
+        moveSafwanAfterGanLaiSoon(data);
         ensureSummaryReferralFee(data);
         sortSectionsByAgentName(data);
         state.rawData = data;
@@ -1369,6 +1403,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 },
             });
             noDataView.classList.add("hidden");
+            moveSafwanAfterGanLaiSoon(data);
             ensureSummaryReferralFee(data);
             sortSectionsByAgentName(data);
             state.rawData = data;
@@ -2295,7 +2330,10 @@ modalPackageType.value = defaults.pkg || "-";
         modal.style.display = "flex";
 
         try {
-            const pdfUrl = `/api/download/pdf?year=${state.activeYear}&month=${state.activeMonth}`;
+            // The Basic & NFP page gets its own report; other pages keep the
+            // company-wide pack until theirs are designed.
+            const pdfUrl = `/api/download/pdf?year=${state.activeYear}&month=${state.activeMonth}`
+                + (state.activeSection === "basic_nfp" ? "&section=basic_nfp" : "");
             const response = await fetch(pdfUrl);
 
             if (!response.ok) {
@@ -3844,7 +3882,7 @@ modalPackageType.value = defaults.pkg || "-";
     // 0.25% for an internal senior, and 20% of the whole commission on a
     // Factory profit-sharing split -- quoting any one of those as "the" rate
     // would be wrong on the other two.
-    function getOverrideBreakdownTooltip(row, headers, custName, cellValue) {
+    function getOverrideBreakdownTooltip(row, headers, custName, cellValue, exactTotal) {
         const raw = String(cellValue == null ? "" : cellValue).trim();
         if (!raw || raw === "-") return null;
 
@@ -3898,7 +3936,7 @@ modalPackageType.value = defaults.pkg || "-";
         if (parsedCount > 1) {
             lines.push(`<div style="display:flex; justify-content:space-between; gap:20px;
                 border-top:1px dashed rgba(255,255,255,0.25); margin-top:6px; padding-top:6px;">
-                <span>Total</span><strong>${formatRM(total)}</strong>
+                <span>Total</span><strong>${formatRM(exactTotal !== undefined ? exactTotal : total)}</strong>
             </div>`);
         }
 
@@ -4525,7 +4563,9 @@ modalPackageType.value = defaults.pkg || "-";
                     return { value: String(agentStats.customers.size), rowspan: 1, visible: true };
                 }
                 if (agentStats && ci === otherCommColIdx) {
-                    return { value: formatOtherCommissionBreakdown(agentStats), rowspan: 1, visible: true };
+                    // `total` is the exact sum; adding the rounded lines can be a sen out.
+                    return { value: formatOtherCommissionBreakdown(agentStats), total: agentStats.other || 0,
+                             rowspan: 1, visible: true };
                 }
                 if (agentStats && ci === referralFeeColIdx) {
                     return { value: agentStats.referral ? formatRM(agentStats.referral) : "-", rowspan: 1, visible: true };
@@ -4645,10 +4685,21 @@ modalPackageType.value = defaults.pkg || "-";
                 }
 
                 // Same breakdown on the summary's Override cell, which holds
-                // the "override from <source agent>" spelling.
-                if (ci === overrideColIdx && cellGrid[ri][ci].value !== "-") {
+                // the "override from <source agent>" spelling. Other
+                // Commission shows only its total; the per-source lines are
+                // on hover (user, 2026-10-23).
+                if ((ci === overrideColIdx || ci === otherCommColIdx) && cellGrid[ri][ci].value !== "-") {
+                    const raw = cellGrid[ri][ci].value;
                     const ovrInfo = getOverrideBreakdownTooltip(
-                        row, headers, resolveAgentName(fullAgentNames[ri]), cellGrid[ri][ci].value);
+                        row, headers, resolveAgentName(fullAgentNames[ri]), raw, cellGrid[ri][ci].total);
+                    if (ci === otherCommColIdx) {
+                        const amounts = String(raw).replace(/<[^>]*>/g, " ")
+                            .match(/-?\s*RM\s*-?\s*[\d,]+(?:\.\d+)?/gi) || [];
+                        if (amounts.length) {
+                            const total = cellGrid[ri][ci].total !== undefined ? cellGrid[ri][ci].total : amounts.reduce((sum, a) => sum + (parseFloat(a.replace(/[^0-9.-]/g, "")) || 0), 0);
+                            td.textContent = total < 0 ? `-${formatRM(-total)}` : formatRM(total);
+                        }
+                    }
                     if (ovrInfo) {
                         td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, ovrInfo));
                         td.addEventListener("mousemove", (e) => moveCommCalcTooltip(e));
@@ -5046,7 +5097,7 @@ modalPackageType.value = defaults.pkg || "-";
                         ci++;
                     }
                     const groupTh = document.createElement("th");
-                    groupTh.textContent = "Other Commission";
+                    groupTh.textContent = basicNfpHeaderLabel("Other Commission");
                     groupTh.colSpan = runCols.length;
                     // The whole Other Commission block -- the merged heading and its
                     // Override / Safwan / Gan Lai Soon sub-headers -- is light pink.
@@ -5055,7 +5106,7 @@ modalPackageType.value = defaults.pkg || "-";
                     runCols.forEach(rc => {
                         const subH = headers[rc];
                         const th = document.createElement("th");
-                        th.textContent = subH;
+                        th.textContent = basicNfpHeaderLabel(subH);
                         if (isNumericHeader(subH)) th.classList.add("numeric");
                         else if (isDateHeader(subH)) th.classList.add("date");
                         th.classList.add("other-commission-header");
@@ -5127,17 +5178,8 @@ modalPackageType.value = defaults.pkg || "-";
             nfpListBtn.innerHTML = '<span class="icon">📋</span> View Net Floor Price List';
             nfpListBtn.addEventListener("click", goToNfpListPage);
             actionsGroup.appendChild(nfpListBtn);
-
-            if (userObj && !userObj.readOnly) {
-                const addCustBtn = document.createElement("button");
-                addCustBtn.className = "btn btn-primary btn-sm-inline";
-                addCustBtn.innerHTML = '<span class="icon">➕</span> Add Special Case Customer';
-                // "Adds" already implies the customer is missing from the table,
-                // so the reason they are missing is the only thing worth saying.
-                addCustBtn.title = "Adds a customer below the payout threshold — creates both commission rows.";
-                addCustBtn.addEventListener("click", openAddCustomerSpecialCaseModal);
-                actionsGroup.appendChild(addCustBtn);
-            }
+            // The "Add Special Case Customer" button was removed (user,
+            // 2026-10-23); its modal stays for the other special-case entry points.
 
             if (state.activeAgentType === "all") {
                 // Give these their own toolbar directly above the Summary Agent
@@ -6908,11 +6950,19 @@ modalPackageType.value = defaults.pkg || "-";
     // On-screen label for a Basic & NFP column. Only the text drawn in the <th>
     // changes: the header itself stays "Sales Price" because every column
     // lookup (findIndex on "sales price") and the server match on that name.
+    // The money columns carry "(RM)" on screen, like Safwan (RM) (user,
+    // 2026-10-23).
+    const BASIC_NFP_HEADER_LABELS = {
+        "sales price": "Original Price/Cash Price after discount",
+        "commission price": "Commission Price (RM)",
+        "other commission": "Other Commission (RM)",
+        "referral fee": "Referral Fee (RM)",
+        "override": "Override (RM)",
+        "gan lai soon": "Gan Lai Soon (RM)",
+    };
     function basicNfpHeaderLabel(h) {
         if (state.activeSection !== "basic_nfp") return h;
-        return String(h).toLowerCase().trim() === "sales price"
-            ? "Original Price/Cash Price after discount"
-            : h;
+        return BASIC_NFP_HEADER_LABELS[String(h).toLowerCase().trim()] || h;
     }
 
     // Helper functions for alignments
