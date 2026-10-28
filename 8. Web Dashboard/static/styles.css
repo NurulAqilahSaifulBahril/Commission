@@ -2612,6 +2612,7 @@ body {
     margin-bottom: 6px;
 }
 
+.sr-tip-note { font-size: 11px; color: var(--text-muted, #64748b); margin: -2px 0 6px; max-width: 520px; }
 .sr-tip-table { border-collapse: collapse; font-size: 11px; width: 100%; }
 
 .sr-tip-table th {

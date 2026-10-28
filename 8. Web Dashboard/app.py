@@ -3758,8 +3758,9 @@ SALES_REPORT_CONFIRMED_ANS_PINS: dict = {
     # RM115,900.00. Carried on SERIJIT KAUR @ SURJIT KAUR A/P PRAM SINGH.
     "4cb4ed2a-236f-4fee-9baa-5b71315453e9": "-1488.0",
     # Olivier Koh Cong Lee, Sep RES -- confirmed RM219,500.00; the rules give
-    # RM221,604.94. Carried on Tan Teh Siang.
-    "c7fadb70-caa8-4567-9453-a599483a2481": "-2104.94",
+    # RM222,752.44 (TAN YUAN TAT's invoice was raised from RM30,000 to
+    # RM31,147.50 in the ERP after 27 Oct). Carried on Tan Teh Siang.
+    "c7fadb70-caa8-4567-9453-a599483a2481": "-3252.44",
     # Chan Wing On, Mar RES -- confirmed RM94,400.00; the rules give
     # RM94,518.00. Carried on TEE LI LEONG (ATAP).
     "198457ae-43c7-493c-9c14-da248624f52d": "-118.0",
@@ -5450,7 +5451,7 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
                 # Cases whose RES/COM placement deserves a human look.
                 "reviews": [],
                 "acc_noc": 0, "acc_ans": zero, "collected": zero,
-                "ep": zero, "ep_rows": [],
+                "ep": zero, "ep_rows": [], "ep_lines": [],
             }
 
         entry["raw_names"].add(raw)
@@ -5494,7 +5495,13 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         # A late entry (paid in one month, keyed in a later one, from August)
         # stays on the Sales Report but earns no EP: no EGA/ESA or Early Bird
         # points from it, in either month (user, 28 Oct 2026).
+        # Each case's EP, for the EP point hover: its month, customer, line,
+        # the sales it is worked on (total less EPP), the EP and the rule.
+        ep_line = {"m": when.month, "n": str(r.get("customer_name") or "").strip(),
+                   "k": kind, "s": float(sales)}
+        entry["ep_lines"].append(ep_line)
         if str(bubble or "") in late_entries:
+            ep_line.update(e=0.0, r="late")
             continue
         # A case on the report's COM line earns EP by the commercial rule -- the
         # first RM40,000 at 100%, the balance at 40%, for invoices dated from the
@@ -5503,12 +5510,11 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         # a point per ringgit. A RES-line case keeps the recorded type, and a
         # hand-set EP above still wins.
         ep_prop = "Factory" if kind == "COM" else prop
-        entry["ep_rows"].append((
-            when.strftime("%Y-%m-%d"),
-            Decimal(ep_fixed) if ep_fixed is not None
-            else int_mod.calc_ep_points(sales, ep_prop, r.get("invoice_date"),
-                                        int(r.get("panel_qty") or 0)),
-        ))
+        ep_val = (Decimal(ep_fixed) if ep_fixed is not None
+                  else int_mod.calc_ep_points(sales, ep_prop, r.get("invoice_date"),
+                                              int(r.get("panel_qty") or 0)))
+        entry["ep_rows"].append((when.strftime("%Y-%m-%d"), ep_val))
+        ep_line.update(e=float(ep_val), r="hand" if ep_fixed is not None else "")
 
     scope_agent = _overview_scope_agent()
     if scope_agent:
@@ -5622,6 +5628,8 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
             "campaign_ans": float(entry["campaign_ans"]),
             "campaign_custs": entry["campaign_custs"],
             "ep": float(entry["ep"]),
+            # Case by case, for the EP point hover (see ep_line above).
+            "ep_lines": entry["ep_lines"],
             # Shown alongside EP so the bonus can be checked without recomputing
             # it by hand, and so an agent with a blank carry-over row is
             # visibly blank rather than silently scoring zero bonus.

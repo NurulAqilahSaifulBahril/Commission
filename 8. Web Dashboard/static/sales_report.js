@@ -374,6 +374,99 @@
         return ` data-cases="${caseLists.length - 1}"`;
     }
 
+    /** Registers an agent's EP point cell, so hovering it opens the panel
+     *  that shows how the EP is worked out (epTable). */
+    function epAttrs(agent) {
+        if (!agent || !(agent.ep_lines || []).length) return "";
+        caseLists.push({ ep: agent });
+        return ` data-cases="${caseLists.length - 1}"`;
+    }
+
+    /** How one case's EP was reached, read off its own figures: the rule is
+     *  whichever one the numbers fit, so the panel never claims a rule the
+     *  calculation did not use. */
+    function epRule(l) {
+        if (l.r === "late") return "Uploaded late: no points";
+        if (l.r === "hand") return "Set by hand";
+        if (Math.abs(l.e - l.s) < 0.01) return "1 point per RM";
+        if (Math.abs(l.e - 0.4 * l.s) < 1) return "40% of sales";
+        if (l.s > 40000 && Math.abs(l.e - (40000 + 0.4 * (l.s - 40000))) < 1)
+            return "First RM40,000 at 100%, rest at 40%";
+        return l.s ? `${(100 * l.e / l.s).toFixed(1)}% of sales` : "";
+    }
+
+    /** The EP point hover: EP month by month, the cases not earning a point
+     *  per RM and why, then the May multiplier on top. */
+    function epTable(agent) {
+        const lines = agent.ep_lines || [];
+        // First table: only the cases earning a point per RM, by month. The
+        // rest are in the Commercial and Late payment upload tables below.
+        const perRM = lines.filter(l => l.r !== "late" && epRule(l) === "1 point per RM");
+        const byMonth = new Map();
+        perRM.forEach(l => {
+            const m = byMonth.get(l.m) || { n: 0, s: 0, e: 0 };
+            m.n += 1; m.s += l.s; m.e += l.e;
+            byMonth.set(l.m, m);
+        });
+        const monthRows = [...byMonth.keys()].sort((a, b) => a - b).map(k => {
+            const m = byMonth.get(k);
+            return `<tr><td>${MONTH_ABBR[k - 1]}</td><td class="numeric">${m.n}</td>`
+                + `<td class="numeric">${fmtRM(m.s)}</td><td class="numeric">${fmtRM(m.e)}</td></tr>`;
+        }).join("");
+        // Cases not earning a point per RM, in two groups: commercial jobs
+        // (and any other case on its own rule), and late payment uploads.
+        const late = lines.filter(l => l.r === "late");
+        const commercial = lines.filter(l => l.r !== "late" && epRule(l) !== "1 point per RM");
+        const group = (title, list) => {
+            if (!list.length) return "";
+            const shown = list.slice(0, 8);
+            const rows = shown.map(l =>
+                `<tr><td>${MONTH_ABBR[l.m - 1]}</td><td class="sr-tip-cust">${escapeHtml(l.n)}</td>`
+                + `<td>${escapeHtml(l.k)}</td><td class="numeric">${fmtRM(l.s)}</td>`
+                + `<td class="sr-tip-basis">${escapeHtml(epRule(l))}</td><td class="numeric">${fmtRM(l.e)}</td></tr>`).join("")
+                + (list.length > shown.length
+                    ? `<tr><td colspan="6" class="sr-tip-none">…and ${plural(list.length - shown.length, "more case")}</td></tr>` : "");
+            // Every case in the group, the trimmed ones too.
+            const total = `<tfoot><tr class="sr-tip-total"><td colspan="3">Total (${plural(list.length, "case")})</td>`
+                + `<td class="numeric">${fmtRM(list.reduce((t, l) => t + l.s, 0))}</td><td></td>`
+                + `<td class="numeric">${fmtRM(list.reduce((t, l) => t + l.e, 0))}</td></tr></tfoot>`;
+            return `<div class="sr-tip-head" style="margin-top:10px">${title}</div>
+            <table class="sr-tip-table">
+                <thead><tr><th>Month</th><th>Customer</th><th>Line</th><th>Sales</th><th>Rule</th><th>EP</th></tr></thead>
+                <tbody>${rows}</tbody>${total}
+            </table>`;
+        };
+        const bonus = Number(agent.campaign_bonus) || 0;
+        const tier = Number(agent.bonus_tier) || 0;
+        const bonusRow = bonus
+            ? `<tr><td colspan="3">May multiplier: ${tier.toFixed(1)}x on ${fmtRM(agent.campaign_ans)} campaign sales</td>`
+                + `<td class="numeric">+ ${fmtRM(bonus)}</td></tr>` : "";
+        return `<div class="sr-tip-head">${escapeHtml(agent.agent)} — EP point ${fmtRM(agent.ep)}</div>
+            <div class="sr-tip-head" style="margin-top:6px">1 point per RM</div>
+            <div class="sr-tip-note">Sales are the invoice total less EPP.</div>
+            <table class="sr-tip-table">
+                <thead><tr><th>Month</th><th>Cases</th><th>Sales</th><th>EP</th></tr></thead>
+                <tbody>${monthRows}</tbody>
+                <tfoot><tr class="sr-tip-total"><td>Total</td>
+                    <td class="numeric">${perRM.length}</td>
+                    <td class="numeric">${fmtRM(perRM.reduce((t, l) => t + l.s, 0))}</td>
+                    <td class="numeric">${fmtRM(perRM.reduce((t, l) => t + l.e, 0))}</td></tr></tfoot>
+            </table>
+            ${group("Commercial", commercial)}
+            ${group("Late payment upload", late)}
+            <table class="sr-tip-table" style="margin-top:10px">
+                <thead><tr><th></th><th>Cases</th><th>Sales</th><th>EP</th></tr></thead>
+                <tbody>
+                    <tr class="sr-tip-total"><td>Grand total</td>
+                        <td class="numeric">${lines.length}</td>
+                        <td class="numeric">${fmtRM(lines.reduce((t, l) => t + l.s, 0))}</td>
+                        <td class="numeric">${fmtRM(agent.base_ep)}</td></tr>
+                    ${bonusRow}
+                    <tr class="sr-tip-total"><td colspan="3">EP point</td><td class="numeric">${fmtRM(agent.ep)}</td></tr>
+                </tbody>
+            </table>`;
+    }
+
     /** True when a month cell has cases and every one of them is fully paid
      *  -- that cell is shaded #F7C7AC (user, 28 Oct 2026). */
     function allFullyPaid(cases) {
@@ -448,7 +541,7 @@
         const entry = caseLists[Number(cell.dataset.cases)];
         if (!entry) return;
         const tip = document.getElementById("srCaseTip");
-        tip.innerHTML = caseTable(entry);
+        tip.innerHTML = entry.ep ? epTable(entry.ep) : caseTable(entry);
         tip.hidden = false;
         // Measured against documentElement rather than window.innerWidth: the
         // latter reads 0 in an embedded preview, which sent the clamp the wrong
@@ -550,9 +643,6 @@
             const collectedTitle = agent.acc_ans
                 ? `${fmtRM(collected)} received of ${fmtRM(agent.acc_ans)} invoiced, ${pctPaid}%`
                 : "Nothing invoiced in this period";
-            const epTitle = tier
-                ? `${fmtRM(agent.base_ep)} sales + ${tier.toFixed(1)}x campaign bonus ${fmtRM(agent.campaign_bonus)}`
-                : `${fmtRM(agent.base_ep)} sales, no campaign bonus`;
             // Collected sits between the months and TOTAL, one merged cell per agent.
             if (first) {
                 cells.push(`<td class="numeric"${span} title="${escapeHtml(collectedTitle)}">${collectedCell}</td>`);
@@ -574,7 +664,7 @@
             }
             if (first) {
                 cells.push(
-                    `<td class="numeric sr-strong sr-col-ep"${span} title="${escapeHtml(epTitle)}">${fmtRM(agent.ep)}</td>`);
+                    `<td class="numeric sr-strong sr-col-ep"${span}${epAttrs(agent)}>${fmtRM(agent.ep)}</td>`);
                 // Early Bird Balance to Qualify: October's bar until the end of
                 // October, November's from 1 November (earlyKind decides).
                 const early = earlyStatus(agent, data);
