@@ -658,6 +658,8 @@ class OutsourceNfpLine:
     # bucket on this and full_payment_date keeps meaning "paid in full".
     payout_date: Optional[str] = None
     payout_trigger_pct: Optional[float] = None
+    # The invoice's lines, for the price cell hover (invoice_price_basis.price_breakdown).
+    price_items: Optional[Any] = None
 
 
 
@@ -1026,6 +1028,7 @@ def build_report(year: int, month: Optional[int] = None) -> tuple[List[Outsource
                 pct75_date=row_p75,
                 payout_date=row_payout,
                 payout_trigger_pct=float(row_trigger),
+                price_items=row.get("price_items"),
             )
         )
 

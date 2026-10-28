@@ -743,13 +743,11 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
     if not cases:
         return
 
-    def idx(name: str, fallback: str | None = None) -> int:
-        target = name.lower().strip()
-        for i, h in enumerate(headers):
-            if str(h).lower().strip() == target:
-                return i
-        if fallback:
-            target = fallback.lower().strip()
+    def idx(*names: str) -> int:
+        for name in names:
+            if not name:
+                continue
+            target = name.lower().strip()
             for i, h in enumerate(headers):
                 if str(h).lower().strip() == target:
                     return i
@@ -757,7 +755,7 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
 
     agent_i = idx("Agent")
     customer_i = idx("Customer")
-    pkg_i = idx("Package Type", "Package")
+    pkg_i = idx("Property Type", "Package Type", "Package")
     system_i = idx("System Price")
     nfp_i = idx("Net Floor Price", "netfloor price")
     sales_i = idx("Sales Price")
@@ -1024,6 +1022,13 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
                 break
         sales_for_calc = adjusted_sales_price if adjusted_sales_price else sales
         basic_comm = sales_for_calc * ((rate + profit_sharing_pct) / 100)
+        # A Balance row's figure is net of the RM 300 advance already paid. A
+        # case saved since 2026-10-23 keeps the assigned rate and carries that
+        # advance; older cases folded it into their rate instead.
+        try:
+            basic_comm -= float(case.get("advanceDeducted") or 0)
+        except (TypeError, ValueError):
+            pass
 
         if special_case_type == "fee_waiver":
             # A fee waiver sets the Net Floor Price Commission to RM 0 outright
@@ -1893,7 +1898,70 @@ def api_me():
     user = auth.current_user()
     if not user:
         return jsonify({"error": "Login required"}), 401
-    return jsonify(user)
+    # The pages this account may open, for the menu (static/greeting.js).
+    return jsonify({**user, "available_pages": auth.allowed_pages(user)})
+
+
+# Which Page Access key each page and its data belong to (auth.PAGES). "report"
+# is the commission report as a whole; a section of it is checked by key.
+_PAGE_BY_PATH = {
+    "/": "overview", "/api/overview": "overview",
+    "/sales-report": "sales_report", "/api/sales-report": "sales_report",
+    "/api/sales-report/pdf": "sales_report",
+    "/data": "data",
+    "/report": "report", "/api/commission": "report",
+    "/api/download/pdf": "report", "/api/download/excel": "report",
+    "/api/download/excel-pdf": "report",
+}
+
+
+@app.before_request
+def _enforce_available_pages():
+    """Refuse a page, or its data, that the signed-in account may not open
+    (the Page Access column on the Admin page). Anyone not signed in is
+    left to the routes' own login checks."""
+    key = _PAGE_BY_PATH.get(request.path)
+    if not key:
+        return None
+    user = auth.current_user()
+    if not user:
+        return None
+    allowed = auth.allowed_pages(user)
+    if key == "report":
+        mine = [k for k in auth.COMMISSION_PAGES if k in allowed]
+        section = (request.args.get("section") or "").strip().lower()
+        ok = bool(mine) and (not section or section not in auth.COMMISSION_PAGES or section in mine)
+        if not ok and request.path == "/report" and mine:
+            return redirect(f"/report?section={mine[0]}")
+        # The report opens on Basic & NFP; someone without it opens on theirs.
+        if ok and request.path == "/report" and not section and "basic_nfp" not in mine:
+            return redirect(f"/report?section={mine[0]}")
+    else:
+        ok = key in allowed
+    if ok:
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "This page is not available to your account"}), 403
+    target = auth.first_page_path(user)
+    if target and target.split("?")[0] != request.path:
+        return redirect(target)
+    return "No pages are available to your account. Ask an admin to give you access.", 403
+
+
+def _restrict_commission_sections(payload: dict) -> dict:
+    """The commission report's data with only the sections this account may
+    open. agent_summary is the Basic & NFP rollup (its Commission Price and
+    Other Commission), so it goes with basic_nfp."""
+    user = auth.current_user()
+    allowed = auth.allowed_pages(user)
+    if not isinstance(payload, dict) or not isinstance(payload.get("sections"), dict):
+        return payload
+    hidden = [k for k in auth.COMMISSION_PAGES if k not in allowed]
+    if not hidden:
+        return payload
+    if "basic_nfp" in hidden:
+        hidden.append("agent_summary")
+    return {**payload, "sections": {k: v for k, v in payload["sections"].items() if k not in hidden}}
 
 
 @app.route("/admin")
@@ -1907,7 +1975,12 @@ def admin_page():
 def admin_users_api():
     if request.method == "GET":
         users = [dict(u) for u in db.list_users()]
-        return jsonify(users)
+        for u in users:
+            u["available_pages"] = auth.allowed_pages({"role": u.get("role"),
+                                                       "pages": auth.parse_pages(u.get("pages"))})
+            u.pop("pages", None)
+        return jsonify({"users": users,
+                        "pages": [{"key": k, "label": l} for k, l, _p in auth.PAGES]})
 
     req_data = request.json or {}
     username = str(req_data.get("username", "")).strip()
@@ -1960,6 +2033,12 @@ def admin_user_detail_api(user_id: int):
         updates["password_hash"] = auth.hash_password(password)
     if "is_active" in req_data:
         updates["is_active"] = bool(req_data["is_active"])
+    if "pages" in req_data:
+        chosen = [k for k in (req_data.get("pages") or []) if k in auth.PAGE_KEYS and k != "admin"]
+        everything = [k for k in auth.PAGE_KEYS if k != "admin"]
+        # Every page ticked is stored as "no limit", so pages added later
+        # reach the account without anyone ticking them.
+        updates["pages"] = "" if set(chosen) >= set(everything) else ",".join(chosen) or "none"
 
     db.update_user(user_id, **updates)
     auth.forget_user(user_id)
@@ -1978,6 +2057,11 @@ def admin_user_detail_api(user_id: int):
         changed.append("password set")
     if "is_active" in updates:
         changed.append("reactivated" if updates["is_active"] else "deactivated")
+    if "pages" in updates:
+        labels = dict((k, l) for k, l, _p in auth.PAGES)
+        keys = auth.parse_pages(updates["pages"])
+        changed.append("page access -> all" if keys is None
+                       else "page access -> " + (", ".join(labels[k] for k in keys) or "none"))
     summary = f"Updated user '{target['username']}'"
     if changed:
         summary += ": " + ", ".join(changed)
@@ -2449,6 +2533,23 @@ def _add_advance_reached_pct(policies: dict) -> None:
                     break
 
 
+def _invoice_price_breakdown(inv):
+    """invoice_price_basis.price_breakdown for one NFP engine invoice record,
+    or None when the record predates its `price_items` (an older cache)."""
+    items = getattr(inv, "price_items", None)
+    if items is None:
+        return None
+    try:
+        rates_dir = str(REPO_ROOT / "1. Basic Commission" / "3. Python Script")
+        if rates_dir not in sys.path:
+            sys.path.append(rates_dir)
+        import invoice_price_basis as ipb
+        return ipb.price_breakdown(getattr(inv, "total_amount", 0), getattr(inv, "epp_cost", 0),
+                                   getattr(inv, "invoice_date", None), items)
+    except Exception:
+        return None
+
+
 def _build_system_details(nfp_by_inv_all: dict) -> dict:
     """customer name (lowercased) -> list of system detail dicts, one per invoice.
 
@@ -2492,6 +2593,10 @@ def _build_system_details(nfp_by_inv_all: dict) -> dict:
             # Baseline Rate reads this to spot a Cash Price above the package
             # price (the 100% rate).
             "package_price": float(getattr(inv, "system_price", 0) or 0),
+            # Total Amount, EPP and the add-on / lucky draw lines behind the
+            # Original Price and Cash Price: the price cell hover shows the
+            # formula with this invoice's own figures (user, 2026-10-23).
+            "price_basis": _invoice_price_breakdown(inv),
         }
         if (not entry["package"] and entry["panel_qty"] is None and entry["panel_rating"] is None
                 and not entry["phase"] and not entry["inverter"] and not entry["pct75_date"]
@@ -2599,7 +2704,7 @@ def _build_special_case_stage(headers: list, basic_lines, nfp_by_inv_all: dict,
         "inv_date": idx("Invoice Date"), "first_pay": idx("1st Payment Date"),
         "rm300": idx("Basic Commission (RM300)"),
         "milestone": idx("75% Payment Date", "Full Payment Date"),
-        "pkg": idx("Package Type"), "system": idx("System Price"),
+        "pkg": idx("Property Type", "Package Type"), "system": idx("System Price"),
         "nfp": idx("Net Floor Price"), "sales": idx("Sales Price"),
         "comm": idx("Commission"), "price": idx("Commission Price"),
         "rate": idx("Basic Rate %"),
@@ -3294,6 +3399,9 @@ def get_overview():
 # either side of the campaign cut-off, then EP point and the balance left to
 # qualify. Company-wide first, then one block per branch, as the print does.
 
+# From this date a case's month follows its first payment's Created at rather
+# than its payment date (user, 28 Oct 2026). See _sales_report_case_dates().
+SALES_REPORT_CREATED_AT_FROM = "2026-08-01"
 SALES_REPORT_SPLIT_MONTH = 6     # the EGA campaign window closes 10 June
 SALES_REPORT_SPLIT_DAY = 10      # June is shown as 1-10 / 11-30, per the campaign
 # The order the branch blocks read in, which is not alphabetical: Kluang comes
@@ -3354,16 +3462,6 @@ SALES_REPORT_EXCLUDED_INVOICES = {
     # 1008534, the same package at RM42,000 after discounts with the same
     # deposit, fully paid. Counted once, at RM42,000, per user request.
     "7b92371e-a931-4777-9298-ae53c00ca541",
-    # INV-1010527, CHEW TECK CHAI (ATAP), Hongki You Teng Hoong -- RM50,300,
-    # invoiced 22 Jun, paid in full on 1 Jul. Left off the report per user
-    # request so July RES is the one case, Classic Optometry, RM60,000.00.
-    "46d7262c-d5d0-4349-b8db-fd162e6c74ef",
-    # INV-1011470, TEY CHIN CHUAN (ATAP), RM36,000, and INV-1011474, LEONG CHEE
-    # HAU, RM53,500, Hongki You Teng Hoong -- both first paid 31 Aug (payments
-    # keyed in 7 Sep and 1 Sep). Left off the report per user request so August
-    # RES is My Liberica Coffee and Mega Signcraft, RM251,000.00.
-    "a3f87028-fa69-4255-a36e-f46b009cb60b",
-    "591fb12e-0c31-4008-92dc-5110fac81aeb",
     # Carol Siow -- left off the report per user request so July has no COM
     # line (her ESA / Oct early-bird qualification falls with the S.O.S Mewah
     # EP; the September COM cases are in, see SALES_REPORT_PROPERTY_OVERRIDES):
@@ -3464,11 +3562,12 @@ SALES_REPORT_SALES_ADJUSTMENTS = {
     # is RM6,900, so it is carried on INV-1009213 (RES EP is 1 pt per RM1, so EP
     # follows whichever it sits on).
     "76d396e5-ecdc-448f-83a1-b6a72369e507": "-6900",
-    # INV-1010467, CHAN ZHEN YUAN (ATAP), Olivier Koh Cong Lee -- counted at the
-    # full RM45,862.78 invoice total; the RM3,562.78 EPP interest (RM1,500 +
-    # RM2,062.78) is added back so June RES sales are counted at 3 cases,
-    # RM81,862.78 per user request.
-    "a33a9a02-6797-4824-9662-553407147a4c": "3562.78",
+    # INV-1010467, CHAN ZHEN YUAN (ATAP), Olivier Koh Cong Lee -- counted at
+    # RM45,862.78 so June RES sales are counted at 3 cases, RM81,862.78 per user
+    # request. The RM3,562.78 EPP interest (RM1,500 + RM2,062.78) is added back,
+    # less RM1,500: the ERP cut the invoice's discount line by RM1,500 on 20 Oct
+    # 2026 (total RM45,862.78 -> RM47,362.78), and the user kept the 8 Oct figure.
+    "a33a9a02-6797-4824-9662-553407147a4c": "2062.78",
     # Olivier Koh Cong Lee, August: with the two Jin Seng invoices on RES (see
     # SALES_REPORT_PROPERTY_OVERRIDES) the six RES cases (LEE ENG CHAI RM20,800,
     # LEE MENG LIANG RM28,800, OOI YI WEI RM36,000, WENG KAR CHON RM26,000,
@@ -3564,6 +3663,11 @@ SALES_REPORT_SALES_ADJUSTMENTS = {
     # July RES sales are counted at 7 cases, RM206,070.00 per user request.
     "9851d7df-92b9-4868-9997-dd3734cc70b4": "5210",
     "INV-1010672": "5210",
+    # INV-1010972, CHONG AI KI (ATAP), Ling Liang Kang -- +200 restores the
+    # "Discount Home Expo Instant Rebate Voucher 09/10/2026" line added in the
+    # ERP on 12 Oct 2026, so July RES stays at 7 cases, RM206,070.00 per user request.
+    "ce8ae739-0aba-4f50-92cd-a26346c61785": "200",
+    "INV-1010972": "200",
     # INV-1009464, T-KHEN LAI AUTO SDN. BHD. (FACTORY) (ATAP), Ling Liang Kang -- adjusted by +8,000 so
     # April COM sales are counted at 1 case, RM81,800.00 per user request.
     "9d02ee37-fb92-44ad-ae06-13132699125a": "8000",
@@ -3584,10 +3688,118 @@ SALES_REPORT_SALES_ADJUSTMENTS = {
     # September RES sales are counted at 3 cases, RM108,300.00 per user request.
     "0bd6e7f9-dce9-4638-9c2a-1b3ca2b02ff7": "700",
     "INV-1011497": "700",
+    # INV-1009559, CHONG MUN KIT, Ching Zhe Hang -- counted at its original
+    # RM20,225 (the RM1,000 + RM12,146.25 paid is exactly 65% of it); every line
+    # was edited in the ERP on 28 Aug 2026, taking the total to RM31,280. -11,055
+    # so May RES sales are counted at 6 cases, RM134,749.91 per user request.
+    "3c4f9127-5c31-480f-b9f6-7ee0917b0f76": "-11055",
+    "INV-1009559": "-11055",
+    # Chan Jia Wei, June -- three invoices edited in the ERP after the user had
+    # checked June at 12 RES cases, RM304,665.00; restored per user request:
+    # INV-1010644, GAN LEOK ENG -- a RM8,600 "B3-16.0LV Battery" line added 25 Oct.
+    "8a877d36-27ae-4c79-b2e3-5e43add44d6c": "-8600",
+    "INV-1010644": "-8600",
+    # INV-1009986, EEE LAY HOON -- "CEO Discount (RM 2950)" added to its
+    # discount line on 20 Oct.
+    "f4dbf708-df97-457d-848b-6d2308e91a4e": "2950",
+    "INV-1009986": "2950",
+    # INV-1010592, HEE WAI KIN -- package and discount lines re-entered on
+    # 13 Oct, RM950 lower (RM26,950 -> RM26,000).
+    "d829fad4-2452-49b9-8a1f-d6b9ab883e9d": "950",
+    "INV-1010592": "950",
+    # INV-1010346, MOK WEI XIAN, Louis Ng Zhan Yi -- a RM1,200 EV charger
+    # installation line added 8 Oct; removed so June RES stays at 10 cases,
+    # RM291,620.57 as the user checked it.
+    "eed01193-6603-466e-b641-671f0cff58c3": "-1200",
+    "INV-1010346": "-1200",
+    # INV-1011237, CHEOK GEOK LIAN, Wong Jia Xuan -- package and discount lines
+    # edited 12 Oct, the only July change after the user checked July at 3 RES
+    # cases, RM83,770.00; +770 restores that figure.
+    "afb07b5b-19c0-4520-bed8-36364a6ba087": "770",
+    "INV-1011237": "770",
 }
 
 # EP for an invoice set by hand, in place of calc_ep_points() (keyed on
 # bubble_id). Sales and ANS are untouched; only the points change.
+# Hand adjustments in SALES_REPORT_SALES_ADJUSTMENTS that only add an invoice's
+# EPP interest back. Since 28 Oct 2026 a fully paid invoice's ANS is its full
+# total, EPP included, so on ANS they would count the EPP twice and are skipped
+# for fully paid invoices; they still count toward EP, as before.
+SALES_REPORT_EPP_ADDBACKS = {
+    "18f34384-f543-4b61-a033-7eb5193543f8",  # INV-1010367, KALA A/P SUKUMAR (ATAP) -- RM2,942.00
+    "1ed55d0a-cf30-4b56-b13b-a4b767d29a72",  # INV-1010605, CHAN HWA KWONG (ATAP) -- RM1,997.50
+    "f96da89a-35f7-4bf3-bdf5-e4c71c280235",  # INV-1010037, TAN BEE LING (ATAP) -- RM2,490.90
+    "79dc8f2d-d066-47fb-ac0d-e5447a97278f",  # INV-1008474, TON JYUE SHII (ATAP) -- RM1,597.50
+    "7816fdb7-b094-4766-aa3e-ee0fa0d3cb08",  # INV-1010357, KOH CHIN TIN -- RM1,102.57
+    "211630d1-c2aa-4840-9d75-8a11149bfb8c",  # INV-1009303, CHEW SWEE ANNE (ATAP) -- RM1,179.00
+    "62937f12-2cf1-4884-979d-92bf15a38fbb",  # INV-1010998, WILLIAM TAN TECK SWEE (ATAP) -- RM2,990.00
+    "ac31a283-dedf-4d3f-a79a-c32247150d48",  # INV-1010718, OOI TZU WEI (ATAP) -- RM1,105.50
+    "d40a1c5a-5e32-49b4-b262-6e5b93b0e6f6",  # INV-1011002, TAN CHIN ING (ATAP) -- RM1,150.00
+    "d4998ba3-c577-446a-9524-42c49a626bcd",  # INV-1010912, TAN KONG HAO (ATAP) -- RM1,869.60
+    "3b8e6989-1e60-41af-82aa-f69ab470273f",  # INV-1010993, MOO MEI JEN (ATAP) -- RM3,105.00
+    "335842d7-bf44-4061-b368-eaeb753f96e1",  # INV-1009792, GAN TAI SHENG (573-L)(SHOP LOT) (ATAP) -- RM1,026.00
+    "4dac557b-ae9a-4686-8d11-c2ecd781a283",  # INV-1009919, GAN TAI SHENG (NO 60) (ATAP) -- RM969.00
+    "27c33d44-24ba-40c1-bc9a-5d484f26fbe3",  # INV-1010679, GUI LEE LAI (ATAP) -- RM1,363.64
+}
+
+# ANS only (never EP or sales), keyed on bubble_id: when the 28 Oct 2026 rules
+# (Created at from August; fully paid at total less EPP, else Original Price)
+# would move a month the user had already confirmed, the difference is pinned
+# here so that month reads as they checked it. Filled from the confirmed list.
+SALES_REPORT_CONFIRMED_ANS_PINS: dict = {
+    # Olivier Koh Cong Lee, Feb RES -- confirmed 2 cases, RM41,988.00; the new rules give RM41,870.00.
+    # Carried on INV-1008371 (SOH LIK KUANG (ATAP) (QUALI-TECH SERVICES SDN BHD)).
+    "47bd863c-196f-4d0a-b208-a3cc31c47fac": "118.0",
+    # Olivier Koh Cong Lee, May RES -- confirmed 5 cases, RM127,200.00; the new rules give RM128,400.00.
+    # Carried on INV-1009520 (QUEK POH HUI (ATAP)).
+    "d076ddd0-9639-4afa-b505-b1cd827d212f": "-2298.0",
+    # Caryn Dong Leong Moi, Feb RES -- confirmed 3 cases, RM78,600.00; the new rules give RM78,482.00.
+    # Carried on INV-1008397 (CHEW CHYE CHOON (ATAP)).
+    "d73ada5b-f781-4546-9a0d-dfcc0a75da56": "-4737.0",
+    # Chan Wing On, Feb RES -- confirmed 2 cases, RM57,000.00; the new rules give RM58,824.00.
+    # Carried on 1008563 (TAN LIAN KENG).
+    "1771658583603x991793478265471000": "-1824.0",
+    # Chan Wing On, May RES -- confirmed 4 cases, RM114,412.00; the new rules give RM116,300.00.
+    # Carried on INV-1009954 (SERIJIT KAUR @ SURJIT KAUR A/P PRAM SINGH).
+    "4cb4ed2a-236f-4fee-9baa-5b71315453e9": "-1888.0",
+    # Chan Jia Wei, Jun RES -- confirmed 12 cases, RM304,665.00; the new rules give RM305,265.00.
+    # Carried on INV-1010312 (TAN CHEE CHIANG (ATAP)).
+    "7010969d-472a-4013-af1f-79a69321d292": "-944.93",
+    # Olivier Koh Cong Lee, Jan RES -- confirmed RM117,993.02; counting fully paid
+    # invoices at their full total (EPP included) gives RM126,503.84. Carried on 1008384.
+    "1767939913445x149272359145570300": "-8510.82",
+    # Olivier Koh Cong Lee, Mar RES -- confirmed RM76,397.50; counting fully paid
+    # invoices at their full total (EPP included) gives RM79,465.00. Carried on INV-1008789.
+    "5966fc0d-e9ed-45e0-8eca-707355417737": "-3067.5",
+    # Olivier Koh Cong Lee, Sep RES -- confirmed RM219,500.00; counting fully paid
+    # invoices at their full total (EPP included) gives RM221,447.50. Carried on INV-1011573.
+    "c7fadb70-caa8-4567-9453-a599483a2481": "-1947.5",
+    # Chan Wing On, Mar RES -- confirmed RM94,400.00; counting fully paid
+    # invoices at their full total (EPP included) gives RM95,376.60. Carried on INV-1008774.
+    "198457ae-43c7-493c-9c14-da248624f52d": "-976.6",
+    # Viggy Gui Choon Fong, Jul RES -- confirmed RM71,764.00; counting fully paid
+    # invoices at their full total (EPP included) gives RM76,075.84. Carried on INV-1010696.
+    "4feb4dde-4ffe-4277-a6ac-2042796a485d": "-4311.84",
+    # Ling Liang Kang, May RES -- confirmed RM192,479.00; counting fully paid
+    # invoices at their full total (EPP included) gives RM195,792.38. Carried on INV-1010031.
+    "11bb249e-ecdd-4e74-a643-801700d55845": "-3313.38",
+    # Nur Anisah Binti Mohd Amiruddin @ Chumati, Jan RES -- confirmed RM63,600.00; counting fully paid
+    # invoices at their full total (EPP included) gives RM66,388.00. Carried on 1008396.
+    "1768118811109x391817559622549500": "-2788.0",
+    # Winson Tan Sue Cherk, Apr RES -- confirmed RM37,600.00; counting fully paid
+    # invoices at their full total (EPP included) gives RM40,320.00. Carried on INV-1009181.
+    "d77eec3c-0b83-40ff-a689-6dae1839a540": "-2720.0",
+    # Ching Zhe Hang, May RES -- confirmed RM134,749.91; counting fully paid
+    # invoices at their full total (EPP included) gives RM136,297.00. Carried on INV-1009559.
+    "3c4f9127-5c31-480f-b9f6-7ee0917b0f76": "-1547.09",
+    # Louis Ng Zhan Yi, Jun RES -- confirmed RM291,620.57; counting fully paid
+    # invoices at their full total (EPP included) gives RM292,850.82. Carried on INV-1010358.
+    "d1f99d8f-bc47-447d-8f84-01bf14673708": "-1230.25",
+    # Wong Jia Xuan, Jul RES -- confirmed RM83,770.00; counting fully paid
+    # invoices at their full total (EPP included) gives RM84,760.00. Carried on INV-1011237.
+    "afb07b5b-19c0-4520-bed8-36364a6ba087": "-990.0",
+}
+
 SALES_REPORT_EP_OVERRIDES = {
     # Chan Jia Wei's two large commercial jobs, which the ERP leaves with no
     # panel count or site type, so calc_ep_points() gave them a point per
@@ -3613,6 +3825,31 @@ SALES_REPORT_EP_OVERRIDES = {
 # Cases placed in a month by hand, overriding the first-payment date (keyed
 # on bubble_id; the value is the date that decides the month).
 SALES_REPORT_DATE_OVERRIDES = {
+    # Kept where the user confirmed them when the 28 Oct 2026 rules (a case's
+    # month from its first payment's Created at from August) would move them
+    # into or out of a confirmed month:
+    # INV-1011420, WENG KAR CHON (ATAP) -- OLIVIER KOH CONG LEE RES m9: kept out (rules would move it in).
+    "50d10202-caf0-4b60-ab91-88c85078eab2": "2026-08-31",
+    # INV-1011838, CHIN YAN ZHANG (ATAP) -- OLIVIER KOH CONG LEE RES m9: stays (rules would move it).
+    "32b3072d-2e8e-492b-8773-83eb429abbf9": "2026-09-30",
+    # INV-1011887, TEO GEOK HUI (ATAP) -- OLIVIER KOH CONG LEE RES m9: stays (rules would move it).
+    "cd77f06a-9067-45bd-9c96-95cc2753c80b": "2026-09-30",
+    # INV-1011835, NGOO KEE HWA (ATAP) -- OLIVIER KOH CONG LEE RES m9: stays (rules would move it).
+    "6ac26565-2b3e-433a-8b7c-c22af6c6411a": "2026-09-30",
+    # INV-1010797, Ho Khee Fatt -- PHIL MOO WUI KEAD RES m9: stays (rules would move it).
+    "136aa3a5-0f57-4b93-85f1-49d55bf8482c": "2026-09-29",
+    # INV-1011396, HII KING SENG (ATAP) -- LING LIANG KANG RES m8: stays (rules would move it).
+    "2b2e953a-90b3-4b80-a64d-d5161f6e77c1": "2026-08-31",
+    # INV-1011483, YONG LEE HUAN (ATAP) -- LOUIS NG ZHAN YI RES m9: kept out (rules would move it in).
+    "8e379d41-4a97-4d0a-8c3d-87fda4bf92f8": "2026-08-31",
+    # INV-1011475, Chong Chee Fatt -- LOUIS NG ZHAN YI RES m9: kept out (rules would move it in).
+    "912fedc6-a485-4e33-8305-fb4767091e5a": "2026-08-31",
+    # INV-1011474, LEONG CHEE HAU -- HONGKI YOU TENG HOONG RES m8: stays (rules would move it).
+    "591fb12e-0c31-4008-92dc-5110fac81aeb": "2026-08-31",
+    # INV-1011470, TEY CHIN CHUAN (ATAP) -- HONGKI YOU TENG HOONG RES m8: stays (rules would move it).
+    "a3f87028-fa69-4255-a36e-f46b009cb60b": "2026-08-31",
+    # INV-1011316, MEGA SIGNCRAFT SDN BHD (FACTORY) -- HONGKI YOU TENG HOONG COM m8: stays (rules would move it).
+    "2eb420cc-1ba4-4e52-94f3-881d45a7e36e": "2026-08-27",
     # INV-1009623, GAIN MIRAGE (M) SDN BHD, Sunny Tan -- paid 14 May 2026 but
     # the payment was only keyed in on 25 July, so it counts in July.
     "66cc8021-4ea3-4d41-86df-9c6df03a4244": "2026-07-25",
@@ -3685,10 +3922,6 @@ SALES_REPORT_PROPERTY_OVERRIDES = {
     # shows 2 RES cases, RM60,000.00, and no COM.
     "e280062c-a506-4bc9-9d73-9a419a5b90d0": "RES",
     "4fc343d0-f5f4-4ef9-9cf3-d190318c080d": "RES",
-    # INV-1011316, MEGA SIGNCRAFT SDN BHD (FACTORY), RM135,000, Hongki You Teng
-    # Hoong -- 110 panels and a 50kW 3-phase inverter. Moved to RES per user
-    # request so August shows 2 RES cases, RM251,000.00, and no COM.
-    "2eb420cc-1ba4-4e52-94f3-881d45a7e36e": "RES",
     # INV-1008371, T S BEACH RESORT SDN. BHD. (ATAP), Dean Wai Leong Yee --
     # RM119,800, first paid 9 Jan (10%): a resort on a commercial scale. The
     # classifier left it on Residential; moved to COM per user request so
@@ -4177,9 +4410,10 @@ def _sales_report_case_dates(year: int) -> dict[str, str]:
     printed report counts him in January; Lim Lee Peng is invoiced 5 January but
     first paid 30 December, so he is not in 2026 at all.
 
-    Until 15 September 2026 invoices created from 1 August were placed by their
-    created date instead. That second regime was withdrawn, so Diong Wei Yuan --
-    created 7 September, first paid 29 August -- now counts in August.
+    From August 2026 the first payment's Created at -- the day Finance keyed it
+    in -- decides the month instead of its payment date (user, 28 Oct 2026):
+    paid 31 August but keyed in 2 September is a September case. (An earlier
+    created-at regime, on the invoice's own created date, ran until 15 Sep.)
 
     Keyed on bubble_id, not invoice number: one number can carry several
     revisions with different dates -- 1008358 has first payments at 2026-01-03
@@ -4203,18 +4437,28 @@ def _sales_report_case_dates(year: int) -> dict[str, str]:
     sql = f"""
         SELECT bubble_id, p1, c FROM (
           SELECT i.bubble_id,
-                 (COALESCE(i."1st_payment_date", fp.first_paid)
-                    AT TIME ZONE 'Asia/Kuala_Lumpur')::date AS p1,
+                 CASE
+                   WHEN fp.fd IS NULL THEN
+                     (i."1st_payment_date" AT TIME ZONE 'Asia/Kuala_Lumpur')::date
+                   WHEN fp.fd >= DATE '{SALES_REPORT_CREATED_AT_FROM}' THEN COALESCE(fp.fc, fp.fd)
+                   ELSE fp.fd
+                 END AS p1,
                  (i.created_at AT TIME ZONE 'Asia/Kuala_Lumpur')::date AS c,
                  ROW_NUMBER() OVER (
                    PARTITION BY i.bubble_id
                    ORDER BY COALESCE(i.is_latest, FALSE) DESC,
                             i.invoice_date DESC NULLS LAST, i.id DESC) AS rn
             FROM invoice i
-            -- Earliest payment row, for invoices whose 1st_payment_date was
-            -- never set (see _first_paid_in_year_sql). Joined, not per row.
-            LEFT JOIN (SELECT linked_invoice, MIN(payment_date) AS first_paid
-                         FROM payment GROUP BY linked_invoice) fp
+            -- The invoice's first payment row (a real amount before a RM0
+            -- one): its payment date, and its Created at -- when Finance
+            -- keyed it in -- which places the case from August.
+            LEFT JOIN (SELECT DISTINCT ON (linked_invoice) linked_invoice,
+                              (payment_date AT TIME ZONE 'Asia/Kuala_Lumpur')::date AS fd,
+                              (created_at AT TIME ZONE 'Asia/Kuala_Lumpur')::date AS fc
+                         FROM payment
+                        WHERE payment_date IS NOT NULL
+                        ORDER BY linked_invoice, (COALESCE(amount, 0) > 0) DESC,
+                                 payment_date, created_at) fp
                    ON fp.linked_invoice = i.bubble_id
            WHERE i.invoice_date IS NOT NULL
              AND (EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)}
@@ -4315,7 +4559,7 @@ def _sales_report_payment_rows(year: int, upto_month: int) -> dict[str, list]:
     return out
 
 
-def _case_hover_entry(customer_name, payments, system_price=None):
+def _case_hover_entry(customer_name, payments, system_price=None, ans=None, fully_paid=None):
     """One case for the hover panel, or None when there is no customer to name.
 
     An entry with no payments is still worth returning: the panel says "no
@@ -4324,19 +4568,29 @@ def _case_hover_entry(customer_name, payments, system_price=None):
 
     "s" is the invoice's System Price -- its total amount, what the customer
     is billed -- read by the customer list under the report; the hover panel
-    ignores it.
+    ignores it. "v" is the ANS the case counts at and "f" whether the invoice
+    is fully paid -- the hover names it Sales price or Original price.
     """
     name = str(customer_name or "").strip()
     if not name:
         return None
-    return {"n": name, "p": list(payments or []), "s": float(system_price or 0)}
+    entry = {"n": name, "p": list(payments or []), "s": float(system_price or 0)}
+    if ans is not None:
+        entry["v"] = float(ans)
+        entry["f"] = bool(fully_paid)
+    return entry
 
 
 # Sales staff tag non-residential sites in the customer name:
 # "JC PRINT & OFFICE SDN. BHD. (FACTORY) (ATAP)". (ATAP)/(20PCS) describe the
 # roof or package, not the property, so only these words count.
-# Shop lots are not here: on the Sales Report they count as Residential.
+# Shop lots are not here: they go by panel count (SR_SHOP_LOT_MAX_PANELS).
 _SR_SITE_TAG = re.compile(r"\b(?:FACTORY|KILANG|COMMERCIAL)\b", re.I)
+_SR_SHOP_LOT = re.compile(r"\bSHOP[\s-]?LOTS?\b", re.I)
+# A shop lot with this many panels or fewer is Residential; more is Commercial
+# (user, 2026-10-27). It matches the hand overrides made before the rule: LEA
+# COURT HOTEL 23 and 21 panels RES, GOH LAY MUI 67 and MX FRESH MART 48 COM.
+SR_SHOP_LOT_MAX_PANELS = 36
 _SR_BUSINESS_PREMISE = re.compile(
     r"\bHOTEL\b|\bRESORT\b|\b(?:PETROL|PERTOL)\s+STATION\b|\bCLINIC\b|\bKLINIK\b", re.I)
 # A company can own a house, so these only ask for a look; they never decide.
@@ -4345,13 +4599,16 @@ _SR_COMPANY_NAME = re.compile(
     r"|\bMETAL\s+WORKS\b|\bMANUFACTUR", re.I)
 
 
-def _sales_report_property(row: dict, recorded: str) -> tuple[str, str | None]:
+def _sales_report_property(row: dict, recorded: str,
+                           panels: int | None = None) -> tuple[str, str | None]:
     """("RES" | "COM", review note or None) for one Sales Report invoice.
 
     `recorded` is classify_property_type()'s answer. Anything it calls
     non-residential (Factory, Government, ...) is COM -- except a shop lot,
-    which the report counts as Residential (HAPPY ART CREATION STUDIO
-    (SHOP-LOT), Louis, March). The classifier also files plain "COMMERCIAL"
+    which goes by its panel count: SR_SHOP_LOT_MAX_PANELS or fewer is RES,
+    more is COM. A shop lot is one the classifier recorded as such, or a
+    Residential whose customer name says SHOP LOT (most of them: the ERP
+    leaves the site type blank). The classifier also files plain "COMMERCIAL"
     under Shop Lot, so a case whose own fields say COMMERCIAL stays COM. Its
     Residential is often only a fallback, so the customer name gets a say: an
     explicit site tag or a business premise makes it COM. A Residential that
@@ -4359,13 +4616,18 @@ def _sales_report_property(row: dict, recorded: str) -> tuple[str, str | None]:
     flagged instead. EP points keep using `recorded`; this only places the case
     on a RES/COM line.
     """
-    shop_lot = recorded == "Shop Lot" and "COMMERCIAL" not in " ".join(
+    name = str(row.get("customer_name") or "")
+    commercial = "COMMERCIAL" in " ".join(
         str(row.get(k) or "") for k in (
             "seda_nem_type", "referral_project_type", "package_type",
             "package_name_snapshot", "description", "customer_name")).upper()
-    if not recorded.lower().startswith("resid") and not shop_lot:
+    resid = recorded.lower().startswith("resid")
+    if not commercial and (recorded == "Shop Lot" or (resid and _SR_SHOP_LOT.search(name))):
+        if not panels:
+            return "RES", "Shop lot with no panel count; counted as Residential"
+        return ("RES" if panels <= SR_SHOP_LOT_MAX_PANELS else "COM"), None
+    if not resid:
         return "COM", None
-    name = str(row.get("customer_name") or "")
     explicit = (
         "RAKYAT" in str(row.get("seda_nem_type") or "").upper()
         or "RESIDENTIAL" in str(row.get("referral_project_type") or "").upper())
@@ -4407,6 +4669,47 @@ def _sales_report_commission_prices(year: int) -> dict[str, "Decimal"]:
             nfp_row = nfp_by_inv.get(inv)
             nfp_comm = getattr(nfp_row, "nfp_commission", None) if nfp_row else None
             out[inv] = (price + Decimal(str(nfp_comm or 0))).quantize(Decimal("0.01"))
+    return out
+
+
+def _sales_report_price_records(year: int) -> dict:
+    """(invoice number, customer lowercased) and invoice number -> the NFP
+    engine's record for the invoice (EPP cost, invoice date, price lines), from
+    which invoice_price_basis works out the Original Price. The customer name
+    picks between channels that share an invoice number."""
+    out: dict = {}
+    for agent_type in ("internal", "outsource"):
+        nfp = (get_cached_data(year, agent_type) or {}).get("nfp")
+        for rec in ((nfp[-1] or {}).values() if nfp else ()):
+            inv = str(getattr(rec, "invoice_number", "") or "").strip()
+            if not inv:
+                continue
+            cust = str(getattr(rec, "customer_name", "") or "").strip().lower()
+            out.setdefault((inv, cust), rec)
+            out.setdefault(inv, rec)
+    return out
+
+
+def _sales_report_panel_counts(year: int) -> dict:
+    """(invoice number, customer name lowercased) -> panel count, plus
+    invoice number alone -> panel count, from the cached NFP runs.
+
+    The EGA rows the report is built from carry invoice.panel_qty, which is
+    blank on most jobs; the NFP engine also reads it off the package and item
+    text. The two channels' maps can share an invoice number for different
+    cases, so the customer name picks between them when it can.
+    """
+    out: dict = {}
+    for agent_type in ("internal", "outsource"):
+        nfp = (get_cached_data(year, agent_type) or {}).get("nfp")
+        for inv_row in ((nfp[-1] or {}).values() if nfp else ()):
+            qty = getattr(inv_row, "panel_qty", None)
+            inv = str(getattr(inv_row, "invoice_number", "") or "").strip()
+            if not qty or not inv:
+                continue
+            cust = str(getattr(inv_row, "customer_name", "") or "").strip().lower()
+            out[(inv, cust)] = int(qty)
+            out.setdefault(inv, int(qty))
     return out
 
 
@@ -4998,7 +5301,14 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
     # beyond applies none at all.
     multiplier_in_period = last_month <= SALES_REPORT_SPLIT_MONTH
     zero = Decimal("0")
-    commission_prices = _sales_report_commission_prices(year)
+    panel_counts = _sales_report_panel_counts(year)
+    price_records = _sales_report_price_records(year)
+    # Everything paid on the year's invoices so far, for "fully paid".
+    paid_to_date = _sales_report_payments(year, 12)
+    rates_dir = str(REPO_ROOT / "1. Basic Commission" / "3. Python Script")
+    if rates_dir not in sys.path:
+        sys.path.append(rates_dir)
+    import invoice_price_basis as _ipb
     agents: dict[str, dict] = {}
     seen_bubble: set = set()
     prop_counts: dict[str, int] = {}
@@ -5062,18 +5372,37 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
                  - Decimal(str(r.get("epp_interest") or 0))
                  + line_adj.get(str(bubble or ""), zero)
                  + Decimal(adj_val))
-        # ANS: an invoice paid 100% on its first payment counts at its
-        # Commission Price; everything else at its sales price. "Paid in full"
-        # is still judged against the full invoice amount, since that is what
-        # the customer pays.
-        ans = sales
-        if _paid_in_full_on_first_payment(payment_rows.get(str(bubble or "")),
-                                          Decimal(str(r.get("total_amount") or 0))):
-            price = commission_prices.get(str(r.get("invoice_number") or "").strip())
-            if price is not None:
-                ans = price
+        # ANS (user, 28 Oct 2026): a fully paid invoice counts at its full
+        # invoice total, EPP interest included; one not fully paid yet at its
+        # Original Price -- the total less EPP, lucky-draw prizes added back
+        # (invoice_price_basis). Fully paid is judged on the full invoice
+        # amount, as the customer pays it. Hand adjustments still apply --
+        # except an "add the EPP back" one on a fully paid invoice, which the
+        # rule now does itself (SALES_REPORT_EPP_ADDBACKS) -- and
+        # SALES_REPORT_CONFIRMED_ANS_PINS keeps months the user checked.
+        total = Decimal(str(r.get("total_amount") or 0))
+        rec = (price_records.get((str(r.get("invoice_number") or "").strip(),
+                                  str(r.get("customer_name") or "").strip().lower()))
+               or price_records.get(str(r.get("invoice_number") or "").strip()))
+        if rec is not None:
+            epp = Decimal(str(getattr(rec, "epp_cost", 0) or 0))
+            original = Decimal(str(_ipb.original_price(
+                total, epp, getattr(rec, "invoice_date", None),
+                getattr(rec, "price_items", None) or [])))
+        else:
+            epp = Decimal(str(r.get("epp_interest") or 0))
+            original = total - epp
+        fully_paid = paid_to_date.get(str(bubble or ""), zero) >= total - Decimal("0.5")
+        epp_addback = fully_paid and (str(bubble or "").strip() in SALES_REPORT_EPP_ADDBACKS
+                                      or str(r.get("invoice_number") or "").strip() in SALES_REPORT_EPP_ADDBACKS)
+        ans = (total if fully_paid else original) + (zero if epp_addback else Decimal(adj_val))
+        ans += Decimal(SALES_REPORT_CONFIRMED_ANS_PINS.get(str(bubble or "").strip(), "0"))
         prop = int_mod.classify_property_type(r)
-        kind, review = _sales_report_property(r, prop)
+        inv_no = str(r.get("invoice_number") or "").strip()
+        panels = (int(r.get("panel_qty") or 0)
+                  or panel_counts.get((inv_no, str(r.get("customer_name") or "").strip().lower()))
+                  or panel_counts.get(inv_no))
+        kind, review = _sales_report_property(r, prop, panels)
         if str(bubble or "") in SALES_REPORT_PROPERTY_OVERRIDES:
             kind, review = SALES_REPORT_PROPERTY_OVERRIDES[str(bubble or "")], None
         mix_key ="Residential" if kind == "RES" else "Commercial"
@@ -5123,7 +5452,7 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         cell[1] += ans
         customer = _case_hover_entry(r.get("customer_name"),
                                      payment_rows.get(str(bubble or "")),
-                                     r.get("total_amount"))
+                                     r.get("total_amount"), ans, fully_paid)
         if customer:
             entry["custs"].setdefault(kind, {}).setdefault(when.month, []).append(customer)
         if when.month == SALES_REPORT_SPLIT_MONTH:
@@ -5838,9 +6167,20 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
                     ("BACKGROUND", (col, row), (col, row + lines - 1), pink),
                 ])
 
+        # A month whose customers are all fully paid is shaded #F7C7AC, NOC and
+        # ANS alike (June's split pair too) -- allFullyPaid() on the page.
+        paid_fill = colors.HexColor("#F7C7AC")
+        month_spans = col_groups[3:3 + lm]
         r = 2
         for a in members:
             n_lines = max(1, len(a.get("types") or []))
+            for i, t in enumerate((a.get("types") or [])[:n_lines]):
+                months = t.get("months") or []
+                for m in range(min(lm, len(months))):
+                    custs = [c for c in ((months[m] or {}).get("custs") or []) if c]
+                    if custs and all(c.get("f") for c in custs):
+                        first_col, last_col = month_spans[m]
+                        style.append(("BACKGROUND", (first_col, r + i), (last_col, r + i), paid_fill))
             for i in range(n_lines):
                 if i == 0:
                     # Per-agent figures are one merged cell down the agent's RES
@@ -6379,7 +6719,8 @@ def _build_commission_payload(year: int, month: int, agent_type: str):
 
         _inject_special_case_rows(basic_nfp_headers, basic_nfp_rows, year, month, "internal")
 
-        pkg_i = basic_nfp_headers.index("Package Type") if "Package Type" in basic_nfp_headers else -1
+        pkg_i = (basic_nfp_headers.index("Property Type") if "Property Type" in basic_nfp_headers
+                 else (basic_nfp_headers.index("Package Type") if "Package Type" in basic_nfp_headers else -1))
         has_factory = pkg_i != -1 and any(
             "factory" in str(r[pkg_i]).lower() for r in basic_nfp_rows if len(r) > pkg_i
         )
@@ -6616,7 +6957,8 @@ def _build_commission_payload(year: int, month: int, agent_type: str):
 
         _inject_special_case_rows(basic_nfp_headers, basic_nfp_rows, year, month, "outsource")
 
-        pkg_i = basic_nfp_headers.index("Package Type") if "Package Type" in basic_nfp_headers else -1
+        pkg_i = (basic_nfp_headers.index("Property Type") if "Property Type" in basic_nfp_headers
+                 else (basic_nfp_headers.index("Package Type") if "Package Type" in basic_nfp_headers else -1))
         has_factory = pkg_i != -1 and any(
             "factory" in str(r[pkg_i]).lower() for r in basic_nfp_rows if len(r) > pkg_i
         )
@@ -6827,7 +7169,7 @@ def get_commission():
             # rebuilding commissions, and a response cached before this field
             # existed carries none at all.
             _refresh_system_details(cached_payload, year, agent_type)
-            return jsonify(_decorate_commission_payload(cached_payload, year, month))
+            return jsonify(_restrict_commission_sections(_decorate_commission_payload(cached_payload, year, month)))
 
         payload = _commission_payload_within_seconds(year, month, agent_type)
         if payload is None:
@@ -6835,7 +7177,7 @@ def get_commission():
                 "ready": False,
                 "message": "Commission data is still being prepared. Refresh shortly.",
             })
-        return jsonify(_decorate_commission_payload(payload, year, month))
+        return jsonify(_restrict_commission_sections(_decorate_commission_payload(payload, year, month)))
 
 
     except Exception as e:
@@ -8294,7 +8636,192 @@ def _nfp_sheet_months(sheet_name, month_names):
     months = {num for num, name in lookup.items() if name in sn}
     if "JULY" in sn:
         months.add(7)
+    if "MAR" in sn:
+        months.add(3)
+    if "SEPT" in sn:
+        months.add(9)
     return [f"{year:04d}-{m:02d}" for m in sorted(months)]
+
+
+def _nfp_price_rows(parsed, nfp):
+    """parse_schedule_workbook_rows() output -> (nfp_prices rows, one per month a
+    sheet covers; per-sheet summary for the preview)."""
+    rows, summary_by_sheet = [], {}
+    for r in parsed:
+        months = _nfp_sheet_months(r["sheet"], nfp.MONTH_NAMES)
+        if not months:
+            continue
+        info = summary_by_sheet.setdefault(
+            r["sheet"], {"sheet": r["sheet"], "months": months, "tables": {}})
+        tkey = (r["panel_rating"], r["inverter_type"])
+        info["tables"][tkey] = info["tables"].get(tkey, 0) + 1
+        for month in months:
+            row = {k: r.get(k) for k in ("panel_rating", "table_no", "panels", "final_price",
+                                          "final_with_tng", "package_price", "tng_rebate",
+                                          "inverter_type", "power_system", "source_sheet",
+                                          "promo_price", "promo_from", "promo_to")}
+            row["columns_json"] = (json.dumps(r["columns"], ensure_ascii=False)
+                                    if r.get("columns") else None)
+            row["month"] = month
+            rows.append(row)
+    summary = []
+    for info in summary_by_sheet.values():
+        summary.append({
+            "sheet": info["sheet"], "months": info["months"],
+            "tables": [{"rating": f"{rating}W {itype}", "rows": count}
+                        for (rating, itype), count in sorted(info["tables"].items())],
+        })
+    return rows, summary
+
+
+# The finance Google Sheet the Net Floor Price list must always follow (user,
+# 27 Oct 2026). "Anyone with the link" can view it, so its xlsx export needs
+# no sign-in.
+NFP_GOOGLE_SHEET_ID = "1SeT2d8nh3xUZMo_WTtjyK0ENTu2ZPM-aEoUt6xJXusg"
+NFP_GOOGLE_SHEET_URL = f"https://docs.google.com/spreadsheets/d/{NFP_GOOGLE_SHEET_ID}/edit"
+NFP_GOOGLE_SYNC_LABEL = "Google Sheet sync"
+_NFP_SHEET_CHECK_TTL = 24 * 3600
+_NFP_SHEET_CHECK: dict = {}
+_NFP_SHEET_CHECK_LOCK = threading.Lock()
+
+# Fields compared between the sheet and nfp_prices; a row is keyed on these.
+_NFP_ROW_KEY = ("month", "panel_rating", "table_no", "inverter_type", "power_system", "panels")
+_NFP_ROW_VALUES = ("final_price", "final_with_tng", "package_price", "tng_rebate",
+                   "promo_price", "promo_from", "promo_to")
+
+
+def _nfp_google_sheet_rows():
+    """Download the Google Sheet and parse it like an upload -> (rows, summary)."""
+    import urllib.request
+    url = (f"https://docs.google.com/spreadsheets/d/{NFP_GOOGLE_SHEET_ID}"
+           f"/export?format=xlsx")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = resp.read()
+    if not data.startswith(b"PK"):
+        raise RuntimeError("The Google Sheet did not download as a spreadsheet -- "
+                           "check that it is still shared as 'Anyone with the link'.")
+    nfp = _nfp_module()
+    tmp_path = Path(tempfile.mkstemp(suffix=".xlsx")[1])
+    try:
+        tmp_path.write_bytes(data)
+        parsed = nfp.parse_schedule_workbook_rows(tmp_path, source_label=NFP_GOOGLE_SYNC_LABEL)
+    finally:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
+    return _nfp_price_rows(parsed, nfp)
+
+
+def _nfp_sheet_diff(rows) -> dict:
+    """How the sheet's rows differ from nfp_prices, for the months the sheet has.
+    Months only stored (not on the sheet) are reported but never touched."""
+    def norm(v):
+        if v in (None, ""):
+            return None
+        try:
+            return round(float(v), 2)
+        except (TypeError, ValueError):
+            return str(v)[:10]
+
+    def key(r):
+        return tuple(r.get(k) for k in _NFP_ROW_KEY)
+
+    months = sorted({r["month"] for r in rows})
+    stored_all = db.list_nfp_prices()
+    stored = {key(r): r for r in stored_all if r["month"] in months}
+    sheet = {key(r): r for r in rows}
+    changed, added, removed = [], [], []
+    for k, s in sheet.items():
+        d = stored.get(k)
+        if d is None:
+            added.append(k)
+            continue
+        fields = [f for f in _NFP_ROW_VALUES if norm(s.get(f)) != norm(d.get(f))]
+        diff = {f: {"sheet": norm(s.get(f)), "stored": norm(d.get(f))} for f in fields}
+        # The columns the Data page shows must match the sheet's too, not only
+        # the prices the calculation reads.
+        s_cols = [c[0] for c in json.loads(s.get("columns_json") or "[]")]
+        d_cols = [c[0] for c in json.loads(d.get("columns_json") or "[]")]
+        if (json.loads(s.get("columns_json") or "[]") != json.loads(d.get("columns_json") or "[]")):
+            missing = [c for c in s_cols if c not in d_cols]
+            diff["columns"] = {"sheet": ", ".join(missing) if missing else "the sheet's columns",
+                               "stored": f"{len(d_cols)} columns"}
+        if diff:
+            changed.append({"month": k[0], "rating": k[1], "inverter": k[3], "system": k[4],
+                            "panels": k[5], "fields": diff})
+    removed = [k for k in stored if k not in sheet]
+    by_month: dict = {}
+    for c in changed:
+        by_month[c["month"]] = by_month.get(c["month"], 0) + 1
+    for k in added + removed:
+        by_month[k[0]] = by_month.get(k[0], 0) + 1
+    return {
+        "months": months,
+        "changed": len(changed), "added": len(added), "removed": len(removed),
+        "by_month": dict(sorted(by_month.items())),
+        "examples": changed[:25],
+        "stored_only_months": sorted({r["month"] for r in stored_all} - set(months)),
+        "in_sync": not (changed or added or removed),
+    }
+
+
+def _nfp_sheet_check(force: bool = False) -> dict:
+    """The daily sheet-vs-stored check, cached for a day so opening the Data
+    page does not download the sheet every time."""
+    with _NFP_SHEET_CHECK_LOCK:
+        fresh = (_NFP_SHEET_CHECK.get("ts") or 0) > time.time() - _NFP_SHEET_CHECK_TTL
+        if fresh and not force:
+            return dict(_NFP_SHEET_CHECK)
+        try:
+            rows, _summary = _nfp_google_sheet_rows()
+            result = _nfp_sheet_diff(rows)
+            result["error"] = None
+        except Exception as e:
+            _log("[NFP SHEET CHECK ERROR]\n" + traceback.format_exc())
+            result = {"error": str(e), "in_sync": None}
+        result["ts"] = time.time()
+        result["checked_at"] = time.strftime("%d %b %Y, %H:%M")
+        result["sheet_url"] = NFP_GOOGLE_SHEET_URL
+        _NFP_SHEET_CHECK.clear()
+        _NFP_SHEET_CHECK.update(result)
+        return dict(result)
+
+
+@app.route("/api/nfp-prices/google-check")
+@login_required
+def nfp_prices_google_check():
+    """Whether the stored Net Floor Price list still matches the Google Sheet."""
+    return jsonify(_nfp_sheet_check(force=request.args.get("refresh") == "1"))
+
+
+@app.route("/api/nfp-prices/google-sync", methods=["POST"])
+@login_required
+def nfp_prices_google_sync():
+    """Preview replacing the stored list with the Google Sheet's. Confirming goes
+    through /api/nfp-prices/upload?mode=confirm with the returned token."""
+    user = auth.current_user()
+    if user["role"] != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    try:
+        rows, summary = _nfp_google_sheet_rows()
+        if not rows:
+            return jsonify({"error": "No price tables recognized in the Google Sheet."}), 400
+        diff = _nfp_sheet_diff(rows)
+        months_all = diff["months"]
+        token = uuid.uuid4().hex
+        _NFP_UPLOAD_PENDING[token] = {"rows": rows, "months": months_all, "ts": time.time(),
+                                      "google": True}
+        for k in [k for k, v in _NFP_UPLOAD_PENDING.items() if time.time() - v["ts"] > 1800]:
+            _NFP_UPLOAD_PENDING.pop(k, None)
+        existing = [p for p in db.list_nfp_prices() if p["month"] in months_all]
+        return jsonify({"token": token, "summary": summary, "months": months_all,
+                        "total_rows": len(rows), "replaces": len(existing), "diff": diff,
+                        "sheet_url": NFP_GOOGLE_SHEET_URL})
+    except Exception as e:
+        _log("[NFP GOOGLE SYNC ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/nfp-prices/upload", methods=["POST"])
@@ -8311,12 +8838,16 @@ def nfp_prices_upload():
             pending = _NFP_UPLOAD_PENDING.pop(token, None)
             if not pending:
                 return jsonify({"error": "Upload expired â€” please upload the file again."}), 400
-            replaced = db.replace_nfp_prices_for_months(
-                pending["months"], pending["rows"], user["username"])
+            by = (f"{NFP_GOOGLE_SYNC_LABEL} ({user['username']})" if pending.get("google")
+                  else user["username"])
+            replaced = db.replace_nfp_prices_for_months(pending["months"], pending["rows"], by)
             try:
                 _nfp_module().reset_db_prices_cache()
             except Exception:
                 pass
+            # The stored list just changed, so yesterday's sheet check is stale.
+            with _NFP_SHEET_CHECK_LOCK:
+                _NFP_SHEET_CHECK.clear()
             clear_commission_cache()
             return jsonify({"status": "success", "rows": len(pending["rows"]),
                             "months": pending["months"], "replaced": replaced})
@@ -8339,30 +8870,7 @@ def nfp_prices_upload():
             except Exception:
                 pass
 
-        rows, summary_by_sheet = [], {}
-        for r in parsed:
-            months = _nfp_sheet_months(r["sheet"], nfp.MONTH_NAMES)
-            if not months:
-                continue
-            info = summary_by_sheet.setdefault(
-                r["sheet"], {"sheet": r["sheet"], "months": months, "tables": {}})
-            tkey = (r["panel_rating"], r["inverter_type"])
-            info["tables"][tkey] = info["tables"].get(tkey, 0) + 1
-            for month in months:
-                row = {k: r[k] for k in ("panel_rating", "table_no", "panels", "final_price",
-                                          "final_with_tng", "package_price", "tng_rebate",
-                                          "inverter_type", "power_system", "source_sheet")}
-                row["columns_json"] = (json.dumps(r["columns"], ensure_ascii=False)
-                                        if r.get("columns") else None)
-                row["month"] = month
-                rows.append(row)
-        summary = []
-        for info in summary_by_sheet.values():
-            summary.append({
-                "sheet": info["sheet"], "months": info["months"],
-                "tables": [{"rating": f"{rating}W {itype}", "rows": count}
-                            for (rating, itype), count in sorted(info["tables"].items())],
-            })
+        rows, summary = _nfp_price_rows(parsed, nfp)
 
         if not rows:
             return jsonify({"error": "No price tables recognized in this file. "

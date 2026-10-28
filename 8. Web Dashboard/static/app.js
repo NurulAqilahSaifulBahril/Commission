@@ -1609,7 +1609,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!found) return null;
 
         const headers = state.rawData.sections.basic_nfp.headers;
-        const packageIdx = headers.findIndex(h => h.toLowerCase().trim() === "package type" || h.toLowerCase().trim() === "package");
+        const packageIdx = headers.findIndex(h => h.toLowerCase().trim() === "package type" || h.toLowerCase().trim() === "property type" || h.toLowerCase().trim() === "package");
         const systemIdx = headers.findIndex(h => h.toLowerCase().trim() === "system price");
         const nfpIdx = headers.findIndex(h => h.toLowerCase().trim() === "net floor price" || h.toLowerCase().trim() === "netfloor price");
         const salesIdx = headers.findIndex(h => h.toLowerCase().trim() === "sales price" || h.toLowerCase().trim() === "total amount");
@@ -2024,7 +2024,8 @@ document.addEventListener("DOMContentLoaded", () => {
             profitSharingPct = parseFloat(modalProfitSharingPct?.value) || 0;
         }
 
-        const basicComm = salesForCalc * ((rate + profitSharingPct) / 100);
+        // Net of the RM 300 advance on a Balance row, like the row itself.
+        const basicComm = salesForCalc * ((rate + profitSharingPct) / 100) - (state.specialCaseAdvance || 0);
         const profitSharingComm = salesForCalc * (profitSharingPct / 100);
 
         let nfp = parseFloat(modalNetFloorPrice?.value) || 0;
@@ -2505,12 +2506,31 @@ modalPackageType.value = defaults.pkg || "-";
     // ------------------------------------------------------------------
     // Filtering helpers
     // ------------------------------------------------------------------
-    function matchesSearch(agentName, customerName) {
+    /** `invoiceDate` is passed by the Basic & Net Floor Price table only: its
+     *  rows carry no invoice number, so one typed in the search box is matched
+     *  against the customer's invoices in system_details -- the invoice dated
+     *  that day when the row has a date, else any of theirs. */
+    function matchesSearch(agentName, customerName, invoiceDate) {
         const query = state.filters.search;
         if (!query) return true;
         return String(agentName || "").toLowerCase().includes(query) ||
                String(customerName || "").toLowerCase().includes(query) ||
-               agentAliasMatches(agentName, query);
+               agentAliasMatches(agentName, query) ||
+               (invoiceDate !== undefined && invoiceNumberMatches(customerName, invoiceDate, query));
+    }
+
+    // "1009559", "INV-1009559" and "inv 1009559" all find INV-1009559. Only a
+    // query with a digit in it is tried, so typing "inv" does not match every row.
+    function invoiceNumberMatches(customerName, invoiceDate, query) {
+        const q = String(query).toLowerCase().replace(/[\s-]/g, "");
+        if (!/\d/.test(q)) return false;
+        const map = state.rawData?.sections?.basic_nfp?.system_details;
+        const entries = (map && customerName) ? (map[String(customerName).trim().toLowerCase()] || []) : [];
+        const day = String(invoiceDate || "").slice(0, 10);
+        const sameDay = /^\d{4}-\d{2}-\d{2}$/.test(day)
+            ? entries.filter(e => String(e.invoice_date || "").slice(0, 10) === day) : [];
+        return (sameDay.length ? sameDay : entries).some(e =>
+            String(e.invoice || "").toLowerCase().replace(/[\s-]/g, "").includes(q));
     }
 
     function getMonthRateKey() {
@@ -3367,20 +3387,34 @@ modalPackageType.value = defaults.pkg || "-";
     // are rebuilt from the basic_nfp payload rather than the active section's
     // rows, which carry no commission columns of their own. Headers are used
     // exactly as the payload gives them, so column indexes stay aligned.
+    /** The invoice date a Basic & NFP row belongs to. A Net Floor Price row
+     *  shows "-" under Invoice Date and sits under its Basic Commission row,
+     *  so it inherits that row's date -- until a new customer starts. */
+    function carryInvoiceDate(row, customerIdx, invDateIdx, current, currentCustomer) {
+        const date = invDateIdx !== -1 ? String(row[invDateIdx] || "").trim().slice(0, 10) : "";
+        if (/^\d{4}-\d{2}-\d{2}$/.test(date)) return date;
+        // The NFP row repeats its customer's name, so only a different name
+        // starts a new customer.
+        const cust = customerIdx !== -1 ? String(row[customerIdx] || "").trim() : "";
+        return cust && cust !== currentCustomer ? "" : current;
+    }
+
     function buildBasicNfpProcessed() {
         const sec = basicNfpSectionInView();
         if (!sec || !sec.headers || !sec.rows) return null;
         const headers = sec.headers;
         const agentIdx = headers.findIndex(h => h.toLowerCase().trim() === "agent");
         const customerIdx = headers.findIndex(h => h.toLowerCase().trim() === "customer");
-        let curAgent = "", curCustomer = "";
+        const invDateIdx = headers.findIndex(h => h.toLowerCase().trim() === "invoice date");
+        let curAgent = "", curCustomer = "", curInvDate = "";
         const processed = sec.rows.map(row => {
             if (agentIdx !== -1 && row[agentIdx] && String(row[agentIdx]).trim()) curAgent = String(row[agentIdx]).trim();
+            curInvDate = carryInvoiceDate(row, customerIdx, invDateIdx, curInvDate, curCustomer);
             if (customerIdx !== -1 && row[customerIdx] && String(row[customerIdx]).trim()) curCustomer = String(row[customerIdx]).trim();
             const n = curAgent.toLowerCase();
             return {
                 rawRow: [...row], originalRow: row,
-                fullAgentName: curAgent, customerName: curCustomer,
+                fullAgentName: curAgent, customerName: curCustomer, invoiceDate: curInvDate,
                 isTotalRow: n.includes("total") || n.includes("summary") || n.includes("grand"),
                 isSpecialCase: state.specialCaseRowRefs.has(row)
             };
@@ -3445,7 +3479,7 @@ modalPackageType.value = defaults.pkg || "-";
 
         const isVisible = (p) => {
             if (!filtersActive) return true;
-            if (searchOn && !matchesSearch(p.fullAgentName, p.customerName)) return false;
+            if (searchOn && !matchesSearch(p.fullAgentName, p.customerName, p.invoiceDate || "")) return false;
             if (payoutStageOn && !passesPayoutStage(p.rawRow)) return false;
             return true;
         };
@@ -4043,6 +4077,81 @@ modalPackageType.value = defaults.pkg || "-";
         };
     }
 
+    // "Original Price/Cash Price after discount" cell hover (user, 2026-10-23):
+    // the formula with this invoice's own figures -- Original Price on a Basic
+    // row, Cash Price on a Net Floor Price row -- from system_details'
+    // price_basis (invoice_price_basis.price_breakdown, the same rules the
+    // commission uses). A customer with several invoices is matched on the
+    // row's price, then its invoice date.
+    function getPriceBasisTooltip(row, headers, custName) {
+        const map = state.rawData?.sections?.basic_nfp?.system_details;
+        const name = String(custName || "").trim();
+        const entries = (map && name ? map[name.toLowerCase()] : null) || [];
+        const withBasis = entries.filter(e => e.price_basis);
+        if (!withBasis.length) return null;
+
+        const find = (pred) => headers.findIndex(h => pred(String(h).toLowerCase().trim()));
+        const commIdx = find(n => n === "commission" || n === "commission type");
+        const priceIdx = find(n => n === "sales price");
+        const dateIdx = find(n => n.includes("invoice date"));
+        const isNfp = commIdx !== -1 && /net floor/i.test(String(row[commIdx] || ""));
+        const cellPrice = priceIdx === -1 ? NaN
+            : parseFloat(String(row[priceIdx] || "").replace(/RM/gi, "").replace(/,/g, ""));
+        const key = isNfp ? "cash" : "original";
+        const rowDate = dateIdx === -1 ? "" : String(row[dateIdx] || "").trim();
+        const entry = withBasis.find(e => Math.abs(e.price_basis[key] - cellPrice) < 0.01)
+            || withBasis.find(e => rowDate && String(e.invoice_date || "").startsWith(rowDate.slice(0, 10)))
+            || withBasis[0];
+        const pb = entry.price_basis;
+
+        const line = (label, amount, sign = "", strong = false) => `
+            <div style="display:flex; gap:12px; margin-bottom:3px;${strong ? " font-weight:700;" : ""}">
+                <span style="flex:1;">${label}</span>
+                <span style="white-space:nowrap; text-align:right;">${sign}${formatRM(amount)}</span>
+            </div>`;
+        const item = (desc, amount) => `
+            <div style="display:flex; gap:12px; margin:0 0 2px 14px; font-size:11px; opacity:0.85;">
+                <span style="flex:1;">${escapeHtml(desc)}</span>
+                <span style="white-space:nowrap; text-align:right;">${formatRM(amount)}</span>
+            </div>`;
+        const rule = `<div style="border-top:1px solid rgba(127,127,127,0.35); margin:6px 0;"></div>`;
+
+        const out = [];
+        if (withBasis.length > 1) out.push(`<div style="margin-bottom:6px; opacity:0.75;">Invoice ${escapeHtml(entry.invoice)}</div>`);
+        out.push(line("Total Amount", pb.total));
+        let formula, result;
+        if (isNfp) {
+            const addonSum = pb.addons.reduce((s, a) => s + a.amount, 0);
+            if (pb.new_basis) {
+                out.push(line("− Add-ons", addonSum, "− "));
+                pb.addons.forEach(a => out.push(item(a.description, a.amount)));
+            }
+            out.push(line("− EPP interest", pb.epp, "− "));
+            formula = pb.new_basis ? "Total Amount − add-ons − EPP interest" : "Total Amount − EPP interest";
+            result = line("= Cash Price", pb.cash, "", true);
+        } else {
+            out.push(line("− EPP interest", pb.epp, "− "));
+            if (pb.new_basis) {
+                const luckySum = pb.lucky.reduce((s, a) => s + a.amount, 0);
+                out.push(line("+ Lucky draw", luckySum, "+ "));
+                pb.lucky.forEach(a => out.push(item(a.description, a.amount)));
+            }
+            formula = pb.new_basis ? "Total Amount − EPP interest + lucky draw" : "Total Amount − EPP interest";
+            result = line("= Original Price", pb.original, "", true);
+        }
+        out.push(rule, result);
+        // A special case can set its own price; say so rather than let the
+        // formula's figure contradict the cell.
+        if (!isNaN(cellPrice) && Math.abs(pb[key] - cellPrice) >= 0.01) {
+            out.push(`<div style="margin-top:6px; font-size:11px; opacity:0.85;">Price on this row: ${formatRM(cellPrice)} (special case)</div>`);
+        }
+        return {
+            title: isNfp ? "Cash Price after discount" : "Original Price",
+            formula,
+            subtext: out.join("")
+        };
+    }
+
     // Payment milestones for a Basic Commission row, rendered above the formula.
     //
     // The advance triggers on the 1st Payment Date. The balance triggers at 75%
@@ -4259,7 +4368,9 @@ modalPackageType.value = defaults.pkg || "-";
                     title: `Basic Commission — ${custName || "Special Case"}`,
                     preformula: milestones,
                     formula: `Original Price = Total Amount - EPP + Lucky Draw`,
-                    subtext: `Basic Commission = Original Price × Rate % = ${fmtNum(usedSales)} × ${rateText} = ${commValStr}` + clickTip
+                    subtext: `Basic Commission = Original Price × Rate % = ${fmtNum(usedSales)} × ${rateText}`
+                        + (parseFloat(sc.advanceDeducted) > 0 ? ` - ${fmtNum(parseFloat(sc.advanceDeducted))}` : "")
+                        + ` = ${commValStr}` + clickTip
                 };
             }
             // The RM 300 advance is a flat amount earned at a payment level,
@@ -4422,7 +4533,7 @@ modalPackageType.value = defaults.pkg || "-";
         // working against the payload's own column positions.
         // "Sales Price" is the column shown as "Original Price/Cash Price after
         // discount" (basicNfpHeaderLabel); removed here 2026-10-20.
-        const HIDDEN_SUMMARY_HEADERS = ["package type", "system price", "net floor price", "sales price"];
+        const HIDDEN_SUMMARY_HEADERS = ["package type", "property type", "system price", "net floor price", "sales price"];
         const hiddenSummaryCols = new Set(
             headers.reduce((acc, h, i) => {
                 if (HIDDEN_SUMMARY_HEADERS.includes(String(h).toLowerCase().trim())) acc.push(i);
@@ -4802,6 +4913,11 @@ modalPackageType.value = defaults.pkg || "-";
         // Lets the stylesheet draw the Basic & NFP tables' grid lines without
         // touching the other sections' tables (styles.css).
         document.body.classList.toggle("section-basic-nfp", state.activeSection === "basic_nfp");
+        // Invoice numbers are only searchable on the Basic & NFP table.
+        if (searchFilter) {
+            searchFilter.placeholder = state.activeSection === "basic_nfp"
+                ? "Type agent, customer or invoice no..." : "Type agent or customer name...";
+        }
         updateHeaders();
         updateNoteBox();
 
@@ -4975,12 +5091,15 @@ modalPackageType.value = defaults.pkg || "-";
             return advanceText;
         };
 
-        let currentAgentName = "", currentCustomerName = "";
+        const invDateIdx = headers.findIndex(h => h.toLowerCase().trim() === "invoice date");
+        let currentAgentName = "", currentCustomerName = "", currentInvoiceDate = "";
         const processedRows = rows.map(row => {
             const rowCopy = [...row];
             if (agentIdx !== -1 && rowCopy[agentIdx] && String(rowCopy[agentIdx]).trim()) currentAgentName = String(rowCopy[agentIdx]).trim();
+            currentInvoiceDate = carryInvoiceDate(rowCopy, customerIdx, invDateIdx, currentInvoiceDate, currentCustomerName);
             if (customerIdx !== -1 && rowCopy[customerIdx] && String(rowCopy[customerIdx]).trim()) currentCustomerName = String(rowCopy[customerIdx]).trim();
             return { rawRow: rowCopy, originalRow: row, fullAgentName: currentAgentName, customerName: currentCustomerName,
+                invoiceDate: currentInvoiceDate,
                 isTotalRow: currentAgentName.toLowerCase().includes("total") || currentAgentName.toLowerCase().includes("summary") || currentAgentName.toLowerCase().includes("grand"),
                 isSpecialCase: state.specialCaseRowRefs.has(row) };
         });
@@ -5005,7 +5124,8 @@ modalPackageType.value = defaults.pkg || "-";
             if (p.isTotalRow) {
                 return userObj && userObj.filterAgentName === null;
             }
-            if (applySearch && !matchesSearch(p.fullAgentName, p.customerName)) return false;
+            if (applySearch && !matchesSearch(p.fullAgentName, p.customerName,
+                state.activeSection === "basic_nfp" ? (p.invoiceDate || "") : undefined)) return false;
             if (applySearch && payoutStageActive && !passesPayoutStage(p.rawRow)) return false;
 
             // Single agent filtering
@@ -5801,6 +5921,16 @@ modalPackageType.value = defaults.pkg || "-";
 
                     // Add hover breakdown & click handlers for Basic/NFP commission cells
                     if (state.activeSection === "basic_nfp" && !isTotalRow) {
+                        // The price cell's formula (Original Price / Cash Price).
+                        if (String(headers[ci]).toLowerCase().trim() === "sales price"
+                            && cellVal != null && !["", "-"].includes(String(cellVal).trim())) {
+                            const priceInfo = getPriceBasisTooltip(row, headers, custName);
+                            if (priceInfo) {
+                                td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, priceInfo));
+                                td.addEventListener("mousemove", (e) => moveCommCalcTooltip(e));
+                                td.addEventListener("mouseleave", hideCommCalcTooltip);
+                            }
+                        }
                         if (ci === commissionIdx || ci === commissionPriceIdx) {
                             const isFactoryCell = isFactoryBasicCommission(row, headers, agentName, custName);
                             const calcInfo = getCommissionCalcBreakdown(row, headers, agentName, custName, ri, rowsToRender);
@@ -5887,6 +6017,16 @@ modalPackageType.value = defaults.pkg || "-";
 
                     // Add hover breakdown & click handlers for Basic/NFP commission cells
                     if (state.activeSection === "basic_nfp" && !isTotalRow) {
+                        // The price cell's formula (Original Price / Cash Price).
+                        if (String(headers[ci]).toLowerCase().trim() === "sales price"
+                            && cellVal != null && !["", "-"].includes(String(cellVal).trim())) {
+                            const priceInfo = getPriceBasisTooltip(row, headers, custName);
+                            if (priceInfo) {
+                                td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, priceInfo));
+                                td.addEventListener("mousemove", (e) => moveCommCalcTooltip(e));
+                                td.addEventListener("mouseleave", hideCommCalcTooltip);
+                            }
+                        }
                         if (ci === commissionIdx || ci === commissionPriceIdx) {
                             const isFactoryCell = isFactoryBasicCommission(row, headers, agentName, custName);
                             const calcInfo = getCommissionCalcBreakdown(row, headers, agentName, custName, displayedRows, rows);
@@ -6969,6 +7109,8 @@ modalPackageType.value = defaults.pkg || "-";
     // The money columns carry "(RM)" on screen, like Safwan (RM) (user,
     // 2026-10-23).
     const BASIC_NFP_HEADER_LABELS = {
+        "package type": "Property Type",
+        "property type": "Property Type",
         "sales price": "Original Price/Cash Price after discount",
         "commission price": "Commission Price (RM)",
         "other commission": "Other Commission (RM)",
@@ -7068,7 +7210,7 @@ modalPackageType.value = defaults.pkg || "-";
 
     function isFactoryBasicCommission(row, headers, fullAgentName, customerName) {
         if (state.activeSection !== "basic_nfp") return false;
-        const packageIdx = headers.findIndex(h => h.toLowerCase().trim() === "package type" || h.toLowerCase().trim() === "package");
+        const packageIdx = headers.findIndex(h => h.toLowerCase().trim() === "package type" || h.toLowerCase().trim() === "property type" || h.toLowerCase().trim() === "package");
         const commissionIdx = headers.findIndex(h => h.toLowerCase().trim() === "commission");
         if (packageIdx === -1 || commissionIdx === -1) return false;
         const pkg = String(row[packageIdx] || "").toLowerCase();
@@ -7811,7 +7953,7 @@ modalPackageType.value = defaults.pkg || "-";
         modalCustomerName.value = customerName;
         
         const headers = state.rawData.sections.basic_nfp.headers;
-        const packageIdx = headers.findIndex(h => h.toLowerCase().trim() === "package type" || h.toLowerCase().trim() === "package");
+        const packageIdx = headers.findIndex(h => h.toLowerCase().trim() === "package type" || h.toLowerCase().trim() === "property type" || h.toLowerCase().trim() === "package");
         const systemIdx = headers.findIndex(h => h.toLowerCase().trim() === "system price");
         const nfpIdx = headers.findIndex(h => h.toLowerCase().trim() === "net floor price" || h.toLowerCase().trim() === "netfloor price");
         const salesIdx = headers.findIndex(h => h.toLowerCase().trim() === "sales price" || h.toLowerCase().trim() === "total amount");
@@ -7838,13 +7980,24 @@ modalPackageType.value = defaults.pkg || "-";
         // of a price ("invoice before Oct 25", "EV package"), and stripping the
         // letters out of that read "25" as a floor price of RM 25.
         const origNfp = nfpIdx !== -1 ? parseMoneyValue(cellOf(nfpIdx)) : 0;
-        // Read the rate the report ALREADY computed for this exact invoice
-        // (basic commission ÷ sales price) instead of recalculating it from
-        // scratch — getDefaultBasicRateForPackage() is a simplified client-side
-        // guess that knows nothing about invoice date or effective-dated Data
-        // page rates, so it can (and did) disagree with the real server value.
+        // The rate the report ALREADY assigned this invoice -- its Basic Rate %
+        // column, the one the hover shows -- not a client-side guess
+        // (getDefaultBasicRateForPackage knows nothing of invoice dates or the
+        // Data page). Not Commission Price ÷ sales either: a Balance row's
+        // Commission Price is net of the RM 300 advance, which made Chang Yuk
+        // Leng's 6% read 4.97% (user, 2026-10-23). The advance is carried
+        // separately and comes off the figure instead.
         const actualCommVal = priceIdx !== -1 ? parseMoney(rowRef[priceIdx]) : 0;
-        let baseRate = sales > 0 && actualCommVal > 0 ? (actualCommVal / sales) * 100 : NaN;
+        const basicRateIdx = headers.findIndex(h => h.toLowerCase().trim() === "basic rate %");
+        const advanceIdx = headers.findIndex(h => h.toLowerCase().trim() === "advance deducted");
+        const assigned = basicRateIdx !== -1 ? String((figureRow || [])[basicRateIdx] || "").trim() : "";
+        const advance = advanceIdx !== -1 ? (parseMoneyValue((figureRow || [])[advanceIdx]) || 0) : 0;
+        state.specialCaseAdvance = advance;
+        let baseRate = /^\d+(\.\d+)?\s*%$/.test(assigned) ? parseFloat(assigned) : NaN;
+        if (!Number.isFinite(baseRate)) {
+            const basicComm = figureRow && priceIdx !== -1 ? parseMoney(figureRow[priceIdx]) : actualCommVal;
+            baseRate = sales > 0 && basicComm > 0 ? ((basicComm + advance) / sales) * 100 : NaN;
+        }
         if (!Number.isFinite(baseRate)) baseRate = getDefaultBasicRateForPackage(pkg, agentName);
 
         modalPackageType.value = pkg || "Residential";
@@ -7855,7 +8008,7 @@ modalPackageType.value = defaults.pkg || "-";
         if (modalBaselineRate) modalBaselineRate.value = baseRate;
         if (modalRatePct) modalRatePct.value = String(baseRate);
 
-        const origBasicCommVal = sales * (baseRate / 100);
+        const origBasicCommVal = sales * (baseRate / 100) - advance;
         let origNfpCommVal = 0;
         origNfpCommVal = nfpCommissionFor(sales, origNfp, packagePriceFor(customerName), nfpRatesFor(""));
 
@@ -7912,6 +8065,7 @@ modalPackageType.value = defaults.pkg || "-";
         modalNetFloorPrice.value = 0;
         modalSalesPrice.value = 0;
         const baseRate = getDefaultBasicRateForPackage("", "");
+        state.specialCaseAdvance = 0;
         if (modalBaselineRate) modalBaselineRate.value = baseRate;
         if (modalRatePct) modalRatePct.value = baseRate;
         if (modalOrigBasicComm) modalOrigBasicComm.value = "-";
@@ -7978,6 +8132,9 @@ modalPackageType.value = defaults.pkg || "-";
         modalNetFloorPrice.value = data.nfp;
         if (modalBaselineRate) modalBaselineRate.value = data.rate;
         if (modalRatePct) modalRatePct.value = data.rate;
+        // Only cases saved with the assigned rate carry the advance; older
+        // ones folded it into their rate (see openSpecialCaseModal).
+        state.specialCaseAdvance = parseFloat(data.advanceDeducted) || 0;
         // The NFP Baseline Rate is the one the invoice's own row was paid at:
         // the row this case replaced (foldSpecialCaseRows), else the case's
         // own figures against the standard rates.
@@ -8237,7 +8394,9 @@ modalPackageType.value = defaults.pkg || "-";
                 }
             }
 
-            const basicComm = salesForCalc * ((rate + profitSharingPct) / 100);
+            // Net of the RM 300 advance on a Balance row (app.py does the same).
+            const advanceDeducted = state.specialCaseAdvance || 0;
+            const basicComm = salesForCalc * ((rate + profitSharingPct) / 100) - advanceDeducted;
             let nfpComm = 0;
             if (specialCaseType === "fee_waiver") {
                 // Waived to RM 0 (app.py does the same); feeWaiver keeps the
@@ -8300,6 +8459,7 @@ modalPackageType.value = defaults.pkg || "-";
                 setVal("Agent", agent);
                 setVal("Customer", customer);
                 setVal("Package Type", pkg);
+                setVal("Property Type", pkg);
                 setVal("Package", pkg);
                 setVal("System Price", sysStr);
                 setVal("Net Floor Price", nfpStr);
@@ -8350,7 +8510,7 @@ modalPackageType.value = defaults.pkg || "-";
                 ? String(modalGanOverridePct?.value ?? "").trim() : "";
 
             const dataObject = {
-                agent, customer, pkg, system, nfp, sales, rate, remarks,
+                agent, customer, pkg, system, nfp, sales, rate, remarks, advanceDeducted,
                 profitSharingPct, specialCaseType, feeWaiver, adjustedSalesPrice,
                 adjustedCashPrice,
                 caseType: state.specialCaseMode, rowKind,
@@ -8637,7 +8797,7 @@ modalPackageType.value = defaults.pkg || "-";
         // saveFactoryRates() now read and write each agent's own bucket.
         if (!factoryRateModal) return;
 
-        const packageIdx = headers.findIndex(h => h.toLowerCase().trim() === "package type" || h.toLowerCase().trim() === "package");
+        const packageIdx = headers.findIndex(h => h.toLowerCase().trim() === "package type" || h.toLowerCase().trim() === "property type" || h.toLowerCase().trim() === "package");
         const systemIdx = headers.findIndex(h => h.toLowerCase().trim() === "system price");
         const nfpIdx = headers.findIndex(h => h.toLowerCase().trim() === "net floor price" || h.toLowerCase().trim() === "netfloor price");
         const salesIdx = headers.findIndex(h => h.toLowerCase().trim() === "sales price" || h.toLowerCase().trim() === "total amount");

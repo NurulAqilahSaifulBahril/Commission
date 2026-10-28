@@ -531,6 +531,9 @@ def init_db() -> None:
             -- A person's name beside the login, shown on the Admin page. Blank
             -- for accounts made before it existed until an admin fills it in.
             ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT;
+            -- The menu pages a staff account may open, comma-separated page
+            -- keys (auth.PAGES). NULL = every page its role allows.
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS pages TEXT;
 
             ALTER TABLE commission_rates ADD COLUMN IF NOT EXISTS override_from TEXT;
             ALTER TABLE commission_rates ADD COLUMN IF NOT EXISTS profit_sharing_mode TEXT;
@@ -671,7 +674,7 @@ def get_user_by_id(user_id: int) -> dict[str, Any] | None:
 def list_users() -> list[dict[str, Any]]:
     with _connect() as conn:
         return conn.execute(
-            "SELECT id, username, name, role, is_active, created_at FROM users ORDER BY created_at ASC"
+            "SELECT id, username, name, role, is_active, created_at, pages FROM users ORDER BY created_at ASC"
         ).fetchall()
 
 
@@ -686,9 +689,13 @@ def create_user(username: str, password_hash: str, role: str, name: str | None =
 
 def update_user(user_id: int, *, username: str | None = None, password_hash: str | None = None,
                  role: str | None = None, is_active: bool | None = None,
-                 name: str | None = None) -> None:
+                 name: str | None = None, pages: str | None = None) -> None:
     fields = []
     values: list[Any] = []
+    if pages is not None:
+        # "" = every page the role allows, stored as NULL.
+        fields.append("pages = %s")
+        values.append(pages or None)
     if username is not None:
         fields.append("username = %s")
         values.append(username)

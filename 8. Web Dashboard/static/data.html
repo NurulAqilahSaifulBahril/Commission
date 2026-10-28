@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/styles.css?v=20261021-greeting">
+    <link rel="stylesheet" href="/static/styles.css?v=20261027-rt-loose3">
     <style>
         /* Small additions specific to the data page, layered on top of styles.css */
         .data-content { display: flex; flex-direction: column; gap: 24px; }
@@ -426,18 +426,14 @@
                     <div class="card-header">
                         <h3>Net Floor Price List</h3>
                         <div style="display:flex; gap:12px;">
-                            <button class="btn btn-primary" id="nfpUploadBtn" style="display:none;">⬆️ Upload Net Floor Price List</button>
+                            <button class="btn btn-primary" id="nfpSyncBtn" style="display:none;">🔄 Sync from Google Sheet</button>
+                            <button class="btn btn-secondary" id="nfpUploadBtn" style="display:none;">⬆️ Upload Net Floor Price List</button>
                             <button class="btn btn-secondary" id="nfpListCloseBtn">✕ Close</button>
                         </div>
                     </div>
                     <input type="file" id="nfpUploadInput" accept=".xlsx" style="display:none;">
+                    <div id="nfpSheetStatus" class="section-hint" style="display:none;"></div>
                     <div id="nfpUploadPreview" class="section-hint" style="display:none;"></div>
-                    <div class="section-hint">
-                        This list is what the NFP calculation reads (the old monthly Excel is only a
-                        fallback for months with no rows here). Admins add new months with the Upload
-                        button — same layout as the monthly schedule file; a preview is shown before
-                        anything is saved.
-                    </div>
                     <div class="data-toolbar">
                         <select id="nfpListMonth"></select>
                         <select id="nfpListRating">
@@ -477,7 +473,10 @@
                 <section class="card table-card" id="rolesCard">
                     <div class="card-header">
                         <h3>Basic Commission</h3>
-                        <span class="row-count-badge" id="rolesCount">0 agents</span>
+                        <div style="display:flex; gap:10px; align-items:center;">
+                            <button class="btn btn-secondary" id="rolesReportBtn" title="Who reports to whom, from each agent's Reports To">📊 View Report</button>
+                            <span class="row-count-badge" id="rolesCount">0 agents</span>
+                        </div>
                     </div>
                     <!-- Needs-review summary: only shown when something is flagged -->
                     <div id="rolesReviewBanner" style="display:none; margin:0 24px 0; padding:8px 14px; border-radius:8px; background:#fffbeb; border:1px solid #fde68a; color:#92400e; font-size:13px; font-weight:600; align-items:center; gap:8px;">
@@ -814,6 +813,37 @@
          row on the EGA/ESA landing table, or by "New rule set". The field ids
          are the ones RULE_SECTIONS.ega already drives, so load and save are
          unchanged — only where the fields live has moved. -->
+    <!-- Reporting lines: who reports to whom, read from each agent's Reports To
+         on the Basic Commission table, as at the chosen month. -->
+    <div id="reportsToModal" class="modal hidden">
+        <div class="modal-content card rt-modal">
+            <div class="modal-header">
+                <h3>Reporting Lines — who reports to whom</h3>
+                <button id="reportsToCloseBtn" class="btn-close">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 0 0 12px; gap: 0; overflow-y: auto;">
+                <div class="data-toolbar" style="flex-wrap:wrap; gap:12px; align-items:center;">
+                    <label for="rtView" style="font-weight:600; font-size:13px;">View</label>
+                    <select id="rtView" style="padding:6px 10px; border-radius:8px; border:1px solid var(--border-color); font-size:13px;">
+                        <option value="level">By level</option>
+                        <option value="tree">Tree</option>
+                    </select>
+                    <label for="rtMonth" style="font-weight:600; font-size:13px;">As at</label>
+                    <input type="month" id="rtMonth" style="padding:6px 10px; border-radius:8px; border:1px solid var(--border-color); font-size:13px;">
+                    <label for="rtType" style="font-weight:600; font-size:13px;">Agent Type</label>
+                    <select id="rtType" style="padding:6px 10px; border-radius:8px; border:1px solid var(--border-color); font-size:13px;">
+                        <option value="">All Types</option>
+                        <option value="Internal">Internal</option>
+                        <option value="Outsource">Outsource</option>
+                    </select>
+                    <input type="text" id="rtSearch" placeholder="Find an agent..." style="padding:6px 12px; border-radius:8px; border:1px solid var(--border-color); font-size:13px; width:200px;">
+                    <span id="rtSummary" style="font-size:12.5px; color:var(--text-muted);"></span>
+                </div>
+                <div id="rtChart" class="rt-chart"></div>
+            </div>
+        </div>
+    </div>
+
     <div id="egaModal" class="modal hidden">
         <div class="modal-content card">
             <div class="modal-header">
@@ -1074,6 +1104,7 @@
                             <span class="prop-chip" data-val="Residential">+ Residential</span>
                             <span class="prop-chip" data-val="Commercial">+ Commercial</span>
                             <span class="prop-chip" data-val="Shop Lot">+ Shop Lot</span>
+                            <span class="prop-chip" data-val="Shoplot =< 36">+ Shoplot =&lt; 36</span>
                             <span class="prop-chip" data-val="Factory">+ Factory</span>
                             <span class="prop-chip" data-val="NGO Project">+ NGO Project</span>
                             <span class="prop-chip" data-val="Government Project">+ Government Project</span>
@@ -1231,8 +1262,8 @@
         </div>
     </div>
 
-    <script src="/static/data.js?v=20261021-grid-split"></script>
+    <script src="/static/data.js?v=20261027-override-onelist"></script>
     <script src="/static/sidebar_toggle.js?v=20261014-2"></script>
-    <script src="/static/greeting.js"></script>
+    <script src="/static/greeting.js?v=20261028-pages"></script>
 </body>
 </html>

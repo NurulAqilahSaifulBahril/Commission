@@ -2549,6 +2549,10 @@ body {
     padding-left: 10px;
     padding-right: 10px;
 }
+/* A month cell whose customers are all fully paid. */
+.sr-table td.sr-all-paid {
+    background-color: #F7C7AC;
+}
 .sr-table th.sr-col-jun-header {
     min-width: 220px;
 }
@@ -2585,9 +2589,11 @@ body {
 .sr-tip {
     position: fixed;
     z-index: 900;
-    max-width: 560px;
+    /* The panel ignores the mouse, so a scrollbar on it can never be used:
+       everything has to fit. Long customer names wrap instead of widening it. */
+    max-width: 640px;
     max-height: 60vh;
-    overflow-y: auto;
+    overflow: hidden;
     padding: 10px 12px;
     background: var(--bg-card, #fff);
     border: 1px solid var(--border-color, #dfe3ec);
@@ -2622,7 +2628,14 @@ body {
 }
 
 .sr-tip-table td.numeric { text-align: right; font-variant-numeric: tabular-nums; }
-.sr-tip-cust { font-weight: 600; border-top: 1px solid var(--border-color, #dfe3ec); }
+.sr-tip-cust {
+    font-weight: 600;
+    border-top: 1px solid var(--border-color, #dfe3ec);
+    white-space: normal !important;
+    min-width: 180px;
+    max-width: 300px;
+    overflow-wrap: anywhere;
+}
 .sr-tip-none { color: var(--text-muted, #64748b); font-style: italic; }
 
 /* A referral cell is hand-entered, so it invites a click rather than looking
@@ -2751,3 +2764,98 @@ body {
     border-color: var(--accent-blue, #2563eb);
     outline: none;
 }
+
+/* ── Reporting Lines chart (Data page, Basic Commission "View Report") ──── */
+/* Large, with a little of the page still showing round it; wide enough for
+   the seven role columns (1,372px) on a 1600px screen. */
+.modal-content.rt-modal {
+    max-width: none; width: min(1520px, calc(100vw - 80px));
+    height: calc(100vh - 64px); height: calc(100dvh - 64px);
+}
+.rt-modal .modal-body { flex: 1 1 auto; min-height: 0; }
+.rt-chart { padding: 8px 24px 16px; }
+.rt-section-title {
+    font-size: 13px; font-weight: 700; color: var(--text-secondary, #475569);
+    margin: 14px 0 6px; text-transform: uppercase; letter-spacing: .04em;
+}
+.rt-tree, .rt-tree ul { list-style: none; margin: 0; padding: 0; }
+.rt-tree ul { margin-left: 22px; padding-left: 14px; border-left: 1px solid var(--border-color, #dfe3ec); }
+.rt-tree li { position: relative; margin: 6px 0; }
+.rt-tree ul > li::before {
+    content: ""; position: absolute; left: -14px; top: 18px; width: 12px;
+    border-top: 1px solid var(--border-color, #dfe3ec);
+}
+.rt-node {
+    display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 7px 12px; border-radius: 10px; cursor: pointer;
+    background: var(--bg-card, #fff); border: 1px solid var(--border-color, #dfe3ec);
+    box-shadow: 0 1px 2px rgba(15, 23, 42, .05); max-width: 100%;
+}
+.rt-node:hover { border-color: var(--accent-blue, #2563eb); }
+.rt-node.rt-leaf { cursor: default; }
+.rt-node.rt-hit { border-color: #f59e0b; background: #fffbeb; box-shadow: 0 0 0 2px rgba(245, 158, 11, .25); }
+.rt-node.rt-missing { border-style: dashed; color: var(--text-muted, #64748b); }
+.rt-name { font-weight: 600; font-size: 13px; color: var(--text-primary, #0f172a); }
+.rt-meta { font-size: 11.5px; color: var(--text-muted, #64748b); }
+.rt-badge {
+    font-size: 10.5px; font-weight: 600; padding: 1px 7px; border-radius: 999px;
+    background: #eff6ff; color: #1d4ed8;
+}
+.rt-badge.rt-out { background: #f0fdf4; color: #15803d; }
+.rt-count {
+    font-size: 11px; font-weight: 700; min-width: 20px; text-align: center;
+    padding: 1px 6px; border-radius: 999px; background: #f1f5f9; color: #334155;
+}
+.rt-caret { font-size: 10px; color: var(--text-muted, #64748b); width: 10px; }
+.rt-tree li.rt-closed > ul { display: none; }
+.rt-unset { display: flex; flex-wrap: wrap; gap: 6px; }
+.rt-chip {
+    font-size: 12px; padding: 3px 10px; border-radius: 999px;
+    border: 1px dashed var(--border-color, #cbd5e1); color: var(--text-secondary, #475569);
+}
+.rt-chip.rt-hit { border-color: #f59e0b; background: #fffbeb; }
+
+/* Reporting Lines "By level": one band per role, people placed on their
+   role's band, lines drawn from leader to team in an SVG underneath. */
+.rtl-wrap { overflow-x: auto; overflow-y: hidden; border: 1px solid var(--border-color, #dfe3ec); border-radius: 10px; margin: 4px 0 12px; }
+.rtl-canvas { position: relative; }
+.rtl-band { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--border-color, #e2e8f0); }
+.rtl-band:nth-child(even) { background: rgba(148, 163, 184, .06); }
+.rtl-band-label {
+    position: sticky; left: 0; display: inline-block; padding: 6px 10px; z-index: 2;
+    font-size: 11px; font-weight: 700; color: var(--text-secondary, #475569);
+    background: var(--bg-card, #fff); border-right: 1px solid var(--border-color, #e2e8f0);
+    border-bottom: 1px solid var(--border-color, #e2e8f0); border-bottom-right-radius: 8px;
+}
+.rtl-lines { position: absolute; left: 0; top: 0; pointer-events: none; }
+.rtl-lines path { fill: none; stroke: #94a3b8; stroke-width: 1.4; }
+.rtl-node {
+    position: absolute; box-sizing: border-box; padding: 6px 8px; border-radius: 10px;
+    background: var(--bg-card, #fff); border: 1px solid var(--border-color, #dfe3ec);
+    box-shadow: 0 1px 3px rgba(15, 23, 42, .08); cursor: pointer; overflow: hidden; z-index: 1;
+}
+.rtl-node:hover { border-color: var(--accent-blue, #2563eb); }
+.rtl-node.rt-leaf { cursor: default; }
+.rtl-node.rt-hit { border-color: #f59e0b; background: #fffbeb; box-shadow: 0 0 0 2px rgba(245, 158, 11, .3); }
+.rtl-node.rt-missing { border-style: dashed; color: var(--text-muted, #64748b); }
+.rtl-node .rt-name { display: block; font-size: 12px; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rtl-node .rt-meta { display: block; font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rtl-node .rt-count { position: absolute; top: 5px; right: 6px; font-size: 10px; padding: 0 5px; }
+.rtl-node.rtl-folded { border-bottom: 3px solid var(--accent-blue, #2563eb); }
+/* Sideways layout: each role band is a column with its name on top. */
+.rtl-band.rtl-col { top: 0; bottom: 0; right: auto; border-top: none; border-left: 1px dashed var(--border-color, #e2e8f0); }
+.rtl-band.rtl-col:first-child { border-left: none; }
+.rtl-col .rtl-band-label {
+    position: relative; left: auto; display: block; text-align: center;
+    border-right: none; border-radius: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* By level: someone with no leader and no team, placed in their role's column. */
+.rtl-node.rtl-loose { border-style: dashed; background: var(--bg-secondary, #f8fafc); box-shadow: none; }
+.rtl-divider { position: absolute; left: 0; border-top: 2px dashed #cbd5e1; z-index: 1; }
+.rtl-divider span {
+    position: absolute; left: 8px; top: -11px; padding: 1px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 700; color: #64748b; background: var(--bg-card, #fff); border: 1px solid #e2e8f0;
+}
+/* Sales Report hover: which price a case counts at, under its amount. */
+.sr-tip-basis { font-size: 10px; font-weight: 600; color: var(--text-muted, #64748b); margin-left: 4px; }
+.sr-tip-total td { border-top: 1px solid var(--border-color, #dfe3ec); font-weight: 700; padding-top: 4px; }

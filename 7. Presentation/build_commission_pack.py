@@ -3908,9 +3908,9 @@ def _build_customer_summary_table_chunk(title: str, headers: list[str], rows: li
     # pair. Sales Price is not spanned: the Basic row carries the Original
     # Price and the NFP row the Cash Price (invoice_price_basis.py).
     lower_hdrs = [h.lower().strip() for h in headers]
-    if "customer" in lower_hdrs and "package type" in lower_hdrs and "commission" in lower_hdrs:
+    if "customer" in lower_hdrs and ("package type" in lower_hdrs or "property type" in lower_hdrs) and "commission" in lower_hdrs:
         cust_idx = lower_hdrs.index("customer")
-        pkg_idx = lower_hdrs.index("package type")
+        pkg_idx = lower_hdrs.index("property type") if "property type" in lower_hdrs else lower_hdrs.index("package type")
 
         for r_idx in range(0, len(rows), 2):
             if r_idx + 1 < len(rows):
@@ -5217,19 +5217,19 @@ EXCEL_SECTION_SHEETS = {
 # date column is the full payment date.
 _BASIC_NFP_ROW_HEADERS = {
     "Internal": ["Agent", "Customer", "Invoice Date", "1st Payment Date",
-                 "Basic Commission (RM300)", "75% Payment Date", "Package Type",
+                 "Basic Commission (RM300)", "75% Payment Date", "Property Type",
                  "System Price", "Net Floor Price", "Sales Price", "Commission",
                  "Commission Price", "Override", "Safwan (RM)", "Referral Name",
                  "Referral Fee", "Basic Rate %", "Advance Deducted", "Advance Payment Date"],
     "Outsource": ["Agent", "Customer", "Invoice Date", "1st Payment Date",
-                  "Basic Commission (RM300)", "75% Payment Date", "Package Type",
+                  "Basic Commission (RM300)", "75% Payment Date", "Property Type",
                   "System Price", "Net Floor Price", "Sales Price", "Commission",
                   "Commission Price", "Override", "Safwan (RM)", "Gan Lai Soon",
                   "Referral Name", "Referral Fee", "Basic Rate %", "Advance Deducted",
                   "Advance Payment Date"],
 }
 _STAGE_SHEET_COLUMNS = ["Agent", "Customer", "Invoice Date", "1st Payment Date",
-                        "Basic Commission (RM300)", "75% Payment Date", "Package Type",
+                        "Basic Commission (RM300)", "75% Payment Date", "Property Type",
                         "System Price", "Net Floor Price", "Sales Price", "Commission",
                         "Commission Price", "Override", "Safwan (RM)", "Gan Lai Soon",
                         "Referral Name", "Referral Fee", "Basic Rate %"]
@@ -5682,8 +5682,8 @@ def build_commission_excel(
     # 1. Int Basic & NFP by Customer
     ws = wb.active
     ws.title = "Int Basic & NFP by Customer"
-    int_cust_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)"]
-    int_cust_headers_july = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)"]
+    int_cust_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Property Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)"]
+    int_cust_headers_july = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Property Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)"]
     curr_row = 1
     for m in months_to_export:
         rows = int_customer_summary_rows.get(m, [])
@@ -5707,8 +5707,8 @@ def build_commission_excel(
 
     # 3. Out Basic & NFP by Customer
     ws = wb.create_sheet("Out Basic & NFP by Customer")
-    out_cust_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
-    out_cust_headers_july = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Package Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
+    out_cust_headers = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Full Payment Date", "Property Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
+    out_cust_headers_july = ["Agent", "Customer", "Invoice Date", "1st Payment Date", "Basic Commission (RM300)", "75% Payment Date", "Property Type", "System Price", "Net Floor Price", "Sales Price", "Commission", "Commission Price", "Senior Override", "Referral Name", "Referral Fee", "Safwan (RM)", "Gan Lai Soon"]
     curr_row = 1
     for m in months_to_export:
         rows = out_customer_summary_rows.get(m, [])

@@ -287,15 +287,99 @@ def _cell(row, key) -> str:
 # scoped to anything — it means "all types" — so it must behave exactly like a
 # row that leaves the column blank. Without this, ticking every box makes a row
 # stricter than ticking none, which is the opposite of what it reads like.
-_ALL_PROPERTY_TYPES = {"residential", "commercial", "shop lot", "factory",
-                       "ngo project", "government project"}
+_ALL_PROPERTY_TYPES = {"residential", "commercial", "shop lot", "shoplot =< 36",
+                       "factory", "ngo project", "government project"}
+
+
+def normalize_prop_name(s: str) -> str:
+    """Canonical lower-case property type name."""
+    v = str(s or "").strip().lower()
+    if v in ("shoplot =< 36", "shoplot <= 36", "shop lot =< 36", "shop lot <= 36"):
+        return "shoplot =< 36"
+    if v == "ngo":
+        return "ngo project"
+    if v in ("goverment", "government"):
+        return "government project"
+    return v
 
 
 def _row_property_list(r) -> list:
-    props = [p.strip() for p in _cell(r, "property_type").lower().split(",") if p.strip()]
-    if not props or _ALL_PROPERTY_TYPES.issubset(set(props)):
+    props = [normalize_prop_name(p) for p in _cell(r, "property_type").split(",") if p.strip()]
+    primary_props = {"residential", "commercial", "shop lot", "factory", "ngo project", "government project"}
+    if not props or primary_props.issubset(set(props)):
         return []
     return props
+
+
+def get_invoice_panel_qty(row: dict) -> int:
+    """Return the integer panel quantity for an invoice row, or 0 if unknown."""
+    if not isinstance(row, dict):
+        return 0
+    raw_qty = row.get("panel_qty")
+    if raw_qty is not None:
+        try:
+            qty = int(raw_qty)
+            if qty > 0:
+                return qty
+        except (ValueError, TypeError):
+            pass
+
+    import re
+    for field in ("package_name_snapshot", "description", "package_type"):
+        text = str(row.get(field) or "").strip()
+        if not text:
+            continue
+        m = re.search(r'\b(\d+)\s*[xX×]\s*\d{3,4}\s*[wW]?\b', text)
+        if m:
+            try:
+                val = int(m.group(1))
+                if val > 0:
+                    return val
+            except ValueError:
+                pass
+        m = re.search(r'\b(\d+)\s*[xX×]\s*(?:JINKO|LONGI|TRINA|JA\s+SOLAR|CANADIAN|PANELS?)\b', text, re.I)
+        if m:
+            try:
+                val = int(m.group(1))
+                if val > 0:
+                    return val
+            except ValueError:
+                pass
+        m = re.search(r'\b(?:panel\s*qty|qty|panels?)\s*[:=]?\s*(\d+)\b', text, re.I)
+        if m:
+            try:
+                val = int(m.group(1))
+                if val > 0:
+                    return val
+            except ValueError:
+                pass
+        m = re.search(r'\b(\d+)\s*(?:pcs|panels?)\b', text, re.I)
+        if m:
+            try:
+                val = int(m.group(1))
+                if val > 0:
+                    return val
+            except ValueError:
+                pass
+    return 0
+
+
+def resolve_invoice_property_type(row: dict, base_prop_type: str) -> tuple:
+    """Return (display_property_type, rate_property_type) for an invoice row.
+
+    If classified as 'Shop Lot' and the invoice has 36 or fewer panels:
+    - display_property_type is 'Shoplot =< 36'
+    - rate_property_type is 'Shoplot =< 36, Shop Lot' (matches Shoplot =< 36 first, falling back to Shop Lot)
+    Otherwise:
+    - display_property_type is base_prop_type (e.g. 'Shop Lot', 'Residential', 'Factory')
+    - rate_property_type is base_prop_type
+    """
+    prop = base_prop_type or "Residential"
+    if prop == "Shop Lot":
+        panel_count = get_invoice_panel_qty(row)
+        if 0 < panel_count <= 36:
+            return "Shoplot =< 36", "Shoplot =< 36, Shop Lot"
+    return prop, prop
 
 
 # Job Type splits the business into the solar installs it was built on and
@@ -502,6 +586,8 @@ def _scan_unified_rows(agent_type, hierarchy, month, year, agent, property_type,
     target = f"{year:04d}-{month:02d}"
     agent_key = _canon_agent_key(agent)
     prop_key = str(property_type or "").strip().lower()
+    agent_type = str(agent_type or "").strip().lower()
+    hierarchy = _normalize_hierarchy(hierarchy)
     # The most specific row wins, and only then the latest effective_from:
     # naming the agent (2) outranks naming the property (1), which outranks a
     # row that names neither. Without this the winner would depend on row order.
@@ -528,12 +614,15 @@ def _scan_unified_rows(agent_type, hierarchy, month, year, agent, property_type,
         # this, a tie between e.g. a Factory row and a Residential row at the
         # same effective_from is resolved by silent row order, not by rule.
         row_props = _row_property_list(r)
+        prop_score = 0
         if row_props:
             if not prop_key:
                 continue
-            caller_props = [p.strip().lower() for p in prop_key.split(",") if p.strip()]
-            if not any(cp in row_props for cp in caller_props):
+            caller_props = [normalize_prop_name(p) for p in prop_key.split(",") if p.strip()]
+            matches = [len(caller_props) - i for i, cp in enumerate(caller_props) if cp in row_props]
+            if not matches:
                 continue
+            prop_score = max(matches)
         eff = _cell(r, "effective_from")
         if not effective_covers(eff, target):
             continue
@@ -544,7 +633,7 @@ def _scan_unified_rows(agent_type, hierarchy, month, year, agent, property_type,
             rate = Decimal(_cell(r, "rate_pct").replace("%", "")) / Decimal("100")
         except Exception:
             continue
-        spec = (2 if row_agents else 0) + (1 if row_props else 0)
+        spec = (10 if row_agents else 0) + prop_score
         # Rank on the start month — the raw cell would sort a range above the
         # plain month it starts in, purely on string length — but hand back the
         # cell as written, because callers display it and "2026-07 to 2026-08"
@@ -1264,11 +1353,14 @@ def get_agent_role(agent_name: str, month: int, year: int = 2026,
 # Since 2026-10-20 every Basic override comes from the Data page. An agent's
 # own rate rows carry Override Rate % and From Role pairs ("0.5" / "OSA", or
 # several comma-joined: "0.5, 0.75" / "Sales Team Manager, Sales Consultant");
-# a From Role may name one person, stored as "Role (Name)". Whoever sells, the
-# people above them in the Reports To chain are checked in turn, and each one
-# whose override names the seller's role (or the seller by name, or no role
-# at all) earns that rate on the sale. Nobody else earns an override: the old
-# hardcoded 0.25% / 0.5% and the hardcoded tier map are gone.
+# a From Role may name one person, stored as "Role (Name)", and either may end
+# in "(group)" to take in everyone under them (see _parse_override_from).
+# Whoever sells, the people above them in the Reports To chain are checked in
+# turn, and each one whose override takes in the seller earns that rate on the
+# sale -- from July 2026 only; before that only the seller's own Reports To
+# earns on a role line (TEAM_OVERRIDES_FROM). A line naming a person earns
+# wherever its owner sits. Nobody else earns an override: the old hardcoded
+# 0.25% / 0.5% and the hardcoded tier map are gone.
 #
 # Gan Lai Soon's 0.75% OGM override, Safwan's 0.5% and the Factory split stay
 # hardcoded in the engines (user, 2026-10-20), so Gan Lai Soon is skipped here
@@ -1278,14 +1370,38 @@ _OVERRIDE_SKIP = {"gan lai soon"}
 _OVERRIDE_CHAIN_LIMIT = 8
 
 
-def _split_override_from(value: str) -> tuple[str, str]:
-    """("Role", "Person") for a From Role cell; "Role (Person)" names one
-    person, a plain "Role" names everyone holding it, blank names everyone."""
+_GROUP_SUFFIX = re.compile(r"\s*\(group\)\s*$", re.I)
+
+# Overrides from July 2026 are a team's: anyone in the leader's Reports To
+# chain can earn. Before that they were individual (user, 27 Oct 2026): only
+# the seller's own Reports To earns, plus anyone whose override names the
+# seller as a person.
+TEAM_OVERRIDES_FROM = (2026, 7)
+
+
+def _parse_override_from(value: str) -> tuple[str, str, bool]:
+    """("Role", "Person", group) for a From Role cell:
+      ""                                  everyone below (all roles)
+      "Sales Team Manager"                anyone holding that role below
+      "Sales Team Manager (group)"        those people and everyone under them
+      "Sales Team Manager (Ng Zhan Yi)"   that one person
+      "Sales Team Manager (Ng Zhan Yi) (group)"  that person and everyone under them"""
     text = str(value or "").strip()
+    group = bool(_GROUP_SUFFIX.search(text))
+    if group:
+        text = _GROUP_SUFFIX.sub("", text).strip()
     m = re.match(r"^(.*?)\s*\(([^()]*)\)\s*$", text)
     if m:
-        return m.group(1).strip(), m.group(2).strip()
-    return text, ""
+        return m.group(1).strip(), m.group(2).strip(), group
+    return text, "", group
+
+
+def _split_override_from(value: str) -> tuple[str, str]:
+    """("Role", "Person") for a From Role cell; "Role (Person)" names one
+    person, a plain "Role" names everyone holding it, blank names everyone.
+    A "(group)" suffix is set aside -- see _parse_override_from."""
+    role, person, _group = _parse_override_from(value)
+    return role, person
 
 
 def _override_pairs(row) -> list:
@@ -1341,10 +1457,17 @@ def _override_row_for(agent_name: str, role_row, month: int, year: int,
             if row_atype and atype and row_atype != atype:
                 continue
         row_props = _row_property_list(r)
-        if row_props and prop_key and prop_key not in row_props:
-            continue
+        prop_score = 0
+        if row_props:
+            if not prop_key:
+                continue
+            caller_props = [normalize_prop_name(p) for p in prop_key.split(",") if p.strip()]
+            matches = [len(caller_props) - i for i, cp in enumerate(caller_props) if cp in row_props]
+            if not matches:
+                continue
+            prop_score = max(matches)
         job_fit = 1 if _row_job_type(r) == want_job else 0
-        cand = ((2 if row_agents else 0), job_fit, (1 if row_props else 0),
+        cand = ((10 if row_agents else 0) + prop_score, job_fit,
                 effective_start(_cell(r, "effective_from")))
         if best is None or cand > best[0]:
             best = (cand, r)
@@ -1380,8 +1503,11 @@ def get_data_page_overrides(agent_name: str, month: int, year: int = 2026,
         return []
     seller_role = _normalize_hierarchy(str(seller_row.get("hierarchy", "") or ""))
     seller_key = _canon_agent_key(agent_name)
+    team = (year, month) >= TEAM_OVERRIDES_FROM
+    skip = {_canon_agent_key(s) for s in _OVERRIDE_SKIP}
 
-    out = []
+    # The Reports To chain above the seller: [(name, key, role row)], nearest first.
+    chain = []
     seen = {seller_key}
     current = seller_row
     for _ in range(_OVERRIDE_CHAIN_LIMIT):
@@ -1391,23 +1517,109 @@ def get_data_page_overrides(agent_name: str, month: int, year: int = 2026,
             break
         seen.add(boss_key)
         boss_row = get_agent_role_row(boss, month, year=year, package=package)
-        if boss_key not in {_canon_agent_key(s) for s in _OVERRIDE_SKIP}:
-            row = _override_row_for(boss, boss_row, month, year, package, property_type)
-            for rate, from_cell in (_override_pairs(row) if row else []):
-                from_role, from_person = _split_override_from(from_cell)
-                if from_person:
-                    hit = _canon_agent_key(from_person) == seller_key
-                else:
-                    hit = (not from_role or from_role.lower() == ROLE_ALL
-                           or _normalize_hierarchy(from_role) == seller_role)
-                if hit:
-                    out.append({"name": boss, "key": boss_key, "rate": rate,
-                                "from_role": from_cell})
-                    break
+        chain.append((boss, boss_key, boss_row))
         if boss_row is None:
             break
         current = boss_row
+
+    def _role_of(row):
+        return _normalize_hierarchy(str((row or {}).get("hierarchy", "") or ""))
+
+    # Who sits between the seller and someone in the chain (the seller too):
+    # the people a "(group)" line can reach the seller through.
+    below = [(seller_key, seller_role)]
+
+    def _match(from_cell, between, in_chain):
+        """How strongly one From Role line takes in this sale, 0 = not at all.
+        A person beats a person's group, which beats a role's group, then a
+        role, then all roles; a leader earns on the best line only."""
+        role, person, group = _parse_override_from(from_cell)
+        if person:
+            pkey = _canon_agent_key(person)
+            if pkey == seller_key:
+                return 5
+            if group and team and any(k == pkey for k, _r in between):
+                return 4
+            return 0
+        if not in_chain:
+            return 0
+        if not role or role.lower() == ROLE_ALL:
+            return 1
+        want = _normalize_hierarchy(role)
+        if group:
+            return 3 if any(r == want for _k, r in between) else 0
+        return 2 if want == seller_role else 0
+
+    out = []
+    earned = set()
+    for depth, (boss, boss_key, boss_row) in enumerate(chain):
+        direct = depth == 0
+        if boss_key not in skip:
+            row = _override_row_for(boss, boss_row, month, year, package, property_type)
+            best = (0, None, None)
+            for rate, from_cell in (_override_pairs(row) if row else []):
+                score = _match(from_cell, below, True)
+                # Before July only the direct Reports To earns on role lines;
+                # anyone further up needs a line naming the seller.
+                if not team and not direct and score != 5:
+                    score = 0
+                if score > best[0]:
+                    best = (score, rate, from_cell)
+            if best[0]:
+                out.append({"name": boss, "key": boss_key, "rate": best[1],
+                            "from_role": best[2]})
+                earned.add(boss_key)
+        below.append((boss_key, _role_of(boss_row)))
+
+    # A line naming a person (or a person's group) earns wherever its owner
+    # sits -- a same-level override such as Teng Kah Kent's 0.1% on Ng Zhan Yi
+    # needs no Reports To between them.
+    chain_keys = {k for _n, k, _r in chain}
+    for owner in dict.fromkeys(o for o, _r in _person_override_rows(month, year)):
+        okey = _canon_agent_key(owner)
+        if okey in earned or okey in chain_keys or okey == seller_key or okey in skip:
+            continue
+        owner_row = get_agent_role_row(owner, month, year=year, package=package)
+        own = _override_row_for(owner, owner_row, month, year, package, property_type)
+        if own is None:
+            continue
+        best = (0, None, None)
+        for rate, from_cell in _override_pairs(own):
+            score = _match(from_cell, below, False)
+            if score > best[0]:
+                best = (score, rate, from_cell)
+        if best[0]:
+            out.append({"name": owner, "key": okey, "rate": best[1], "from_role": best[2]})
+            earned.add(okey)
     return out
+
+
+_PERSON_ROWS_INDEX = (None, [])
+
+
+def _person_override_rows(month: int, year: int) -> list:
+    """[(owner name, rate row)] for rate rows naming one owner whose overrides
+    include a person ("Role (Name)") line and cover the month. Built once per
+    load of the rate table: it is asked for every invoice line."""
+    global _PERSON_ROWS_INDEX
+    rows = _unified_rows()
+    if _PERSON_ROWS_INDEX[0] is not rows:
+        index = []
+        for r in rows:
+            if (_cell(r, "rate_type") or "Basic Commission") != "Basic Commission":
+                continue
+            if _cell(r, "remarks").lower() == "deleted" or not _cell(r, "override_rate_pct"):
+                continue
+            owners = _row_agent_list(r)
+            if len(owners) != 1:
+                continue
+            if not any(_parse_override_from(c)[1] for _rate, c in _override_pairs(r)):
+                continue
+            index.append((owners[0], r))
+        _PERSON_ROWS_INDEX = (rows, index)
+    target = f"{year:04d}-{month:02d}"
+    return [(o, r) for o, r in _PERSON_ROWS_INDEX[1]
+            if effective_covers(_cell(r, "effective_from"), target)]
 
 
 # ── Agent type routing (dashboard "agent_roles") ─────────────────────────────

@@ -132,15 +132,20 @@ def _is_system(item: dict) -> bool:
             or bool(_PANEL_RE.search(str(item.get("description") or ""))))
 
 
-def addon_total(price_items: Any) -> Decimal:
-    """What the invoice's add-on lines add to its Total Amount."""
+def addon_items(price_items: Any) -> list[dict]:
+    """The invoice's add-on lines: every positive line that is neither the
+    package (the system) nor EPP interest."""
     positive = [it for it in _items(price_items)
                 if _dec(it.get("amount")) > 0 and not _is_epp(it)]
     system = [it for it in positive if _is_system(it)]
     if not system and positive:
         system = [max(positive, key=lambda it: _dec(it.get("amount")))]
-    return sum((_dec(it.get("amount")) for it in positive
-                if not any(it is s for s in system)), Decimal("0"))
+    return [it for it in positive if not any(it is s for s in system)]
+
+
+def addon_total(price_items: Any) -> Decimal:
+    """What the invoice's add-on lines add to its Total Amount."""
+    return sum((_dec(it.get("amount")) for it in addon_items(price_items)), Decimal("0"))
 
 
 def _opening_day_part(desc: str, amount: Decimal) -> Decimal:
@@ -162,10 +167,10 @@ def _opening_day_part(desc: str, amount: Decimal) -> Decimal:
     return min(total, -amount)
 
 
-def lucky_draw_addback(price_items: Any) -> Decimal:
-    """The lucky draw prizes and Opening Day special discounts deducted on the
-    invoice, as a positive amount."""
-    total = Decimal("0")
+def lucky_draw_items(price_items: Any) -> list[tuple[dict, Decimal]]:
+    """(line, amount added back) for each lucky draw prize or Opening Day
+    special discount deducted on the invoice; the amount is positive."""
+    out = []
     for it in _items(price_items):
         amount = _dec(it.get("amount"))
         desc = str(it.get("description") or "")
@@ -175,10 +180,20 @@ def lucky_draw_addback(price_items: Any) -> Decimal:
             plain = sum((_dec(m.group(1)) for m in
                          (_PLAIN_DISCOUNT_RE.match(part) for part in desc.splitlines())
                          if m), Decimal("0"))
-            total += max(Decimal("0"), -amount - plain)
+            back = max(Decimal("0"), -amount - plain)
         elif _OPENING_DAY_RE.search(desc):
-            total += _opening_day_part(desc, amount)
-    return total
+            back = _opening_day_part(desc, amount)
+        else:
+            continue
+        if back:
+            out.append((it, back))
+    return out
+
+
+def lucky_draw_addback(price_items: Any) -> Decimal:
+    """The lucky draw prizes and Opening Day special discounts deducted on the
+    invoice, as a positive amount."""
+    return sum((back for _, back in lucky_draw_items(price_items)), Decimal("0"))
 
 
 def original_price(total: Any, epp: Any, invoice_date: Any,
@@ -236,3 +251,27 @@ def cash_price(total: Any, epp: Any, invoice_date: Any,
     if not applies(invoice_date):
         return _dec(total) - _dec(epp)
     return _dec(total) - addon_total(price_items) - _dec(epp)
+
+
+def price_breakdown(total: Any, epp: Any, invoice_date: Any,
+                    price_items: Any) -> dict:
+    """How the Original Price and the Cash Price come off this invoice, line
+    by line -- for the price cell hover on the Basic & NFP report (user,
+    2026-10-23). Built from the same helpers as original_price / cash_price,
+    so the two prices here are the ones the commission uses."""
+    def line(it, amount):
+        desc = " ".join(str(it.get("description") or "").split())
+        return {"description": desc, "amount": float(amount)}
+
+    new_basis = applies(invoice_date)
+    addons = [line(it, _dec(it.get("amount"))) for it in addon_items(price_items)] if new_basis else []
+    lucky = [line(it, back) for it, back in lucky_draw_items(price_items)] if new_basis else []
+    return {
+        "new_basis": new_basis,
+        "total": float(_dec(total)),
+        "epp": float(_dec(epp)),
+        "addons": addons,
+        "lucky": lucky,
+        "original": float(original_price(total, epp, invoice_date, price_items)),
+        "cash": float(cash_price(total, epp, invoice_date, price_items)),
+    }

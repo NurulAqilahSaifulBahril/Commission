@@ -30,9 +30,33 @@
         return me;
     }
 
+    // Every menu page, {key, label}, as the server lists them.
+    let pageList = [];
+
+    /** The Page Access cell: the pages this account may open. An admin
+     *  always has every page; a staff account every page but Admin unless an
+     *  admin has narrowed it. */
+    function pagesCellHtml(u) {
+        const mine = u.available_pages || [];
+        const staffPages = pageList.filter((p) => p.key !== "admin");
+        let text;
+        if (u.role === "admin") text = `<span class="pages-all">All pages</span>`;
+        else if (staffPages.every((p) => mine.includes(p.key))) text = `<span class="pages-all">All pages</span>`;
+        else if (!mine.length) text = `<span class="pages-none">No pages</span>`;
+        else text = pageList.filter((p) => mine.includes(p.key))
+            .map((p) => `<span class="page-chip">${escapeHtml(p.label)}</span>`).join("");
+        const edit = u.role === "admin"
+            ? `<span class="pages-note" title="Admins can always open every page">admin</span>`
+            : `<button class="btn btn-secondary name-edit" data-action="pages" data-id="${u.id}"
+                    data-pages="${escapeHtml(mine.join(","))}" title="Choose the pages this user can open">Edit</button>`;
+        return `<td class="pages-col"><div class="pages-cell"><div class="pages-list">${text}</div>${edit}</div></td>`;
+    }
+
     async function loadUsers() {
         const res = await api("/api/admin/users");
-        const all = await res.json();
+        const body = await res.json();
+        const all = Array.isArray(body) ? body : (body.users || []);
+        pageList = (body && body.pages) || pageList;
         // Deactivated accounts are hidden unless asked for. They are never
         // deleted: their login and audit history still names them, and an
         // admin may want to reactivate one.
@@ -55,6 +79,7 @@
                             data-name="${escapeHtml(u.name || "")}" title="Edit name">Edit</button>
                 </div></td>
                 <td>${escapeHtml(u.role)}</td>
+                ${pagesCellHtml(u)}
                 <td>${u.is_active ? "Active" : "Deactivated"}</td>
                 <td>${fmtDate(u.created_at)}</td>
                 <td class="row-actions">
@@ -102,6 +127,11 @@
             return;
         }
 
+        if (action === "pages") {
+            editPages(btn);
+            return;
+        }
+
         if (action === "password") {
             openPasswordModal(id, btn.getAttribute("data-username"),
                               btn.getAttribute("data-active") === "1");
@@ -137,6 +167,38 @@
         }
         loadUsers();
         loadAudit();
+    }
+
+    // ── Available pages, ticked in place ─────────────────────────────────────
+    // A tick box per page (Admin is for admins only, so it is not offered);
+    // Save stores them, Cancel puts the cell back.
+    function editPages(btn) {
+        const id = btn.getAttribute("data-id");
+        const mine = (btn.getAttribute("data-pages") || "").split(",").filter(Boolean);
+        const cell = btn.closest(".pages-cell");
+        const boxes = pageList.filter((p) => p.key !== "admin").map((p) => `
+            <label class="page-tick"><input type="checkbox" value="${escapeHtml(p.key)}"${mine.includes(p.key) ? " checked" : ""}>
+                ${escapeHtml(p.label)}</label>`).join("");
+        cell.innerHTML = `<div class="pages-editor">${boxes}
+            <div class="pages-editor-actions">
+                <button class="btn btn-primary" data-pe="save">Save</button>
+                <button class="btn btn-secondary" data-pe="cancel">Cancel</button>
+            </div></div>`;
+        cell.querySelector("[data-pe='cancel']").addEventListener("click", () => loadUsers());
+        cell.querySelector("[data-pe='save']").addEventListener("click", async (ev) => {
+            const pages = [...cell.querySelectorAll("input[type=checkbox]")].filter((c) => c.checked).map((c) => c.value);
+            if (!pages.length && !confirm("Untick every page? This user will not be able to open anything.")) return;
+            ev.target.disabled = true;
+            try {
+                await sendUserUpdate(id, { pages });
+            } catch (e) {
+                alert(e.message);
+                ev.target.disabled = false;
+                return;
+            }
+            loadUsers();
+            loadAudit();
+        });
     }
 
     // ── Name, edited in place ────────────────────────────────────────────────

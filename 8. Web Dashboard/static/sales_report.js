@@ -374,9 +374,27 @@
         return ` data-cases="${caseLists.length - 1}"`;
     }
 
-    /** The hover panel itself: one table of every payment behind the cases in
-     *  the cell, newest first. A browser tooltip cannot draw a table and wraps
-     *  long text into an unreadable block, so this is a panel of our own. */
+    /** True when a month cell has cases and every one of them is fully paid
+     *  -- that cell is shaded #F7C7AC (user, 28 Oct 2026). */
+    function allFullyPaid(cases) {
+        const all = (cases || []).filter(Boolean);
+        return all.length > 0 && all.every(c => c.f);
+    }
+
+    /** A case's first payment -- the one that places it in a month: the
+     *  earliest by payment date, a real amount before a RM0 one. */
+    function firstPayment(pays) {
+        const list = (pays || []).slice().sort((x, y) =>
+            ((y.a > 0) - (x.a > 0)) || String(x.d || "").localeCompare(String(y.d || ""))
+            || String(x.m || "").localeCompare(String(y.m || "")));
+        return list[0] || null;
+    }
+
+    /** The hover panel itself: one row per case in the cell -- its first
+     *  payment (amount, paid date, created date) and the price it counts at:
+     *  Sales price once fully paid, Original price until then (user, 28 Oct
+     *  2026). A browser tooltip cannot draw a table and wraps long text into
+     *  an unreadable block, so this is a panel of our own. */
     function caseTable(entry) {
         const rows = [];
         // The panel cannot be scrolled -- it ignores the mouse so it never
@@ -385,31 +403,38 @@
         const shown = entry.cases.slice(0, 12);
         const more = entry.cases.length - shown.length;
         shown.forEach(c => {
-            const pays = c.p || [];
-            const span = Math.max(1, pays.length);
-            const name = `<td class="sr-tip-cust" rowspan="${span}">${escapeHtml(c.n)}</td>`;
-            if (!pays.length) {
+            const name = `<td class="sr-tip-cust">${escapeHtml(c.n)}</td>`;
+            // Figure and label in cells of their own, so the figures and the
+            // total line up while the label still sits beside each figure.
+            const price = c.v === undefined ? `<td class="sr-tip-none">—</td><td></td>`
+                : `<td class="numeric">${fmtRM(c.v)}</td><td class="sr-tip-basis">${c.f ? "Sales price" : "Original price"}</td>`;
+            const p = firstPayment(c.p);
+            if (!p) {
                 rows.push(`<tr>${name}<td colspan="3" class="sr-tip-none">`
-                    + `no payment recorded in this period</td></tr>`);
+                    + `no payment recorded in this period</td>${price}</tr>`);
                 return;
             }
-            pays.forEach((p, i) => {
-                rows.push(`<tr>${i === 0 ? name : ""}`
-                    + `<td class="numeric">${fmtRM(p.a)}</td>`
-                    + `<td>${escapeHtml(p.d || "—")}</td>`
-                    + `<td>${escapeHtml(p.m || "—")}</td></tr>`);
-            });
+            rows.push(`<tr>${name}`
+                + `<td class="numeric">${fmtRM(p.a)}</td>`
+                + `<td>${escapeHtml(p.d || "—")}</td>`
+                + `<td>${escapeHtml(p.m || "—")}</td>${price}</tr>`);
         });
         if (more) {
-            rows.push(`<tr><td colspan="4" class="sr-tip-none">`
+            rows.push(`<tr><td colspan="6" class="sr-tip-none">`
                 + `…and ${plural(more, "more case")}</td></tr>`);
         }
+        // Every case in the cell, the trimmed ones too, so it reads as the ANS.
+        const priced = entry.cases.filter(c => c.v !== undefined);
+        const total = priced.length
+            ? `<tfoot><tr class="sr-tip-total"><td colspan="4">Total</td>`
+                + `<td class="numeric">${fmtRM(priced.reduce((s, c) => s + c.v, 0))}</td><td></td></tr></tfoot>`
+            : "";
         return `<div class="sr-tip-head">${escapeHtml(entry.label)} —
                 ${plural(entry.cases.length, "case")}</div>
             <table class="sr-tip-table">
-                <thead><tr><th>Customer</th><th>Amount</th>
-                    <th>Paid</th><th>Created</th></tr></thead>
-                <tbody>${rows.join("")}</tbody>
+                <thead><tr><th>Customer</th><th>1st payment</th>
+                    <th>Paid</th><th>Created</th><th colspan="2">Price</th></tr></thead>
+                <tbody>${rows.join("")}</tbody>${total}
             </table>`;
     }
 
@@ -469,13 +494,14 @@
             cells.push(`<td class="sr-type">${escapeHtml(t.type)}</td>`);
             for (let m = 1; m <= lm; m++) {
                 const cell = t.months[m - 1] || { noc: 0, ans: 0 };
+                const paid = allFullyPaid(cell.custs) ? " sr-all-paid" : "";
                 if (m === sm && splitJune(data)) {
-                    cells.push(`<td class="numeric"${caseAttrs(cell.custs, MONTH_ABBR[m - 1])}>${cell.noc}</td>`,
-                        `<td class="numeric sr-col-jun-val">${fmtRM(t.jun_early)}</td>`,
-                        `<td class="numeric sr-col-jun-val">${fmtRM(t.jun_late)}</td>`);
+                    cells.push(`<td class="numeric${paid}"${caseAttrs(cell.custs, MONTH_ABBR[m - 1])}>${cell.noc}</td>`,
+                        `<td class="numeric sr-col-jun-val${paid}">${fmtRM(t.jun_early)}</td>`,
+                        `<td class="numeric sr-col-jun-val${paid}">${fmtRM(t.jun_late)}</td>`);
                 } else {
-                    cells.push(`<td class="numeric"${caseAttrs(cell.custs, MONTH_ABBR[m - 1])}>${cell.noc}</td>`,
-                        `<td class="numeric${m === 6 ? " sr-col-jun-val" : ""}">${fmtRM(cell.ans)}</td>`);
+                    cells.push(`<td class="numeric${paid}"${caseAttrs(cell.custs, MONTH_ABBR[m - 1])}>${cell.noc}</td>`,
+                        `<td class="numeric${m === 6 ? " sr-col-jun-val" : ""}${paid}">${fmtRM(cell.ans)}</td>`);
                 }
             }
             const tier = Number(agent.bonus_tier) || 0;

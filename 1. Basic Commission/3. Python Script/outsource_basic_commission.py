@@ -728,6 +728,7 @@ candidates AS (
     COALESCE(NULLIF(TRIM(a.name), ''), '(unknown)') AS agent_name,
     a.agent_type,
     a.commission AS agent_comm_field,
+    COALESCE(i.panel_qty, 0)::int AS panel_qty,
     i.package_type,
     i.package_name_snapshot,
     i.description,
@@ -1267,7 +1268,9 @@ def main(argv: list[str]) -> int:
         canonical_name = info["canonical_name"]
         customer_name = str(r.get("customer_name") or "(unknown)").strip()
         invoice_num = str(r.get("invoice_number") or "").strip()
-        prop_type = classify_property_type(r)
+        base_prop_type = classify_property_type(r)
+        from basic_commission_rates import resolve_invoice_property_type
+        prop_type, rate_prop_type = resolve_invoice_property_type(r, base_prop_type)
         
         total = _to_decimal(r.get("total_amount"))
         paid_amount = _to_decimal(r.get("paid_amount"))
@@ -1289,7 +1292,7 @@ def main(argv: list[str]) -> int:
             month=_inv_dt_parsed.month if _inv_dt_parsed else 5,
             year=_inv_dt_parsed.year if _inv_dt_parsed else 2026,
             agent=canonical_name,
-            property_type=prop_type,
+            property_type=rate_prop_type,
         )
 
         NOT_FULLY_PAID_INVS = {'1008316', '1007905'}
@@ -1444,7 +1447,7 @@ def main(argv: list[str]) -> int:
             comm, rate, ev_rate, ev_comm, ev_amt, rate_display = basic_commission_for_row(
                 r, sales_price,
                 lambda job, ev: get_own_commission_rate(
-                    info, agent_comm_field, inv_dt, property_type=prop_type,
+                    info, agent_comm_field, inv_dt, property_type=rate_prop_type,
                     job_type=job, ev_type=ev,
                 ),
             )
@@ -1461,7 +1464,7 @@ def main(argv: list[str]) -> int:
             # Overrides earned on this invoice, from the Data page (Override
             # Rate % / From Role up the Reports To chain) -- since 2026-10-20
             # no hardcoded 0.5% and no hardcoded tier map.
-            line_overrides = _line_overrides(canonical_name, inv_dt, r, prop_type)
+            line_overrides = _line_overrides(canonical_name, inv_dt, r, rate_prop_type)
             senior_ovr = sum((sales_price * h["rate"] for h in line_overrides), Decimal("0"))
 
             processed_outsource_invoices.append(
@@ -1501,8 +1504,8 @@ def main(argv: list[str]) -> int:
         # confirmed 70/20/10 split, above) inside the `if prop_type ==
         # "Factory":` branch, and applying this flat 0.5% on top would
         # double-credit the same OUM.
-        if prop_type != "Factory":
-            for h in _line_overrides(canonical_name, inv_dt, r, prop_type):
+        if base_prop_type != "Factory":
+            for h in _line_overrides(canonical_name, inv_dt, r, rate_prop_type):
                 override_commissions[h["name"]] += sales_price * h["rate"]
 
     # Credit Data page overrides under the name the recipient's own sales use.

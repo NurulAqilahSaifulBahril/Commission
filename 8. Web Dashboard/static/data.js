@@ -211,7 +211,7 @@
     // Commission's own payout mechanics; kept as a list so a future scheme can
     // add its own without touching the grid code.
     const RULE_TYPE_OPTIONS = ["", "Advance", "Payout"];
-    const PROPERTY_TYPES = ["", "Residential", "Commercial", "Shop Lot", "Factory", "NGO Project", "Government Project"];
+    const PROPERTY_TYPES = ["", "Residential", "Commercial", "Shop Lot", "Shoplot =< 36", "Factory", "NGO Project", "Government Project"];
 
     // The edit page is scoped to one commission type per visit, set by which
     // "Add / Edit entries" button opened it — no visible type switcher.
@@ -277,6 +277,7 @@
             let str = item.trim().toLowerCase();
             if (str === "ngo") return "ngo project";
             if (str === "goverment" || str === "government") return "government project";
+            if (str === "shoplot =< 36" || str === "shoplot <= 36" || str === "shop lot =< 36" || str === "shop lot <= 36") return "shoplot =< 36";
             return str;
         }).filter(Boolean);
         items.sort();
@@ -391,7 +392,7 @@
         document.getElementById("accountWhoami").textContent = `${me.username} (${me.role})`;
         isAdmin = me.role === "admin";
         if (isAdmin) {
-            ["editModeBtn", "nfpAddBtn", "nfpUploadBtn", "seedRolesBtn", "addRoleBtn", "showExcludedRolesBtn", "saveRolesBtn",
+            ["editModeBtn", "nfpAddBtn", "nfpUploadBtn", "nfpSyncBtn", "seedRolesBtn", "addRoleBtn", "showExcludedRolesBtn", "saveRolesBtn",
              "contestSaveBtn", "contestNewBtn", "contestAddRosterBtn",
              "anpSaveBtn", "anpAddTierBtn", "egaSaveBtn", "egaAddMonthBtn", "egaNewBtn", "pbSaveBtn",
              "egaCarryAddBtn", "egaCarrySaveBtn"].forEach((id) => {
@@ -1682,6 +1683,29 @@
         return ev ? -1 : 0;
     }
 
+    /** The order an agent's own rates are dealt to identical role rows (see
+     *  identicalRowShare and loadAgentOwnRates): Residential first, then a rate
+     *  for every property type, then Commercial / Shop Lot, Factory and the
+     *  rest. Dealt in stored order instead, saving a rate gave it a new id at
+     *  the end of the list and swapped it onto the other row: Chan Jia Wei's
+     *  5.25% Residential rate (27 Oct 2026) moved to his second Branch Sales
+     *  Manager row and the first showed the 2% Factory rate. */
+    function ownRateDealRank(row) {
+        const props = normProp(row.property_type).split(", ").filter(Boolean)
+            .map((p) => p.toLowerCase());
+        if (props.some((p) => p.startsWith("residential"))) return 0;
+        if (!props.length) return 1;
+        if (props.some((p) => p.startsWith("shoplot") || p === "shop lot" || p === "commercial")) return 2;
+        if (props.includes("factory")) return 3;
+        return 4;
+    }
+
+    function byOwnRateDealOrder(a, b) {
+        return ownRateDealRank(a) - ownRateDealRank(b)
+            || normProp(a.property_type).localeCompare(normProp(b.property_type))
+            || String(a.rate_pct || "").localeCompare(String(b.rate_pct || ""));
+    }
+
     /** A role row's own share of the agent's rates when the agent has two or
      *  more identical role rows (same dates, package, Agent Type and Role --
      *  a second "Branch Sales Manager" row added for a Factory rate). Their
@@ -1701,7 +1725,7 @@
         if (siblings.length < 2) return null;
         const owners = new Map(siblings.map((x) => [x, []]));
         const shared = new Set();
-        roleRateRows.forEach((row) => {
+        [...roleRateRows].sort(byOwnRateDealOrder).forEach((row) => {
             if ((row.rate_type || "Basic Commission") !== "Basic Commission") return;
             if (String(row.remarks || "").trim().toLowerCase() === "deleted") return;
             const agents = String(row.agent || "").split(",").map((a) => a.trim().toLowerCase()).filter(Boolean);
@@ -1773,7 +1797,7 @@
         // of whose types is priced by this agent's own rate. The cell shows the
         // everyday types -- Residential, Commercial, Shop Lot -- and the hover
         // lists every type, Factory / NGO / Government projects included.
-        const MAIN = ["Residential", "Commercial", "Shop Lot"];
+        const MAIN = ["Residential", "Commercial", "Shop Lot", "Shoplot =< 36"];
         const group = (list) => {
             const out = [];
             list.forEach((prop) => {
@@ -1790,11 +1814,27 @@
             return { html: `<span style="color:var(--text-muted);">—</span>`,
                 title: "No Basic Commission rate on the Data page covers this role; the calculation falls back to its built-in default." };
         }
-        const main = group(MAIN);
-        const shown = main.length ? main : all;
-        const html = shown.length === 1
-            ? escapeHtml(`${shown[0].rate}%`)
-            : shown.map((g) => `<div style="white-space:nowrap;">${escapeHtml(`${g.rate}%`)} <span style="color:var(--text-muted); font-size:11px;">${escapeHtml(g.props.join(", "))}</span></div>`).join("");
+        // One line per rate row, labelled with the property types the row
+        // itself names ("2% Commercial, Shop Lot, Factory"). A role row holding
+        // a single rate showed the bare "2%" before, which hid what it was for
+        // (Chan Jia Wei's second Branch Sales Manager row, 27 Oct 2026). Only a
+        // single rate for every property type stays unlabelled.
+        const rateRows = [];
+        [...MAIN, ...props].forEach((prop) => {
+            const b = best[prop];
+            if (b && !rateRows.some((x) => x.row === b.row)) rateRows.push(b);
+        });
+        // normProp lower-cases for matching; show the names as the page spells
+        // them, in the page's order.
+        const labelOf = (b) => {
+            const own = normProp(b.row.property_type).split(", ").filter(Boolean);
+            if (!own.length) return "Other property types";
+            const named = props.filter((p) => own.includes(normProp(p)));
+            return (named.length ? named : own).join(", ");
+        };
+        const html = rateRows.length === 1 && !normProp(rateRows[0].row.property_type)
+            ? escapeHtml(`${rateRows[0].rate}%`)
+            : rateRows.map((b) => `<div style="white-space:nowrap;">${escapeHtml(`${b.rate}%`)} <span style="color:var(--text-muted); font-size:11px;">${escapeHtml(labelOf(b))}</span></div>`).join("");
         const title = `Basic Commission rate as at ${fmtMonth(ym)}:\n`
             + all.map((g) => `${g.rate}% — ${g.props.join(", ")}${g.own ? " (this agent's own rate)" : ""}`).join("\n");
         return { html, title };
@@ -1833,7 +1873,7 @@
         };
         const all = groupBy(PROPERTY_TYPES.filter(Boolean));
         if (!all.length) return dash;
-        const main = groupBy(["Residential", "Commercial", "Shop Lot"]);
+        const main = groupBy(["Residential", "Commercial", "Shop Lot", "Shoplot =< 36"]);
         const shown = main.length ? main : all;
         const block = (g) => g.lines.length
             ? g.lines.map((t) => `<div style="white-space:nowrap;">${escapeHtml(t)}</div>`).join("")
@@ -1989,19 +2029,24 @@
      *  which stays put when a nick name changes. {role, agent}; agent is "" for
      *  a plain role. */
     function splitOverrideFrom(value) {
-        const v = String(value || "").trim();
+        let v = String(value || "").trim();
+        // "(group)" at the end takes in everyone under them too (user, 27 Oct
+        // 2026): "Sales Team Manager (group)", "Sales Team Manager (Ng Zhan Yi) (group)".
+        const group = /\s*\(group\)\s*$/i.test(v);
+        if (group) v = v.replace(/\s*\(group\)\s*$/i, "").trim();
         const m = /^(.*?)\s*\(([^()]+)\)$/.exec(v);
-        return m ? { role: m[1].trim(), agent: m[2].trim() } : { role: v, agent: "" };
+        return m ? { role: m[1].trim(), agent: m[2].trim(), group } : { role: v, agent: "", group };
     }
 
     /** What a From Role reads as: the person by nick name, as the team knows
-     *  them -- "Sales Team Manager (Louis Ng)". */
+     *  them -- "Sales Team Manager (Louis Ng)", "Sales Team Manager (group)". */
     function overrideFromLabel(value) {
-        const { role, agent } = splitOverrideFrom(value);
-        if (!agent) return role;
+        const { role, agent, group } = splitOverrideFrom(value);
+        const tail = group ? " (group)" : "";
+        if (!agent) return role + (role ? tail : "");
         const key = agent.toLowerCase();
         const row = rolesList.find((x) => String(x.agent || "").trim().toLowerCase() === key && x.nick_name);
-        return `${role} (${(row && row.nick_name) || agent})`;
+        return `${role} (${(row && row.nick_name) || agent})${tail}`;
     }
 
     /** The people a role card's override can name: everyone of the card's
@@ -2659,21 +2704,29 @@
                     ${line.oRules.length > 1 ? `<button type="button" class="btn btn-secondary" data-act="rm-orule" data-k="${k}" style="${tiny}" title="Remove this override">✕</button>` : ""}
                     ${k === last ? `<button type="button" class="btn btn-secondary" data-act="add-orule" style="${tiny}" title="Add another override, e.g. from a different role">+</button>` : ""}
                 </div>`).join("");
-            // Below the roles, one choice per person who held one of them in
-            // this role's dates: the override then comes from that agent only.
-            const people = overridePersonOptions(p, roleOpts.filter(Boolean));
+            // One From Role list in sections (user, 27 Oct 2026): roles, then
+            // whole groups ("Sales Team Manager (group)" -- them and everyone
+            // under them), then people under their role's heading, each with
+            // their own "(group)". People come last: they are rarely used.
+            const roleList = roleOpts.filter(Boolean);
+            const people = overridePersonOptions(p, roleList);
+            const byRole = roleList.map((r) => [r, people.filter((x) => splitOverrideFrom(x.value).role === r)])
+                .filter(([, list]) => list.length);
+            const listed = new Set([""].concat(roleList, roleList.map((r) => `${r} (group)`),
+                people.map((x) => x.value), people.map((x) => `${x.value} (group)`)));
             const oFrom = line.oRules.map((o, k) => {
                 const from = o.override_from || "";
-                const known = roleOpts.includes(from) || people.some((x) => x.value === from);
-                const roleList = known ? roleOpts : roleOpts.concat([from]);
-                const personHtml = people.length
-                    ? `<optgroup label="A specific person">${people.map((x) => opt(x.value, from, x.label)).join("")}</optgroup>`
-                    : "";
-                // A person's name needs the room; a plain role keeps the narrow box.
-                const w = splitOverrideFrom(from).agent ? 176 : 104;
+                // A saved value the list no longer offers stays selectable.
+                const extra = from && !listed.has(from) ? opt(from, from, overrideFromLabel(from)) : "";
+                const html = opt("", from, "(all roles)") + extra
+                    + `<optgroup label="Roles">${roleList.map((r) => opt(r, from, r)).join("")}</optgroup>`
+                    + `<optgroup label="Whole groups — them and everyone under them">${roleList.map((r) => opt(`${r} (group)`, from, `${r} (group)`)).join("")}</optgroup>`
+                    + byRole.map(([r, list]) => `<optgroup label="${escapeHtml(r)} — a specific person">${list.map((x) =>
+                        opt(x.value, from, x.label) + opt(`${x.value} (group)`, from, `${x.label} (group)`)).join("")}</optgroup>`).join("");
+                const w = splitOverrideFrom(from).agent || splitOverrideFrom(from).group ? 210 : 150;
                 return `
                 <div data-orule="${k}" style="height:30px; display:flex; align-items:center; gap:3px; white-space:nowrap;">
-                    <select data-o="from" title="${escapeHtml(overrideFromLabel(from) || "(all roles)")}" style="${ctl} width:${w}px;">${roleList.map((x) => opt(x, from, x ? overrideFromLabel(x) : "(all roles)")).join("")}${personHtml}</select>
+                    <select data-o="from" title="${escapeHtml(overrideFromLabel(from) || "(all roles)")}" style="${ctl} width:${w}px;">${html}</select>
                 </div>`;
             }).join("");
             const props = propList.concat(line.property.filter((x) => !propList.includes(x)));
@@ -3113,6 +3166,10 @@
             ownRows.push(r);
         });
         const orphans = [];
+        // Dealt in a fixed order, as identicalRowShare deals them for the
+        // table, so the popup and the table always agree on which card holds
+        // which rate, and a save never swaps them.
+        ownRows.sort(byOwnRateDealOrder);
         ownRows.forEach((r) => {
             const exact = rolePeriods.filter((q) => sameSlot(q, r)
                 && canonRole(rateRoleOf(q)) === canonRole(r.hierarchy));
@@ -3888,7 +3945,73 @@
             if (months.includes(viewYm)) sel.value = viewYm;
         }
         renderNfpList();
+        loadNfpSheetStatus();
         document.getElementById("nfpListCard").scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+
+    const NFP_DIFF_LABELS = {
+        final_price: "Net floor price", final_with_tng: "With TNG", package_price: "Package price",
+        tng_rebate: "TNG rebate", promo_price: "Promo price", promo_from: "Promo from", promo_to: "Promo to",
+        columns: "Columns",
+    };
+
+    function nfpDiffValue(v) {
+        return typeof v === "number" ? fmtRM(v) : (v == null ? "—" : escapeHtml(String(v)));
+    }
+
+    /** One line per row that differs: "Mar 2026 · 650W string · 9 panels — Net floor
+     *  price: stored 15,827.40 → sheet 15,827.55". */
+    function nfpDiffList(examples) {
+        return examples.map((c) => {
+            const fields = Object.entries(c.fields).map(([f, v]) =>
+                `${NFP_DIFF_LABELS[f] || f}: stored ${nfpDiffValue(v.stored)} → sheet <strong>${nfpDiffValue(v.sheet)}</strong>`
+            ).join("; ");
+            const what = [c.rating ? `${c.rating}W` : "", c.inverter || "", c.system ? `${c.system}-phase` : ""]
+                .filter(Boolean).join(" ");
+            return `<li>${fmtMonth(c.month)} · ${escapeHtml(what)} · ${c.panels} panels — ${fields}</li>`;
+        }).join("");
+    }
+
+    function nfpDiffCounts(diff) {
+        const parts = [];
+        if (diff.changed) parts.push(`${diff.changed} rows that differ`);
+        if (diff.added) parts.push(`${diff.added} rows only on the sheet`);
+        if (diff.removed) parts.push(`${diff.removed} rows no longer on the sheet`);
+        const months = Object.entries(diff.by_month || {})
+            .map(([m, n]) => `${fmtMonth(m)} (${n})`).join(", ");
+        return `${parts.join(", ")}${months ? ` — ${months}` : ""}`;
+    }
+
+    /** The daily check: does the stored list still match the Google Sheet? */
+    async function loadNfpSheetStatus(refresh) {
+        const box = document.getElementById("nfpSheetStatus");
+        if (!box) return;
+        box.style.display = "";
+        box.innerHTML = refresh ? "Checking the Google Sheet…" : (box.innerHTML || "Checking the Google Sheet…");
+        let s;
+        try {
+            const res = await api(`/api/nfp-prices/google-check${refresh ? "?refresh=1" : ""}`);
+            s = await res.json();
+        } catch (e) {
+            box.innerHTML = `<span style="color:#b91c1c;">Could not check the Google Sheet: ${escapeHtml(e.message || "")}</span>`;
+            return;
+        }
+        const recheck = ` <a href="#" id="nfpSheetRecheck">Check again</a>`;
+        if (s.error) {
+            box.innerHTML = `<span style="color:#b91c1c;">Could not read the Google Sheet (${escapeHtml(s.error)}).</span>${recheck}`;
+        } else if (s.in_sync) {
+            box.innerHTML = `<span style="color:#16a34a;">✓ Matches the Google Sheet</span> — every price for ` +
+                `${s.months.length} months, checked ${escapeHtml(s.checked_at)}.${recheck}`;
+        } else {
+            box.innerHTML = `<span style="color:#b45309; font-weight:600;">⚠ Differs from the Google Sheet</span> — ` +
+                `${escapeHtml(nfpDiffCounts(s))}. Checked ${escapeHtml(s.checked_at)}.` +
+                (isAdmin ? " Use Sync from Google Sheet to review and apply." : " An admin can apply it with Sync from Google Sheet.") +
+                recheck;
+        }
+        document.getElementById("nfpSheetRecheck")?.addEventListener("click", (ev) => {
+            ev.preventDefault();
+            loadNfpSheetStatus(true);
+        });
     }
 
     // Power System per price row: within a month, a 650W table whose panel counts
@@ -3931,10 +4054,18 @@
         return out;
     }
 
+    // The sheet's discount-rate column ("Max Discount percentage"), not the
+    // price worked out from it ("Price after Max Percentage Discount"), which
+    // read as "17613%" until 2026-10-23.
+    function isRateColumn(label) {
+        const l = String(label).toLowerCase();
+        return l.includes("percentage") && !l.includes("after");
+    }
+
     function fmtColValue(label, v) {
         if (v == null || v === "") return "—";
         if (typeof v === "number") {
-            if (label.toLowerCase().includes("percentage")) {
+            if (isRateColumn(label)) {
                 return v <= 1 ? `${Math.round(v * 100)}%` : `${v}%`;
             }
             return v.toLocaleString("en-MY", { minimumFractionDigits: 2 });
@@ -4008,9 +4139,16 @@
 
             const wrap = document.createElement("div");
             wrap.className = "table-container";
+            // The sheet merges the discount rate down each band of panel
+            // counts, so only the band's first row stores it: carry it down.
+            const lastRate = {};
             const bodyHtml = groupRows.map((p) => {
                 const byLabel = {};
                 rowColumns(p).forEach(([label, v]) => { byLabel[label] = v; });
+                labels.filter(isRateColumn).forEach((l) => {
+                    if (byLabel[l] != null && byLabel[l] !== "") lastRate[l] = byLabel[l];
+                    else if (lastRate[l] != null) byLabel[l] = lastRate[l];
+                });
                 return `<tr><td class="sm-cell">${escapeHtml(p.panels)}</td>` +
                     labels.map((l) => `<td>${escapeHtml(fmtColValue(l, byLabel[l] != null ? byLabel[l] : null))}</td>`).join("") +
                     `</tr>`;
@@ -4029,6 +4167,398 @@
             container.innerHTML = `<div class="section-hint" style="padding-bottom:16px;">No price rows for this selection.</div>`;
         }
     }
+
+    // ── Reporting Lines chart ("View Report" on the Basic Commission card) ──
+    // Who reports to whom, read from the Reports To on each agent's role rows
+    // that cover the chosen month -- reporting lines change over time, so the
+    // chart is as at one month, today's by default.
+
+    const rtOpen = new Set();          // leaders the user has unfolded
+    let rtAllOpen = true;              // the chart opens fully unfolded
+
+    const rtKey = (s) => String(s || "").toLowerCase().replace(/[^a-z]/g, "");
+
+    function rtEditDistance(a, b) {
+        const prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+        for (let i = 1; i <= a.length; i++) {
+            let diag = prev[0];
+            prev[0] = i;
+            for (let j = 1; j <= b.length; j++) {
+                const keep = prev[j];
+                prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+                diag = keep;
+            }
+        }
+        return prev[b.length];
+    }
+
+    /** One person per agent as at `ym`: their role(s), type, branch and leader. */
+    function rtPeople(ym) {
+        const byAgent = new Map();
+        // Every dated row per agent, for someone whose rows this month carry no
+        // real Role (only "All" / EV rows): their latest earlier Role places
+        // them -- Chee Kai Kian's Sales Consultant row ended Sep 2026.
+        const allRows = new Map();
+        rolesList.forEach((r) => {
+            if (r.needs_date || !r.agent) return;
+            const k = rtKey(r.agent);
+            if (!allRows.has(k)) allRows.set(k, []);
+            allRows.get(k).push(r);
+        });
+        rolesList.forEach((r) => {
+            if (r.needs_date || !r.agent || !effectiveCoversMonth(r.effective_from, ym)) return;
+            const k = rtKey(r.agent);
+            if (!byAgent.has(k)) byAgent.set(k, []);
+            byAgent.get(k).push(r);
+        });
+        const people = [];
+        byAgent.forEach((rows) => {
+            // The Solar row with a real Role and a Reports To speaks for the
+            // agent; an EV or "All" row only fills in what it lacks.
+            const rank = (r) => (String(r.reports_to || "").trim() ? 0 : 4)
+                + (/solar/i.test(r.package_type || "Solar") ? 0 : 2)
+                + (canonRole(r.hierarchy) && canonRole(r.hierarchy) !== canonRole("All") ? 0 : 1);
+            rows.sort((a, b) => rank(a) - rank(b) || effStart(b.effective_from).localeCompare(effStart(a.effective_from)));
+            const main = rows[0];
+            let roles = [...new Set(rows.map((r) => String(r.hierarchy || "").trim())
+                .filter((h) => h && canonRole(h) !== canonRole("All")))];
+            let roleNote = "";
+            if (!roles.length) {
+                const earlier = (allRows.get(rtKey(main.agent)) || [])
+                    .filter((r) => String(r.hierarchy || "").trim() && canonRole(r.hierarchy) !== canonRole("All")
+                        && effStart(r.effective_from) <= ym)
+                    .sort((a, b) => effEnd(b.effective_from).localeCompare(effEnd(a.effective_from))
+                        || effStart(b.effective_from).localeCompare(effStart(a.effective_from)))[0];
+                if (earlier) {
+                    roles = [String(earlier.hierarchy).trim()];
+                    roleNote = `last role ${roles[0]}, ended ${fmtMonth(effEnd(earlier.effective_from))}`;
+                }
+            }
+            people.push({
+                roleNote,
+                key: rtKey(main.agent), name: main.agent, roles,
+                aliases: [main.agent, main.nick_name, main.full_name].map(rtKey).filter(Boolean),
+                type: main.agent_type || "", branch: main.branch || "",
+                role: roles.join(" / ") || String(main.hierarchy || "").trim() || "—",
+                reportsTo: String(rows.map((r) => r.reports_to || "").find((x) => x.trim()) || "").trim(),
+                team: [],
+            });
+        });
+        return people;
+    }
+
+    /** The person a Reports To names: exact (name, nickname or full name), else
+     *  a near spelling ("Olivier Koh Chong Lee" for "Olivier Koh Cong Lee"). */
+    function rtResolve(people, name) {
+        const k = rtKey(name);
+        if (!k) return null;
+        const exact = people.find((p) => p.aliases.includes(k));
+        if (exact) return exact;
+        let best = null, bestD = 3;
+        people.forEach((p) => {
+            const d = rtEditDistance(p.key, k);
+            if (d < bestD && k.length > 6) { best = p; bestD = d; }
+        });
+        return best;
+    }
+
+    function rtBuild(ym, typeFilter) {
+        const people = rtPeople(ym);
+        const placeholders = new Map();
+        people.forEach((p) => {
+            p.leader = null;
+            if (!p.reportsTo) return;
+            let lead = rtResolve(people, p.reportsTo);
+            if (lead === p) lead = null;
+            if (!lead) {
+                // A leader with no role row this month still heads their team.
+                const k = rtKey(p.reportsTo);
+                if (!placeholders.has(k)) {
+                    placeholders.set(k, { key: "missing:" + k, name: p.reportsTo, aliases: [k], type: p.type,
+                        branch: "", role: "not on the table this month", reportsTo: "", team: [], missing: true });
+                }
+                lead = placeholders.get(k);
+            }
+            p.leader = lead;
+            lead.team.push(p);
+        });
+        const all = people.concat([...placeholders.values()]);
+        // Break any loop (A reports to B, B to A) at the person found last.
+        all.forEach((p) => {
+            const seen = new Set([p]);
+            let q = p.leader;
+            while (q) {
+                if (seen.has(q)) {
+                    q.leader.team = q.leader.team.filter((x) => x !== q);
+                    q.leader = null;
+                    break;
+                }
+                seen.add(q);
+                q = q.leader;
+            }
+        });
+        const byName = (a, b) => a.name.localeCompare(b.name);
+        all.forEach((p) => p.team.sort(byName));
+        const typeOk = (p) => !typeFilter || String(p.type).toLowerCase() === typeFilter.toLowerCase();
+        const roots = all.filter((p) => !p.leader && p.team.length && typeOk(p)).sort(byName);
+        const unset = people.filter((p) => !p.leader && !p.team.length && typeOk(p)).sort(byName);
+        const lines = people.filter((p) => p.leader && typeOk(p)).length;
+        return { roots, unset, lines, people: people.filter(typeOk) };
+    }
+
+    function rtCount(p) { return p.team.reduce((n, c) => n + 1 + rtCount(c), 0); }
+
+    function rtNodeHtml(p, query) {
+        const hit = query && p.aliases.concat([rtKey(p.name)]).some((a) => a.includes(rtKey(query)));
+        const typeBadge = p.type
+            ? `<span class="rt-badge${/out/i.test(p.type) ? " rt-out" : ""}">${escapeHtml(p.type)}</span>` : "";
+        const meta = [p.role, p.branch].filter(Boolean).join(" · ");
+        const open = rtAllOpen || rtOpen.has(p.key) || (query && rtHasHit(p, query));
+        const leaf = !p.team.length;
+        const node = `<div class="rt-node${leaf ? " rt-leaf" : ""}${hit ? " rt-hit" : ""}${p.missing ? " rt-missing" : ""}" data-key="${escapeHtml(p.key)}">
+                ${leaf ? "" : `<span class="rt-caret">${open ? "▼" : "▶"}</span>`}
+                <span class="rt-name">${escapeHtml(p.name)}</span>
+                ${typeBadge}
+                <span class="rt-meta">${escapeHtml(meta)}</span>
+                ${leaf ? "" : `<span class="rt-count" title="Everyone under ${escapeHtml(p.name)}">${rtCount(p)}</span>`}
+            </div>`;
+        const kids = leaf ? "" : `<ul>${p.team.map((c) => rtNodeHtml(c, query)).join("")}</ul>`;
+        return `<li class="${leaf || open ? "" : "rt-closed"}">${node}${kids}</li>`;
+    }
+
+    function rtHasHit(p, query) {
+        const q = rtKey(query);
+        return p.team.some((c) => c.aliases.concat([rtKey(c.name)]).some((a) => a.includes(q)) || rtHasHit(c, query));
+    }
+
+    // "By level": each role on a band of its own, top down. From July 2026 the
+    // Internal ladder is BSM > SDM > STM > SSC > SC; the earlier Sales Senior /
+    // Sales Executive roles and the Outsource OUM > OSA sit below or apart.
+    const RT_LEVELS = [
+        ["Senior Branch Director", "SBD"], ["Branch Sales Manager", "BSM"],
+        ["Sales Development Manager", "SDM"], ["Sales Team Manager", "STM"],
+        ["Senior Sales Consultant", "SSC"], ["Sales Consultant", "SC"],
+        ["Sales Senior", "Sales Senior"], ["Sales Executive", "Sales Executive"],
+        ["OGM", "OGM"], ["OUM", "OUM"], ["OSA", "OSA"],
+    ];
+    const RTL = { col: 196, nodeW: 164, nodeH: 46, slotH: 54, head: 34 };
+
+    /** Index into RT_LEVELS of a person's highest role (RT_LEVELS.length when
+     *  none is a known role). */
+    function rtLevelOf(p) {
+        let best = RT_LEVELS.length;
+        (p.roles || []).forEach((r) => {
+            const i = RT_LEVELS.findIndex(([name]) => canonRole(name) === canonRole(r));
+            if (i !== -1 && i < best) best = i;
+        });
+        return best;
+    }
+
+    function rtShortRole(p) {
+        const i = rtLevelOf(p);
+        return i < RT_LEVELS.length ? RT_LEVELS[i][1] : (p.role || "—");
+    }
+
+    function rtIsOpen(p) { return rtAllOpen || rtOpen.has(p.key); }
+
+    /** One section's level chart: a tidy tree with each person's row from the
+     *  order of its leaves and their column from their role, so a skipped
+     *  level (an SC reporting straight to an SDM) is simply a longer line. */
+    function rtLevelChartHtml(roots, query, loose = []) {
+        const placed = [];
+        let slot = 0;
+        const visibleTeam = (p) => (p.team.length && (rtIsOpen(p) || (query && rtHasHit(p, query)))) ? p.team : [];
+        const place = (p) => {
+            placed.push(p);
+            const kids = visibleTeam(p);
+            if (!kids.length) { p._x = slot; slot += 1; return; }
+            kids.forEach(place);
+            p._x = (kids[0]._x + kids[kids.length - 1]._x) / 2;
+        };
+        const sorted = [...roots].sort((a, b) => rtLevelOf(a) - rtLevelOf(b) || a.name.localeCompare(b.name));
+        sorted.forEach((r, i) => { if (i) slot += 0.4; place(r); });
+        // A leader with no role row this month sits one band above their team.
+        placed.forEach((p) => {
+            p._lvl = p.missing
+                ? Math.max(0, Math.min(...p.team.map(rtLevelOf)) - 1)
+                : rtLevelOf(p);
+        });
+        let levels = [...new Set(placed.map((p) => p._lvl))].sort((a, b) => a - b);
+        // Columns are roles, not tree depths, so a leader centred beside their
+        // team can land on a box of the same column from a neighbouring team.
+        // Push the later box, and everything below it, one row clear.
+        for (let pass = 0; pass < placed.length; pass++) {
+            let moved = false;
+            levels.forEach((l) => {
+                const band = placed.filter((p) => p._lvl === l).sort((a, b) => a._x - b._x);
+                for (let i = 1; i < band.length; i++) {
+                    const gap = band[i]._x - band[i - 1]._x;
+                    if (gap < 1 - 1e-6) {
+                        const from = band[i]._x, d = 1 - gap;
+                        placed.forEach((p) => { if (p._x >= from - 1e-6 && p !== band[i - 1]) p._x += d; });
+                        moved = true;
+                    }
+                }
+            });
+            if (!moved) break;
+        }
+        // People with no leader and no team still belong on the chart: each
+        // goes in their own role's column (user, 27 Oct 2026: Chee Kai Kian,
+        // Gan Zhi Hong, Elyn Pua Yee Ling), drawn dashed with no line, BELOW
+        // the teams. Dropped into gaps between them, a box sat on someone
+        // else's line to a further column and read as part of that team.
+        const looseFrom = placed.length ? Math.max(...placed.map((p) => p._x)) + 1.6 : 0;
+        const nextRow = new Map();
+        [...loose].sort((a, b) => rtLevelOf(a) - rtLevelOf(b) || a.name.localeCompare(b.name)).forEach((p) => {
+            p._lvl = rtLevelOf(p);
+            p._loose = true;
+            const row = nextRow.get(p._lvl) || 0;
+            nextRow.set(p._lvl, row + 1);
+            p._x = looseFrom + row;
+            placed.push(p);
+        });
+        levels = [...new Set(placed.map((p) => p._lvl))].sort((a, b) => a - b);
+        const rowOf = new Map(levels.map((l, i) => [l, i]));
+        slot = Math.max(slot, ...placed.map((p) => p._x + 1));
+        // Laid out sideways (user, 27 Oct 2026): each role is a column, left
+        // to right from the top role, and a team runs down the page beside
+        // its leader -- the chart grows down rather than thousands of pixels
+        // wide. `_x` is the person's row; their role band is the column.
+        const W = levels.length * RTL.col;
+        const H = RTL.head + Math.max(slot, 1) * RTL.slotH;
+        const pos = (p) => ({
+            x: rowOf.get(p._lvl) * RTL.col + (RTL.col - RTL.nodeW) / 2,
+            y: RTL.head + p._x * RTL.slotH + (RTL.slotH - RTL.nodeH) / 2,
+        });
+        const bands = levels.map((l, i) => {
+            const label = l < RT_LEVELS.length
+                ? `${RT_LEVELS[l][1]}${RT_LEVELS[l][1] !== RT_LEVELS[l][0] ? ` — ${RT_LEVELS[l][0]}` : ""}` : "Other roles";
+            return `<div class="rtl-band rtl-col" style="left:${i * RTL.col}px; width:${RTL.col}px;"><span class="rtl-band-label" title="${escapeHtml(label)}">${escapeHtml(label)}</span></div>`;
+        }).join("");
+        const paths = [];
+        placed.forEach((p) => visibleTeam(p).forEach((c) => {
+            const a = pos(p), b = pos(c);
+            const x1 = a.x + RTL.nodeW, y1 = a.y + RTL.nodeH / 2, x2 = b.x, y2 = b.y + RTL.nodeH / 2;
+            if (x2 > x1) {
+                // The line turns down right beside its leader, so each leader
+                // has a trunk of their own. Turning just before the team's
+                // column instead merged an SDM's line to an SC with an STM's
+                // line to theirs: Choong Ye Hong (SC, reports to Sunny Tan)
+                // read as Denise Ng Pei Sing's (27 Oct 2026).
+                const trunk = x1 + (RTL.col - RTL.nodeW) / 2;
+                paths.push(`M${x1},${y1} H${trunk} V${y2} H${x2}`);
+            } else {
+                // Reports To names someone in the same or an earlier column.
+                paths.push(`M${a.x + RTL.nodeW / 2},${a.y + RTL.nodeH} L${b.x + RTL.nodeW / 2},${b.y}`);
+            }
+        }));
+        const q = rtKey(query);
+        const nodes = placed.map((p) => {
+            const { x, y } = pos(p);
+            const hit = q && p.aliases.concat([rtKey(p.name)]).some((a) => a.includes(q));
+            const leaf = !p.team.length;
+            const folded = !leaf && !visibleTeam(p).length;
+            const title = [p.name, p.type, p.role, p.branch, p.missing ? "not on the table this month" : "", p.roleNote,
+                p._loose ? "no Reports To set" : ""].filter(Boolean).join(" · ");
+            return `<div class="rtl-node${leaf ? " rt-leaf" : ""}${hit ? " rt-hit" : ""}${p.missing ? " rt-missing" : ""}${p._loose ? " rtl-loose" : ""}${folded ? " rtl-folded" : ""}"
+                    data-key="${escapeHtml(p.key)}" title="${escapeHtml(title)}"
+                    style="left:${x}px; top:${y}px; width:${RTL.nodeW}px; height:${RTL.nodeH}px;">
+                    <span class="rt-name" style="${leaf ? "" : "padding-right:26px;"}">${escapeHtml(p.name)}</span>
+                    <span class="rt-meta">${escapeHtml([p.missing ? "?" : rtShortRole(p), p.branch.replace(/^Team-/i, "")].filter(Boolean).join(" · "))}</span>
+                    ${leaf ? "" : `<span class="rt-count">${rtCount(p)}</span>`}
+                </div>`;
+        }).join("");
+        const divider = loose.length
+            ? `<div class="rtl-divider" style="top:${RTL.head + (looseFrom - 0.6) * RTL.slotH}px; width:${W}px;"><span>No Reports To set (${loose.length})</span></div>`
+            : "";
+        return `<div class="rtl-wrap"><div class="rtl-canvas" style="width:${W}px; height:${H}px;">
+                ${bands}${divider}
+                <svg class="rtl-lines" width="${W}" height="${H}"><path d="${paths.join(" ")}"/></svg>
+                ${nodes}
+            </div></div>`;
+    }
+
+    function renderReportsTo() {
+        const ym = document.getElementById("rtMonth").value || CURRENT_YM;
+        const typeFilter = document.getElementById("rtType").value;
+        const query = document.getElementById("rtSearch").value.trim();
+        const byLevel = (document.getElementById("rtView")?.value || "level") === "level";
+        const { roots, unset, lines, people } = rtBuild(ym, typeFilter);
+        const chart = document.getElementById("rtChart");
+        document.getElementById("rtSummary").textContent =
+            `${people.length} agents in ${fmtMonth(ym)} · ${lines} reporting lines · ${unset.length} with no Reports To`;
+        const groups = typeFilter ? [typeFilter] : ["Internal", "Outsource", ""];
+        let html = "";
+        const inGroup = (g) => (r) => (typeFilter ? true : (g ? String(r.type).toLowerCase() === g.toLowerCase()
+            : !/^(internal|outsource)$/i.test(String(r.type))));
+        groups.forEach((g) => {
+            const rs = roots.filter(inGroup(g));
+            // By level, people with no leader sit in their role's column too.
+            const loose = byLevel ? unset.filter(inGroup(g)) : [];
+            if (!rs.length && !loose.length) return;
+            html += `<div class="rt-section-title">${escapeHtml(g || "Other")} teams</div>`
+                + (byLevel ? rtLevelChartHtml(rs, query, loose)
+                    : `<ul class="rt-tree">${rs.map((r) => rtNodeHtml(r, query)).join("")}</ul>`);
+        });
+        if (!roots.length && !(byLevel && unset.length)) {
+            html += `<div class="section-hint">No one in ${escapeHtml(fmtMonth(ym))} has a Reports To set${typeFilter ? ` among ${escapeHtml(typeFilter)} agents` : ""}.</div>`;
+        }
+        if (unset.length && !byLevel) {
+            const q = rtKey(query);
+            html += `<div class="rt-section-title">No Reports To set (${unset.length})</div>
+                <div class="section-hint" style="padding:0 0 6px;">Fill in Reports To on the Basic Commission table to place them.</div>
+                <div class="rt-unset">${unset.map((p) => `<span class="rt-chip${q && p.aliases.some((a) => a.includes(q)) ? " rt-hit" : ""}" title="${escapeHtml([p.type, p.role, p.branch].filter(Boolean).join(" · "))}">${escapeHtml(p.name)}</span>`).join("")}</div>`;
+        }
+        chart.innerHTML = html;
+        chart.querySelector(".rt-hit")?.scrollIntoView({ block: "center", inline: "center" });
+    }
+
+    async function openReportsTo() {
+        if (!rolesList.length) await loadRoles();
+        const month = document.getElementById("rtMonth");
+        if (!month.value) month.value = CURRENT_YM;
+        rtAllOpen = true;
+        rtOpen.clear();
+        document.getElementById("reportsToModal").classList.remove("hidden");
+        renderReportsTo();
+    }
+
+    document.getElementById("rolesReportBtn")?.addEventListener("click", openReportsTo);
+    document.getElementById("reportsToCloseBtn")?.addEventListener("click", () =>
+        document.getElementById("reportsToModal").classList.add("hidden"));
+    document.getElementById("reportsToModal")?.addEventListener("click", (e) => {
+        if (e.target.id === "reportsToModal") e.target.classList.add("hidden");
+    });
+    ["rtMonth", "rtType", "rtView"].forEach((id) =>
+        document.getElementById(id)?.addEventListener("change", renderReportsTo));
+    document.getElementById("rtSearch")?.addEventListener("input", renderReportsTo);
+    document.getElementById("rtChart")?.addEventListener("click", (e) => {
+        // By level: the layout depends on who is folded, so redraw.
+        const box = e.target.closest(".rtl-node");
+        if (box) {
+            if (box.classList.contains("rt-leaf")) return;
+            if (rtAllOpen) {
+                rtAllOpen = false;
+                document.querySelectorAll("#rtChart .rtl-node:not(.rt-leaf):not(.rtl-folded)")
+                    .forEach((n) => rtOpen.add(n.dataset.key));
+            }
+            const k = box.dataset.key;
+            if (rtOpen.has(k)) rtOpen.delete(k); else rtOpen.add(k);
+            renderReportsTo();
+            return;
+        }
+        const node = e.target.closest(".rt-node");
+        if (!node || node.classList.contains("rt-leaf")) return;
+        const li = node.parentElement;
+        const k = node.dataset.key;
+        // Unfolding by hand ends "everything open": track each leader instead.
+        if (rtAllOpen) {
+            rtAllOpen = false;
+            document.querySelectorAll("#rtChart .rt-node:not(.rt-leaf)").forEach((n) => rtOpen.add(n.dataset.key));
+        }
+        if (li.classList.toggle("rt-closed")) rtOpen.delete(k); else rtOpen.add(k);
+        node.querySelector(".rt-caret").textContent = li.classList.contains("rt-closed") ? "▶" : "▼";
+    });
 
     // ── Wiring ───────────────────────────────────────────────────────────────
 
@@ -5144,6 +5674,68 @@
 
     const modalDeleteBtn = document.getElementById("modalDeleteBtn");
     if (modalDeleteBtn) modalDeleteBtn.addEventListener("click", deleteModalEntry);
+
+    // ── NFP price list sync from the finance Google Sheet (preview → confirm) ─
+
+    const nfpSyncBtn = document.getElementById("nfpSyncBtn");
+    if (nfpSyncBtn) {
+        nfpSyncBtn.addEventListener("click", async () => {
+            const box = document.getElementById("nfpUploadPreview");
+            if (!box) return;
+            box.style.display = "";
+            box.textContent = "Reading the Google Sheet…";
+            let data;
+            try {
+                const res = await api("/api/nfp-prices/google-sync", { method: "POST" });
+                data = await res.json();
+                if (!res.ok) throw new Error(data.error || "Sync failed");
+            } catch (e) {
+                box.innerHTML = `<span style="color:#dc2626;">${escapeHtml(e.message)}</span>`;
+                return;
+            }
+            const diff = data.diff;
+            if (diff.in_sync) {
+                box.innerHTML = `<span style="color:#16a34a;">✓ Already matches the Google Sheet — nothing to change.</span>`;
+                loadNfpSheetStatus(true);
+                return;
+            }
+            const more = diff.changed > diff.examples.length
+                ? `<li>…and ${diff.changed - diff.examples.length} more</li>` : "";
+            box.innerHTML = `
+                <strong>Google Sheet vs this list:</strong> ${escapeHtml(nfpDiffCounts(diff))}.
+                ${diff.examples.length ? `<ul style="margin:8px 0 8px 20px;">${nfpDiffList(diff.examples)}${more}</ul>` : "<br>"}
+                Syncing replaces the ${data.replaces} stored rows of ${data.months.length} months
+                (${escapeHtml(data.months.map(fmtMonth).join(", "))}) with the sheet's ${data.total_rows}.
+                ${diff.stored_only_months.length ? `Not on the sheet, left as they are: ${escapeHtml(diff.stored_only_months.map(fmtMonth).join(", "))}.` : ""}
+                Commission figures are recalculated with the new prices.<br><br>
+                <button class="btn btn-primary" id="nfpSyncConfirm">Apply sheet prices</button>
+                <button class="btn btn-secondary" id="nfpSyncCancel">Cancel</button>
+            `;
+            document.getElementById("nfpSyncCancel")?.addEventListener("click", () => {
+                box.style.display = "none";
+                box.innerHTML = "";
+            });
+            document.getElementById("nfpSyncConfirm")?.addEventListener("click", async () => {
+                box.textContent = "Applying…";
+                try {
+                    const res = await api("/api/nfp-prices/upload?mode=confirm", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ token: data.token })
+                    });
+                    const result = await res.json();
+                    if (!res.ok) throw new Error(result.error || "Sync failed");
+                    box.innerHTML = `<span style="color:#16a34a;">Synced ${result.rows} rows from the Google Sheet for ` +
+                        `${result.months.length} months (replaced ${result.replaced}). Commission cache cleared.</span>`;
+                    nfpPricesCache = null;
+                    showNfpList();
+                    loadNfpSheetStatus(true);
+                } catch (e) {
+                    box.innerHTML = `<span style="color:#dc2626;">${escapeHtml(e.message)}</span>`;
+                }
+            });
+        });
+    }
 
     // ── NFP price list upload (xlsx, parse → preview → confirm) ─────────────
 

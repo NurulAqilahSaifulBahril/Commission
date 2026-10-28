@@ -75,7 +75,7 @@ def _read_db_prices():
         # String-inverter rows only: hybrid rows are display data for the
         # dashboard and must never feed commission calculations.
         "SELECT month, panel_rating, table_no, panels, final_price, final_with_tng,"
-        " promo_price, promo_from, promo_to, columns_json, source_sheet"
+        " promo_price, promo_from, promo_to, columns_json, source_sheet, power_system"
         " FROM nfp_prices"
         " WHERE inverter_type IS NULL OR inverter_type = '' OR LOWER(inverter_type) = 'string'"
         " ORDER BY month, panel_rating, table_no, panels"
@@ -114,7 +114,12 @@ def _read_db_prices():
         table_no = int(r["table_no"])
         tables = prices.setdefault(month, {}).setdefault(rating, {})
         promo_price = r["promo_price"] if "promo_price" in r.keys() else None
-        tables.setdefault(table_no, {})[int(r["panels"])] = PriceRow(
+        # Keyed on the phase too: a single- and a three-phase table sharing a
+        # table number must never merge (see parse_schedule_workbook_rows).
+        # Three-phase sorts first, as pick_table_for_panels expects.
+        phase = str(r["power_system"] or "") if "power_system" in r.keys() else ""
+        tkey = (table_no, 0 if phase == "three" else 1)
+        tables.setdefault(tkey, {})[int(r["panels"])] = PriceRow(
             int(r["panels"]), float(r["final_price"]),
             float(r["final_with_tng"]) if r["final_with_tng"] is not None else None,
             float(promo_price) if promo_price is not None else None,
@@ -480,6 +485,12 @@ def _db_lookup_net_floor_price(
         rating_used = target_rating
         if exact_rating and exact_rating != target_rating and month_data.get(exact_rating):
             rating_used = exact_rating
+        # The invoice's own month follows its Google Sheet tab even when the tab
+        # has no list for this wattage (user, 27 Oct 2026): a 620W job in Feb-Aug
+        # 2026, whose tabs list only 650W, is priced off that month's 650W list
+        # rather than the last 620W list (Jan 2026).
+        if m == inv_ym and not month_data.get(rating_used) and month_data.get(650):
+            rating_used = 650
         tables = month_data.get(rating_used, [])
         if not tables:
             continue
@@ -539,12 +550,30 @@ class PriceRow:
     sheet: str = ""
 
 
+def _clean_money_val(value: Any) -> float | int | Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        if isinstance(value, float) and pd.isna(value):
+            return None
+        return value
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "-", "—"):
+        return None
+    s = s.replace("RM", "").replace("rm", "").replace(",", "").strip()
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def round_rm(value: float | int | str | Decimal, places: int = 2) -> float:
     """Round money to N decimal places (half up). Used for commission amounts."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    cleaned = _clean_money_val(value)
+    if cleaned is None:
         return 0.0
     q = Decimal("1").scaleb(-places)
-    return float(Decimal(str(value)).quantize(q, rounding=ROUND_HALF_UP))
+    return float(Decimal(str(cleaned)).quantize(q, rounding=ROUND_HALF_UP))
 
 
 def _is_feb_schedule_sheet(sheet_name: str) -> bool:
@@ -554,14 +583,13 @@ def _is_feb_schedule_sheet(sheet_name: str) -> bool:
 
 def schedule_amount_round(value: float | int | str | Decimal, sheet_name: str) -> float:
     """
-    Per-sheet NFP schedule rounding when rebuilding FINAL from Excel.
+    A schedule amount as the price list shows it: half-up to the sen.
 
-    - **FEB** sheets (e.g. FEB 2026): half-up to **2 decimal places** (sen), `round_rm`.
-    - **Other** months: `round_nfp` (1-decimal business rule).
+    Every sheet keeps its cents (user, 27 Oct 2026: the finance Google Sheet
+    is the source, so 15,827.55 stays 15,827.55). Until then only FEB sheets
+    did; the others went through round_nfp's 1-decimal rule (15,827.4).
     """
-    if _is_feb_schedule_sheet(sheet_name):
-        return round_rm(value, 2)
-    return round_nfp(value)
+    return round_rm(value, 2)
 
 
 def round_nfp(value: float | int | str | Decimal) -> float:
@@ -572,10 +600,11 @@ def round_nfp(value: float | int | str | Decimal) -> float:
     - Truncate to 1 decimal (20,135.7)
     - If the 2nd decimal (sen) is 5–9, reduce by RM 0.10 (20,135.6)
     """
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    cleaned = _clean_money_val(value)
+    if cleaned is None:
         return 0.0
     # First, round float inputs to 2 decimal places to avoid float precision loss (e.g. 31869.199999999997 -> 31869.20)
-    rounded_val = round(float(value), 2)
+    rounded_val = round(float(cleaned), 2)
     d = Decimal(str(rounded_val))
     truncated = d.quantize(Decimal("0.1"), rounding=ROUND_DOWN)
     hundredths = int((abs(d) * 100) % 10)
@@ -609,6 +638,8 @@ def _rebate_column_indices(
         "earth",
         "cny",
         "地球",
+        "cashback",
+        "parent",
     )
     skip = (
         "no.panels",
@@ -633,11 +664,68 @@ def _rebate_column_indices(
 def _parse_sheet_tables(df: pd.DataFrame, sheet_name: str) -> List[Dict[int, PriceRow]]:
     tables: List[Dict[int, PriceRow]] = []
     n = len(df)
+    sn = sheet_name.upper().strip()
+
+    # September 2026 layout (3P is Table 1, 1P is Table 2)
+    if ("SEPT" in sn or "SEP 2026" in sn) and any(x in sn for x in ("HYB", "STR")):
+        t1_3p: Dict[int, PriceRow] = {}
+        t2_1p: Dict[int, PriceRow] = {}
+        for r_idx in range(2, n):
+            r = df.iloc[r_idx]
+            if pd.isna(r.iloc[0]):
+                continue
+            try:
+                panels = int(float(r.iloc[0]))
+            except (ValueError, TypeError):
+                continue
+            pkg_name = str(r.iloc[1]) if pd.notna(r.iloc[1]) else ""
+            final_price = schedule_amount_round(r.iloc[4], sheet_name)
+            promo_val = r.iloc[6] if len(r) > 6 and pd.notna(r.iloc[6]) else None
+            promo_price = schedule_amount_round(promo_val, sheet_name) if promo_val is not None else None
+            pr = PriceRow(
+                panels=panels, final_price=final_price, final_with_tng=None,
+                promo_price=promo_price,
+                promo_from=date(2026, 9, 18) if promo_price is not None else None,
+                promo_to=date(2026, 9, 30) if promo_price is not None else None,
+            )
+            if "[1P]" in pkg_name or "1P" in pkg_name:
+                t2_1p[panels] = pr
+            else:
+                t1_3p[panels] = pr
+        res = []
+        if t1_3p:
+            res.append(t1_3p)
+        if t2_1p:
+            res.append(t2_1p)
+        return res
+
+    # 590W split layout (590W NOV 2025, 590W DEC 2025, 590W JAN 2026)
+    if "590W" in sn and ("NOV" in sn or "DEC" in sn or "JAN" in sn):
+        t_rows: Dict[int, PriceRow] = {}
+        col_final = None
+        for j in range(len(df.columns)):
+            h = str(df.iloc[1, j]).lower() if pd.notna(df.iloc[1, j]) else ""
+            if "final price" in h:
+                col_final = j
+                break
+        if col_final is None:
+            col_final = 6
+        for r_idx in range(2, n):
+            r = df.iloc[r_idx]
+            if pd.isna(r.iloc[0]):
+                continue
+            panels = 8 + (r_idx - 2)
+            if col_final < len(r) and pd.notna(r.iloc[col_final]):
+                fp = schedule_amount_round(r.iloc[col_final], sheet_name)
+                t_rows[panels] = PriceRow(panels=panels, final_price=fp, final_with_tng=None)
+        if t_rows:
+            return [t_rows]
+
     i = 0
     while i < n:
         row = df.iloc[i]
         row_text = " ".join(str(v).lower() for v in row if pd.notna(v))
-        if "no.panels" not in row_text:
+        if "no.panels" not in row_text and "no panels" not in row_text:
             i += 1
             continue
 
@@ -907,11 +995,11 @@ def _display_scan_sheet(df: pd.DataFrame, sheet_name: str) -> List[dict]:
     while i < n:
         row = df.iloc[i]
         row_text = " ".join(str(v).lower() for v in row if pd.notna(v))
-        if "no.panels" not in row_text:
+        if "no.panels" not in row_text and "no panels" not in row_text:
             i += 1
             continue
         headers = [str(v).strip() if pd.notna(v) else "" for v in row]
-        panel_cols = [j for j, h in enumerate(headers) if "no.panels" in h.lower()]
+        panel_cols = [j for j, h in enumerate(headers) if "no.panels" in h.lower() or "no panels" in h.lower()]
         bounds = panel_cols + [len(headers)]
         header_row = i
 
@@ -930,7 +1018,10 @@ def _display_scan_sheet(df: pd.DataFrame, sheet_name: str) -> List[dict]:
             # anything else (e.g. internal cost columns) is not hybrid data.
             hybrid_ok = (
                 len(after) >= 2
-                and reg_headers[after[0]].strip().lower() == reg_headers[after[1]].strip().lower()
+                and (
+                    reg_headers[after[0]].strip().lower() == reg_headers[after[1]].strip().lower()
+                    or ("string" in reg_headers[after[0]].lower() and "hyb" in reg_headers[after[1]].lower())
+                )
             )
 
             # Table title 1-3 rows above, within this region's columns
@@ -1033,6 +1124,8 @@ def _split_label_blocks(labels):
         key = label.lower()
         if key in seen:
             return labels[:pos], labels[pos:]
+        if pos > 0 and ("add-on" in key or "hybird" in key or "hybrid" in key) and not any("hyb" in l[1].lower() for l in labels[:pos]):
+            return labels[:pos], labels[pos:]
         seen.add(key)
     return labels, []
 
@@ -1077,6 +1170,146 @@ def parse_schedule_workbook_rows(
         xls = pd.ExcelFile(tmp_path)
         for sheet in xls.sheet_names:
             df = pd.read_excel(xls, sheet, header=None)
+            sn = sheet.upper().strip()
+
+            # September 2026 format (HYB and STR sheets for 650W and 625W)
+            if ("SEPT" in sn or "SEP 2026" in sn) and any(x in sn for x in ("HYB", "STR")):
+                rating = 625 if "625" in sn else 650
+                inverter_type = "hybrid" if "HYB" in sn else "string"
+                src = f"{source_label}: {sheet}" if source_label else sheet
+                # The Data page shows the sheet's own columns and headings
+                # (Package Type and Mid Autumn Disc included), not a renamed few.
+                sept_heads = [" ".join(str(v).split()) if pd.notna(v) else ""
+                              for v in df.iloc[1]]
+                for r_idx in range(2, len(df)):
+                    r = df.iloc[r_idx]
+                    if pd.isna(r.iloc[0]):
+                        continue
+                    try:
+                        panels = int(float(r.iloc[0]))
+                    except (ValueError, TypeError):
+                        continue
+                    pkg_name = " ".join(str(r.iloc[1]).split()) if pd.notna(r.iloc[1]) else ""
+                    power_system = "single" if "[1P]" in pkg_name else "three"
+                    table_no = 2 if power_system == "single" else 1
+                    pkg_price = _clean_money_val(r.iloc[3]) if len(r) > 3 and pd.notna(r.iloc[3]) else None
+                    final_price = schedule_amount_round(r.iloc[4], sheet) if len(r) > 4 and pd.notna(r.iloc[4]) else None
+                    promo_price = schedule_amount_round(r.iloc[6], sheet) if len(r) > 6 and pd.notna(r.iloc[6]) else None
+                    cols = []
+                    for c in range(1, min(len(sept_heads), len(r))):
+                        if not sept_heads[c] or pd.isna(r.iloc[c]):
+                            continue
+                        money = _clean_money_val(r.iloc[c])
+                        cols.append([sept_heads[c],
+                                     " ".join(str(r.iloc[c]).split()) if money is None
+                                     else round_rm(money, 2)])
+                    rows.append({
+                        "sheet": sheet,
+                        "panel_rating": rating,
+                        "table_no": table_no,
+                        "panels": panels,
+                        "final_price": final_price,
+                        "final_with_tng": None,
+                        "package_price": float(pkg_price) if pkg_price is not None else None,
+                        "tng_rebate": None,
+                        "inverter_type": inverter_type,
+                        "power_system": power_system,
+                        "columns": cols,
+                        "source_sheet": src,
+                        "promo_price": promo_price,
+                        "promo_from": "2026-09-18",
+                        "promo_to": "2026-09-30",
+                    })
+                continue
+
+            # 590W split format (590W NOV 2025, 590W DEC 2025, 590W JAN 2026)
+            if "590W" in sn and ("NOV" in sn or "DEC" in sn or "JAN" in sn):
+                headers = [" ".join(str(v).split()) for v in df.iloc[1] if pd.notna(v)]
+                col_final = None
+                for idx, h in enumerate(headers):
+                    if "final price" in h.lower():
+                        col_final = idx
+                        break
+                if col_final is None:
+                    col_final = min(6, len(headers) - 1)
+                src = f"{source_label}: {sheet}" if source_label else sheet
+                for r_idx in range(2, len(df)):
+                    r = df.iloc[r_idx]
+                    if pd.isna(r.iloc[0]):
+                        continue
+                    panels = 8 + (r_idx - 2)
+                    pkg_price = _clean_money_val(r.iloc[0]) if pd.notna(r.iloc[0]) else None
+                    final_price = schedule_amount_round(r.iloc[col_final], sheet) if col_final < len(r) and pd.notna(r.iloc[col_final]) else None
+                    cols = [[headers[c], float(_clean_money_val(r.iloc[c])) if _clean_money_val(r.iloc[c]) is not None else r.iloc[c]]
+                            for c in range(min(len(headers), len(r))) if pd.notna(r.iloc[c])]
+                    rows.append({
+                        "sheet": sheet,
+                        "panel_rating": 590,
+                        "table_no": 2,
+                        "panels": panels,
+                        "final_price": final_price,
+                        "final_with_tng": None,
+                        "package_price": float(pkg_price) if pkg_price is not None else None,
+                        "tng_rebate": None,
+                        "inverter_type": "string",
+                        "power_system": None,
+                        "columns": cols,
+                        "source_sheet": src,
+                        "promo_price": None,
+                        "promo_from": None,
+                        "promo_to": None,
+                    })
+                continue
+
+            # 620W split layout (620W OCT 2025, 620W NOV 2025, etc.)
+            if "620W" in sn and ("OCT" in sn or "NOV" in sn or "DEC" in sn or "JAN" in sn):
+                headers = [" ".join(str(v).split()) for v in df.iloc[1] if pd.notna(v)]
+                # The floor is "Max amount after discount". Column B is headed
+                # "FINAL PRICE" but holds the package price -- matching it first
+                # stored RM36,414 as the 20-panel floor instead of RM29,329.
+                final_col = next((i for i, h in enumerate(headers)
+                                  if "max amount after" in h.lower()), None)
+                for idx, h in enumerate(headers):
+                    if final_col is not None:
+                        break
+                    if idx > 1 and "final price" in h.lower():
+                        final_col = idx
+                        break
+                if final_col is None:
+                    final_col = len(headers) - 1
+                src = f"{source_label}: {sheet}" if source_label else sheet
+                for r_idx in range(2, len(df)):
+                    r = df.iloc[r_idx]
+                    if pd.isna(r.iloc[0]):
+                        continue
+                    try:
+                        panels = int(float(r.iloc[0]))
+                    except (ValueError, TypeError):
+                        continue
+                    pkg_price = _clean_money_val(r.iloc[1]) if len(r) > 1 and pd.notna(r.iloc[1]) else None
+                    final_price = schedule_amount_round(r.iloc[final_col], sheet) if final_col < len(r) and pd.notna(r.iloc[final_col]) else None
+                    # Column A is the panel count, which the page already shows.
+                    cols = [[headers[c], float(_clean_money_val(r.iloc[c])) if _clean_money_val(r.iloc[c]) is not None else r.iloc[c]]
+                            for c in range(1, min(len(headers), len(r))) if pd.notna(r.iloc[c])]
+                    rows.append({
+                        "sheet": sheet,
+                        "panel_rating": 620,
+                        "table_no": 1,
+                        "panels": panels,
+                        "final_price": final_price,
+                        "final_with_tng": None,
+                        "package_price": float(pkg_price) if pkg_price is not None else None,
+                        "tng_rebate": None,
+                        "inverter_type": "string",
+                        "power_system": "single" if "OCT" in sn else None,
+                        "columns": cols,
+                        "source_sheet": src,
+                        "promo_price": None,
+                        "promo_from": None,
+                        "promo_to": None,
+                    })
+                continue
+
             engine_tables = _parse_sheet_tables(df, sheet)
             if not engine_tables:
                 continue
@@ -1103,10 +1336,15 @@ def parse_schedule_workbook_rows(
                     string_cols = _clean_label_block(blk_a if t_idx == 0 else blk_b)
                 power_system = region["power_system"] if region else None
                 src = f"{source_label}: {sheet}" if source_label else sheet
+                # A single-phase tab ("650W 1P MAY 2026") is the month's second
+                # table, after the 3P tab. Stored as table 1 too (26 Oct sync),
+                # the two merged into one and the price for a panel count both
+                # list depended on which row the database returned last.
+                table_no = t_idx + 1 + (1 if re.search(r"\b1P\b", sn) else 0)
                 for panels, pr in sorted(table.items()):
                     extras = region["string"].get(panels, {}) if (region and aligned) else {}
                     rows.append({
-                        "sheet": sheet, "panel_rating": rating, "table_no": t_idx + 1,
+                        "sheet": sheet, "panel_rating": rating, "table_no": table_no,
                         "panels": panels, "final_price": pr.final_price,
                         "final_with_tng": pr.final_with_tng,
                         "package_price": extras.get("package_price"),
@@ -1118,7 +1356,7 @@ def parse_schedule_workbook_rows(
                 if region and aligned:
                     for panels, h in sorted(region["hybrid"].items()):
                         rows.append({
-                            "sheet": sheet, "panel_rating": rating, "table_no": t_idx + 1,
+                            "sheet": sheet, "panel_rating": rating, "table_no": table_no,
                             "panels": panels, "final_price": h["final_price"],
                             "final_with_tng": h["final_with_tng"],
                             "package_price": h["package_price"],
@@ -1228,10 +1466,17 @@ def infer_table_panel_rating(sheet_name: str, table_index: int, num_tables: int)
     Infer inverter wattage for a parsed table within a monthly Excel sheet.
 
     - NOV-DEC 2025 / JAN 2026 side-by-side: table 0 = 620W, table 1 = 590W.
+    - If sheet name explicitly has 590W / 620W / 625W / 650W, respect it.
     - For other months (FEB 2026 onwards):
       - If there are multiple tables, the last table is always 620W, and others are 650W.
     """
     sn = sheet_name.upper().strip()
+    if "590" in sn and "620" not in sn:
+        return 590
+    if "625" in sn:
+        return 625
+    if "620" in sn and "590" not in sn:
+        return 620
     if "NOV" in sn or "DEC" in sn or "JAN" in sn:
         if num_tables >= 2:
             return 620 if table_index == 0 else 590

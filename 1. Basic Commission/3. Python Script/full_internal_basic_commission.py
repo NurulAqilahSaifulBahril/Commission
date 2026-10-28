@@ -549,6 +549,7 @@ candidates AS (
     COALESCE(NULLIF(TRIM(i.customer_name_snapshot), ''), c.name, '(unknown)') AS customer_name,
     COALESCE(NULLIF(TRIM(a.name), ''), '(unknown)') AS agent_name,
     a.agent_type,
+    COALESCE(i.panel_qty, 0)::int AS panel_qty,
     i.package_type,
     i.package_name_snapshot,
     i.description,
@@ -964,7 +965,9 @@ def _process_invoices(
                                     row.get("invoice_date")):
             continue
 
-        prop_type = classify_property_type(row)
+        base_prop_type = classify_property_type(row)
+        from basic_commission_rates import resolve_invoice_property_type
+        prop_type, rate_prop_type = resolve_invoice_property_type(row, base_prop_type)
         
         total = _to_decimal(row.get("total_amount"))
         paid_amount = _to_decimal(row.get("paid_amount"))
@@ -996,14 +999,14 @@ def _process_invoices(
         # Solar or EV role, for an agent who holds both over these months.
         _hier_pkg = _role_pkg(row)
         _hierarchy = _internal_hierarchy(agent_name, _inv_month, _inv_year,
-                                         prop_type, is_agent_senior,
+                                         rate_prop_type, is_agent_senior,
                                          job_type=_hier_job,
                                          ev_type=_hier_ev,
                                          package=_hier_pkg)
         from basic_commission_rates import invoice_milestones as _milestones
         policy, pct5_str, pct75_str, pct100_str = _milestones(
             row, "Internal", _hierarchy, _inv_month, year=_inv_year,
-            agent=agent_name, property_type=prop_type, job_type=_hier_job,
+            agent=agent_name, property_type=rate_prop_type, job_type=_hier_job,
             ev_type=_hier_ev)
 
         NOT_FULLY_PAID_INVS = {'1008316', '1007905'}
@@ -1074,14 +1077,14 @@ def _process_invoices(
                                            agent_type="Internal", package=_hier_pkg):
                     return hierarchy
                 return _internal_hierarchy(agent_name, inv_month, inv_year,
-                                           prop_type, is_agent_senior,
+                                           rate_prop_type, is_agent_senior,
                                            job_type=job, ev_type=ev, package=pkg)
 
             comm, rate, ev_rate, ev_comm, ev_amt, rate_display = basic_commission_for_row(
                 row, sales_price,
                 lambda job, ev: get_basic_rate(
                     "Internal", _piece_hierarchy(job, ev), inv_month, agent=agent_name,
-                    property_type=prop_type, year=inv_year,
+                    property_type=rate_prop_type, year=inv_year,
                     job_type=job, ev_type=ev,
                 ),
             )
@@ -1110,7 +1113,7 @@ def _process_invoices(
         # Rate % / From Role up the Reports To chain) -- since 2026-10-20 no
         # hardcoded 0.25%.
         senior_ovr = sum((sales_price * h["rate"] for h in _line_overrides(
-            agent_name, _inv_month, _inv_year, _hier_pkg, prop_type)), Decimal("0"))
+            agent_name, _inv_month, _inv_year, _hier_pkg, rate_prop_type)), Decimal("0"))
 
         lines.append(
             InvoiceLine(

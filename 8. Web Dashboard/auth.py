@@ -22,6 +22,56 @@ def hash_password(password: str) -> str:
     return generate_password_hash(password)
 
 
+# ── Available pages (Admin page, 28 Oct 2026) ─────────────────────────────────
+# The menu pages an account may open: (key, label, path). An admin may open
+# every page; a staff account every page but Admin unless its `pages` column
+# names a narrower set. A page left out is hidden from the menu and refused by
+# the server, its data too.
+PAGES = (
+    ("overview", "Overview", "/"),
+    ("sales_report", "Sales Report", "/sales-report"),
+    ("basic_nfp", "Basic & Net Floor Price Commission", "/report?section=basic_nfp"),
+    ("anp", "ANP Commission", "/report?section=anp"),
+    ("ega_esa", "EGA/ESA Award", "/report?section=ega_esa"),
+    ("production_bonus", "Production Bonus", "/report?section=production_bonus"),
+    ("monthly_contest", "Monthly Contest", "/report?section=monthly_contest"),
+    ("data", "Data", "/data"),
+    ("admin", "Admin", "/admin"),
+)
+PAGE_KEYS = tuple(k for k, _l, _p in PAGES)
+COMMISSION_PAGES = ("basic_nfp", "anp", "ega_esa", "production_bonus", "monthly_contest")
+
+
+def parse_pages(value) -> list[str] | None:
+    """The stored `pages` cell as page keys, or None for "every page"."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return [k for k in (p.strip() for p in text.split(",")) if k in PAGE_KEYS and k != "admin"]
+
+
+def allowed_pages(user: dict | None) -> list[str]:
+    """The page keys this account may open, in menu order."""
+    if not user:
+        return []
+    if user.get("role") == "admin":
+        return list(PAGE_KEYS)
+    chosen = user.get("pages")
+    if chosen is None:
+        return [k for k in PAGE_KEYS if k != "admin"]
+    return [k for k in PAGE_KEYS if k in chosen]
+
+
+def can_view(user: dict | None, key: str) -> bool:
+    return key in allowed_pages(user)
+
+
+def first_page_path(user: dict | None) -> str | None:
+    """Where to send someone who opened a page they may not see."""
+    keys = allowed_pages(user)
+    return next((p for k, _l, p in PAGES if k in keys), None)
+
+
 def verify_login(username: str, password: str) -> dict | None:
     user = db.get_user_by_username(username)
     if not user or not check_password_hash(user["password_hash"], password):
@@ -66,6 +116,7 @@ def _account(user_id: int) -> dict | None:
     if row and int(row.get("is_active") or 0) == 1:
         account = {"username": row["username"], "role": row["role"],
                    "name": str(row.get("name") or "").strip(),
+                   "pages": parse_pages(row.get("pages")),
                    "mark": _password_mark(row["password_hash"])}
     with _checked_lock:
         _checked[user_id] = (now, account)
@@ -90,7 +141,7 @@ def current_user() -> dict | None:
         # proxy has a bad minute would be worse than trusting a signed cookie
         # for that minute, and nobody can sign in meanwhile either.
         return {"id": user_id, "username": session.get("username"), "role": session.get("role"),
-                "name": session.get("name") or ""}
+                "name": session.get("name") or "", "pages": session.get("pages")}
 
     if account is None:
         session.clear()
@@ -111,8 +162,11 @@ def current_user() -> dict | None:
     session["role"] = account["role"]
     # The Name from the Admin page, for the sidebar's "Hi Name!".
     session["name"] = account.get("name") or ""
+    # Kept in the cookie too, so the pages stay limited for the minute the
+    # users table may be unreachable.
+    session["pages"] = account.get("pages")
     return {"id": user_id, "username": account["username"], "role": account["role"],
-            "name": account.get("name") or ""}
+            "name": account.get("name") or "", "pages": account.get("pages")}
 
 
 def login_user(user: dict) -> None:
