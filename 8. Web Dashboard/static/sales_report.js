@@ -710,7 +710,7 @@
         // leaving every reader to infer it.
         chunks.push(`<p class="sr-legend">
             <strong>NOC</strong> is the number of cases.
-            <strong>ANS</strong> is net sales in RM, after EPP interest is taken out.
+            <strong>ANS</strong> is sales in RM: the full invoice total (EPP included) once fully paid, the Original Price until then.
         </p>`);
 
         // Company-wide takes every visible agent, so it always has something

@@ -2859,3 +2859,17 @@ body {
 /* Sales Report hover: which price a case counts at, under its amount. */
 .sr-tip-basis { font-size: 10px; font-weight: 600; color: var(--text-muted, #64748b); margin-left: 4px; }
 .sr-tip-total td { border-top: 1px solid var(--border-color, #dfe3ec); font-weight: 700; padding-top: 4px; }
+
+/* Sales Report sidebar: the report's rules in short, folded by default. */
+.sr-rules summary.group-label {
+    cursor: pointer;
+    margin-bottom: 0;
+    list-style: none;
+}
+.sr-rules summary.group-label::-webkit-details-marker { display: none; }
+.sr-rules summary.group-label::after { content: " \25B8"; }
+.sr-rules[open] summary.group-label::after { content: " \25BE"; }
+.sr-rules dl { margin: 12px 0 0; font-size: 12px; line-height: 1.5; color: #cbd5e1; }
+.sr-rules dt { font-weight: 600; color: #f8fafc; margin-top: 10px; }
+.sr-rules dt:first-child { margin-top: 0; }
+.sr-rules dd { margin: 2px 0 0; }

@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/styles.css?v=20261028-sr-paid">
+    <link rel="stylesheet" href="/static/styles.css?v=20261028-sr-rules2">
 </head>
 <body class="report-page">
     <div class="app-container">
@@ -44,6 +44,34 @@
                     <li class="nav-link-item"><a href="/"><span class="bullet"></span> Overview</a></li>
                     <li class="active"><span class="bullet"></span> Sales Report</li>
                 </ul>
+            </div>
+
+            <!-- How the report counts, in short. Folded by default so the
+                 navigation below stays in view. -->
+            <div class="sidebar-group">
+                <details class="sr-rules">
+                    <summary class="group-label">Sales Report Rules</summary>
+                    <dl>
+                        <dt>Month</dt>
+                        <dd>A case counts in the month of its first payment. From August 2026, the month that payment was created in the system.</dd>
+                        <dt>NOC</dt>
+                        <dd>One case per invoice. Duplicates, top-ups and cancelled invoices are left out.</dd>
+                        <dt>ANS</dt>
+                        <dd>Fully paid: the full invoice total, EPP included. Not fully paid yet: the Original Price.</dd>
+                        <dt>RES / COM</dt>
+                        <dd>COM: factory, kilang or commercial jobs, hotels, resorts, petrol stations and clinics. A shop lot of 36 panels or fewer is RES, more is COM. Anything tagged COMMERCIAL stays COM. Everything else is RES.</dd>
+                        <dt>Shaded cell</dt>
+                        <dd>Every customer in that month is fully paid.</dd>
+                        <dt>Collected</dt>
+                        <dd>Cash received on this year's invoices, up to the month picked above.</dd>
+                        <dt>EP point</dt>
+                        <dd>RES: 1 point per RM. COM before May 2026: 40%. COM from May 2026: the first RM40,000 at 100%, the rest at 40%.</dd>
+                        <dt>May multiplier</dt>
+                        <dd>Sales from 1 May to 10 June earn extra EP: +0.5 for every 3 cases in that window. Applies up to June only.</dd>
+                        <dt>Confirmed figures</dt>
+                        <dd>Months already confirmed with Finance stay fixed, even if the invoice is edited later.</dd>
+                    </dl>
+                </details>
             </div>
 
             <div class="sidebar-group">
@@ -140,7 +168,7 @@
         </main>
     </div>
 
-    <script src="/static/sales_report.js?v=20261028-sr-paid"></script>
+    <script src="/static/sales_report.js?v=20261028-sr-ansnote"></script>
     <script src="/static/updater.js?v=20260923-adminonly"></script>
     <script src="/static/sidebar_toggle.js?v=20261014-2"></script>
     <script src="/static/greeting.js?v=20261028-pages"></script>

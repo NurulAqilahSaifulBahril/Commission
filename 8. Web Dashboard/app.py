@@ -3439,6 +3439,11 @@ SALES_REPORT_EXCLUDED_INVOICES = {
     # INV-1008594, NG KOK CHEU (ATAP), Chan Jia Wei -- a RM4,800 top-up on the
     # February sale INV-1008241 (RM46,106), not a case of its own.
     "48c00c12-fd1a-4bb1-a869-ae59748e9d40",
+    # INV-1008805, CHIA KIM HENG (ATAP), Chan Jia Wei -- a RM33,188 second
+    # quote with only a RM1,659.40 deposit, beside the real sale INV-1008593
+    # (RM19,800, fully paid). Counted once, so March RES is 8 cases, per user
+    # request (28 Oct 2026).
+    "df1e31bf-1473-4c56-909d-650829e09a1c",
     # 1008435, Cheong Hong Wee (Atap), Teng Kah Kent -- RM29,800, first paid
     # 16 Jan 2026; not a January case per Finance, left out.
     "1768594400823x535666973979967500",
