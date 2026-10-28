@@ -3424,8 +3424,11 @@ def _sales_report_excluded(raw: str) -> bool:
 def _sales_report_cancelled(row: dict) -> bool:
     """A cancelled package is recorded by renaming the customer, e.g.
     "GARY TAN (CANCEL PACKAGE REFUND ON 13/06/2026 RM934.79)"; the invoice
-    itself stays live. Such a case is not a sale."""
-    return "cancel" in str(row.get("customer_name") or "").lower()
+    itself stays live. Such a case is not a sale. Nor is an invoice raised
+    for a "Sample Quotation" customer (Wong Jia Xuan, Aug 2026): left off
+    per user request (28 Oct 2026)."""
+    name = " ".join(str(row.get("customer_name") or "").lower().split())
+    return "cancel" in name or "sample quotation" in name
 
 
 # Invoices left out of the report by hand: duplicates and cancellations the
