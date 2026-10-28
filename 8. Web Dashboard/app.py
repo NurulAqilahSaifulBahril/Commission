@@ -3399,8 +3399,10 @@ def get_overview():
 # either side of the campaign cut-off, then EP point and the balance left to
 # qualify. Company-wide first, then one block per branch, as the print does.
 
-# From this date a case's month follows its first payment's Created at rather
-# than its payment date (user, 28 Oct 2026). See _sales_report_case_dates().
+# A case's month is its first payment's paid date. From this date a first
+# payment keyed in (Created at) in a later month than it was paid is a late
+# entry: it still counts on the Sales Report, but earns no EGA/ESA, Early Bird
+# or Monthly Contest points (user, 28 Oct 2026). See _sales_report_case_dates().
 SALES_REPORT_CREATED_AT_FROM = "2026-08-01"
 SALES_REPORT_SPLIT_MONTH = 6     # the EGA campaign window closes 10 June
 SALES_REPORT_SPLIT_DAY = 10      # June is shown as 1-10 / 11-30, per the campaign
@@ -3439,11 +3441,11 @@ SALES_REPORT_EXCLUDED_INVOICES = {
     # INV-1008594, NG KOK CHEU (ATAP), Chan Jia Wei -- a RM4,800 top-up on the
     # February sale INV-1008241 (RM46,106), not a case of its own.
     "48c00c12-fd1a-4bb1-a869-ae59748e9d40",
-    # INV-1008805, CHIA KIM HENG (ATAP), Chan Jia Wei -- a RM33,188 second
-    # quote with only a RM1,659.40 deposit, beside the real sale INV-1008593
-    # (RM19,800, fully paid). Counted once, so March RES is 8 cases, per user
-    # request (28 Oct 2026).
-    "df1e31bf-1473-4c56-909d-650829e09a1c",
+    # INV-1008593, CHIA KIM HENG (ATAP), Chan Jia Wei -- RM19,800, fully paid,
+    # beside INV-1008805 (RM33,188, RM1,659.40 deposit) for the same customer.
+    # Counted once, on INV-1008805, so March RES is 8 cases, RM201,220.15, per
+    # user request (28 Oct 2026).
+    "20625b3d-8ce9-461d-af1f-fd97b2821c7c",
     # 1008435, Cheong Hong Wee (Atap), Teng Kah Kent -- RM29,800, first paid
     # 16 Jan 2026; not a January case per Finance, left out.
     "1768594400823x535666973979967500",
@@ -3507,9 +3509,6 @@ SALES_REPORT_SALES_ADJUSTMENTS = {
     # INV-1010037, TAN BEE LING (ATAP), Chan Jia Wei -- counted at the full
     # RM25,290.90 invoice total; the RM2,490.90 EPP interest is added back.
     "f96da89a-35f7-4bf3-bdf5-e4c71c280235": "2490.90",
-    # INV-1010642, LEE MENG WAI (ATAP), Chan Jia Wei -- counted at RM27,465:
-    # RM28,205 less RM740, not the RM1,785 EPP interest on the invoice.
-    "c79bec50-7536-438b-8ab4-355ef45f25c9": "1045",
     # INV-1011142, TAM PUI TENG (ATAP), Chan Jia Wei -- counted at RM37,750,
     # before the RM6,670 "Discount (RM 6670)" line (RM31,080 after it).
     "4809d0b2-abf7-4841-952c-cfde02f8adbb": "6670",
@@ -3699,19 +3698,9 @@ SALES_REPORT_SALES_ADJUSTMENTS = {
     # so May RES sales are counted at 6 cases, RM134,749.91 per user request.
     "3c4f9127-5c31-480f-b9f6-7ee0917b0f76": "-11055",
     "INV-1009559": "-11055",
-    # Chan Jia Wei, June -- three invoices edited in the ERP after the user had
-    # checked June at 12 RES cases, RM304,665.00; restored per user request:
-    # INV-1010644, GAN LEOK ENG -- a RM8,600 "B3-16.0LV Battery" line added 25 Oct.
-    "8a877d36-27ae-4c79-b2e3-5e43add44d6c": "-8600",
-    "INV-1010644": "-8600",
-    # INV-1009986, EEE LAY HOON -- "CEO Discount (RM 2950)" added to its
-    # discount line on 20 Oct.
-    "f4dbf708-df97-457d-848b-6d2308e91a4e": "2950",
-    "INV-1009986": "2950",
-    # INV-1010592, HEE WAI KIN -- package and discount lines re-entered on
-    # 13 Oct, RM950 lower (RM26,950 -> RM26,000).
-    "d829fad4-2452-49b9-8a1f-d6b9ab883e9d": "950",
-    "INV-1010592": "950",
+    # Chan Jia Wei, June: no corrections. Its twelve invoices follow the
+    # invoice Total Amount (Commission Price once fully paid), 12 RES,
+    # RM310,705.00, per user request (28 Oct 2026).
     # INV-1010346, MOK WEI XIAN, Louis Ng Zhan Yi -- a RM1,200 EV charger
     # installation line added 8 Oct; removed so June RES stays at 10 cases,
     # RM291,620.57 as the user checked it.
@@ -3748,61 +3737,51 @@ SALES_REPORT_EPP_ADDBACKS = {
 }
 
 # ANS only (never EP or sales), keyed on bubble_id: when the 28 Oct 2026 rules
-# (Created at from August; fully paid at total less EPP, else Original Price)
-# would move a month the user had already confirmed, the difference is pinned
-# here so that month reads as they checked it. Filled from the confirmed list.
+# (paid date for the month; fully paid at Original Price, else the full total
+# with EPP) would move a month the user had already confirmed, the difference
+# is pinned here so that month reads as they checked it. Filled from the
+# confirmed list; a confirmed month the rules already match needs no pin.
 SALES_REPORT_CONFIRMED_ANS_PINS: dict = {
-    # Olivier Koh Cong Lee, Feb RES -- confirmed 2 cases, RM41,988.00; the new rules give RM41,870.00.
-    # Carried on INV-1008371 (SOH LIK KUANG (ATAP) (QUALI-TECH SERVICES SDN BHD)).
-    "47bd863c-196f-4d0a-b208-a3cc31c47fac": "118.0",
-    # Olivier Koh Cong Lee, May RES -- confirmed 5 cases, RM127,200.00; the new rules give RM128,400.00.
-    # Carried on INV-1009520 (QUEK POH HUI (ATAP)).
-    "d076ddd0-9639-4afa-b505-b1cd827d212f": "-2298.0",
-    # Caryn Dong Leong Moi, Feb RES -- confirmed 3 cases, RM78,600.00; the new rules give RM78,482.00.
-    # Carried on INV-1008397 (CHEW CHYE CHOON (ATAP)).
-    "d73ada5b-f781-4546-9a0d-dfcc0a75da56": "-4737.0",
+    # Olivier Koh Cong Lee, May RES -- confirmed RM127,200.00; the rules give
+    # RM128,000.00. Carried on QUEK POH HUI (ATAP).
+    "d076ddd0-9639-4afa-b505-b1cd827d212f": "-800.0",
+    # Caryn Dong Leong Moi, Feb RES -- confirmed RM78,600.00; the rules give
+    # RM79,288.00. Carried on CHEW CHYE CHOON (ATAP).
+    "d73ada5b-f781-4546-9a0d-dfcc0a75da56": "-688.0",
     # Chan Wing On, Feb RES -- confirmed 2 cases, RM57,000.00; the new rules give RM58,824.00.
     # Carried on 1008563 (TAN LIAN KENG).
     "1771658583603x991793478265471000": "-1824.0",
-    # Chan Wing On, May RES -- confirmed 4 cases, RM114,412.00; the new rules give RM116,300.00.
-    # Carried on INV-1009954 (SERIJIT KAUR @ SURJIT KAUR A/P PRAM SINGH).
-    "4cb4ed2a-236f-4fee-9baa-5b71315453e9": "-1888.0",
-    # Chan Jia Wei, Jun RES -- confirmed 12 cases, RM304,665.00; the new rules give RM305,265.00.
-    # Carried on INV-1010312 (TAN CHEE CHIANG (ATAP)).
-    "7010969d-472a-4013-af1f-79a69321d292": "-944.93",
-    # Olivier Koh Cong Lee, Jan RES -- confirmed RM117,993.02; counting fully paid
-    # invoices at their full total (EPP included) gives RM126,503.84. Carried on 1008384.
-    "1767939913445x149272359145570300": "-8510.82",
-    # Olivier Koh Cong Lee, Mar RES -- confirmed RM76,397.50; counting fully paid
-    # invoices at their full total (EPP included) gives RM79,465.00. Carried on INV-1008789.
-    "5966fc0d-e9ed-45e0-8eca-707355417737": "-3067.5",
-    # Olivier Koh Cong Lee, Sep RES -- confirmed RM219,500.00; counting fully paid
-    # invoices at their full total (EPP included) gives RM221,447.50. Carried on INV-1011573.
-    "c7fadb70-caa8-4567-9453-a599483a2481": "-1947.5",
-    # Chan Wing On, Mar RES -- confirmed RM94,400.00; counting fully paid
-    # invoices at their full total (EPP included) gives RM95,376.60. Carried on INV-1008774.
-    "198457ae-43c7-493c-9c14-da248624f52d": "-976.6",
-    # Viggy Gui Choon Fong, Jul RES -- confirmed RM71,764.00; counting fully paid
-    # invoices at their full total (EPP included) gives RM76,075.84. Carried on INV-1010696.
-    "4feb4dde-4ffe-4277-a6ac-2042796a485d": "-4311.84",
-    # Ling Liang Kang, May RES -- confirmed RM192,479.00; counting fully paid
-    # invoices at their full total (EPP included) gives RM195,792.38. Carried on INV-1010031.
-    "11bb249e-ecdd-4e74-a643-801700d55845": "-3313.38",
-    # Nur Anisah Binti Mohd Amiruddin @ Chumati, Jan RES -- confirmed RM63,600.00; counting fully paid
-    # invoices at their full total (EPP included) gives RM66,388.00. Carried on 1008396.
-    "1768118811109x391817559622549500": "-2788.0",
-    # Winson Tan Sue Cherk, Apr RES -- confirmed RM37,600.00; counting fully paid
-    # invoices at their full total (EPP included) gives RM40,320.00. Carried on INV-1009181.
-    "d77eec3c-0b83-40ff-a689-6dae1839a540": "-2720.0",
-    # Ching Zhe Hang, May RES -- confirmed RM134,749.91; counting fully paid
-    # invoices at their full total (EPP included) gives RM136,297.00. Carried on INV-1009559.
-    "3c4f9127-5c31-480f-b9f6-7ee0917b0f76": "-1547.09",
-    # Louis Ng Zhan Yi, Jun RES -- confirmed RM291,620.57; counting fully paid
-    # invoices at their full total (EPP included) gives RM292,850.82. Carried on INV-1010358.
-    "d1f99d8f-bc47-447d-8f84-01bf14673708": "-1230.25",
-    # Wong Jia Xuan, Jul RES -- confirmed RM83,770.00; counting fully paid
-    # invoices at their full total (EPP included) gives RM84,760.00. Carried on INV-1011237.
-    "afb07b5b-19c0-4520-bed8-36364a6ba087": "-990.0",
+    # Chan Wing On, May RES -- confirmed RM114,412.00; the rules give
+    # RM115,900.00. Carried on SERIJIT KAUR @ SURJIT KAUR A/P PRAM SINGH.
+    "4cb4ed2a-236f-4fee-9baa-5b71315453e9": "-1488.0",
+    # Olivier Koh Cong Lee, Sep RES -- confirmed RM219,500.00; the rules give
+    # RM221,604.94. Carried on Tan Teh Siang.
+    "c7fadb70-caa8-4567-9453-a599483a2481": "-2104.94",
+    # Chan Wing On, Mar RES -- confirmed RM94,400.00; the rules give
+    # RM94,518.00. Carried on TEE LI LEONG (ATAP).
+    "198457ae-43c7-493c-9c14-da248624f52d": "-118.0",
+    # Louis Ng Zhan Yi, Jun RES -- confirmed RM291,620.57; the rules give
+    # RM292,308.57. Carried on ANG SIONG HENG (ATAP).
+    "d1f99d8f-bc47-447d-8f84-01bf14673708": "-688.0",
+    # Olivier Koh Cong Lee, Jun RES -- confirmed RM81,862.78; the rules give
+    # RM85,425.56. Carried on KOH CHONG LEE.
+    "7d53dcc0-3ee6-48e4-9f78-983cc5198a44": "-3562.78",
+    # Olivier Koh Cong Lee, Aug RES -- confirmed RM175,360.00; the rules give
+    # RM176,530.00. Carried on LEE ENG CHAI.
+    "c15c93af-4d7f-4154-8d4e-0a754b4df085": "-1170.0",
+    # Ivan Low Chin Chai, May RES -- confirmed RM47,913.00; the rules give
+    # RM50,802.18. Carried on LOW BOON HUAT.
+    "efc30b6f-ee81-4550-8dd0-5b9688a4b9d4": "-2889.18",
+    # Ling Liang Kang, Jul RES -- confirmed RM206,070.00; the rules give
+    # RM209,558.58. Carried on TAN YONG KOK (ATAP).
+    "9851d7df-92b9-4868-9997-dd3734cc70b4": "-3488.58",
+    # Chan Jia Wei, Mar RES -- confirmed 8 cases, RM201,220.15: INV-1008804,
+    # LOH KAH GUAN (ATAP), fully paid, counted at its RM35,436.40 total, without
+    # the RM6,888 lucky draw prize the Commission Price adds back.
+    "e5eb526a-2013-472b-8d89-ba99a0ee0d30": "-6888",
+    # Louis Ng Zhan Yi, Sep RES -- confirmed RM108,300.00; the rules give
+    # RM109,696.80. Carried on CHIENG JIN SOON (ATAP).
+    "0bd6e7f9-dce9-4638-9c2a-1b3ca2b02ff7": "-1396.8",
 }
 
 SALES_REPORT_EP_OVERRIDES = {
@@ -4415,10 +4394,11 @@ def _sales_report_case_dates(year: int) -> dict[str, str]:
     printed report counts him in January; Lim Lee Peng is invoiced 5 January but
     first paid 30 December, so he is not in 2026 at all.
 
-    From August 2026 the first payment's Created at -- the day Finance keyed it
-    in -- decides the month instead of its payment date (user, 28 Oct 2026):
-    paid 31 August but keyed in 2 September is a September case. (An earlier
-    created-at regime, on the invoice's own created date, ran until 15 Sep.)
+    The paid date decides the month all year (user, 28 Oct 2026). From August
+    2026 a first payment keyed in (Created at) in a later month than it was
+    paid -- paid 29 August, keyed in 9 September -- is a late entry: still an
+    August case here, but it earns no contest points. Those invoices are kept
+    in _LATE_ENTRY_CACHE; see _sales_report_late_entries().
 
     Keyed on bubble_id, not invoice number: one number can carry several
     revisions with different dates -- 1008358 has first payments at 2026-01-03
@@ -4440,14 +4420,12 @@ def _sales_report_case_dates(year: int) -> dict[str, str]:
         return hit[1]
 
     sql = f"""
-        SELECT bubble_id, p1, c FROM (
+        SELECT bubble_id, p1, c, late FROM (
           SELECT i.bubble_id,
-                 CASE
-                   WHEN fp.fd IS NULL THEN
-                     (i."1st_payment_date" AT TIME ZONE 'Asia/Kuala_Lumpur')::date
-                   WHEN fp.fd >= DATE '{SALES_REPORT_CREATED_AT_FROM}' THEN COALESCE(fp.fc, fp.fd)
-                   ELSE fp.fd
-                 END AS p1,
+                 COALESCE(fp.fd,
+                          (i."1st_payment_date" AT TIME ZONE 'Asia/Kuala_Lumpur')::date) AS p1,
+                 (fp.fd >= DATE '{SALES_REPORT_CREATED_AT_FROM}'
+                  AND date_trunc('month', fp.fc) > date_trunc('month', fp.fd)) AS late,
                  (i.created_at AT TIME ZONE 'Asia/Kuala_Lumpur')::date AS c,
                  ROW_NUMBER() OVER (
                    PARTITION BY i.bubble_id
@@ -4455,11 +4433,13 @@ def _sales_report_case_dates(year: int) -> dict[str, str]:
                             i.invoice_date DESC NULLS LAST, i.id DESC) AS rn
             FROM invoice i
             -- The invoice's first payment row (a real amount before a RM0
-            -- one): its payment date, and its Created at -- when Finance
-            -- keyed it in -- which places the case from August.
+            -- one): its payment date, which places the case, and its Created
+            -- at -- when Finance keyed it in, as the hover shows it -- which
+            -- marks a late entry from August.
             LEFT JOIN (SELECT DISTINCT ON (linked_invoice) linked_invoice,
                               (payment_date AT TIME ZONE 'Asia/Kuala_Lumpur')::date AS fd,
-                              (created_at AT TIME ZONE 'Asia/Kuala_Lumpur')::date AS fc
+                              (COALESCE(created_date, created_at)
+                                 AT TIME ZONE 'Asia/Kuala_Lumpur')::date AS fc
                          FROM payment
                         WHERE payment_date IS NOT NULL
                         ORDER BY linked_invoice, (COALESCE(amount, 0) > 0) DESC,
@@ -4493,6 +4473,7 @@ def _sales_report_case_dates(year: int) -> dict[str, str]:
         return {}
 
     out: dict[str, str] = {}
+    late: set = set()
     for r in rows or []:
         bid = str(r.get("bubble_id") or "").strip()
         if not bid:
@@ -4500,8 +4481,22 @@ def _sales_report_case_dates(year: int) -> dict[str, str]:
         paid = str(r.get("p1") or "")[:10]
         if paid:
             out[bid] = paid
+        if str(r.get("late")).lower() in ("true", "t", "1"):
+            late.add(bid)
     _FIRST_PAYMENT_CACHE[key] = (time.time(), out)
+    _LATE_ENTRY_CACHE[key] = frozenset(late)
     return out
+
+
+_LATE_ENTRY_CACHE: dict[int, frozenset] = {}
+
+
+def _sales_report_late_entries(year: int) -> frozenset:
+    """bubble_ids whose first payment was keyed in a later month than it was
+    paid, from August 2026: they earn no EGA/ESA, Early Bird or Monthly
+    Contest points (user, 28 Oct 2026). Read alongside the case dates."""
+    _sales_report_case_dates(year)
+    return _LATE_ENTRY_CACHE.get(int(year), frozenset())
 
 
 _PAYMENT_ROWS_CACHE: dict[tuple[int, int], tuple[float, dict]] = {}
@@ -4564,7 +4559,8 @@ def _sales_report_payment_rows(year: int, upto_month: int) -> dict[str, list]:
     return out
 
 
-def _case_hover_entry(customer_name, payments, system_price=None, ans=None, fully_paid=None):
+def _case_hover_entry(customer_name, payments, system_price=None, ans=None, fully_paid=None,
+                      paid_pct=None):
     """One case for the hover panel, or None when there is no customer to name.
 
     An entry with no payments is still worth returning: the panel says "no
@@ -4574,7 +4570,8 @@ def _case_hover_entry(customer_name, payments, system_price=None, ans=None, full
     "s" is the invoice's System Price -- its total amount, what the customer
     is billed -- read by the customer list under the report; the hover panel
     ignores it. "v" is the ANS the case counts at and "f" whether the invoice
-    is fully paid -- the hover names it Sales price or Original price.
+    is fully paid -- the hover names it Sales price or Original price. "pc" is
+    the share of the invoice total paid to date, for the % Payment column.
     """
     name = str(customer_name or "").strip()
     if not name:
@@ -4583,6 +4580,8 @@ def _case_hover_entry(customer_name, payments, system_price=None, ans=None, full
     if ans is not None:
         entry["v"] = float(ans)
         entry["f"] = bool(fully_paid)
+    if paid_pct is not None:
+        entry["pc"] = round(float(paid_pct), 1)
     return entry
 
 
@@ -4957,6 +4956,7 @@ def _ega_award_report(mod, out_mod, rows, year, upto_month, channel, carryover, 
     named_as: dict = {}
 
     first_paid = first_paid or {}
+    late = _sales_report_late_entries(year) if first_paid else frozenset()
     for row in rows:
         # Same rule as the Sales Report: a case belongs to the month its first
         # payment arrived, so the two pages agree case for case.
@@ -4987,6 +4987,10 @@ def _ega_award_report(mod, out_mod, rows, year, upto_month, channel, carryover, 
                        - _D(str(row.get("epp_interest") or 0)))
         ep = mod.calc_ep_points(sales_price, prop, row.get("invoice_date"),
                                 panel_qty).quantize(_D("0.01"), rounding=_RH)
+        # A late entry (paid in one month, keyed in a later one, from August)
+        # is listed but earns no points, as on the Sales Report.
+        if str(row.get("bubble_id") or "") in late:
+            ep = _D("0")
         inv_dt = str(row.get("invoice_date") or "")[:10]
 
         agent_ep[agent] += ep
@@ -5295,6 +5299,7 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         payments = f_payments.result()
         payment_rows = f_payment_rows.result()
         case_dates = f_case_dates.result()
+        late_entries = _sales_report_late_entries(year)
         carryover = f_carryover.result()
         targets, esa_targets = f_targets.result()
         # A new list, not +=: `rows` is the cached bundle's own list.
@@ -5377,14 +5382,15 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
                  - Decimal(str(r.get("epp_interest") or 0))
                  + line_adj.get(str(bubble or ""), zero)
                  + Decimal(adj_val))
-        # ANS (user, 28 Oct 2026): a fully paid invoice counts at its full
-        # invoice total, EPP interest included; one not fully paid yet at its
-        # Original Price -- the total less EPP, lucky-draw prizes added back
-        # (invoice_price_basis). Fully paid is judged on the full invoice
-        # amount, as the customer pays it. Hand adjustments still apply --
-        # except an "add the EPP back" one on a fully paid invoice, which the
-        # rule now does itself (SALES_REPORT_EPP_ADDBACKS) -- and
-        # SALES_REPORT_CONFIRMED_ANS_PINS keeps months the user checked.
+        # ANS (user, 28 Oct 2026, revised the same day): a fully paid invoice
+        # counts at its Original Price -- the total less EPP, lucky-draw prizes
+        # added back (invoice_price_basis); one not fully paid yet at its Sales
+        # price, the full invoice total with EPP interest included. Fully paid
+        # is judged on the full invoice amount, as the customer pays it. Hand
+        # adjustments still apply -- except an "add the EPP back" one on an
+        # invoice not fully paid, whose total already carries the EPP
+        # (SALES_REPORT_EPP_ADDBACKS) -- and SALES_REPORT_CONFIRMED_ANS_PINS
+        # keeps months the user checked.
         total = Decimal(str(r.get("total_amount") or 0))
         rec = (price_records.get((str(r.get("invoice_number") or "").strip(),
                                   str(r.get("customer_name") or "").strip().lower()))
@@ -5398,9 +5404,9 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
             epp = Decimal(str(r.get("epp_interest") or 0))
             original = total - epp
         fully_paid = paid_to_date.get(str(bubble or ""), zero) >= total - Decimal("0.5")
-        epp_addback = fully_paid and (str(bubble or "").strip() in SALES_REPORT_EPP_ADDBACKS
-                                      or str(r.get("invoice_number") or "").strip() in SALES_REPORT_EPP_ADDBACKS)
-        ans = (total if fully_paid else original) + (zero if epp_addback else Decimal(adj_val))
+        epp_addback = not fully_paid and (str(bubble or "").strip() in SALES_REPORT_EPP_ADDBACKS
+                                          or str(r.get("invoice_number") or "").strip() in SALES_REPORT_EPP_ADDBACKS)
+        ans = (original if fully_paid else total) + (zero if epp_addback else Decimal(adj_val))
         ans += Decimal(SALES_REPORT_CONFIRMED_ANS_PINS.get(str(bubble or "").strip(), "0"))
         prop = int_mod.classify_property_type(r)
         inv_no = str(r.get("invoice_number") or "").strip()
@@ -5455,9 +5461,11 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         cell = months.setdefault(when.month, [0, zero])
         cell[0] += 1
         cell[1] += ans
+        paid_so_far = paid_to_date.get(str(bubble or ""), zero)
         customer = _case_hover_entry(r.get("customer_name"),
                                      payment_rows.get(str(bubble or "")),
-                                     r.get("total_amount"), ans, fully_paid)
+                                     r.get("total_amount"), ans, fully_paid,
+                                     (paid_so_far / total * 100) if total > 0 else None)
         if customer:
             entry["custs"].setdefault(kind, {}).setdefault(when.month, []).append(customer)
         if when.month == SALES_REPORT_SPLIT_MONTH:
@@ -5480,8 +5488,11 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         entry["collected"] += payments.get(str(bubble or ""), zero)
         ep_fixed = (SALES_REPORT_EP_OVERRIDES.get(str(bubble or "").strip())
                     or SALES_REPORT_EP_OVERRIDES.get(str(r.get("invoice_number") or "").strip()))
-        if "louis" in entry["agent"].lower():
-            _log(f"[DEBUG LOUIS] inv={r.get('invoice_number')}, bubble={bubble}, ep_fixed={ep_fixed}")
+        # A late entry (paid in one month, keyed in a later one, from August)
+        # stays on the Sales Report but earns no EP: no EGA/ESA or Early Bird
+        # points from it, in either month (user, 28 Oct 2026).
+        if str(bubble or "") in late_entries:
+            continue
         # A case on the report's COM line earns EP by the commercial rule -- the
         # first RM40,000 at 100%, the balance at 40%, for invoices dated from the
         # Data page's cutoff (1 May 2026) -- whatever the ERP recorded: it holds

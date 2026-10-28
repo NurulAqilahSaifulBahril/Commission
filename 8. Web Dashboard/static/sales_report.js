@@ -392,8 +392,8 @@
 
     /** The hover panel itself: one row per case in the cell -- its first
      *  payment (amount, paid date, created date) and the price it counts at:
-     *  Sales price once fully paid, Original price until then (user, 28 Oct
-     *  2026). A browser tooltip cannot draw a table and wraps long text into
+     *  Commission price (the Original Price) once fully paid, Sales price until then (user, 28 Oct
+     *  2026, revised the same day). A browser tooltip cannot draw a table and wraps long text into
      *  an unreadable block, so this is a panel of our own. */
     function caseTable(entry) {
         const rows = [];
@@ -404,35 +404,38 @@
         const more = entry.cases.length - shown.length;
         shown.forEach(c => {
             const name = `<td class="sr-tip-cust">${escapeHtml(c.n)}</td>`;
+            // Share of the invoice total paid to date.
+            const pct = `<td class="numeric">${c.pc === undefined ? "—"
+                : c.pc.toLocaleString("en-MY", { maximumFractionDigits: 1 }) + "%"}</td>`;
             // Figure and label in cells of their own, so the figures and the
             // total line up while the label still sits beside each figure.
             const price = c.v === undefined ? `<td class="sr-tip-none">—</td><td></td>`
-                : `<td class="numeric">${fmtRM(c.v)}</td><td class="sr-tip-basis">${c.f ? "Sales price" : "Original price"}</td>`;
+                : `<td class="numeric">${fmtRM(c.v)}</td><td class="sr-tip-basis">${c.f ? "Commission price" : "Sales price"}</td>`;
             const p = firstPayment(c.p);
             if (!p) {
-                rows.push(`<tr>${name}<td colspan="3" class="sr-tip-none">`
+                rows.push(`<tr>${name}${pct}<td colspan="3" class="sr-tip-none">`
                     + `no payment recorded in this period</td>${price}</tr>`);
                 return;
             }
-            rows.push(`<tr>${name}`
+            rows.push(`<tr>${name}${pct}`
                 + `<td class="numeric">${fmtRM(p.a)}</td>`
                 + `<td>${escapeHtml(p.d || "—")}</td>`
                 + `<td>${escapeHtml(p.m || "—")}</td>${price}</tr>`);
         });
         if (more) {
-            rows.push(`<tr><td colspan="6" class="sr-tip-none">`
+            rows.push(`<tr><td colspan="7" class="sr-tip-none">`
                 + `…and ${plural(more, "more case")}</td></tr>`);
         }
         // Every case in the cell, the trimmed ones too, so it reads as the ANS.
         const priced = entry.cases.filter(c => c.v !== undefined);
         const total = priced.length
-            ? `<tfoot><tr class="sr-tip-total"><td colspan="4">Total</td>`
+            ? `<tfoot><tr class="sr-tip-total"><td colspan="5">Total</td>`
                 + `<td class="numeric">${fmtRM(priced.reduce((s, c) => s + c.v, 0))}</td><td></td></tr></tfoot>`
             : "";
         return `<div class="sr-tip-head">${escapeHtml(entry.label)} —
                 ${plural(entry.cases.length, "case")}</div>
             <table class="sr-tip-table">
-                <thead><tr><th>Customer</th><th>1st payment</th>
+                <thead><tr><th>Customer</th><th>% Payment</th><th>1st payment</th>
                     <th>Paid</th><th>Created</th><th colspan="2">Price</th></tr></thead>
                 <tbody>${rows.join("")}</tbody>${total}
             </table>`;
@@ -709,8 +712,8 @@
         // across the whole table, so say once what they hold rather than
         // leaving every reader to infer it.
         chunks.push(`<p class="sr-legend">
-            <strong>NOC</strong> is the number of cases.
-            <strong>ANS</strong> is sales in RM: the full invoice total (EPP included) once fully paid, the Original Price until then.
+            <strong>NOC</strong>: number of cases &middot;
+            <strong>ANS</strong>: 100% paid = Commission Price, below 100% = Sales Price (invoice total)
         </p>`);
 
         // Company-wide takes every visible agent, so it always has something

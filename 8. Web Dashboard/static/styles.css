@@ -43,6 +43,9 @@ body {
     padding: 24px;
     flex-shrink: 0;
     border-right: 1px solid rgba(255, 255, 255, 0.05);
+    /* Scrolls on its own when taller than the window (the Sales Report
+       rules, opened), instead of running past its background. */
+    overflow-y: auto;
 }
 
 .sidebar-header {
@@ -2873,3 +2876,5 @@ body {
 .sr-rules dt { font-weight: 600; color: #f8fafc; margin-top: 10px; }
 .sr-rules dt:first-child { margin-top: 0; }
 .sr-rules dd { margin: 2px 0 0; }
+.sr-rules dd ul { margin: 0; padding-left: 14px; }
+.sr-rules dd li { margin: 1px 0; }

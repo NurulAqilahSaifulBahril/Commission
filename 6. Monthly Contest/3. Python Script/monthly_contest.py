@@ -372,7 +372,17 @@ def fetch_invoices_from_db(token):
         pkg.price as pkg_price,
         pkg.nett_price as pkg_nett_price,
         a.name as agent_name,
-        c.name as customer_name
+        c.name as customer_name,
+        -- Late entry: from August 2026, a first payment keyed in (Created at)
+        -- in a later month than it was paid earns no contest points (user,
+        -- 28 Oct 2026). Same first-payment row the Sales Report uses.
+        (SELECT (fp.payment_date AT TIME ZONE 'Asia/Kuala_Lumpur')::date >= DATE '2026-08-01'
+                AND date_trunc('month', COALESCE(fp.created_date, fp.created_at) AT TIME ZONE 'Asia/Kuala_Lumpur')
+                    > date_trunc('month', fp.payment_date AT TIME ZONE 'Asia/Kuala_Lumpur')
+           FROM payment fp
+          WHERE fp.linked_invoice = inv.bubble_id AND fp.payment_date IS NOT NULL
+          ORDER BY (COALESCE(fp.amount, 0) > 0) DESC, fp.payment_date, fp.created_at
+          LIMIT 1) AS late_entry
     FROM invoice inv
     LEFT JOIN package pkg ON inv.linked_package = pkg.bubble_id
     LEFT JOIN (
@@ -512,7 +522,8 @@ def match_excel_cases_to_db(df_excel_cases, df_db, agent_map):
                 'DB 1stPay': selected_invoice['1st_payment_date'],
                 'DB PkgPrice': float(pkg_price),
                 'DB SalesPrice': float(selected_invoice['inv_total_amount']),
-                'DB Agent': selected_invoice['agent_name']
+                'DB Agent': selected_invoice['agent_name'],
+                'DB Late': str(selected_invoice.get('late_entry')).lower() in ('true', 't', '1'),
             })
             
     return pd.DataFrame(matches_list)
@@ -711,6 +722,15 @@ def calculate_monthly_contest(token=None, base_path=None, month=None, year=None,
     agent_map = {agent_key(k): v for k, v in agent_map.items()}
 
     df_matches = match_excel_cases_to_db(df_cases, df_db, agent_map)
+    # Matched first, so a late invoice still claims its roster line rather
+    # than letting another invoice take its place; then dropped, since it
+    # earns no contest points.
+    if 'DB Late' in df_matches.columns:
+        late_rows = df_matches[df_matches['DB Late'] == True]
+        for _, lr in late_rows.iterrows():
+            print(f"[Late entry] {lr['Excel Agent']} {lr['DB Inv Num']} ({lr['DB Cust']}): "
+                  f"paid in one month, keyed in a later one; no contest points.")
+        df_matches = df_matches[df_matches['DB Late'] != True].reset_index(drop=True)
     df_matches['Counted Revenue'] = df_matches['DB SalesPrice'].apply(
         lambda p: calc_counted_revenue(p, rules['full_rate_cap'], rules['above_cap_pct']))
     agent_to_team = {agent_key(a): t for a, t in zip(df_left['Agent'], df_left['Team'])}
