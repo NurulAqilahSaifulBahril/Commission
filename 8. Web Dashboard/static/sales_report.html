@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/styles.css?v=20261028-sr-ephover">
+    <link rel="stylesheet" href="/static/styles.css?v=20261029-epmult">
 </head>
 <body class="report-page">
     <div class="app-container">
@@ -67,9 +67,11 @@
                         <dt>EP point</dt>
                         <dd><ul><li>RES: 1 point per RM</li><li>COM before May: 40%</li><li>COM from May: first RM40k 100%, rest 40%</li></ul></dd>
                         <dt>Late entry (from Aug)</dt>
-                        <dd><ul><li>Entered a later month than paid: no EGA/ESA, Early Bird or contest points</li></ul></dd>
+                        <dd><ul><li>Entered a later month than paid: no ANP and no Monthly Contest points</li><li>Still counts for EP, EGA/ESA and Early Bird</li></ul></dd>
                         <dt>May multiplier</dt>
                         <dd><ul><li>1 May–10 Jun: +0.5 per 3 cases</li><li>Up to June only</li></ul></dd>
+                        <dt>EP multiplier</dt>
+                        <dd><ul><li>Oct: x1.5 EP on cases paid in Oct</li><li>Counts for ESA and Early Bird</li><li>Set on the Data page (EGA/ESA)</li></ul></dd>
                         <dt>Confirmed months</dt>
                         <dd><ul><li>Stay fixed</li></ul></dd>
                     </dl>
@@ -145,6 +147,7 @@
                 </div>
                 <button id="srClearSearch" class="btn-clear" title="Clear the agent search" hidden>Clear</button>
                 <span class="status-text" id="srMatchNote" style="align-self:center;"></span>
+                <button id="srShowCols" class="btn-clear" title="Bring back every column hidden on this page" hidden>Unhide all columns</button>
             </section>
 
             <section id="srSections"></section>
@@ -158,6 +161,17 @@
                  so it is never clipped by their own scrolling. -->
             <div id="srCaseTip" class="sr-tip" hidden></div>
 
+            <!-- EP point popup: opens on clicking an agent's EP Point. -->
+            <div id="srEpModal" class="modal" style="display:none;">
+                <div class="modal-content sr-ep-modal-content">
+                    <div class="modal-header">
+                        <h3>How the EP point is worked out</h3>
+                        <button class="btn-close" id="srEpClose" aria-label="Close">&times;</button>
+                    </div>
+                    <div class="modal-body sr-ep-body" id="srEpBody"></div>
+                </div>
+            </div>
+
             <div id="srLoader" class="loader-overlay hidden" style="position:relative; min-height:160px;">
                 <div class="spinner"></div>
                 <p>Loading sales report…</p>
@@ -170,7 +184,7 @@
         </main>
     </div>
 
-    <script src="/static/sales_report.js?v=20261028-sr-ep1rm"></script>
+    <script src="/static/sales_report.js?v=20261029-epmult"></script>
     <script src="/static/updater.js?v=20260923-adminonly"></script>
     <script src="/static/sidebar_toggle.js?v=20261014-2"></script>
     <script src="/static/greeting.js?v=20261028-pages"></script>

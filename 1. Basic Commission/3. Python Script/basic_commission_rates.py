@@ -634,14 +634,22 @@ def _scan_unified_rows(agent_type, hierarchy, month, year, agent, property_type,
         except Exception:
             continue
         spec = (10 if row_agents else 0) + prop_score
+        # A row for the invoice's own Role beats an "All" row (no Role) that is
+        # otherwise as specific, whatever their start months. An All row only
+        # fills in what the role itself does not price -- Factory, typically.
+        # Before, the later start won: Mohd Azhar's All-role Residential 2.5%
+        # from Jul 2026 took his OSA invoices off the OSA 5.5% (user, 29 Oct
+        # 2026: an All rate belongs on the All row, as Edit Agent Details
+        # shows it).
+        role_hit = 1 if row_role else 0
         # Rank on the start month — the raw cell would sort a range above the
         # plain month it starts in, purely on string length — but hand back the
         # cell as written, because callers display it and "2026-07 to 2026-08"
         # says something "2026-07" does not.
-        cand = (spec, effective_start(eff), r, rate, eff)
-        if best is None or (cand[0], cand[1]) > (best[0], best[1]):
+        cand = (spec, role_hit, effective_start(eff), r, rate, eff)
+        if best is None or cand[:3] > best[:3]:
             best = cand
-    return (best[2], best[3], best[4]) if best else None
+    return (best[3], best[4], best[5]) if best else None
 
 
 # ── Net Floor Price tier rates (dashboard "commission_rates") ────────────────

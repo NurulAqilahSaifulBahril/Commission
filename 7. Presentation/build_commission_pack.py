@@ -32,7 +32,7 @@ import re
 import copy as _copy
 from collections import defaultdict
 from dataclasses import replace as _dc_replace, is_dataclass as _is_dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -153,6 +153,18 @@ def _token_help_message() -> str:
 # ---------------------------------------------------------------------------
 # Module loader
 # ---------------------------------------------------------------------------
+
+def dynamic_class(module: str, qualname: str):
+    """The class `qualname` of the commission module loaded as `module`, as it
+    is loaded now. The dashboard's disk cache stores classes of the modules
+    loaded through _load_module() by name and finds them again with this, so
+    a cache built before those modules were reloaded (every Data page change
+    reloads them) still saves and loads."""
+    obj = sys.modules[module]
+    for part in qualname.split("."):
+        obj = getattr(obj, part)
+    return obj
+
 
 def _load_module(name: str, path: Path):
     if name in sys.modules:
@@ -335,12 +347,49 @@ def _basic_line_overrides(ln, agent_type: str, name_map: dict | None = None) -> 
 
 
 def advance_recognized_date(ln) -> str:
-    """The date that puts an invoice's Advance RM 300 in a month: the Created
-    at of the payment that reached the advance trigger -- when Finance entered
-    it -- not the payment date typed on it (user, 2026-10-20). A payment dated
-    19 Aug but entered 10 Sep pays its advance in September. Falls back to the
-    payment date for lines that carry no Created at."""
-    return str(getattr(ln, "pct5_created", "") or getattr(ln, "pct5_date", "") or "")[:10]
+    """The date that puts an invoice's Advance RM 300 in a month, from the
+    payment that reached the advance trigger (user, 2026-10-29):
+
+    - paid and keyed in (Created at) in the same month: that month;
+    - paid on either of the last two working days (Mon-Fri) of a month, or a
+      weekend after them, AND keyed in on either of the first two working
+      days of the next month, or a weekend before them: the paid month
+      (Leong Chee Wei: paid Fri 28 Aug, keyed Tue 1 Sep -> August);
+    - otherwise the Created at month (Shamiela: paid Sat 29 Aug, keyed
+      10 Sep -> September).
+
+    Public holidays are not skipped. Falls back to the payment date for lines
+    that carry no Created at. The Balance and NFP still go by the payment
+    date."""
+    paid = str(getattr(ln, "pct5_date", "") or "")[:10]
+    created = str(getattr(ln, "pct5_created", "") or "")[:10]
+    if not paid or not created or paid[:7] == created[:7]:
+        return paid or created
+    try:
+        p = datetime.strptime(paid, "%Y-%m-%d").date()
+        c = datetime.strptime(created, "%Y-%m-%d").date()
+    except ValueError:
+        return created
+    next_first = (p.replace(day=28) + timedelta(days=4)).replace(day=1)
+    if (c.year, c.month) != (next_first.year, next_first.month):
+        return created
+    last_two = _nth_working_day(next_first - timedelta(days=1), 2, -1)
+    first_two = _nth_working_day(next_first, 2, 1)
+    if p >= last_two and c <= first_two:
+        return paid
+    return created
+
+
+def _nth_working_day(start, n: int, step: int):
+    """The n-th Monday-to-Friday counting from `start` (itself included) one
+    day at a time in the direction of `step` (+1 forwards, -1 backwards)."""
+    day, seen = start, 0
+    while True:
+        if day.weekday() < 5:
+            seen += 1
+            if seen == n:
+                return day
+        day += timedelta(days=step)
 
 
 def _expand_basic_lines_for_month(basic_lines: list, m: int) -> list:
@@ -917,6 +966,22 @@ def _anp_ep_lookup(year: int):
         return None
 
 
+# Set by the dashboard: year -> (invoice dict -> True to leave it out of ANP).
+# It names the late entries, first payments keyed in a later month than they
+# were paid (from August 2026), which earn no ANP (user, 29 Oct 2026).
+ANP_SKIP_FACTORY = None
+
+
+def _anp_skip(year: int):
+    if ANP_SKIP_FACTORY is None:
+        return None
+    try:
+        return ANP_SKIP_FACTORY(year)
+    except Exception as e:
+        print(f"[ANP] late entry list unavailable ({e}); no invoice is left out for it.")
+        return None
+
+
 def fetch_internal_anp(year: int, h1_only: bool = True):
     """Returns (summary_rows, detail_rows, meta)."""
     anp_path = _anp_script_path()
@@ -943,7 +1008,7 @@ def fetch_internal_anp(year: int, h1_only: bool = True):
     payout_label = f"invoice-year-{year}-h1" if h1_only else f"invoice-year-{year}"
     detail_rows, summary_rows = anp.build_report_rows(
         agents, invoices, planning, customers, period_start, period_end, payout_label,
-        ep_lookup=_anp_ep_lookup(year),
+        ep_lookup=_anp_ep_lookup(year), skip=_anp_skip(year),
     )
     total_comm = sum(Decimal(str(r.get("anp_commission", 0))) for r in summary_rows)
     meta = {
@@ -1405,7 +1470,7 @@ def fetch_outsource_anp(year: int, h1_only: bool = True):
     payout_label = f"invoice-year-{year}-h1" if h1_only else f"invoice-year-{year}"
     detail_rows, summary_rows = anp.build_report_rows(
         agents, invoices, planning, customers, period_start, period_end, payout_label,
-        ep_lookup=_anp_ep_lookup(year),
+        ep_lookup=_anp_ep_lookup(year), skip=_anp_skip(year),
     )
     total_comm = sum(Decimal(str(r.get("anp_commission", 0))) for r in summary_rows)
     meta = {

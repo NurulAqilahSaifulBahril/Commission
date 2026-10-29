@@ -5186,6 +5186,12 @@ modalPackageType.value = defaults.pkg || "-";
         if (state.activeSection === "basic_nfp") {
             // Unsearched on purpose — see passesFilters above.
             renderBasicNfpTotalCards(unsearchedProcessed, headers, filteredAgentStats, agentsInView);
+        } else if (state.activeSection === "anp") {
+            renderAnpTotalCards(rows, headers, agentIdx, customerIdx);
+            // Only agents whose sales reached a paying tier count here.
+            let paid = 0;
+            anpAgentTotals(rows, headers, agentIdx, customerIdx, true).forEach(a => { if (a.comm > 0) paid += 1; });
+            totalAgents.textContent = paid;
         } else {
             renderSectionTotalCards();
         }
@@ -6077,7 +6083,11 @@ modalPackageType.value = defaults.pkg || "-";
         return n === "ep point" || n === "commission price";
     }
 
-    function renderAnpAgentSummary(rows, headers, agentIdx, customerIdx, isOutsource) {
+    /** ANP per agent: Total Amount and EP Point summed over their customers,
+     *  Commission Price is the agent's tier payout (repeated on each row, so
+     *  the largest is taken, not the sum). `applySearch` false keeps the
+     *  month's full figures for the money card. */
+    function anpAgentTotals(rows, headers, agentIdx, customerIdx, applySearch) {
         const userObj = USER_ROLES[state.currentUser];
         const lower = headers.map(h => String(h).toLowerCase().trim());
         const totIdx = lower.indexOf("total amount");
@@ -6090,7 +6100,7 @@ modalPackageType.value = defaults.pkg || "-";
             if (raw) cur = raw;
             const cust = customerIdx !== -1 && row[customerIdx] ? String(row[customerIdx]).trim() : "";
             if (!cur || /total|grand/i.test(cur)) return;
-            if (!matchesSearch(cur, cust)) return;
+            if (applySearch && !matchesSearch(cur, cust)) return;
             if (userObj && userObj.filterAgentName !== null
                 && cur.toLowerCase().trim() !== userObj.filterAgentName.toLowerCase().trim()) return;
             const a = byAgent.get(cur) || { total: 0, ep: 0, comm: 0 };
@@ -6099,6 +6109,29 @@ modalPackageType.value = defaults.pkg || "-";
             if (commIdx !== -1) a.comm = Math.max(a.comm, parseMoneyValue(row[commIdx]));
             byAgent.set(cur, a);
         });
+        return byAgent;
+    }
+
+    /** ANP page cards: Total Sales as on the other tabs, then the ANP payout
+     *  itself. Other Commission and Referral Fee belong to Basic & NFP and
+     *  are not shown here. */
+    function renderAnpTotalCards(rows, headers, agentIdx, customerIdx) {
+        renderSectionTotalCards();
+        if (!rateCardsContainer) return;
+        let totalComm = 0;
+        anpAgentTotals(rows, headers, agentIdx, customerIdx, false).forEach(a => { totalComm += a.comm; });
+        const cards = rateCardsContainer.querySelectorAll(".rate-card");
+        cards.forEach((card, i) => {
+            if (i >= 2) { card.remove(); return; }
+            if (i === 1) {
+                card.querySelector(".metric-label").textContent = "Total Commission (RM)";
+                card.querySelector(".metric-value").textContent = formatRM(totalComm);
+            }
+        });
+    }
+
+    function renderAnpAgentSummary(rows, headers, agentIdx, customerIdx, isOutsource) {
+        const byAgent = anpAgentTotals(rows, headers, agentIdx, customerIdx, true);
 
         const wrapper = document.createElement("div");
         wrapper.className = "agent-summary-inline-wrapper";

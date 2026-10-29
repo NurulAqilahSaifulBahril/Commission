@@ -374,34 +374,49 @@
         return ` data-cases="${caseLists.length - 1}"`;
     }
 
-    /** Registers an agent's EP point cell, so hovering it opens the panel
-     *  that shows how the EP is worked out (epTable). */
+    /** Registers an agent's EP point cell: hovering it shows how the EP is
+     *  worked out (epTable), and clicking opens the same breakdown as a popup
+     *  that stays open and can scroll (user, 29 Oct 2026). */
     function epAttrs(agent) {
         if (!agent || !(agent.ep_lines || []).length) return "";
         caseLists.push({ ep: agent });
-        return ` data-cases="${caseLists.length - 1}"`;
+        const i = caseLists.length - 1;
+        return ` data-cases="${i}" data-ep="${i}"`;
     }
 
     /** How one case's EP was reached, read off its own figures: the rule is
      *  whichever one the numbers fit, so the panel never claims a rule the
      *  calculation did not use. */
-    function epRule(l) {
-        if (l.r === "late") return "Uploaded late: no points";
+    function epBaseRule(l) {
+        // The rule is read off the EP before any multiplier (l.x, the Data
+        // page's EP Multipliers: October 2026 is 1.5x).
+        const e = l.x ? l.e / l.x : l.e;
         if (l.r === "hand") return "Set by hand";
-        if (Math.abs(l.e - l.s) < 0.01) return "1 point per RM";
-        if (Math.abs(l.e - 0.4 * l.s) < 1) return "40% of sales";
-        if (l.s > 40000 && Math.abs(l.e - (40000 + 0.4 * (l.s - 40000))) < 1)
+        if (Math.abs(e - l.s) < 0.05) return "1 point per RM";
+        if (Math.abs(e - 0.4 * l.s) < 1) return "40% of sales";
+        if (l.s > 40000 && Math.abs(e - (40000 + 0.4 * (l.s - 40000))) < 1)
             return "First RM40,000 at 100%, rest at 40%";
-        return l.s ? `${(100 * l.e / l.s).toFixed(1)}% of sales` : "";
+        return l.s ? `${(100 * e / l.s).toFixed(1)}% of sales` : "";
+    }
+
+    function epRule(l) {
+        return epBaseRule(l) + (l.x ? ` x${l.x}` : "");
+    }
+
+    /** "x1.5", or "" for a month with no multiplier. */
+    function monthMultiplier(lines, month) {
+        const xs = [...new Set(lines.filter(l => l.m === month && l.x).map(l => l.x))];
+        return xs.length ? xs.map(x => `x${x}`).join("/") : "";
     }
 
     /** The EP point hover: EP month by month, the cases not earning a point
-     *  per RM and why, then the May multiplier on top. */
+     *  per RM and why, then the May multiplier on top. A late payment upload
+     *  earns its EP as usual: that rule is ANP and Monthly Contest only. */
     function epTable(agent) {
         const lines = agent.ep_lines || [];
         // First table: only the cases earning a point per RM, by month. The
-        // rest are in the Commercial and Late payment upload tables below.
-        const perRM = lines.filter(l => l.r !== "late" && epRule(l) === "1 point per RM");
+        // rest are in the Commercial table below.
+        const perRM = lines.filter(l => epBaseRule(l) === "1 point per RM");
         const byMonth = new Map();
         perRM.forEach(l => {
             const m = byMonth.get(l.m) || { n: 0, s: 0, e: 0 };
@@ -410,13 +425,13 @@
         });
         const monthRows = [...byMonth.keys()].sort((a, b) => a - b).map(k => {
             const m = byMonth.get(k);
-            return `<tr><td>${MONTH_ABBR[k - 1]}</td><td class="numeric">${m.n}</td>`
+            const x = monthMultiplier(perRM, k);
+            return `<tr><td>${MONTH_ABBR[k - 1]}${x ? ` <strong class="sr-tip-mult">${x}</strong>` : ""}</td><td class="numeric">${m.n}</td>`
                 + `<td class="numeric">${fmtRM(m.s)}</td><td class="numeric">${fmtRM(m.e)}</td></tr>`;
         }).join("");
-        // Cases not earning a point per RM, in two groups: commercial jobs
-        // (and any other case on its own rule), and late payment uploads.
-        const late = lines.filter(l => l.r === "late");
-        const commercial = lines.filter(l => l.r !== "late" && epRule(l) !== "1 point per RM");
+        // Cases not earning a point per RM: commercial jobs, and any other
+        // case on its own rule.
+        const commercial = lines.filter(l => epBaseRule(l) !== "1 point per RM");
         const group = (title, list) => {
             if (!list.length) return "";
             const shown = list.slice(0, 8);
@@ -441,6 +456,16 @@
         const bonusRow = bonus
             ? `<tr><td colspan="3">May multiplier: ${tier.toFixed(1)}x on ${fmtRM(agent.campaign_ans)} campaign sales</td>`
                 + `<td class="numeric">+ ${fmtRM(bonus)}</td></tr>` : "";
+        // The EP multiplier's extra points, already in the totals above:
+        // one line per month that has one (October 2026: x1.5).
+        const multMonths = [...new Set(lines.filter(l => l.x).map(l => l.m))].sort((a, b) => a - b);
+        const multRows = multMonths.map(m => {
+            const ls = lines.filter(l => l.m === m && l.x);
+            const extra = ls.reduce((t, l) => t + (l.e - l.e / l.x), 0);
+            return `<tr><td colspan="3">${MONTH_ABBR[m - 1]} multiplier ${monthMultiplier(ls, m)} on ${plural(ls.length, "case")}`
+                + ` <span class="sr-tip-none">(included above)</span></td>`
+                + `<td class="numeric">+ ${fmtRM(extra)}</td></tr>`;
+        }).join("");
         return `<div class="sr-tip-head">${escapeHtml(agent.agent)} — EP point ${fmtRM(agent.ep)}</div>
             <div class="sr-tip-head" style="margin-top:6px">1 point per RM</div>
             <div class="sr-tip-note">Sales are the invoice total less EPP.</div>
@@ -453,7 +478,6 @@
                     <td class="numeric">${fmtRM(perRM.reduce((t, l) => t + l.e, 0))}</td></tr></tfoot>
             </table>
             ${group("Commercial", commercial)}
-            ${group("Late payment upload", late)}
             <table class="sr-tip-table" style="margin-top:10px">
                 <thead><tr><th></th><th>Cases</th><th>Sales</th><th>EP</th></tr></thead>
                 <tbody>
@@ -461,6 +485,7 @@
                         <td class="numeric">${lines.length}</td>
                         <td class="numeric">${fmtRM(lines.reduce((t, l) => t + l.s, 0))}</td>
                         <td class="numeric">${fmtRM(agent.base_ep)}</td></tr>
+                    ${multRows}
                     ${bonusRow}
                     <tr class="sr-tip-total"><td colspan="3">EP point</td><td class="numeric">${fmtRM(agent.ep)}</td></tr>
                 </tbody>
@@ -564,6 +589,19 @@
         if (top < pad) top = pad;
         tip.style.left = `${Math.round(left)}px`;
         tip.style.top = `${Math.round(top)}px`;
+    }
+
+    function showEpPopup(cell) {
+        const entry = caseLists[Number(cell.dataset.ep)];
+        if (!entry || !entry.ep) return;
+        hideCaseTip();
+        document.getElementById("srEpBody").innerHTML = epTable(entry.ep);
+        document.getElementById("srEpModal").style.display = "flex";
+    }
+
+    function hideEpPopup() {
+        const modal = document.getElementById("srEpModal");
+        if (modal) modal.style.display = "none";
     }
 
     function hideCaseTip() {
@@ -804,6 +842,7 @@
         chunks.push(`<p class="sr-legend">
             <strong>NOC</strong>: number of cases &middot;
             <strong>ANS</strong>: 100% paid = Commission Price, below 100% = Sales Price (invoice total)
+            <span class="sr-legend-hint">&middot; Right-click a column header to hide it</span>
         </p>`);
 
         // Company-wide takes every visible agent, so it always has something
@@ -829,7 +868,190 @@
         });
 
         sectionsBox.innerHTML = chunks.join("");
+        applyHiddenColumns();
     }
+
+    // ── Hide / unhide columns, as in Excel (user, 29 Oct 2026) ──────────────
+    // Right-click a header to hide its column (a group header such as JAN
+    // hides all of its columns); a double line marks where columns are hidden,
+    // and double-clicking it, or the right-click menu, brings them back. The
+    // choice is per column name, so it holds in every table on the page and
+    // in this browser next time. The CSV and PDF leave them out as well.
+    const HIDDEN_KEY = "sr.hiddenColumns";
+    const hiddenCols = new Set(readHidden());
+    const colMenu = document.createElement("div");
+    colMenu.className = "sr-col-menu";
+    colMenu.hidden = true;
+    document.body.appendChild(colMenu);
+    const showColsBtn = document.getElementById("srShowCols");
+
+    function readHidden() {
+        try {
+            const v = JSON.parse(localStorage.getItem(HIDDEN_KEY) || "[]");
+            return Array.isArray(v) ? v : [];
+        } catch (e) { return []; }
+    }
+
+    function saveHidden() {
+        try { localStorage.setItem(HIDDEN_KEY, JSON.stringify([...hiddenCols])); } catch (e) { /* private window */ }
+    }
+
+    /** A header's name, without the figures in brackets, which differ between
+     *  the Internal and Outsource tables ("(1,000,000 EP Point Till 30Oct)"). */
+    function headLabel(cell) {
+        // Read from the markup, not innerText: a hidden header has no innerText,
+        // and its name must not change once it is hidden.
+        const tmp = document.createElement("div");
+        tmp.innerHTML = cell.innerHTML.replace(/<br\s*\/?>/gi, " ");
+        return tmp.textContent.replace(/\([^)]*\)/g, " ").replace(/\s+/g, " ").trim();
+    }
+
+    /** Every cell of a table with the columns it covers, worked out through
+     *  the rowspans and colspans, and each column's name: its header labels,
+     *  top to bottom ("JAN › NOC"). */
+    function tableGrid(table) {
+        const taken = [];
+        const cells = [];
+        const names = [];
+        [...table.rows].forEach((tr, r) => {
+            taken[r] = taken[r] || new Set();
+            let c = 0;
+            [...tr.cells].forEach(cell => {
+                while (taken[r].has(c)) c++;
+                if (!cell.dataset.span) cell.dataset.span = String(cell.colSpan || 1);
+                const span = Number(cell.dataset.span);
+                for (let i = 0; i < (cell.rowSpan || 1); i++) {
+                    taken[r + i] = taken[r + i] || new Set();
+                    for (let j = 0; j < span; j++) taken[r + i].add(c + j);
+                }
+                const head = tr.parentElement.tagName === "THEAD";
+                cells.push({ cell, start: c, span, row: r, head });
+                if (head) {
+                    const label = headLabel(cell);
+                    for (let j = 0; j < span; j++) {
+                        names[c + j] = names[c + j] || [];
+                        if (label) names[c + j].push(label);
+                    }
+                }
+                c += span;
+            });
+        });
+        // Two columns can share a name (the May multiplier's two CASES); the
+        // second is "… › CASES #2", so hiding one leaves the other.
+        const seen = {};
+        const keys = names.map(n => {
+            const k = (n || []).join(" › ");
+            seen[k] = (seen[k] || 0) + 1;
+            return seen[k] > 1 ? `${k} #${seen[k]}` : k;
+        });
+        return { cells, keys };
+    }
+
+    /** The hidden columns by position, read off the first table on screen:
+     *  { cols: how many columns it has, idx: the hidden ones }. The exports
+     *  lay their columns out in the same order, so they drop the same ones. */
+    function hiddenColumnIndexes() {
+        const table = sectionsBox.querySelector("table.sr-table");
+        if (!table) return { cols: 0, idx: [], keys: [] };
+        const { keys } = tableGrid(table);
+        return { cols: keys.length, keys,
+            idx: keys.map((k, i) => hiddenCols.has(k) ? i : -1).filter(i => i >= 0) };
+    }
+
+    function applyHiddenColumns() {
+        sectionsBox.querySelectorAll("table.sr-table").forEach(table => {
+            const { cells, keys } = tableGrid(table);
+            const hidden = keys.map(k => hiddenCols.has(k));
+            cells.forEach(({ cell, start, span }) => {
+                let shown = 0;
+                for (let j = start; j < start + span; j++) if (!hidden[j]) shown++;
+                cell.classList.toggle("sr-col-hidden", shown === 0);
+                if (cell.dataset.unhide) {
+                    // Give the header back its own explanation.
+                    cell.title = cell.dataset.title0 || "";
+                    if (!cell.title) cell.removeAttribute("title");
+                }
+                cell.classList.remove("sr-unhide-left", "sr-unhide-right");
+                delete cell.dataset.unhide;
+                if (shown) cell.colSpan = shown;
+            });
+            // The double line: on the deepest header over the first column
+            // after each hidden run, or before it when the run ends the table.
+            const deepest = col => cells.filter(x => x.head && x.start <= col && col < x.start + x.span)
+                .sort((a, b) => b.row - a.row)[0];
+            for (let c = 0; c < keys.length; c++) {
+                if (!hidden[c]) continue;
+                let end = c;
+                while (end + 1 < keys.length && hidden[end + 1]) end++;
+                const run = keys.slice(c, end + 1);
+                const after = end + 1 < keys.length ? deepest(end + 1) : null;
+                const before = !after && c > 0 ? deepest(c - 1) : null;
+                const mark = after || before;
+                if (mark) {
+                    mark.cell.classList.add(after ? "sr-unhide-left" : "sr-unhide-right");
+                    const prior = mark.cell.dataset.unhide ? JSON.parse(mark.cell.dataset.unhide) : [];
+                    if (!prior.length) mark.cell.dataset.title0 = mark.cell.title || "";
+                    mark.cell.dataset.unhide = JSON.stringify(prior.concat(run));
+                    mark.cell.title = `${plural(prior.length + run.length, "hidden column")} here: double-click to unhide`;
+                }
+                c = end;
+            }
+        });
+        if (showColsBtn) {
+            showColsBtn.hidden = !hiddenCols.size;
+            showColsBtn.textContent = `Unhide all columns (${hiddenCols.size})`;
+        }
+    }
+
+    /** The column names a header covers, read off its own table. */
+    function headerKeys(th) {
+        const { cells, keys } = tableGrid(th.closest("table"));
+        const me = cells.find(x => x.cell === th);
+        return me ? keys.slice(me.start, me.start + me.span) : [];
+    }
+
+    function setHidden(keys, hide) {
+        keys.forEach(k => { if (k) hide ? hiddenCols.add(k) : hiddenCols.delete(k); });
+        saveHidden();
+        hideColMenu();
+        applyHiddenColumns();
+    }
+
+    function hideColMenu() { colMenu.hidden = true; colMenu.innerHTML = ""; }
+
+    function showColMenu(th, x, y) {
+        const keys = headerKeys(th).filter(k => !hiddenCols.has(k));
+        const back = th.dataset.unhide ? JSON.parse(th.dataset.unhide) : [];
+        const items = [];
+        if (keys.length) {
+            items.push({ text: keys.length > 1 ? `Hide ${headLabel(th)} (${keys.length} columns)` : `Hide ${keys[0]}`,
+                run: () => setHidden(keys, true) });
+        }
+        if (back.length) items.push({ text: `Unhide ${plural(back.length, "column")} here`, run: () => setHidden(back, false) });
+        if (hiddenCols.size) items.push({ text: `Unhide all columns (${hiddenCols.size})`, run: () => setHidden([...hiddenCols], false) });
+        if (!items.length) return;
+        colMenu.innerHTML = items.map((it, i) => `<button type="button" data-i="${i}">${escapeHtml(it.text)}</button>`).join("");
+        colMenu.querySelectorAll("button").forEach(b => b.addEventListener("click", () => items[Number(b.dataset.i)].run()));
+        colMenu.hidden = false;
+        const w = colMenu.offsetWidth, h = colMenu.offsetHeight;
+        colMenu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - w - 4))}px`;
+        colMenu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - h - 4))}px`;
+    }
+
+    sectionsBox.addEventListener("contextmenu", (e) => {
+        const th = e.target.closest("table.sr-table thead th");
+        if (!th) return;
+        e.preventDefault();
+        showColMenu(th, e.clientX, e.clientY);
+    });
+    sectionsBox.addEventListener("dblclick", (e) => {
+        const th = e.target.closest("table.sr-table thead th[data-unhide]");
+        if (th) setHidden(JSON.parse(th.dataset.unhide), false);
+    });
+    document.addEventListener("mousedown", (e) => { if (!colMenu.hidden && !colMenu.contains(e.target)) hideColMenu(); });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideColMenu(); });
+    window.addEventListener("scroll", hideColMenu, true);
+    if (showColsBtn) showColsBtn.addEventListener("click", () => setHidden([...hiddenCols], false));
 
     function exportCsv() {
         const data = state.data;
@@ -851,6 +1073,25 @@
             "UP TO DATE EP POINT", "EP AT 30 JUN",
             "EGA THRESHOLD", "EGA BALANCE", "EGA STATUS",
             "ESA THRESHOLD", "ESA BALANCE", "ESA STATUS");
+
+        // The screen column each CSV column comes from (-1: none), so a column
+        // hidden on the page is left out of the file too. The CSV carries more
+        // than the page (thresholds, statuses), each following its column.
+        const monthCols = head.length - 5 - 18;
+        const collected = 3 + monthCols;
+        let next = collected + 5;
+        const camp = showCampaign(data) ? [next, next + 1] : [-1, -1];
+        if (showCampaign(data)) next += 4;
+        const ep = next;
+        next += 2;                                  // EP, then the early bird
+        const ega = showEga(data) ? next++ : -1;
+        const esa = showEsa(data) ? next++ : -1;
+        const src = [-1, -1, 0, 1, 2];
+        for (let i = 0; i < monthCols; i++) src.push(3 + i);
+        src.push(collected, collected + 1, collected + 2, collected + 3, collected + 4,
+            camp[0], camp[1], camp[1], camp[1], ep, ep, ega, ega, ega, ega, esa, esa, esa);
+        const hiddenIdx = new Set(hiddenColumnIndexes().idx);
+        const keep = src.map(s => s < 0 || !hiddenIdx.has(s));
 
         const lines = [head];
         const push = (section, members) => members.forEach((a, i) => {
@@ -897,7 +1138,7 @@
             });
         });
 
-        const csv = lines.map(r => r.map(v => {
+        const csv = lines.map(r => r.filter((v, i) => keep[i]).map(v => {
             const s = String(v == null ? "" : v);
             return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
         }).join(",")).join("\r\n");
@@ -924,9 +1165,13 @@
             btn.innerHTML = '<span class="icon">⏳</span> Building PDF…';
         }
         try {
+            // Hidden columns by position, with the column count they were read
+            // against: the server drops them only if its table has as many.
+            const hidden = hiddenColumnIndexes();
             const url = `/api/sales-report/pdf?year=${encodeURIComponent(state.year)}`
                 + `&month=${encodeURIComponent(state.through || "")}`
-                + `&agent=${encodeURIComponent(state.search || "")}`;
+                + `&agent=${encodeURIComponent(state.search || "")}`
+                + (hidden.idx.length ? `&cols=${hidden.cols}&hide=${hidden.idx.join(",")}` : "");
             const res = await fetch(url);
             if (!res.ok) {
                 const body = await res.json().catch(() => ({}));
@@ -1204,6 +1449,14 @@
             const cell = e.target.closest("td[data-cases]");
             if (cell && !cell.contains(e.relatedTarget)) hideCaseTip();
         });
+        sectionsBox.addEventListener("click", (e) => {
+            const cell = e.target.closest("td[data-ep]");
+            if (cell) showEpPopup(cell);
+        });
+        const epModal = document.getElementById("srEpModal");
+        document.getElementById("srEpClose").addEventListener("click", hideEpPopup);
+        epModal.addEventListener("click", (e) => { if (e.target === epModal) hideEpPopup(); });
+        document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideEpPopup(); });
         // A panel anchored to a cell that has moved is worse than no panel.
         window.addEventListener("scroll", hideCaseTip, true);
         window.addEventListener("resize", hideCaseTip);

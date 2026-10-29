@@ -395,7 +395,7 @@
             ["editModeBtn", "nfpAddBtn", "nfpUploadBtn", "nfpSyncBtn", "seedRolesBtn", "addRoleBtn", "showExcludedRolesBtn", "saveRolesBtn",
              "contestSaveBtn", "contestNewBtn", "contestAddRosterBtn",
              "anpSaveBtn", "anpAddTierBtn", "egaSaveBtn", "egaAddMonthBtn", "egaNewBtn", "pbSaveBtn",
-             "egaCarryAddBtn", "egaCarrySaveBtn"].forEach((id) => {
+             "egaCarryAddBtn", "egaCarrySaveBtn", "epMultAddBtn", "epMultSaveBtn"].forEach((id) => {
                 const el = document.getElementById(id);
                 if (el) el.style.display = "";
             });
@@ -1741,6 +1741,42 @@
         return { mine: new Set(owners.get(r)), shared };
     }
 
+    /** The role row each of an agent's own rates belongs to, dealt the way the
+     *  Edit Agent Details popup deals them (loadAgentOwnRates): same package,
+     *  Agent Type, dates and Role first, then same package and dates. A rate
+     *  on the "All" row (saved with no Role) stays on that row instead of
+     *  showing on every role the agent has -- Mohd Azhar's OSA rows showed his
+     *  All row's 2.5% Shop Lot, Factory and Residential rates (user, 29 Oct
+     *  2026). Rates no role takes are left out of the map. */
+    function ownRateOwners(who) {
+        const roles = rolesList.filter((x) => !x.hidden && !x.needs_date
+            && String(x.effective_from || "").trim()
+            && String(x.agent || "").trim().toLowerCase() === who);
+        const owners = new Map();
+        if (!roles.length) return owners;
+        const held = new Map(roles.map((x) => [x, 0]));
+        const sameSlot = (q, row) => rowFitsCardJob(row, q)
+            && (!row.agent_type || String(q.agent_type || "").toLowerCase() === String(row.agent_type).toLowerCase())
+            && normEffText(q.effective_from) === normEffText(row.effective_from);
+        const give = (cards, row) => {
+            const to = cards.find((q) => !held.get(q)) || cards[0];
+            held.set(to, held.get(to) + 1);
+            owners.set(row, to);
+        };
+        const own = roleRateRows.filter((row) => isOwnRateRow(row, who)).sort(byOwnRateDealOrder);
+        const orphans = [];
+        own.forEach((row) => {
+            const exact = roles.filter((q) => sameSlot(q, row)
+                && canonRole(rateRoleOf(q)) === canonRole(row.hierarchy));
+            if (exact.length) give(exact, row); else orphans.push(row);
+        });
+        orphans.forEach((row) => {
+            const near = roles.filter((q) => sameSlot(q, row));
+            if (near.length) give(near, row);
+        });
+        return owners;
+    }
+
     /** {html, title} for a role row's Rate cell. */
     function roleRateCell(r) {
         if (r.needs_date || !String(r.effective_from || "").trim()) return { html: "—", title: "" };
@@ -1763,10 +1799,13 @@
         const props = PROPERTY_TYPES.filter(Boolean);
         const best = {};
         const share = identicalRowShare(r);
+        const owners = ownRateOwners(who);
         roleRateRows.forEach((row) => {
             if ((row.rate_type || "Basic Commission") !== "Basic Commission") return;
             if (String(row.remarks || "").trim().toLowerCase() === "deleted") return;
             if (share && share.shared.has(row) && !share.mine.has(row)) return;
+            // One of the agent's own rates belonging to another of their roles.
+            if (owners.has(row) && owners.get(row) !== r) return;
             const fit = rolePackageFit(row, r);
             if (fit < 0) return;
             const rate = parseFloat(String(row.rate_pct || "").replace("%", ""));
@@ -1902,10 +1941,13 @@
         let top = null;
         let picks = [];
         const share = identicalRowShare(r);
+        const owners = ownRateOwners(who);
         roleRateRows.forEach((row) => {
             if ((row.rate_type || "Basic Commission") !== "Basic Commission") return;
             if (String(row.remarks || "").trim().toLowerCase() === "deleted") return;
             if (share && share.shared.has(row) && !share.mine.has(row)) return;
+            // One of the agent's own rates belonging to another of their roles.
+            if (owners.has(row) && owners.get(row) !== r) return;
             const fit = rolePackageFit(row, r);
             if (fit < 0) return;
             const pcts = String(row.override_rate_pct || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -3895,6 +3937,84 @@
     });
     document.getElementById("egaCarrySaveBtn")?.addEventListener("click", saveEgaCarryover);
     document.getElementById("egaCarryYear")?.addEventListener("input", renderEgaCarry);
+
+    // ── EP multipliers ───────────────────────────────────────────────────────
+    // A case first paid between From and To earns its EP times the multiplier
+    // on the Sales Report (October 2026: 1.5x; user, 29 Oct 2026). Read by
+    // _ep_multiplier_windows() in app.py.
+
+    let epMultRows = [];
+
+    async function loadEpMultipliers() {
+        try {
+            const res = await api("/api/ep-multipliers");
+            epMultRows = await res.json();
+            if (!Array.isArray(epMultRows)) epMultRows = [];
+        } catch (e) {
+            epMultRows = [];
+        }
+        renderEpMult();
+    }
+
+    function renderEpMult() {
+        const body = document.getElementById("epMultBody");
+        if (!body) return;
+        body.innerHTML = "";
+        if (!epMultRows.length) {
+            body.innerHTML = `<tr><td colspan="5" style="text-align:center; padding:18px; color:var(--text-muted);">`
+                + `No EP multipliers. Every case earns its normal EP.</td></tr>`;
+            return;
+        }
+        const dis = isAdmin ? "" : "disabled";
+        epMultRows.forEach((r) => {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `
+                <td><input type="date" value="${escapeHtml(r.date_from || "")}" data-f="date_from" style="width:100%;" ${dis}></td>
+                <td><input type="date" value="${escapeHtml(r.date_to || "")}" data-f="date_to" style="width:100%;" ${dis}></td>
+                <td><input type="number" min="0" step="0.1" value="${escapeHtml(r.multiplier || "")}" data-f="multiplier" style="width:100%;" ${dis}></td>
+                <td><input type="text" value="${escapeHtml(r.note || "")}" data-f="note" style="width:100%;" ${dis}></td>
+                <td>${isAdmin ? `<button class="btn btn-secondary mult-del" style="padding:4px 8px; font-size:12px;">✕</button>` : ""}</td>`;
+            tr.querySelectorAll("input").forEach((inp) => {
+                inp.addEventListener("input", () => { r[inp.dataset.f] = inp.value; });
+            });
+            tr.querySelector(".mult-del")?.addEventListener("click", () => {
+                epMultRows = epMultRows.filter(x => x !== r);
+                renderEpMult();
+            });
+            body.appendChild(tr);
+        });
+    }
+
+    async function saveEpMultipliers() {
+        const status = document.getElementById("epMultStatus");
+        if (status) { status.className = "save-status"; status.textContent = "Saving..."; }
+        const entries = epMultRows.map(r => ({
+            date_from: String(r.date_from || "").trim(), date_to: String(r.date_to || "").trim(),
+            multiplier: String(r.multiplier || "").trim(), note: String(r.note || "").trim() }));
+        try {
+            const res = await api("/api/ep-multipliers", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ entries })
+            });
+            const d = await res.json();
+            if (!res.ok) throw new Error(d.error || "Save failed");
+            if (status) {
+                status.className = "save-status ok";
+                status.textContent = "Saved. Sales Report EP recalculated.";
+                setTimeout(() => { status.textContent = ""; }, 3000);
+            }
+            await loadEpMultipliers();
+        } catch (e) {
+            if (status) { status.className = "save-status err"; status.textContent = e.message; }
+        }
+    }
+
+    document.getElementById("epMultAddBtn")?.addEventListener("click", () => {
+        epMultRows.push({ date_from: "", date_to: "", multiplier: "", note: "" });
+        renderEpMult();
+    });
+    document.getElementById("epMultSaveBtn")?.addEventListener("click", saveEpMultipliers);
 
     // ── NFP price list viewer ────────────────────────────────────────────────
 
@@ -6900,6 +7020,8 @@
         // per-scheme modal.
         const carryCard = document.getElementById("egaCarryCard");
         if (carryCard) carryCard.style.display = (ruleKey === "ega") ? "block" : "none";
+        const multCard = document.getElementById("epMultCard");
+        if (multCard) multCard.style.display = (ruleKey === "ega") ? "block" : "none";
 
         if (rolesCard) {
             rolesCard.style.display = isRoles ? "block" : "none";
@@ -6984,6 +7106,7 @@
         loadRoles();
         loadPgAgents();
         loadEgaCarryover();
+        loadEpMultipliers();
         startRolesAutoRefresh();
         // updateDataSectionView() already ran, before isAdmin was known, so a
         // deep link straight to the contest section would have rendered its

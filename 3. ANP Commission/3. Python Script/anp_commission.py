@@ -622,6 +622,12 @@ def is_deleted_type(invoice: dict[str, Any]) -> bool:
     return is_cancelled_or_rejected(invoice)
 
 
+def is_sample_quotation(invoice: dict[str, Any], customers: dict[str, str]) -> bool:
+    """A "Sample Quotation" customer is not a sale: it earns no ANP, as it is
+    left off the Sales Report (user, 29 Oct 2026; Wong Jia Xuan, Aug 2026)."""
+    return "sample quotation" in resolve_customer_name(invoice, customers).lower()
+
+
 def count_distinct_agents_in_year(
     invoices: list[dict[str, Any]],
     allowed_agent_ids: set[str],
@@ -699,6 +705,8 @@ def build_anp_tables(
         # A 1st_payment_date can be set without a real payment behind it
         # (data entry gap) — require an actual amount paid, however small.
         if not _is_paid(inv):
+            continue
+        if is_sample_quotation(inv, customers):
             continue
         agent_id = str(inv.get("linked_agent") or "")
         if agent_id not in agent_by_id:
@@ -797,13 +805,18 @@ def build_report_rows(
     period_end: date | None,
     payout_label: str,
     ep_lookup=None,
+    skip=None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """The tier is measured in EP points, as the ANP rules state: `ep_lookup`
     (invoice dict -> Decimal EP, or None) gives each invoice's EP -- the
     dashboard passes the EGA/ESA EP, so a commercial job counts its first
     RM40,000 at 100% and the rest at 40% (since 2026-10-20; Chan Jia Wei's
     September was paid on RM 391,340 of sales instead of 221,540 EP). Without a
-    lookup, or for an invoice it does not know, EP is the invoice total."""
+    lookup, or for an invoice it does not know, EP is the invoice total.
+
+    `skip` (invoice dict -> bool) leaves invoices out altogether: the
+    dashboard passes the late entries, first payments keyed in a later month
+    than they were paid, from August 2026 (user, 29 Oct 2026)."""
     agent_by_id = {str(a["bubble_id"]): a for a in agents}
 
     def _points(inv: dict[str, Any]) -> Decimal:
@@ -838,6 +851,10 @@ def build_report_rows(
         # A 1st_payment_date can be set without a real payment behind it
         # (data entry gap) — require an actual amount paid, however small.
         if not _is_paid(inv):
+            continue
+        if is_sample_quotation(inv, customers):
+            continue
+        if skip is not None and skip(inv):
             continue
         agent_id = str(inv.get("linked_agent") or "")
         if agent_id not in agent_by_id:

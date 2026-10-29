@@ -652,6 +652,36 @@
                     </div>
                 </section>
 
+                <!-- ── EP MULTIPLIERS ──────────────────────────────────────── -->
+                <!-- A case first paid inside a window earns its EP times the
+                     multiplier on the Sales Report (October 2026: 1.5x). -->
+                <section class="card table-card" id="epMultCard" style="display:none;">
+                    <div class="card-header">
+                        <h3>EP Multipliers</h3>
+                        <div style="display:flex; gap:12px; align-items:center;">
+                            <span class="save-status" id="epMultStatus"></span>
+                            <button class="btn btn-secondary" id="epMultAddBtn" style="display:none;">+ Add month</button>
+                            <button class="btn btn-primary" id="epMultSaveBtn" style="display:none;">Save</button>
+                        </div>
+                    </div>
+                    <p class="section-hint" style="padding:0 24px 10px;">
+                        Every case <strong>first paid</strong> between From and To (both days included)
+                        earns its EP times the multiplier on the Sales Report: 1.5 turns RM100,000 of EP
+                        into 150,000. It counts for the UP TO DATE EP POINT, so for ESA and the Early Birds.
+                        ANP and the Monthly Contest are not affected. Add a row for each new month.
+                    </p>
+                    <div class="table-container">
+                        <table class="dashboard-table unified-grid" style="table-layout:auto;">
+                            <thead>
+                                <tr><th style="width:160px;">From</th><th style="width:160px;">To</th>
+                                    <th style="width:120px;">Multiplier</th><th>Note</th>
+                                    <th style="width:56px;"></th></tr>
+                            </thead>
+                            <tbody id="epMultBody"></tbody>
+                        </table>
+                    </div>
+                </section>
+
                 <!-- ── EGA CARRY-OVER CASES ────────────────────────────────── -->
                 <!-- Typed in by hand: no field in eeAdmin reproduces the counts
                      the printed sales report uses, and the figure is closed
@@ -1262,7 +1292,7 @@
         </div>
     </div>
 
-    <script src="/static/data.js?v=20261027-override-onelist"></script>
+    <script src="/static/data.js?v=20261029-ownrates"></script>
     <script src="/static/sidebar_toggle.js?v=20261014-2"></script>
     <script src="/static/greeting.js?v=20261028-pages"></script>
 </body>

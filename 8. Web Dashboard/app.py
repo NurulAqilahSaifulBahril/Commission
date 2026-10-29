@@ -229,6 +229,31 @@ def load_disk_cache():
             _SALES_REPORT_PAYLOAD_CACHE.clear()
             _log(f"Loaded cache from disk: {[k for k in _data_cache if k != _CACHE_STAMP_KEY]}")
 
+class _CachePickler(pickle.Pickler):
+    """Saves a class that is no longer the one its module holds -- or whose
+    module is out of sys.modules mid-reload -- by name, through
+    build_commission_pack.dynamic_class. A Data page change reloads the
+    commission modules, and the yearly bundles built before it (2025 is not
+    rebuilt) still point at the old InvoiceLine class: plain pickle refused
+    them ("it's not the same object as int_basic_commission.InvoiceLine"),
+    so the cache stopped being saved and every restart rebuilt it."""
+
+    def reducer_override(self, obj):
+        if not isinstance(obj, type) or obj.__module__ not in _RELOADED_MODULES:
+            return NotImplemented
+        if "<" in obj.__qualname__:
+            return NotImplemented
+        return (build_commission_pack.dynamic_class, (obj.__module__, obj.__qualname__))
+
+
+# The commission modules clear_commission_cache() reloads; their classes are
+# always saved by name (see _CachePickler).
+_RELOADED_MODULES = {
+    "int_basic_commission", "int_anp_commission", "int_nfp_commission", "int_ega_esa",
+    "out_basic_commission", "out_anp_commission", "out_nfp_commission", "out_ega_esa",
+}
+
+
 def save_disk_cache():
     """Write the cache atomically: full pickle to a temp file alongside it, then
     one rename over the real path.
@@ -248,7 +273,7 @@ def save_disk_cache():
                                             prefix=CACHE_FILE.name + ".", suffix=".tmp")
             _data_cache[_CACHE_STAMP_KEY] = _CACHE_STAMP
             with os.fdopen(fd, "wb") as f:
-                pickle.dump(_data_cache, f)
+                _CachePickler(f, pickle.DEFAULT_PROTOCOL).dump(_data_cache)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, CACHE_FILE)
@@ -1209,6 +1234,18 @@ def _inject_special_case_rows(headers: list, rows: list, year: int, month: int, 
 _prefetch_lock = threading.Lock()
 _is_prefetching = False
 
+# The Data page fingerprint check (see _sync_data_page_rules).
+_RULES_CHECK_SECONDS = 20
+_rules_fingerprint = {"value": None, "checked": 0.0}
+# The fingerprint the cached figures were built from, kept inside the cache
+# so it is saved to disk with them. Without it the first check after a
+# restart could only take the table as it stood as its baseline: a Data page
+# edit made between the cache's last save and that first check was never
+# noticed, and the report kept serving the old figures (Joshua Yap's June
+# advance, 29 Oct 2026).
+_RULES_FP_KEY = "__rules_fingerprint__"
+_rules_fingerprint_lock = threading.Lock()
+
 # A rule change made while a rebuild is already running must not be dropped:
 # that rebuild started from the old rules. It is queued and run straight after.
 _prefetch_again = {"pending": False}
@@ -1223,6 +1260,15 @@ def prefetch_data_worker(year=2026, replay=False):
     import time as _time
     while True:
         started = _time.time()
+        # The Data page state this rebuild reads, recorded with its figures
+        # once it has finished (see _RULES_FP_KEY).
+        with _rules_fingerprint_lock:
+            rules_fp = _rules_fingerprint["value"]
+        if rules_fp is None:
+            try:
+                rules_fp = _data_page_rules_fingerprint()
+            except Exception:
+                rules_fp = None
         with (query_replay.replaying() if replay else contextlib.nullcontext()):
             outcome = _prefetch_run(year)
         if outcome == "busy":
@@ -1237,6 +1283,10 @@ def prefetch_data_worker(year=2026, replay=False):
             again = _prefetch_again["pending"]
             _prefetch_again["pending"] = False
         if not again:
+            if rules_fp is not None:
+                with _disk_cache_lock:
+                    _data_cache[_RULES_FP_KEY] = rules_fp
+                    save_disk_cache()
             return
         _log("Another Data page change arrived during that rebuild; recalculating again.")
         replay = True
@@ -1686,6 +1736,21 @@ def _anp_ep_lookup_factory(year: int):
 
 
 build_commission_pack.ANP_EP_LOOKUP_FACTORY = _anp_ep_lookup_factory
+
+
+def _anp_skip_factory(year: int):
+    """The invoices ANP leaves out (build_commission_pack ANP_SKIP_FACTORY):
+    late entries, first payments keyed in a later month than they were paid,
+    from August 2026 (user, 29 Oct 2026). Keyed on bubble_id, as the Sales
+    Report keeps them (_sales_report_late_entries)."""
+    late = _sales_report_late_entries(year)
+
+    def skip(inv: dict) -> bool:
+        return str(inv.get("bubble_id") or "") in late
+    return skip
+
+
+build_commission_pack.ANP_SKIP_FACTORY = _anp_skip_factory
 
 
 load_disk_cache()
@@ -2402,7 +2467,7 @@ def _build_payout_policies(basic_lines, as_at: str = "") -> dict:
             "balance_pct": _pct_text(policy.balance_trigger),
             # pct75_date/pct5_date on a line are named for the 2026 defaults
             # but hold whatever milestones this policy names.
-            # The advance counts from its payment's Created at (see
+            # The advance counts from its paid or Created at month (see
             # advance_recognized_date), so it reads as pending until then.
             "advance_date": (str(getattr(ln, "pct5_date", "") or "")[:10]
                              if multi and _as_at_date(build_commission_pack.advance_recognized_date(ln), as_at)
@@ -3401,8 +3466,9 @@ def get_overview():
 
 # A case's month is its first payment's paid date. From this date a first
 # payment keyed in (Created at) in a later month than it was paid is a late
-# entry: it still counts on the Sales Report, but earns no EGA/ESA, Early Bird
-# or Monthly Contest points (user, 28 Oct 2026). See _sales_report_case_dates().
+# entry: it counts on the Sales Report and for EGA/ESA and Early Bird, but earns
+# no ANP and no Monthly Contest points (user, 29 Oct 2026). See
+# _sales_report_case_dates() and _anp_skip_factory().
 SALES_REPORT_CREATED_AT_FROM = "2026-08-01"
 SALES_REPORT_SPLIT_MONTH = 6     # the EGA campaign window closes 10 June
 SALES_REPORT_SPLIT_DAY = 10      # June is shown as 1-10 / 11-30, per the campaign
@@ -4401,7 +4467,7 @@ def _sales_report_case_dates(year: int) -> dict[str, str]:
     The paid date decides the month all year (user, 28 Oct 2026). From August
     2026 a first payment keyed in (Created at) in a later month than it was
     paid -- paid 29 August, keyed in 9 September -- is a late entry: still an
-    August case here, but it earns no contest points. Those invoices are kept
+    August case here, but it earns no ANP or Monthly Contest points. Those invoices are kept
     in _LATE_ENTRY_CACHE; see _sales_report_late_entries().
 
     Keyed on bubble_id, not invoice number: one number can carry several
@@ -4497,8 +4563,9 @@ _LATE_ENTRY_CACHE: dict[int, frozenset] = {}
 
 def _sales_report_late_entries(year: int) -> frozenset:
     """bubble_ids whose first payment was keyed in a later month than it was
-    paid, from August 2026: they earn no EGA/ESA, Early Bird or Monthly
-    Contest points (user, 28 Oct 2026). Read alongside the case dates."""
+    paid, from August 2026: they earn no ANP and no Monthly Contest points
+    (user, 29 Oct 2026; EGA/ESA and Early Bird count them). Read alongside
+    the case dates."""
     _sales_report_case_dates(year)
     return _LATE_ENTRY_CACHE.get(int(year), frozenset())
 
@@ -4929,6 +4996,39 @@ class _AwardLine:
             setattr(self, k, kw.get(k))
 
 
+def _ep_multiplier_windows() -> list:
+    """[(from, to, multiplier)] from the Data page's EP Multipliers table:
+    a case first paid from `from` to `to` (YYYY-MM-DD, both inclusive) earns
+    its EP times `multiplier` -- October 2026 is 1.5x (user, 29 Oct 2026).
+    A row that cannot be read is skipped rather than failing the report."""
+    from decimal import Decimal as _D
+    out = []
+    try:
+        rows = db.list_ep_multipliers()
+    except Exception as e:
+        _log(f"[EP MULTIPLIER] could not read the table: {e}")
+        return out
+    for r in rows:
+        try:
+            mult = _D(str(r.get("multiplier") or "").strip())
+        except Exception:
+            continue
+        d_from = str(r.get("date_from") or "").strip()[:10]
+        d_to = str(r.get("date_to") or "").strip()[:10]
+        if mult > 0 and d_from and d_to:
+            out.append((d_from, d_to, mult))
+    return out
+
+
+def _ep_multiplier_on(when, windows) -> "Decimal":
+    """The EP multiplier for a case first paid on `when`; 1 outside every
+    window. Overlapping windows take the largest."""
+    from decimal import Decimal as _D
+    day = when.strftime("%Y-%m-%d") if hasattr(when, "strftime") else str(when or "")[:10]
+    hits = [m for d_from, d_to, m in windows if d_from <= day <= d_to]
+    return max(hits) if hits else _D(1)
+
+
 def _ega_award_report(mod, out_mod, rows, year, upto_month, channel, carryover, roles,
                       first_paid=None):
     """The EGA/ESA award tables for one channel, with the campaign bonus.
@@ -4960,7 +5060,7 @@ def _ega_award_report(mod, out_mod, rows, year, upto_month, channel, carryover, 
     named_as: dict = {}
 
     first_paid = first_paid or {}
-    late = _sales_report_late_entries(year) if first_paid else frozenset()
+    ep_windows = _ep_multiplier_windows()
     for row in rows:
         # Same rule as the Sales Report: a case belongs to the month its first
         # payment arrived, so the two pages agree case for case.
@@ -4991,10 +5091,11 @@ def _ega_award_report(mod, out_mod, rows, year, upto_month, channel, carryover, 
                        - _D(str(row.get("epp_interest") or 0)))
         ep = mod.calc_ep_points(sales_price, prop, row.get("invoice_date"),
                                 panel_qty).quantize(_D("0.01"), rounding=_RH)
-        # A late entry (paid in one month, keyed in a later one, from August)
-        # is listed but earns no points, as on the Sales Report.
-        if str(row.get("bubble_id") or "") in late:
-            ep = _D("0")
+        # The Data page EP multiplier for the month it was paid, as on the
+        # Sales Report (October 2026 is 1.5x).
+        mult = _ep_multiplier_on(when, ep_windows)
+        if mult != 1:
+            ep = (ep * mult).quantize(_D("0.01"), rounding=_RH)
         inv_dt = str(row.get("invoice_date") or "")[:10]
 
         agent_ep[agent] += ep
@@ -5215,7 +5316,7 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
     size is set by how many cases the agent closed before the cutoff. See
     _campaign_bonus_tier().
     """
-    from decimal import Decimal
+    from decimal import Decimal, ROUND_HALF_UP
 
     max_month = _sales_report_last_month(year)
     last_month = max_month if through is None else max(1, min(int(through), max_month))
@@ -5303,7 +5404,7 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         payments = f_payments.result()
         payment_rows = f_payment_rows.result()
         case_dates = f_case_dates.result()
-        late_entries = _sales_report_late_entries(year)
+        ep_windows = _ep_multiplier_windows()
         carryover = f_carryover.result()
         targets, esa_targets = f_targets.result()
         # A new list, not +=: `rows` is the cached bundle's own list.
@@ -5493,16 +5594,13 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         ep_fixed = (SALES_REPORT_EP_OVERRIDES.get(str(bubble or "").strip())
                     or SALES_REPORT_EP_OVERRIDES.get(str(r.get("invoice_number") or "").strip()))
         # A late entry (paid in one month, keyed in a later one, from August)
-        # stays on the Sales Report but earns no EP: no EGA/ESA or Early Bird
-        # points from it, in either month (user, 28 Oct 2026).
+        # earns its EP as usual: the penalty is ANP and Monthly Contest only
+        # (user, 29 Oct 2026).
         # Each case's EP, for the EP point hover: its month, customer, line,
         # the sales it is worked on (total less EPP), the EP and the rule.
         ep_line = {"m": when.month, "n": str(r.get("customer_name") or "").strip(),
                    "k": kind, "s": float(sales)}
         entry["ep_lines"].append(ep_line)
-        if str(bubble or "") in late_entries:
-            ep_line.update(e=0.0, r="late")
-            continue
         # A case on the report's COM line earns EP by the commercial rule -- the
         # first RM40,000 at 100%, the balance at 40%, for invoices dated from the
         # Data page's cutoff (1 May 2026) -- whatever the ERP recorded: it holds
@@ -5513,6 +5611,12 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         ep_val = (Decimal(ep_fixed) if ep_fixed is not None
                   else int_mod.calc_ep_points(sales, ep_prop, r.get("invoice_date"),
                                               int(r.get("panel_qty") or 0)))
+        # A case paid inside an EP multiplier window (Data page; October 2026
+        # is 1.5x) earns its EP times that multiplier.
+        mult = _ep_multiplier_on(when, ep_windows)
+        if mult != 1:
+            ep_val = (ep_val * mult).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            ep_line["x"] = float(mult)
         entry["ep_rows"].append((when.strftime("%Y-%m-%d"), ep_val))
         ep_line.update(e=float(ep_val), r="hand" if ep_fixed is not None else "")
 
@@ -5793,9 +5897,51 @@ def _sales_report_visible(payload: dict, search: str) -> list[dict]:
             or has_customer(a)]
 
 
-def _sales_report_pdf(payload: dict, search: str) -> bytes:
+def _pdf_drop_columns(rows: list, style: list, widths: list, hide: set,
+                      fixed: int = 3) -> tuple[list, list, list]:
+    """One Sales Report table without the columns in `hide`, as the page hides
+    them (user, 29 Oct 2026). Every style command is moved onto the columns
+    that are left, and dropped when all of its columns are gone; a merged
+    heading whose first column is hidden ("JAN" over a hidden NOC) hands its
+    text to the first column left. The room the hidden columns gave up goes to
+    the columns after NO / NAME / TYPE, so the table still fills the page."""
+    n = len(widths)
+    keep = [c for c in range(n) if c not in hide]
+    if not hide or not keep:
+        return rows, style, widths
+    new_of = {c: i for i, c in enumerate(keep)}
+    rows = [list(r) for r in rows]
+
+    def col(c):
+        return c + n if c < 0 else c
+
+    out = []
+    for cmd in style:
+        name, (c0, r0), (c1, r1), *rest = cmd
+        a, b = col(c0), col(c1)
+        kept = [c for c in range(a, b + 1) if c in new_of]
+        if not kept:
+            continue
+        if name == "SPAN" and kept[0] != a:
+            for r in range(r0, r1 + 1):
+                if r < len(rows) and rows[r][kept[0]] in ("", None):
+                    rows[r][kept[0]] = rows[r][a]
+        out.append((name, (new_of[kept[0]], r0), (new_of[kept[-1]], r1), *rest))
+    rows = [[cell for c, cell in enumerate(r) if c in new_of] for r in rows]
+    room = sum(widths) - sum(widths[c] for c in keep if c < fixed)
+    flex_after = sum(widths[c] for c in keep if c >= fixed)
+    scale = room / flex_after if flex_after else 1.0
+    return rows, out, [widths[c] * (scale if c >= fixed else 1.0) for c in keep]
+
+
+def _sales_report_pdf(payload: dict, search: str, hide: set | None = None,
+                      hide_of: int | None = None) -> bytes:
     """Render the sales ledger as a landscape A3 PDF, block for block the same
-    as the page: Company-wide Internal/Outsource first, then each branch."""
+    as the page: Company-wide Internal/Outsource first, then each branch.
+
+    `hide` holds the column positions hidden on the page, read off a table of
+    `hide_of` columns; they are left out only when this table has as many, so
+    a page out of step with the server never drops the wrong column."""
     import io
     from datetime import datetime
     from reportlab.lib import colors
@@ -5907,6 +6053,10 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
         esa_col = col
         col += 1
     ncols = col
+    hide = set(hide or ())
+    if hide and (hide_of != ncols or len(hide) >= ncols or any(c < 0 or c >= ncols for c in hide)):
+        _log(f"[SALES REPORT PDF] hidden columns ignored: page had {hide_of}, PDF has {ncols}")
+        hide = set()
     # NO/NAME/TYPE, Collected and EP are one heading cell down both header
     # rows. The award columns are not: their name sits in the top row and
     # "Balance To Qualify (...)" in the row below, as in the printed report.
@@ -6236,7 +6386,10 @@ def _sales_report_pdf(payload: dict, search: str) -> bytes:
             f"{html.escape(award_name)} target RM {target:,.2f} EP",
             ParagraphStyle("blockHead", fontName="Helvetica", fontSize=8, leading=11,
                            textColor=colors.HexColor("#334155"), spaceAfter=3))
-        table = Table(rows, colWidths=col_widths, repeatRows=2)
+        widths = col_widths
+        if hide:
+            rows, style, widths = _pdf_drop_columns(rows, style, col_widths, hide)
+        table = Table(rows, colWidths=widths, repeatRows=2)
         table.setStyle(TableStyle(style))
         return [head, table, Spacer(1, 8)]
 
@@ -6573,6 +6726,9 @@ def get_sales_report_pdf():
     year = request.args.get("year", 2026, type=int)
     through = request.args.get("month", type=int)
     search = (request.args.get("agent") or "").strip()
+    # Columns hidden on the page, by position, and how many it had.
+    hide_of = request.args.get("cols", type=int)
+    hide = {int(x) for x in (request.args.get("hide") or "").split(",") if x.strip().isdigit()}
     try:
         payload = _sales_report_payload(year, through)
         if payload is None:
@@ -6580,7 +6736,7 @@ def get_sales_report_pdf():
             return jsonify({"ready": False,
                             "message": "Sales data is still being prepared. "
                                        "Refresh shortly."}), 409
-        pdf = _sales_report_pdf(payload, search)
+        pdf = _sales_report_pdf(payload, search, hide, hide_of)
         abbr = ["jan", "feb", "mar", "apr", "may", "jun",
                 "jul", "aug", "sep", "oct", "nov", "dec"][int(payload.get("last_month") or 6) - 1]
         name = f"sales_report_{payload.get('year')}_jan_{abbr}.pdf"
@@ -6602,9 +6758,9 @@ def get_sales_report_pdf():
 # report kept paying the old rule until someone restarted it. A cheap
 # fingerprint of the table, checked at most every _RULES_CHECK_SECONDS,
 # closes that gap.
-_RULES_CHECK_SECONDS = 20
-_rules_fingerprint = {"value": None, "checked": 0.0}
-_rules_fingerprint_lock = threading.Lock()
+# _RULES_CHECK_SECONDS, _rules_fingerprint, _RULES_FP_KEY and its lock are
+# defined with the background pre-fetch state above: the start-up rebuild
+# thread reads them before this part of the module has run.
 
 
 def _data_page_rules_fingerprint():
@@ -6632,7 +6788,12 @@ def _sync_data_page_rules() -> None:
     with _rules_fingerprint_lock:
         previous = _rules_fingerprint["value"]
         _rules_fingerprint["value"] = current
-    if previous is not None and previous != current:
+    if previous is None:
+        # First check since start-up: compare against what the cache on disk
+        # was built from. A cache saved before this was recorded has none, so
+        # it is rebuilt once to be safe.
+        previous = _data_cache.get(_RULES_FP_KEY)
+    if previous != current:
         _log("[RULES SYNC] Data page rates or roles changed since the last check; rebuilding commissions.")
         _rates_module().reset_cache()
         try:
@@ -6646,9 +6807,13 @@ def _note_rules_saved_here() -> None:
     """A save through this server has already cleared everything; make the
     next check take the new state as its baseline instead of rebuilding a
     second time."""
+    try:
+        current = _data_page_rules_fingerprint()
+    except Exception:
+        current = None
     with _rules_fingerprint_lock:
-        _rules_fingerprint["value"] = None
-        _rules_fingerprint["checked"] = 0.0
+        _rules_fingerprint["value"] = current
+        _rules_fingerprint["checked"] = time.time() if current is not None else 0.0
 
 
 def _build_commission_payload(year: int, month: int, agent_type: str):
@@ -8378,6 +8543,49 @@ def ega_carryover_api():
         return jsonify({"status": "success", "total": len(rows)})
     except Exception as e:
         _log("[EGA CARRYOVER SAVE ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ep-multipliers", methods=["GET", "POST"])
+@login_required
+def ep_multipliers_api():
+    """EP multiplier windows (see _ep_multiplier_windows). Admin-only to write,
+    like every other rules grid: a row moves every agent's EP and so every
+    ESA and Early Bird balance."""
+    if request.method == "GET":
+        return jsonify(db.list_ep_multipliers())
+
+    from datetime import datetime
+    user = auth.current_user()
+    if user["role"] != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    try:
+        rows = []
+        for e in (request.json or {}).get("entries", []):
+            d_from = str(e.get("date_from") or "").strip()[:10]
+            d_to = str(e.get("date_to") or "").strip()[:10]
+            mult = str(e.get("multiplier") or "").strip()
+            if not (d_from or d_to or mult):
+                continue
+            try:
+                datetime.strptime(d_from, "%Y-%m-%d")
+                datetime.strptime(d_to, "%Y-%m-%d")
+            except ValueError:
+                return jsonify({"error": f"Dates must be YYYY-MM-DD (got '{d_from}' to '{d_to}')."}), 400
+            if d_to < d_from:
+                return jsonify({"error": f"'To' is before 'From' ({d_from} to {d_to})."}), 400
+            try:
+                if float(mult) <= 0:
+                    raise ValueError
+            except ValueError:
+                return jsonify({"error": f"Multiplier must be a positive number (got '{mult}')."}), 400
+            rows.append({"date_from": d_from, "date_to": d_to, "multiplier": mult,
+                         "note": str(e.get("note") or "").strip()})
+        db.save_ep_multipliers(rows, user["username"])
+        clear_commission_cache()
+        return jsonify({"status": "success", "total": len(rows)})
+    except Exception as e:
+        _log("[EP MULTIPLIER SAVE ERROR]\n" + traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 

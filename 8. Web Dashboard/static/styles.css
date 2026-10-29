@@ -2407,6 +2407,45 @@ body {
     color: var(--text-muted);
 }
 .sr-legend strong { color: var(--text-main); font-weight: 600; }
+.sr-legend-hint { font-style: italic; }
+
+/* Hidden columns (right-click a header), and the double line Excel draws
+   where they were: double-click it to bring them back. */
+.sr-table .sr-col-hidden { display: none; }
+.sr-table th.sr-unhide-left,
+.sr-table th.sr-unhide-right { cursor: col-resize; }
+.sr-table th.sr-unhide-left::before,
+.sr-table th.sr-unhide-right::after {
+    content: ""; position: absolute; top: 0; bottom: 0; width: 2px;
+    border-left: 1.5px solid #2563EB; border-right: 1.5px solid #2563EB;
+}
+.sr-table th.sr-unhide-left::before { left: 0; }
+.sr-table th.sr-unhide-right::after { right: 0; }
+.sr-table thead th { position: relative; }
+.sr-col-menu {
+    position: fixed;
+    z-index: 950;
+    min-width: 200px;
+    padding: 4px;
+    background: var(--bg-card, #fff);
+    border: 1px solid var(--border-color, #dfe3ec);
+    border-radius: 8px;
+    box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);
+}
+.sr-col-menu button {
+    display: block;
+    width: 100%;
+    padding: 7px 10px;
+    border: 0;
+    border-radius: 5px;
+    background: none;
+    color: var(--text-main);
+    font: inherit;
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+}
+.sr-col-menu button:hover { background: rgba(37, 99, 235, 0.08); }
 
 .sr-block { margin-bottom: 18px; }
 
@@ -2612,6 +2651,18 @@ body {
     margin-bottom: 6px;
 }
 
+/* EP Point: a click opens the popup, so it reads as a link, not a hover. */
+.sr-table td[data-ep] {
+    cursor: pointer;
+    text-decoration: underline dotted var(--text-muted, #64748b);
+}
+
+.sr-table td[data-ep]:hover { color: var(--primary, #2563eb); }
+
+.sr-ep-modal-content { max-width: 720px; }
+
+.sr-ep-body { display: block; }
+
 .sr-tip-note { font-size: 11px; color: var(--text-muted, #64748b); margin: -2px 0 6px; max-width: 520px; }
 .sr-tip-table { border-collapse: collapse; font-size: 11px; width: 100%; }
 
@@ -2641,6 +2692,7 @@ body {
     overflow-wrap: anywhere;
 }
 .sr-tip-none { color: var(--text-muted, #64748b); font-style: italic; }
+.sr-tip-mult { color: #C2410C; font-weight: 700; }
 
 /* A referral cell is hand-entered, so it invites a click rather than looking
    like the read-only figures around it. */
