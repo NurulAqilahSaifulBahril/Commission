@@ -660,15 +660,21 @@ def format_senior_override_cell(breakdown_dict: dict[str, float]) -> str:
     return "<br/>".join(parts) if parts else "-"
 
 
-def format_other_commission_for_customer(breakdown_dict: dict[str, float]) -> str:
+def format_other_commission_for_customer(breakdown_dict: dict[str, float],
+                                         teams: dict[str, str] | None = None) -> str:
     """Per-customer counterpart to format_senior_override_cell: shown on the
-    SOURCE agent's own customer row, naming who the override is credited to."""
+    SOURCE agent's own customer row, naming who the override is credited to.
+    `teams` (Excel and PDF only) adds whose team a group override came
+    through: "RM 142.76 (Sunny Tan) – Martin Hing's team (STM)". It goes
+    after the "RM x (name)" pair, which the exports read back."""
     if not breakdown_dict:
         return "-"
+    teams = teams or {}
     parts = []
     for recipient, amount in sorted(breakdown_dict.items()):
         if amount > 0:
-            parts.append(f"RM {amount:,.2f} ({recipient})")
+            team = teams.get(recipient)
+            parts.append(f"RM {amount:,.2f} ({recipient})" + (f" – {team}" if team else ""))
     return "<br/>".join(parts) if parts else "-"
 
 
@@ -2460,7 +2466,8 @@ def build_internal_summary_tables(
     year: int,
     invoice_dates_map: dict,
     month: int | None = None,
-    nfp_by_inv_all: dict | None = None) -> tuple[dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, dict[str, dict]]]:
+    nfp_by_inv_all: dict | None = None,
+    override_teams: bool = False) -> tuple[dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, dict[str, dict]]]:
     """
     Returns:
       agent_summary_by_month - dict of month -> rows for "Summary Internal Agent Commission"
@@ -2519,6 +2526,7 @@ def build_internal_summary_tables(
         # show exactly which of the executive's own sales generated each
         # amount (instead of lumping the whole month's total onto the senior's row).
         basic_override_by_customer = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+        basic_override_teams = defaultdict(lambda: defaultdict(dict))
         basic_rate_by_agent = {}
         referral_by_agent = {}
         referral_name_by_agent = {}
@@ -2550,6 +2558,10 @@ def build_internal_summary_tables(
                 basic_override_breakdown[senior][exec_name] += override
                 basic_override_by_agent[senior] = basic_override_by_agent.get(senior, 0.0) + override
                 basic_override_by_customer[agent][customer][senior] += override
+            if override_teams:
+                basic_override_teams[agent][customer].update(
+                    {d["name"]: d["team"] for d in _basic_line_override_details(ln, "Internal", _ovr_names)
+                     if d["team"]})
 
             # Referral fee
             if basic._is_valid_referral(ln.referral_name):
@@ -2832,7 +2844,9 @@ def build_internal_summary_tables(
                     cust_nfp_pkg_str = "<br/>".join(sorted(cust_nfp_pkgs)) if cust_nfp_pkgs else "-"
 
                     basic_comm_val = f"{basic_info['comm']:,.2f}" if basic_info['comm'] != 0 else ("pending full payment" if basic_dates[0] and "2026" in str(basic_dates[0]) else "-")
-                    row_other_commission = format_other_commission_for_customer(basic_override_by_customer[agent].get(customer, {}))
+                    row_other_commission = format_other_commission_for_customer(
+                        basic_override_by_customer[agent].get(customer, {}),
+                        basic_override_teams[agent].get(customer, {}))
 
                     is_before_oct_25 = is_before_october_2025(basic_dates[0]) or is_before_october_2025(nfp_dates[0])
                     # The invoice's own package too, for a month that carries
@@ -3016,6 +3030,7 @@ def build_outsource_summary_tables(
     invoice_dates_map: dict,
     month: int | None = None,
     nfp_by_inv_all: dict | None = None,
+    override_teams: bool = False,
 ) -> tuple[dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, list[list[str]]], dict[int, dict[str, dict]]]:
     """
     Returns:
@@ -3060,6 +3075,7 @@ def build_outsource_summary_tables(
         # exactly which of the source agent's own sales generated each amount
         # (instead of lumping the whole month's total onto the recipient's row).
         out_override_by_customer = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+        out_override_teams = defaultdict(lambda: defaultdict(dict))
         gan_lai_soon_by_agent = {}
 
         month_basic_lines = _expand_basic_lines_for_month(basic_lines, m)
@@ -3112,6 +3128,10 @@ def build_outsource_summary_tables(
                     out_override_breakdown[oum_parent][agent] += oum_override
                     basic_override_by_agent[oum_parent] = basic_override_by_agent.get(oum_parent, 0.0) + oum_override
                     out_override_by_customer[agent][customer][oum_parent] += oum_override
+                if override_teams:
+                    out_override_teams[agent][customer].update(
+                        {d["name"]: d["team"] for d in _basic_line_override_details(ln, "Outsource", _ovr_names)
+                         if d["team"]})
 
         # NFP commission
         nfp_comm_by_agent = {}
@@ -3422,7 +3442,9 @@ def build_outsource_summary_tables(
                         )
 
                     basic_comm_val = f"{basic_info['comm']:,.2f}" if basic_info['comm'] != 0 else ("pending full payment" if basic_dates[0] and "2026" in str(basic_dates[0]) else "-")
-                    row_other_commission = format_other_commission_for_customer(out_override_by_customer[agent].get(customer, {}))
+                    row_other_commission = format_other_commission_for_customer(
+                        out_override_by_customer[agent].get(customer, {}),
+                        out_override_teams[agent].get(customer, {}))
                     # Outsource invoices carry no referrer in the ERP, so the
                     # only referral an outsource row can have is one typed on
                     # the dashboard. Charged on the same basis as internal:
@@ -5380,6 +5402,27 @@ def customer_balance_dates(basic_lines: list, year: int, month: int) -> dict:
     return {k: v[1] for k, v in best.items()}
 
 
+def customer_advance_paid_dates(basic_lines: list, year: int, month: int) -> dict:
+    """customer (lower case) -> the date the payment reaching the advance was
+    made, for each customer whose Advance RM 300 lands in this month. A case
+    keyed in late lands in a later month than it was paid in; the Advance RM
+    300 sheet's agent table puts it under its paid month, as Finance's "Paid
+    on" sheet does ("Aug'26 case - late submit", user 2026-10-30)."""
+    out: dict = {}
+    want = f"{int(year):04d}-{int(month):02d}"
+    for ln in basic_lines or []:
+        policy = getattr(ln, "payout_policy", None)
+        if policy is None or not getattr(policy, "is_multi_stage", False):
+            continue
+        if advance_recognized_date(ln)[:7] != want:
+            continue
+        cust = str(getattr(ln, "customer_name", "") or "").strip().lower()
+        paid = str(getattr(ln, "pct5_date", "") or "")[:10]
+        if cust and paid and (cust not in out or paid < out[cust]):
+            out[cust] = paid
+    return out
+
+
 def _money(text) -> float:
     """"RM 1,234.50" -> 1234.5; "-RM 158.00" -> -158.0; anything else -> 0."""
     try:
@@ -5496,6 +5539,7 @@ def build_commission_excel(
     contest_t3_headers=None, contest_t3_rows=None,
     sections=None,
     stage_balance_dates=None,
+    stage_advance_paid=None,
 ) -> Path:
     """`sections` limits the workbook to those dashboard sections' sheets
     (see EXCEL_SECTION_SHEETS); None writes every sheet."""
@@ -5987,6 +6031,46 @@ def build_commission_excel(
                                        end_row=first + b, end_column=ci + 1)
                         ws.cell(row=first + a, column=ci + 1).alignment = Alignment(
                             horizontal="center" if ci == 0 else "left", vertical="center", wrap_text=True)
+                if stage == "advance" and rows:
+                    # Finance's "Paid on" sheet under the table (user,
+                    # 2026-10-30): each agent's advances by the month the case
+                    # was paid in -- a case keyed in late sits in its own
+                    # earlier month, remarked "late submit" -- then one line
+                    # per agent to pay, with a Remarks column to fill in.
+                    paid_on = stage_advance_paid or {}
+                    by_agent, owner = {}, ""
+                    for r in rows:
+                        owner = r[src["Agent"]] or owner
+                        amt = _money(r[src["Commission Price"]])
+                        if not owner or not amt:
+                            continue
+                        paid = paid_on.get(str(r[src["Customer"]] or "").strip().lower(), "")
+                        ym = paid[:7] if re.match(r"^\d{4}-\d{2}", paid) else f"{int(year):04d}-{m:02d}"
+                        by_agent.setdefault(owner, {})
+                        by_agent[owner][ym] = by_agent[owner].get(ym, 0.0) + amt
+                    if by_agent:
+                        yms = sorted({ym for months in by_agent.values() for ym in months})
+                        def _mon(ym):
+                            return f"{MONTH_NAMES[int(ym[5:7])][:3]} {ym[:4]}"
+                        agents = sorted(by_agent, key=agent_name_sort_key)
+                        t1 = []
+                        for no, a in enumerate(agents, start=1):
+                            late = [ym for ym in yms if ym in by_agent[a] and ym < f"{int(year):04d}-{m:02d}"]
+                            remark = (" & ".join(MONTH_NAMES[int(ym[5:7])][:3] for ym in late)
+                                      + f"'{late[-1][2:4]} case - late submit") if late else ""
+                            t1.append([no, a] + [f"{by_agent[a][ym]:,.2f}" if ym in by_agent[a] else "-"
+                                                 for ym in yms] + [remark])
+                        t1.append(["Total", ""] + [f"{sum(v.get(ym, 0.0) for v in by_agent.values()):,.2f}"
+                                                   for ym in yms] + [""])
+                        curr_row = write_block(ws, curr_row + 1, None,
+                                               ["No.", "Agent"] + [f"Advance RM300 (RM) - {_mon(ym)}" for ym in yms]
+                                               + ["Remarks"], t1, total_row_fill=advance_total_fill)
+                        t2 = [[no, a, f"{sum(by_agent[a].values()):,.2f}", ""]
+                              for no, a in enumerate(agents, start=1)]
+                        t2.append(["Total", "", f"{sum(sum(v.values()) for v in by_agent.values()):,.2f}", ""])
+                        curr_row = write_block(ws, curr_row, None,
+                                               ["No.", "Agent", "Commission (RM)", "Remarks"], t2,
+                                               total_row_fill=advance_total_fill)
                 if stage == "balance":
                     # Three independent lists under the table, side by side,
                     # each with its own total (user, 2026-10-23): referral
@@ -7234,6 +7318,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         year=year,
         invoice_dates_map=invoice_dates_map,
         month=month,
+        override_teams=True,
     )
     print(f"    Agent summary: {len(int_agent_summary_rows)} rows")
     print(f"    Customer summary: {len(int_customer_summary_rows)} rows")
@@ -7278,6 +7363,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
         year=year,
         invoice_dates_map=invoice_dates_map,
         month=month,
+        override_teams=True,
     )
     print(f"    Agent summary: {len(out_agent_summary_rows)} rows")
     print(f"    Customer summary: {len(out_customer_summary_rows)} rows")
@@ -7347,6 +7433,10 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
             stage_balance_dates={
                 "Internal": customer_balance_dates(int_basic_lines, year, month) if month else {},
                 "Outsource": customer_balance_dates(out_basic_lines, year, month) if month else {},
+            },
+            stage_advance_paid={
+                **(customer_advance_paid_dates(out_basic_lines, year, month) if month else {}),
+                **(customer_advance_paid_dates(int_basic_lines, year, month) if month else {}),
             },
         )
 
