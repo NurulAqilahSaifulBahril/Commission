@@ -3799,7 +3799,23 @@ modalPackageType.value = defaults.pkg || "-";
             };
         }
 
-        const entries = [...seen.values()].sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+        // A summary of the role, not every Data page row behind it (user,
+        // 2026-10-30): "All" rows only carry rates (Factory, EV packages), so
+        // they go whenever a real role is listed; and one role split over
+        // several rows or packages reads as one line spanning all of them.
+        let raw = [...seen.values()];
+        const isAllRow = e => String(e.role || "").trim().toLowerCase() === "all";
+        if (raw.some(e => !isAllRow(e))) raw = raw.filter(e => !isAllRow(e));
+        const merged = new Map();
+        raw.forEach(e => {
+            const k = `${String(e.agent_type || "").toLowerCase()}|${String(e.role || "").trim().toLowerCase()}`;
+            const end = e.end || "9999-12";
+            const cur = merged.get(k);
+            if (!cur) { merged.set(k, { ...e, end }); return; }
+            if (e.start < cur.start) cur.start = e.start;
+            if (end > cur.end) cur.end = end;
+        });
+        const entries = [...merged.values()].sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
         const basisNote = months.length
             ? "Role as at the invoice date"
             : `Role as at ${fmtRoleMonth(reportMonth)}`;
@@ -3810,15 +3826,11 @@ modalPackageType.value = defaults.pkg || "-";
         // Internal and an Outsource role at once). Only the first is a change.
         const types = new Set(entries.map(e => String(e.agent_type || "").toLowerCase()));
         const showType = types.size > 1;
-        // A Solar and an EV role side by side are concurrent too.
-        const showPkg = entries.some(e => e.package && e.package !== "Solar");
 
         const lines = entries.map(e => `
             <div style="display:flex; justify-content:space-between; gap:20px; margin-bottom:4px;">
                 <strong>${escapeHtml(e.role || "(no role)")}${showType && e.agent_type
                     ? ` <span style="font-weight:400;color:#94a3b8;">(${escapeHtml(e.agent_type)})</span>`
-                    : ""}${showPkg
-                    ? ` <span style="font-weight:400;color:#94a3b8;">(${escapeHtml(e.package || "Solar")})</span>`
                     : ""}</strong>
                 <span style="color:#cbd5e1; white-space:nowrap;">${escapeHtml(fmtRolePeriod(e.start, e.end))}</span>
             </div>`).join("");
@@ -3826,7 +3838,7 @@ modalPackageType.value = defaults.pkg || "-";
         let multiNote = "";
         if (entries.length > 1) {
             const starts = new Set(entries.map(e => e.start));
-            multiNote = (showType || showPkg) && starts.size === 1
+            multiNote = showType && starts.size === 1
                 ? `<div style="margin-top:6px; color:#fcd34d;">Holds both roles concurrently.</div>`
                 : `<div style="margin-top:6px; color:#fcd34d;">This row spans a role change.</div>`;
         }
@@ -3839,10 +3851,50 @@ modalPackageType.value = defaults.pkg || "-";
         };
     }
 
+    /** Basic & NFP table: the role each of these customers' invoices was
+     *  actually priced under, as the engine recorded it (payout_policies
+     *  "role"), so the hover always matches the Basic Commission -- fallback
+     *  role, EV role and all (user, 2026-10-30). One line per role with the
+     *  invoice months it covers. Null when the payload carries no roles (an
+     *  older cache), and the Data page summary is shown instead. */
+    function pricedRoleTooltip(agentName, customers) {
+        const map = state.rawData?.sections?.basic_nfp?.payout_policies;
+        if (!map || !customers || !customers.length) return null;
+        const byRole = new Map();
+        const seenInv = new Set();
+        customers.forEach(c => {
+            (map[String(c || "").trim().toLowerCase()] || []).forEach(e => {
+                const role = String(e.role || "").trim();
+                if (!role || seenInv.has(e.invoice)) return;
+                seenInv.add(e.invoice);
+                const ym = String(e.invoice_date || "").slice(0, 7);
+                const cur = byRole.get(role) || { first: ym, last: ym };
+                if (ym && (!cur.first || ym < cur.first)) cur.first = ym;
+                if (ym && ym > cur.last) cur.last = ym;
+                byRole.set(role, cur);
+            });
+        });
+        if (!byRole.size) return null;
+        const name = String(agentName || "").replace(/\*/g, "").trim();
+        const lines = [...byRole.entries()]
+            .sort((a, b) => (a[1].first < b[1].first ? -1 : a[1].first > b[1].first ? 1 : 0))
+            .map(([role, r]) => `
+            <div style="display:flex; justify-content:space-between; gap:20px; margin-bottom:4px;">
+                <strong>${escapeHtml(role)}</strong>
+                <span style="color:#cbd5e1; white-space:nowrap;">${escapeHtml(r.first === r.last
+                    ? fmtRoleMonth(r.first) : `${fmtRoleMonth(r.first)} — ${fmtRoleMonth(r.last)}`)}</span>
+            </div>`).join("");
+        return {
+            title: resolveAgentName(name) || name,
+            formula: "",
+            subtext: `<div style="margin-bottom:6px; color:#cbd5e1;">Role used for Basic Commission (by invoice date)</div>` + lines,
+        };
+    }
+
     /** Wires the role hover onto an agent-name cell. No-op when the agent has
      *  nothing to show, so ordinary cells keep their plain cursor. */
-    function attachAgentRoleHover(td, agentName, invoiceCellText) {
-        const info = agentRoleTooltip(agentName, invoiceCellText);
+    function attachAgentRoleHover(td, agentName, invoiceCellText, customers) {
+        const info = pricedRoleTooltip(agentName, customers) || agentRoleTooltip(agentName, invoiceCellText);
         if (!info) return;
         td.classList.add("agent-role-hover");
         td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, info));
@@ -4584,7 +4636,21 @@ modalPackageType.value = defaults.pkg || "-";
         const headerDiv = document.createElement("div");
         headerDiv.className = "agent-summary-inline-header";
         const h4 = document.createElement("h4");
-        h4.textContent = "Summary Agent Commission";
+        // Names the Payout Stage on show (user, 2026-10-30).
+        const stageTitle = state.activeSection === "basic_nfp" ? {
+            advance: "Advance RM300", balance: "Balance Payout",
+        }[state.filters.payoutStage] : "";
+        h4.textContent = stageTitle ? `Summary Agent Commission - ${stageTitle}` : "Summary Agent Commission";
+        // The advance month rule, as build_commission_pack.advance_recognized_date
+        // applies it (user, 2026-10-30).
+        if (stageTitle === "Advance RM300") {
+            h4.title = "Which month the RM 300 advance falls in:\n"
+                + "• Paid and created in the same month → that month.\n"
+                + "• Paid in the last 2 working days, created in the first 2 working days of next month → paid month.\n"
+                + "• Anything else → created month.\n"
+                + "• Approved exceptions → paid month.";
+            h4.style.cursor = "help";
+        }
         headerDiv.appendChild(h4);
         const badge = document.createElement("span");
         badge.className = "agent-summary-inline-badge";
@@ -5311,7 +5377,6 @@ modalPackageType.value = defaults.pkg || "-";
                     + (hasAgentSummary ? "<br/>Click an agent in Summary Agent Commission below to see their customers." : "");
                 headerHint.style.display = "";
             }
-
             const actionsGroup = document.createElement("div");
             actionsGroup.className = "legend-actions-group";
 
@@ -5715,13 +5780,13 @@ modalPackageType.value = defaults.pkg || "-";
                         // the cell itself covers several, and they can straddle
                         // a role change.
                         let spannedDates = "";
-                        if (invoiceDateIdx !== -1) {
-                            const span = agentSpans[ri] > 1 ? agentSpans[ri] : 1;
-                            for (let k = ri; k < Math.min(ri + span, N); k++) {
-                                spannedDates += " " + String(rowsToRender[k][invoiceDateIdx] || "");
-                            }
+                        const spannedCustomers = [];
+                        const span = agentSpans[ri] > 1 ? agentSpans[ri] : 1;
+                        for (let k = ri; k < Math.min(ri + span, N); k++) {
+                            if (invoiceDateIdx !== -1) spannedDates += " " + String(rowsToRender[k][invoiceDateIdx] || "");
+                            if (customerIdx !== -1) spannedCustomers.push(String(rowsToRender[k][customerIdx] || ""));
                         }
-                        attachAgentRoleHover(td, agentName, spannedDates);
+                        attachAgentRoleHover(td, agentName, spannedDates, spannedCustomers);
                     }
                     if (ci === agentIdx && agentSpans[ri] > 1) td.rowSpan = agentSpans[ri];
                     if (ci === totalInvColIdx && totalInvVisible[ri] && totalInvSpans[ri] > 1) td.rowSpan = totalInvSpans[ri];
@@ -7420,11 +7485,6 @@ modalPackageType.value = defaults.pkg || "-";
         let content = "";
         let secondaryContent = "";
         if (state.activeSection === "basic_nfp") {
-            const isJulyOrLater = parseInt(state.activeMonth) >= 7;
-            const ratesText = state.activeAgentType === "internal" 
-                ? `Executive - 3%, Senior - 3.25%, Senior Override - 0.25%`
-                : `OUM - 2.25%, OSA - 2.0%`;
-            
             content = `
                 <b>Basic Commission Rules:</b>
                 <ul>

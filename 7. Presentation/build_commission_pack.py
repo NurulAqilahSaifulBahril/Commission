@@ -346,6 +346,17 @@ def _basic_line_overrides(ln, agent_type: str, name_map: dict | None = None) -> 
             for h in hits]
 
 
+# Invoices whose Advance RM 300 follows the paid month even though the rule
+# below would put it in the Created at month (user, 2026-10-30). Paid in
+# August, keyed in September, all four to August; the rule itself unchanged.
+ADVANCE_PAID_MONTH_PINS = frozenset({
+    "INV-1011379",   # Wong Jia Xuan, Chin Li Kuan: paid 16 Aug, keyed 9 Sep
+    "INV-1011411",   # Wong Jia Xuan, Ee Chun Tack (Atap): paid 17 Aug, keyed 1 Sep
+    "INV-1011316",   # You Teng Hoong, Mega Signcraft (Factory): paid 27 Aug, keyed 2 Sep
+    "INV-1011470",   # You Teng Hoong, Tey Chin Chuan (Atap): paid 31 Aug, keyed 7 Sep
+})
+
+
 def advance_recognized_date(ln) -> str:
     """The date that puts an invoice's Advance RM 300 in a month, from the
     payment that reached the advance trigger (user, 2026-10-29):
@@ -365,6 +376,8 @@ def advance_recognized_date(ln) -> str:
     created = str(getattr(ln, "pct5_created", "") or "")[:10]
     if not paid or not created or paid[:7] == created[:7]:
         return paid or created
+    if str(getattr(ln, "invoice_number", "") or "").strip() in ADVANCE_PAID_MONTH_PINS:
+        return paid
     try:
         p = datetime.strptime(paid, "%Y-%m-%d").date()
         c = datetime.strptime(created, "%Y-%m-%d").date()
@@ -1176,10 +1189,12 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
         # invoice says — see basic_commission_rates.invoice_milestones.
         _inv_parsed = basic._parse_invoice_date(r.get("invoice_date"))
         from basic_commission_rates import invoice_role_package as _role_pkg
+        # The role this invoice is priced under; kept on the line for the
+        # agent-name hover.
+        line_role = basic._outsource_hierarchy_for(info, _inv_parsed, package=_role_pkg(r))
         policy, pct5_str, pct75_str, pct100_str = basic._invoice_milestones(
             r,
-            hierarchy=basic._outsource_hierarchy_for(
-                info, _inv_parsed, package=_role_pkg(r)),
+            hierarchy=line_role,
             month=_inv_parsed.month if _inv_parsed else 5,
             year=_inv_parsed.year if _inv_parsed else year,
             agent=canonical_name,
@@ -1304,6 +1319,7 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
                 pct75_created=pct75_created,
                 first_payment_date=first_pay_str,
                 payout_policy=policy,
+                role=line_role,
             )
             processed_factory.append(obj)
         else:
@@ -1357,6 +1373,7 @@ def fetch_outsource_basic(year: int, h1_only: bool = True, month: int | None = N
                 ev_commission=float(ev_comm or 0),
                 rate_display=rate_display,
                 role_package=_invoice_role_package(r),
+                role=line_role,
             )
             processed_invoices.append(obj)
 

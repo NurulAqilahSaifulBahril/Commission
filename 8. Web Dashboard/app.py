@@ -2461,6 +2461,9 @@ def _build_payout_policies(basic_lines, as_at: str = "") -> dict:
         entry = {
             "invoice": str(getattr(ln, "invoice_number", "") or ""),
             "invoice_date": str(getattr(ln, "invoice_date", "") or "")[:10],
+            # The role the engine priced this invoice under -- the agent-name
+            # hover shows it, so it always matches the Basic Commission.
+            "role": str(getattr(ln, "role", "") or ""),
             "multi_stage": multi,
             "advance_pct": _pct_text(policy.advance_trigger) if multi else "",
             "advance_rm": _pct_text(policy.advance_amount) if multi else "",

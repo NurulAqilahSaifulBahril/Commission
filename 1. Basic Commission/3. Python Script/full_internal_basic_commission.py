@@ -840,6 +840,9 @@ class InvoiceLine:
     # Solar or EV role the invoice was priced under -- which of the agent's
     # roles (and so whose Reports To chain) its overrides follow.
     role_package: str = ""
+    # The role the invoice was priced under (_internal_hierarchy), for the
+    # agent-name hover on the dashboard.
+    role: str = ""
     # The whole Basic Commission before an advance-only cap. Equal to
     # basic_commission except while the invoice sits between its advance and
     # balance milestones; the dashboard's Special Case list shows this figure.
@@ -1145,6 +1148,7 @@ def _process_invoices(
                 ev_commission=ev_comm,
                 rate_display=rate_display,
                 role_package=_hier_pkg,
+                role=_hierarchy,
                 full_commission=full_comm if full_comm is not None else comm,
             )
         )
