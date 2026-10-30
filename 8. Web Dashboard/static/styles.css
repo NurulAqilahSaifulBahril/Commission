@@ -46,6 +46,13 @@ body {
     /* Scrolls on its own when taller than the window (the Sales Report
        rules, opened), instead of running past its background. */
     overflow-y: auto;
+    /* Still scrolls with the wheel or touch; only the bar is hidden. */
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+
+.sidebar::-webkit-scrollbar {
+    display: none;
 }
 
 .sidebar-header {
