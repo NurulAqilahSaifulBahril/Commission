@@ -1442,6 +1442,40 @@
         custListBox.hidden = !cards.length;
     }
 
+    /** Pull fresh invoices and payments, wait for the rebuild, then reload. */
+    async function syncData() {
+        const btn = document.getElementById("srSync");
+        const original = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = `<span class="icon">⌛</span> Syncing…`;
+        setBusy(true);
+        try {
+            const before = await (await fetch("/api/data-version", { cache: "no-store" })).json();
+            const res = await fetch(`/api/sales-report/sync?year=${encodeURIComponent(state.year)}`,
+                                    { method: "POST" });
+            if (!res.ok) throw new Error("Could not start the sync");
+            const started = Date.now();
+            // The rebuild bumps the data version when the new figures are in.
+            // Without a bump, a rebuild that has stopped (it failed, and the
+            // old figures stay) ends the wait after a short grace period.
+            for (;;) {
+                await new Promise(r => setTimeout(r, 3000));
+                const v = await (await fetch("/api/data-version", { cache: "no-store" })).json();
+                const waited = Date.now() - started;
+                if (v.version !== before.version && !v.rebuilding) break;
+                if (!v.rebuilding && waited > 20000) break;
+                if (waited > 480000) break;
+            }
+            await loadReport();
+        } catch (err) {
+            alert(`Sync error: ${err.message}`);
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = original;
+            setBusy(false);
+        }
+    }
+
     function setBusy(busy) {
         loader.classList.toggle("hidden", !busy);
     }
@@ -1520,6 +1554,7 @@
             }
 
             state.data = data;
+            document.getElementById("srSync").hidden = !!data.scoped_to_agent;
             syncPeriodSelect(data);
             renderCaveat(data);
             if (filterPanel) filterPanel.hidden = false;
@@ -1595,6 +1630,7 @@
             });
         }
 
+        document.getElementById("srSync").addEventListener("click", syncData);
         document.getElementById("srExport").addEventListener("click", exportCsv);
         const pdfBtn = document.getElementById("srExportPdf");
         if (pdfBtn) pdfBtn.addEventListener("click", exportPdf);

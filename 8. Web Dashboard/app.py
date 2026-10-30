@@ -5977,6 +5977,24 @@ def get_sales_report():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/sales-report/sync", methods=["POST"])
+@login_required
+def sync_sales_report():
+    """Download the invoices and payments again, from the database.
+
+    The report is built from the commission bundles cached on disk, so a case
+    created or a payment taken after the last download stays out of it until a
+    rebuild. This starts that rebuild without emptying the cache first: the
+    page keeps showing the current figures until the new bundles replace them,
+    and /api/data-version moves when they do."""
+    year = request.args.get("year", 2026, type=int)
+    with _prefetch_lock:
+        already = bool(_is_prefetching)
+    if not already:
+        start_prefetch(year)
+    return jsonify({"status": "started", "already_running": already})
+
+
 def _sales_report_visible(payload: dict, search: str) -> list[dict]:
     """The agents a given search box would show, in report order. Mirrors
     normalizeName()/visibleAgents() in static/sales_report.js so the PDF and
