@@ -364,6 +364,35 @@ def get_invoice_panel_qty(row: dict) -> int:
     return 0
 
 
+# A solar panel line on an invoice item: "112X Jinko Tiger Neo ... (620W)",
+# "122X ASTRO N7 ... 625W". The wattage keeps inverter ("30KW") and EV
+# charger ("11kW") lines out.
+_PANEL_LINE = re.compile(r"^\s*(\d+)\s*[xX×]\s*(?=.*\b[3-8]\d{2}\s*W\b)", re.I)
+
+# More panels than this and the invoice is a Factory, whatever its name says
+# (user, 2026-10-30).
+FACTORY_PANEL_THRESHOLD = 100
+
+
+def invoice_item_panel_qty(row: dict) -> int:
+    """Panel count read off the invoice's own item lines (`price_items`), the
+    largest panel line found; 0 when none. invoice.panel_qty is empty on most
+    invoices, so get_invoice_panel_qty() alone reads 0 for them."""
+    best = 0
+    for item in (row.get("price_items") or []) if isinstance(row, dict) else []:
+        for line in str((item or {}).get("description") or "").splitlines():
+            m = _PANEL_LINE.match(line)
+            if m:
+                best = max(best, int(m.group(1)))
+    return best
+
+
+def is_factory_by_panels(row: dict) -> bool:
+    """Whether the invoice has more than FACTORY_PANEL_THRESHOLD panels."""
+    qty = get_invoice_panel_qty(row) or invoice_item_panel_qty(row)
+    return qty > FACTORY_PANEL_THRESHOLD
+
+
 def resolve_invoice_property_type(row: dict, base_prop_type: str) -> tuple:
     """Return (display_property_type, rate_property_type) for an invoice row.
 
@@ -1536,6 +1565,22 @@ def get_data_page_overrides(agent_name: str, month: int, year: int = 2026,
     # Who sits between the seller and someone in the chain (the seller too):
     # the people a "(group)" line can reach the seller through.
     below = [(seller_key, seller_role)]
+    names = {seller_key: str(agent_name or "").strip()}
+
+    def _via(from_cell, between):
+        """(name, role) of the leader whose team a "(group)" line reached the
+        sale through -- nearest the earner first -- or None for any other
+        line, or when that leader is the seller themself. Shown on the report
+        as "Martin Hing's team (STM)" (user, 2026-10-30)."""
+        role, person, group = _parse_override_from(from_cell)
+        if not group:
+            return None
+        pkey = _canon_agent_key(person) if person else None
+        want = _normalize_hierarchy(role) if role and not person else None
+        for k, r in reversed(between):
+            if (pkey and k == pkey) or (want and r == want):
+                return None if k == seller_key else (names.get(k, ""), r)
+        return None
 
     def _match(from_cell, between, in_chain):
         """How strongly one From Role line takes in this sale, 0 = not at all.
@@ -1575,9 +1620,10 @@ def get_data_page_overrides(agent_name: str, month: int, year: int = 2026,
                     best = (score, rate, from_cell)
             if best[0]:
                 out.append({"name": boss, "key": boss_key, "rate": best[1],
-                            "from_role": best[2]})
+                            "from_role": best[2], "via": _via(best[2], below)})
                 earned.add(boss_key)
         below.append((boss_key, _role_of(boss_row)))
+        names[boss_key] = boss
 
     # A line naming a person (or a person's group) earns wherever its owner
     # sits -- a same-level override such as Teng Kah Kent's 0.1% on Ng Zhan Yi
@@ -1597,7 +1643,8 @@ def get_data_page_overrides(agent_name: str, month: int, year: int = 2026,
             if score > best[0]:
                 best = (score, rate, from_cell)
         if best[0]:
-            out.append({"name": owner, "key": okey, "rate": best[1], "from_role": best[2]})
+            out.append({"name": owner, "key": okey, "rate": best[1], "from_role": best[2],
+                        "via": _via(best[2], below)})
             earned.add(okey)
     return out
 

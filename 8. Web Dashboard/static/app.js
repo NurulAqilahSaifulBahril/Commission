@@ -3891,6 +3891,27 @@ modalPackageType.value = defaults.pkg || "-";
         };
     }
 
+    /** The Data page override behind one credit, as payout_policies
+     *  "overrides" carries it: {rate, team}. On a customer row `customer`
+     *  names the invoice; on a summary row `seller` names whose sales it came
+     *  from. Null when the payload has none (an older cache). */
+    function overrideDetailFor(recipient, { customer = "", seller = "" } = {}) {
+        const map = state.rawData?.sections?.basic_nfp?.payout_policies;
+        if (!map) return null;
+        const key = s => String(resolveAgentName(s) || s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const want = key(recipient);
+        const sellerKey = key(seller);
+        const pools = customer ? [map[String(customer).trim().toLowerCase()] || []] : Object.values(map);
+        for (const entries of pools) {
+            for (const e of entries) {
+                if (sellerKey && key(e.agent) !== sellerKey) continue;
+                const o = (e.overrides || []).find(x => key(x.name) === want);
+                if (o) return o;
+            }
+        }
+        return null;
+    }
+
     /** Wires the role hover onto an agent-name cell. No-op when the agent has
      *  nothing to show, so ordinary cells keep their plain cursor. */
     function attachAgentRoleHover(td, agentName, invoiceCellText, customers) {
@@ -4011,9 +4032,20 @@ modalPackageType.value = defaults.pkg || "-";
             total += amount;
             parsedCount += 1;
 
+            // The Data page line behind it: its rate, and whose team it came
+            // through ("Martin Hing's team (STM)") or "Direct" (user,
+            // 2026-10-30). A summary row's `custName` is the recipient.
+            const detail = toRecipient
+                ? overrideDetailFor(who, { customer: custName })
+                : overrideDetailFor(custName, { seller: who });
+            const how = detail
+                ? `<div style="opacity:0.7; font-size:11px;">${escapeHtml(
+                    [detail.rate ? `${+(detail.rate * 100).toFixed(4)}%` : "", detail.team || "Direct"]
+                        .filter(Boolean).join(" · "))}</div>`
+                : "";
             // Only the "(recipient)" form is generated from THIS row's sales,
             // so only that form can honestly be shown as a share of them.
-            const share = (toRecipient && sales)
+            const share = (!detail && toRecipient && sales)
                 ? `<div style="opacity:0.7; font-size:11px;">${(amount / sales * 100).toFixed(2)}% of ${formatRM(sales)} sales price</div>`
                 : "";
             const direction = toRecipient ? "credited to" : "from";
@@ -4023,7 +4055,7 @@ modalPackageType.value = defaults.pkg || "-";
                     <span><span style="opacity:0.7;">${direction}</span> <strong>${escapeHtml(who)}</strong></span>
                     <strong>${formatRM(amount)}</strong>
                 </div>
-                ${share}
+                ${how}${share}
             </div>`;
         });
 
@@ -5795,7 +5827,8 @@ modalPackageType.value = defaults.pkg || "-";
                     const colHeader = headers[ci];
                     if (isNumericHeader(colHeader)) td.classList.add("numeric");
                     else if (isDateHeader(colHeader)) td.classList.add("date");
-                    if (ci === overrideColIdx && displayVal !== "-") { td.style.fontWeight = "normal"; td.style.color = "#000"; }
+                    // 2pt smaller than the rest of the row (user, 2026-10-30).
+                    if (ci === overrideColIdx && displayVal !== "-") { td.style.fontWeight = "normal"; td.style.color = "#000"; td.style.fontSize = "calc(1em - 2pt)"; }
 
                     if (ci === customerIdx && !isTotalRow) {
                         const sysInfo = getCustomerSystemTooltip(custName);

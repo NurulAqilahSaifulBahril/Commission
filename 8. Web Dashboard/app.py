@@ -2440,7 +2440,7 @@ def _pct_text(value) -> str:
     return text
 
 
-def _build_payout_policies(basic_lines, as_at: str = "") -> dict:
+def _build_payout_policies(basic_lines, as_at: str = "", agent_type: str = "") -> dict:
     """customer (lower case) -> the payout rule each of their invoices is paid
     under, as the Data page states it, with the date each stage is reached.
 
@@ -2452,18 +2452,38 @@ def _build_payout_policies(basic_lines, as_at: str = "") -> dict:
     the same PayoutPolicy that priced the line -- so the page can follow it.
     """
     out: dict = {}
+    # Override cell hover: who earns an override on each invoice, at what
+    # rate, and through whose team -- credited under the names the report uses.
+    ovr_type = agent_type.capitalize() if agent_type else ""
+    ovr_names = {}
+    if ovr_type:
+        try:
+            ovr_names = _rates_module().override_name_map(sorted(
+                {build_commission_pack.to_title_case(ln.agent_name) for ln in basic_lines or []}))
+        except Exception:
+            ovr_type = ""
     for ln in basic_lines or []:
         customer = str(getattr(ln, "customer_name", "") or "").strip().lower()
         policy = getattr(ln, "payout_policy", None)
         if not customer or policy is None:
             continue
         multi = bool(getattr(policy, "is_multi_stage", False))
+        overrides = []
+        if ovr_type:
+            try:
+                overrides = build_commission_pack._basic_line_override_details(ln, ovr_type, ovr_names)
+            except Exception:
+                overrides = []
         entry = {
             "invoice": str(getattr(ln, "invoice_number", "") or ""),
             "invoice_date": str(getattr(ln, "invoice_date", "") or "")[:10],
             # The role the engine priced this invoice under -- the agent-name
             # hover shows it, so it always matches the Basic Commission.
             "role": str(getattr(ln, "role", "") or ""),
+            # The seller, so the Summary Agent Commission Override hover can
+            # find the overrides earned from each agent's sales.
+            "agent": build_commission_pack.to_title_case(str(getattr(ln, "agent_name", "") or "")),
+            "overrides": overrides,
             "multi_stage": multi,
             "advance_pct": _pct_text(policy.advance_trigger) if multi else "",
             "advance_rm": _pct_text(policy.advance_amount) if multi else "",
@@ -7028,7 +7048,7 @@ def _build_commission_payload(year: int, month: int, agent_type: str):
                 "payout_policies": _build_payout_policies(
                     build_commission_pack.apply_payout_approvals(
                         int_basic_lines, [], {}, year, "internal")[0],
-                    build_commission_pack.as_at_ym(year, month)),
+                    build_commission_pack.as_at_ym(year, month), agent_type="internal"),
                 # Payout Stage "Special Case": deposit paid, not yet 100%.
                 "special_case": _special_case_stage_or_empty(
                     basic_nfp_headers, int_basic_lines, int_nfp_by_inv_all, year, month,
@@ -7284,7 +7304,7 @@ def _build_commission_payload(year: int, month: int, agent_type: str):
                 "payout_policies": _build_payout_policies(
                     build_commission_pack.apply_payout_approvals(
                         out_basic_lines, [], {}, year, "outsource")[0],
-                    build_commission_pack.as_at_ym(year, month)),
+                    build_commission_pack.as_at_ym(year, month), agent_type="outsource"),
                 # Payout Stage "Special Case": deposit paid, not yet 100%.
                 "special_case": _special_case_stage_or_empty(
                     basic_nfp_headers, out_basic_lines, out_nfp_by_inv_all, year, month,

@@ -175,6 +175,11 @@ def _is_valid_referral(ref_name: str | None) -> bool:
     return name_clean not in ("", "none", "no", "client", "(unknown)", "referrer")
 
 def classify_property_type(row: dict[str, Any]) -> str:
+    # 0. More than 100 panels is a Factory, whatever the name says (user,
+    # 2026-10-30) -- as on the internal report.
+    from basic_commission_rates import is_factory_by_panels
+    if is_factory_by_panels(row):
+        return "Factory"
     # 1. Check customer name for explicit company or property type hints
     cust_name = ""
     for k in ("customer_name", "customer_name_snapshot", "db_customer_name"):

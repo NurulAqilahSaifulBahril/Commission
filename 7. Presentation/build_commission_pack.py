@@ -319,6 +319,41 @@ def _invoice_role_package(row: dict) -> str:
     return _bcr.invoice_role_package(row)
 
 
+def _role_initials(role: str) -> str:
+    """"Sales Team Manager" -> "STM", for the override team remark."""
+    words = [w for w in str(role or "").replace("-", " ").split() if w[:1].isalpha()]
+    return "".join(w[0].upper() for w in words)
+
+
+def _basic_line_override_details(ln, agent_type: str, name_map: dict | None = None) -> list:
+    """[{"name", "rate", "team"}] -- each override on one Basic line, for the
+    Override cell hover. "team" is "Martin Hing's team (STM)" when it reaches
+    the seller through a leader's team (a "(group)" line), else "" (user,
+    2026-10-30)."""
+    import basic_commission_rates as _bcr
+    raw = str(getattr(ln, "invoice_date", "") or "")[:10]
+    try:
+        dt = datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        return []
+    hits = _bcr.get_data_page_overrides(
+        ln.agent_name, dt.month, year=dt.year, agent_type=agent_type,
+        package=getattr(ln, "role_package", "") or None,
+        property_type=getattr(ln, "package", "") or None)
+    name_map = name_map or {}
+    out = []
+    for h in hits:
+        team = ""
+        via = h.get("via")
+        if via and via[0]:
+            leader = name_map.get(_bcr._canon_agent_key(via[0])) or to_title_case(via[0])
+            initials = _role_initials(via[1])
+            team = f"{leader}'s team" + (f" ({initials})" if initials else "")
+        out.append({"name": name_map.get(h["key"]) or to_title_case(h["name"]),
+                    "rate": float(h["rate"]), "team": team})
+    return out
+
+
 def _basic_line_overrides(ln, agent_type: str, name_map: dict | None = None) -> list:
     """[(recipient, amount)] -- the overrides earned on one Basic line, read
     only from the Data page (basic_commission_rates.get_data_page_overrides):
