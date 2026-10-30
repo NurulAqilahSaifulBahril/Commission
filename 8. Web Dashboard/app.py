@@ -4058,6 +4058,22 @@ SALES_REPORT_TARGETS = {"Internal": 600000.0, "Outsource": 720000.0}
 # for a year nobody has set up yet.
 SALES_REPORT_ESA_TARGETS = {"Internal": 1300000.0, "Outsource": 1560000.0}
 
+# Fast Track (user, 2026-10-30): these agents restart on 1 October with their
+# ACC reset, an ESA target of RM 400,000 EP over October to December, and their
+# RM 200 restart fee refunded once they reach RM 200,000 EP. EP is counted as
+# for ESA (plain sales points, with any Data page multiplier). The main report
+# is untouched; this is a table of its own.
+SALES_REPORT_FAST_TRACK = {
+    "start": "2026-10-01",
+    "end": "2026-12-31",
+    "target": 400000.0,
+    "refund_at": 200000.0,
+    "refund_rm": 200.0,
+    "agents": ("Koh Yi Jay", "Dean Wai Leong Yee", "You Teng Hoong", "See Cheak Ching",
+               "Ahmad Syahmi Bin Ahmad Nazri", "Ong Yan Yin", "Pua Yee Ling",
+               "Tan Jia Hao", "Choong Ye Hong"),
+}
+
 
 def _sales_report_last_month(year: int) -> int:
     """How many months of `year` the ledger covers: always at least the June
@@ -5614,6 +5630,10 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         # One invoice is visited once (seen_bubble above), so its receipts are
         # added once. An invoice nobody has paid simply contributes nothing.
         entry["collected"] += payments.get(str(bubble or ""), zero)
+        # Fast Track's Collected Payment: cash in on its own window's cases.
+        if (SALES_REPORT_FAST_TRACK["start"] <= when.strftime("%Y-%m-%d")
+                <= SALES_REPORT_FAST_TRACK["end"]):
+            entry["ft_collected"] = entry.get("ft_collected", zero) + payments.get(str(bubble or ""), zero)
         ep_fixed = (SALES_REPORT_EP_OVERRIDES.get(str(bubble or "").strip())
                     or SALES_REPORT_EP_OVERRIDES.get(str(r.get("invoice_number") or "").strip()))
         # A late entry (paid in one month, keyed in a later one, from August)
@@ -5652,7 +5672,56 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
                          for n in v["raw_names"])}
 
     out_agents = []
+    ft = SALES_REPORT_FAST_TRACK
+    ft_keys = {_normalize_search_text(n): n for n in ft["agents"]}
+    ft_months = ([m for m in range(int(ft["start"][5:7]), int(ft["end"][5:7]) + 1) if m <= last_month]
+                 if int(year) == int(ft["start"][:4]) else [])
+    fast_track = []
     for entry in agents.values():
+        ft_name = next((ft_keys[k] for k in [_normalize_search_text(entry["agent"])]
+                        + [_normalize_search_text(n) for n in entry["raw_names"]] if k in ft_keys), None)
+        ft_rec = None
+        if ft_name and ft_months:
+            # ACC restarts on 1 October: only October to December count.
+            months = []
+            for m in ft_months:
+                noc = sum(entry["lines"].get(k, {}).get(m, [0, zero])[0] for k in ("RES", "COM"))
+                ans = sum((entry["lines"].get(k, {}).get(m, [0, zero])[1] for k in ("RES", "COM")), zero)
+                months.append({"month": m, "noc": noc, "ans": float(ans)})
+            ft_ep = float(sum((e for d, e in entry["ep_rows"] if ft["start"] <= d <= ft["end"]), zero))
+            # One line per property type, as on the main table.
+            ft_types = []
+            for kind in ("RES", "COM"):
+                cells = [entry["lines"].get(kind, {}).get(m, [0, zero]) for m in ft_months]
+                if any(c[0] for c in cells) or (kind == "RES" and not entry["lines"].get("COM")):
+                    ft_types.append({
+                        "type": kind,
+                        "months": [{"noc": c[0], "ans": float(c[1]),
+                                    "custs": entry["custs"].get(kind, {}).get(m, [])}
+                                   for c, m in zip(cells, ft_months)],
+                        "total_noc": sum(c[0] for c in cells),
+                        "total_ans": float(sum((c[1] for c in cells), zero)),
+                    })
+            ft_rec = {
+                "agent": entry["agent"],
+                "channel": entry["channel"],
+                "types": ft_types or [{"type": "RES", "months": [{"noc": 0, "ans": 0.0, "custs": []}
+                                                                 for _ in ft_months],
+                                       "total_noc": 0, "total_ans": 0.0}],
+                "collected": float(entry.get("ft_collected", zero)),
+                "months": months,
+                "acc_noc": sum(x["noc"] for x in months),
+                "acc_ans": sum(x["ans"] for x in months),
+                # EP from 1 October: what the 400k target and 200k refund are
+                # measured on (user, 2026-10-30). The column itself shows the
+                # main table's UP TO DATE EP POINT ("ep_up_to_date", below).
+                "ep": ft_ep,
+                "qualified": ft_ep >= ft["target"],
+                "balance": max(ft["target"] - ft_ep, 0.0),
+                "refund": ft_ep >= ft["refund_at"],
+                "refund_balance": max(ft["refund_at"] - ft_ep, 0.0),
+            }
+            fast_track.append(ft_rec)
         # Base points, one per ringgit of sales (large factory jobs earn less
         # -- calc_ep_points decides that per invoice).
         base_ep = sum((ep for _, ep in entry["ep_rows"]), zero)
@@ -5664,6 +5733,8 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         # period, so ESA is always judged on base_ep below.
         bonus = (tier * entry["campaign_ans"]) if multiplier_in_period else zero
         entry["ep"] = base_ep + bonus
+        if ft_rec is not None:
+            ft_rec["ep_up_to_date"] = float(entry["ep"])
         # EGA is settled at the June deadline and cannot be reached on later
         # sales, so it reads EP as at then.
         jun_end = f"{year:04d}-{SALES_REPORT_SPLIT_MONTH:02d}-31"
@@ -5847,6 +5918,14 @@ def _sales_report_payload_uncached(year: int, through: int | None = None) -> dic
         # One early-bird column at a time: October's until the end of October,
         # November's from 1 November (see _sales_report_early_bird_stage).
         "early_bird": early_stage,
+        # Fast Track table (see SALES_REPORT_FAST_TRACK), ranked by EP from
+        # 1 Oct, highest first; ties A-Z by name (user, 2026-10-30).
+        "fast_track": {
+            "start": ft["start"], "end": ft["end"], "target": ft["target"],
+            "refund_at": ft["refund_at"], "refund_rm": ft["refund_rm"],
+            "months": ft_months,
+            "agents": sorted(fast_track, key=lambda a: (-a["ep"], str(a["agent"]).lower())),
+        },
         "show_oct": early_stage == "oct",
         "show_nov": early_stage == "nov",
         "multiplier_in_period": multiplier_in_period,

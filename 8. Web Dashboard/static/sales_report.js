@@ -492,6 +492,9 @@
             </table>`;
     }
 
+    /** The hover on a nude-shaded cell (user, 30 Oct 2026). */
+    const PAID_TITLE = "All invoices full payment";
+
     /** True when a month cell has cases and every one of them is fully paid
      *  -- that cell is shaded #F7C7AC (user, 28 Oct 2026). */
     function allFullyPaid(cases) {
@@ -550,8 +553,11 @@
             ? `<tfoot><tr class="sr-tip-total"><td colspan="5">Total</td>`
                 + `<td class="numeric">${fmtRM(priced.reduce((s, c) => s + c.v, 0))}</td><td></td></tr></tfoot>`
             : "";
+        // Says what the nude shading on the cell means (user, 30 Oct 2026).
+        const allPaid = allFullyPaid(entry.cases)
+            ? `<div class="sr-tip-note"><span class="sr-tip-paid-swatch"></span>All invoices full payment</div>` : "";
         return `<div class="sr-tip-head">${escapeHtml(entry.label)} —
-                ${plural(entry.cases.length, "case")}</div>
+                ${plural(entry.cases.length, "case")}</div>${allPaid}
             <table class="sr-tip-table">
                 <thead><tr><th>Customer</th><th>% Payment</th><th>1st payment</th>
                     <th>Paid</th><th>Created</th><th colspan="2">Price</th></tr></thead>
@@ -621,21 +627,28 @@
         const span = ` rowspan="${types.length}"`;
         return types.map((t, i) => {
             const first = i === 0;
+            // A Fast Track agent's name is shaded blue (user, 30 Oct 2026).
+            const fastTrack = ((data.fast_track || {}).agents || []).some(f => f.agent === agent.agent);
             const cells = first ? [
                 `<td class="sr-no"${span}>${no}</td>`,
-                `<td class="sr-name"${span}>${escapeHtml(agent.agent)}</td>`,
+                fastTrack
+                    ? `<td class="sr-name sr-fast-track"${span} title="Fast Track">${escapeHtml(agent.agent)}</td>`
+                    : `<td class="sr-name"${span}>${escapeHtml(agent.agent)}</td>`,
             ] : [];
             cells.push(`<td class="sr-type">${escapeHtml(t.type)}</td>`);
             for (let m = 1; m <= lm; m++) {
                 const cell = t.months[m - 1] || { noc: 0, ans: 0 };
                 const paid = allFullyPaid(cell.custs) ? " sr-all-paid" : "";
+                // The NOC cell's case panel says it too; the ANS cell has no
+                // panel of its own, so it carries a plain hover.
+                const paidTitle = paid ? ` title="${PAID_TITLE}"` : "";
                 if (m === sm && splitJune(data)) {
                     cells.push(`<td class="numeric${paid}"${caseAttrs(cell.custs, MONTH_ABBR[m - 1])}>${cell.noc}</td>`,
-                        `<td class="numeric sr-col-jun-val${paid}">${fmtRM(t.jun_early)}</td>`,
-                        `<td class="numeric sr-col-jun-val${paid}">${fmtRM(t.jun_late)}</td>`);
+                        `<td class="numeric sr-col-jun-val${paid}"${paidTitle}>${fmtRM(t.jun_early)}</td>`,
+                        `<td class="numeric sr-col-jun-val${paid}"${paidTitle}>${fmtRM(t.jun_late)}</td>`);
                 } else {
                     cells.push(`<td class="numeric${paid}"${caseAttrs(cell.custs, MONTH_ABBR[m - 1])}>${cell.noc}</td>`,
-                        `<td class="numeric${m === 6 ? " sr-col-jun-val" : ""}${paid}">${fmtRM(cell.ans)}</td>`);
+                        `<td class="numeric${m === 6 ? " sr-col-jun-val" : ""}${paid}"${paidTitle}>${fmtRM(cell.ans)}</td>`);
                 }
             }
             const tier = Number(agent.bonus_tier) || 0;
@@ -818,6 +831,112 @@
         </div>`;
     }
 
+    // Fast Track (user, 30 Oct 2026): a few agents restart on 1 October with
+    // their ACC reset, an ESA target of RM 400k EP over October-December, and
+    // their RM 200 restart fee refunded at RM 200k EP. A table of its own; the
+    // main report above is unchanged. Follows the agent search box.
+    /** The EP hover for a Fast Track row: the main table's case list for the
+     *  agent, kept to the Fast Track months, with its totals from those cases
+     *  alone. Null when nothing falls in the window, so the cell stays inert. */
+    function fastTrackEpAgent(a, data) {
+        const main = (data.agents || []).find(x => x.agent === a.agent);
+        const months = new Set(data.fast_track.months || []);
+        const lines = ((main || {}).ep_lines || []).filter(l => months.has(l.m));
+        if (!lines.length) return null;
+        return { ...main, ep_lines: lines, ep: a.ep, base_ep: a.ep,
+                 campaign_bonus: 0, bonus_tier: 0 };
+    }
+
+    function renderFastTrack(data) {
+        const ft = data.fast_track;
+        if (!ft || !(ft.months || []).length) return "";
+        const q = normalizeName(state.search || "");
+        const rows = (ft.agents || []).filter(a => !q || normalizeName(a.agent).includes(q));
+        if (!rows.length) return "";
+        const mon = m => ["", "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"][m];
+        // Laid out as the main table: NO, NAME, TYPE, the months, COLLECTED
+        // PAYMENT, TOTAL, ACC, EP, then the two award columns (user, 30 Oct 2026).
+        const head = `<thead>
+            <tr>
+                <th rowspan="2" class="sr-no">NO</th><th rowspan="2" class="sr-name">NAME</th>
+                <th rowspan="2">TYPE</th>
+                ${ft.months.map(m => `<th colspan="2">${mon(m)}</th>`).join("")}
+                <th rowspan="2" title="Cash received against this agent's invoices from 1 Oct.">COLLECTED<br>PAYMENT</th>
+                <th colspan="2" class="sr-col-total">TOTAL</th>
+                <th colspan="2" class="sr-col-acc">ACC<br>(from 1 Oct)</th>
+                <th rowspan="2" class="sr-col-ep">UP TO DATE<br>EP POINT<br>(from 1 Oct)</th>
+                <th rowspan="2">ESA - CHONGQING<br>Balance to Qualify<br>(400k EP Point Till 31Dec)</th>
+                <th rowspan="2">REFUND RM ${fmtRM(ft.refund_rm)}<br>(at ${fmtThreshold(ft.refund_at)} EP Point)</th>
+            </tr>
+            <tr>
+                ${ft.months.map(() => "<th>NOC</th><th>ANS</th>").join("")}
+                <th class="sr-col-total">NOC</th><th class="sr-col-total">ANS</th>
+                <th class="sr-col-acc">NOC</th><th class="sr-col-acc">ANS</th>
+            </tr>
+        </thead>`;
+        // One line per RES / COM; the per-agent cells are merged down them.
+        const body = rows.map((a, i) => {
+            const types = a.types || [];
+            const span = ` rowspan="${types.length}"`;
+            const fromOct = `Measured on EP from 1 Oct: ${fmtRM(a.ep)}`;
+            return types.map((t, k) => {
+                const first = k === 0;
+                const cells = first ? [`<td class="sr-no"${span}>${i + 1}</td>`,
+                    `<td class="sr-name"${span}>${escapeHtml(a.agent)}</td>`] : [];
+                cells.push(`<td class="sr-type">${escapeHtml(t.type)}</td>`);
+                t.months.forEach((x, j) => {
+                    const paid = allFullyPaid(x.custs) ? " sr-all-paid" : "";
+                    cells.push(`<td class="numeric${paid}"${caseAttrs(x.custs, mon(ft.months[j]))}>${x.noc}</td>`,
+                        `<td class="numeric${paid}"${paid ? ` title="${PAID_TITLE}"` : ""}>${fmtRM(x.ans)}</td>`);
+                });
+                if (first) cells.push(`<td class="numeric"${span}>${a.collected ? fmtRM(a.collected) : '<span class="sr-muted">—</span>'}</td>`);
+                cells.push(`<td class="numeric sr-col-total">${t.total_noc}</td>`,
+                    `<td class="numeric sr-col-total">${fmtRM(t.total_ans)}</td>`);
+                if (first) {
+                    cells.push(`<td class="numeric sr-col-acc"${span}>${a.acc_noc}</td>`,
+                        `<td class="numeric sr-strong sr-col-acc"${span}>${fmtRM(a.acc_ans)}</td>`,
+                        // EP from 1 Oct, as the targets beside it are measured:
+                        // Fast Track restarts the count (user, 30 Oct 2026).
+                        // The hover is the main table's, cut to these cases.
+                        `<td class="numeric sr-strong sr-col-ep"${span}${epAttrs(fastTrackEpAgent(a, data))}>${fmtRM(a.ep)}</td>`,
+                        a.qualified
+                            ? `<td class="sr-qualified"${span} title="${escapeHtml(fromOct)}">Qualified</td>`
+                            : `<td class="numeric sr-short"${span} title="${escapeHtml(fromOct)}">${fmtRM(a.balance)}</td>`,
+                        a.refund
+                            ? `<td${span} title="${escapeHtml(fromOct)}" style="color:#DC2626; font-weight:600;">Refund RM ${fmtRM(ft.refund_rm)}</td>`
+                            : `<td class="numeric sr-short"${span} title="${escapeHtml(fromOct)}">${fmtRM(a.refund_balance)}</td>`);
+                }
+                return `<tr>${cells.join("")}</tr>`;
+            }).join("");
+        }).join("");
+        const sum = f => rows.reduce((t, a) => t + (f(a) || 0), 0);
+        const monthSum = (j, key) => sum(a => (a.types || []).reduce((s, t) => s + ((t.months[j] || {})[key] || 0), 0));
+        const total = `<tr class="sr-subtotal">
+            <td class="sr-no"></td><td class="sr-name">TOTAL</td><td></td>
+            ${ft.months.map((m, j) => `<td class="numeric">${monthSum(j, "noc")}</td>
+                <td class="numeric">${fmtRM(monthSum(j, "ans"))}</td>`).join("")}
+            <td class="numeric">${fmtRM(sum(a => a.collected))}</td>
+            <td class="numeric sr-col-total">${sum(a => a.acc_noc)}</td><td class="numeric sr-col-total">${fmtRM(sum(a => a.acc_ans))}</td>
+            <td class="numeric sr-col-acc">${sum(a => a.acc_noc)}</td><td class="numeric sr-strong sr-col-acc">${fmtRM(sum(a => a.acc_ans))}</td>
+            <td class="numeric sr-col-ep">${fmtRM(sum(a => a.ep))}</td>
+            <td>${rows.filter(a => a.qualified).length} qualified</td>
+            <td>${rows.filter(a => a.refund).length} to refund</td>
+        </tr>`;
+        const day = s => { const d = new Date(s + "T00:00:00");
+            return `${d.getDate()} ${mon(d.getMonth() + 1).charAt(0)}${mon(d.getMonth() + 1).slice(1).toLowerCase()} ${d.getFullYear()}`; };
+        return `<h3 class="sr-section-title">Fast Track (${day(ft.start)} – ${day(ft.end)})</h3>
+        <div class="card table-card sr-block">
+            <div class="card-header">
+                <h3>Fast Track Sales Report</h3>
+                <span class="row-count-badge">${plural(rows.length, "agent")} ·
+                    ESA target RM ${fmtRM(ft.target)} EP · refund RM ${fmtRM(ft.refund_rm)} at RM ${fmtRM(ft.refund_at)} EP</span>
+            </div>
+            <div class="table-container" tabindex="0" aria-label="Fast Track table">
+                <table class="dashboard-table sr-table">${head}<tbody>${body}${total}</tbody></table>
+            </div>
+        </div>`;
+    }
+
     function renderSections(data) {
         // The index the cells point into is rebuilt with the cells themselves,
         // so a stale entry can never outlive the row it described.
@@ -858,6 +977,7 @@
 
         chunks.push('<h3 class="sr-section-title">Company-wide</h3>');
         section(pick("Internal", null), pick("Outsource", null));
+        chunks.push(renderFastTrack(data));
 
         (data.branches || []).forEach(branch => {
             const internal = pick("Internal", branch);
