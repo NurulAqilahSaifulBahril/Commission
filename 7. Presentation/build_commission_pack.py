@@ -244,6 +244,17 @@ def _line_advance_amount(ln) -> float:
     return 300.0
 
 
+def _advance_same_day_as_balance(ln) -> bool:
+    """True when one payment reached the advance trigger and the balance
+    milestone on the same day (user, 2026-11-17: Tan Chen Wei INV-1011801,
+    4.4% and 100% both on 10 Oct). Nothing is advanced then: the whole Basic
+    Commission is paid in the Balance Payout and the RM300 cell reads "-".
+    Same day only -- both in one month on different days still advances."""
+    adv = str(getattr(ln, "pct5_date", "") or "")[:10]
+    bal = str(getattr(ln, "pct75_date", "") or "")[:10]
+    return bool(adv) and adv == bal
+
+
 def _rm300_column_display(cust_basic_lines: list) -> str:
     """Advance-tranche cell for a customer row (multi-stage invoices).
 
@@ -491,6 +502,9 @@ def _expand_basic_lines_for_month(basic_lines: list, m: int) -> list:
 
         if pct75_m is not None and pct5_m == pct75_m:
             if pct75_m == m:
+                if _advance_same_day_as_balance(ln):
+                    ln = _replace_line(ln)
+                    ln._show_rm300 = False
                 result.append(ln)
         elif pct75_m is not None and pct5_m != pct75_m:
             if pct5_m == m:
@@ -6283,6 +6297,8 @@ def basic_nfp_metrics(basic_lines_by_type: dict, nfp_rows_by_type: dict, year: i
                 adv = paid                       # the advance alone
             elif getattr(ln, "_advance_deducted", None) is not None:
                 adv = 0.0                        # the balance alone
+            elif not getattr(ln, "_show_rm300", True):
+                adv = 0.0                        # no advance: paid whole at balance
             else:                                # both stages this month
                 adv = min(paid, float(pol.advance_amount or 300))
             a["basic"] += paid; a["advance"] += adv; a["balance"] += paid - adv
