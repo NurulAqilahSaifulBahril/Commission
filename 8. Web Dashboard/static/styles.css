@@ -2979,3 +2979,15 @@ body {
 /* While a month/agent type loads, the emptied table area keeps its height so
    "Preparing commission data" sits in a visible panel (2026-11-18). */
 .table-container.is-preparing { min-height: 260px; }
+
+/* Special Case popup: the customer's rows copied from Summary Agent by
+   Customer fit the popup's width -- cells wrap instead of scrolling sideways. */
+#payoutApprovalSummary table[data-popup-copy] { table-layout: auto; font-size: 11px; }
+#payoutApprovalSummary table[data-popup-copy] th,
+#payoutApprovalSummary table[data-popup-copy] td {
+    white-space: normal !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    padding: 6px 6px !important;
+    position: static !important;
+}

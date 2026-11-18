@@ -2832,6 +2832,28 @@ def _build_special_case_stage(headers: list, basic_lines, nfp_by_inv_all: dict,
         _log(f"[SPECIAL CASE STAGE] could not read payments: {e}")
         return {"headers": list(headers), "rows": [], "customers": {},
                 "error": "Payments could not be read."}
+    # Each payment's Paid on and Created at, for the details under the
+    # approval popup's table (user, 2026-11-18: Tor Sok Chin, paid on
+    # 2026-11-01, created at 2026-11-03).
+    payments_by_inv: dict = {}
+    try:
+        for r in _pg_query(f"""
+            SELECT TRIM(i.invoice_number) AS inv, p.amount,
+                   p.payment_date::date::text AS paid_on,
+                   (p.created_at AT TIME ZONE 'Asia/Kuala_Lumpur')::date::text AS created_at
+            FROM invoice i
+            JOIN payment p ON p.linked_invoice = i.bubble_id
+            WHERE TRIM(i.invoice_number) IN ({inv_list})
+              AND p.id NOT IN ({_excl})
+            ORDER BY p.payment_date, p.id
+        """) or []:
+            payments_by_inv.setdefault(str(r.get("inv") or ""), []).append({
+                "amount": round(float(r.get("amount") or 0), 2),
+                "paid_on": str(r.get("paid_on") or "")[:10],
+                "created_at": str(r.get("created_at") or "")[:10],
+            })
+    except Exception as e:
+        _log(f"[SPECIAL CASE STAGE] could not read payment dates: {e}")
     paid_by_inv: dict = {}
     for r in pay_rows or []:
         paid_by_inv.setdefault(str(r.get("inv") or ""), []).append(
@@ -2999,6 +3021,7 @@ def _build_special_case_stage(headers: list, basic_lines, nfp_by_inv_all: dict,
         ref_name, ref_fee = line_referral(ln, agent_title, customer_title)
         entry["items"].append({
             "invoice": inv, "paid": round(paid, 2), "total": round(total, 2),
+            "payments": payments_by_inv.get(inv, []),
             "paid_pct": _pct_text(round(paid / total * 100, 2)),
             "basic": round(basic_full, 2), "advance": round(advance, 2),
             "advance_on": advance_on if advance else "",

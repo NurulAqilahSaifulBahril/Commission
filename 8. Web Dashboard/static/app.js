@@ -3089,6 +3089,62 @@ modalPackageType.value = defaults.pkg || "-";
     // choice first: the RM 300 advance alone (paid in the Advance run; the rest
     // waits), or the full Basic Commission (paid in Balance Payout).
     let payoutApprovalEntry = null;
+    // The clicked customer's rows copied from Summary Agent by Customer, so the
+    // popup shows them exactly as the page does (user, 2026-11-18).
+    let payoutApprovalTableHtml = "";
+
+    /** The customer's rows of the page table, cloned with the page's header.
+     *  Cells merged down from a row above (the agent cell) are carried into
+     *  the copy, and every merge is cut to the customer's own rows. */
+    function cloneCustomerRowsTable(clickedTr) {
+        const table = clickedTr && clickedTr.closest("table");
+        const tbody = clickedTr && clickedTr.parentElement;
+        if (!table || !tbody) return "";
+        const key = clickedTr.dataset.scKey;
+        const rows = [...tbody.rows];
+        // Expand rowspans into a grid: grid[r][c] = the td covering that slot.
+        const grid = [];
+        const carry = [];   // per column: { td, left }
+        rows.forEach((tr, r) => {
+            const line = [];
+            let c = 0;
+            const place = () => { while (carry[c] && carry[c].left > 0) { line[c] = carry[c].td; carry[c].left--; c++; } };
+            place();
+            [...tr.cells].forEach(td => {
+                place();
+                for (let k = 0; k < (td.colSpan || 1); k++) {
+                    line[c] = td;
+                    carry[c] = { td, left: (td.rowSpan || 1) - 1 };
+                    c++;
+                }
+            });
+            place();
+            grid[r] = line;
+        });
+        const picked = rows.map((tr, r) => r).filter(r => rows[r].dataset.scKey === key);
+        if (!picked.length) return "";
+        const pickedSet = new Set(picked);
+        const outRows = picked.map(r => {
+            const out = document.createElement("tr");
+            out.className = rows[r].className;
+            const seen = new Set();
+            (grid[r] || []).forEach(td => {
+                if (!td || seen.has(td)) return;
+                seen.add(td);
+                if (r > 0 && pickedSet.has(r - 1) && (grid[r - 1] || []).includes(td)) return;
+                let span = 1;
+                while (pickedSet.has(r + span) && (grid[r + span] || []).includes(td)) span++;
+                const copy = td.cloneNode(true);
+                copy.rowSpan = span;
+                copy.removeAttribute("title");
+                copy.style.cursor = "default";
+                out.appendChild(copy);
+            });
+            return out.outerHTML;
+        }).join("");
+        const thead = table.tHead ? table.tHead.cloneNode(true).outerHTML : "";
+        return `<table class="${table.className}" style="width:100%;" data-popup-copy="1">${thead}<tbody>${outRows}</tbody></table>`;
+    }
     let payoutApprovalStep = 1;
     let payoutApprovalKind = null;     // "full" | "advance" | null (not chosen yet)
 
@@ -3138,10 +3194,67 @@ modalPackageType.value = defaults.pkg || "-";
             day: "numeric", month: "short", year: "numeric", hour: "numeric", minute: "2-digit" });
     }
 
-    function openPayoutApprovalModal(entry) {
+    /** The popup's copied table as it reads for the choice made: under
+     *  "Advance RM300" each Basic Commission row's Commission Price shows the
+     *  advance that would be paid (user, 2026-11-18). */
+    function payoutApprovalTableForKind(html, entry, kind) {
+        if (!html || kind !== "advance") return html;
+        const box = document.createElement("div");
+        box.innerHTML = html;
+        const table = box.querySelector("table");
+        if (!table) return html;
+        const headRow = [...(table.tHead ? table.tHead.rows : [])]
+            .find(tr => /commission price/i.test(tr.textContent));
+        const heads = [...(headRow ? headRow.cells : [])]
+            .map(th => th.textContent.replace(/\s+/g, " ").trim().toLowerCase());
+        const priceCol = heads.findIndex(h => h.startsWith("commission price"));
+        const commCol = heads.findIndex(h => h === "commission" || (h.startsWith("commission") && !h.startsWith("commission price")));
+        if (priceCol === -1 || commCol === -1) return html;
+        // Expand rowspans so a column index finds its cell on every row.
+        const carry = [];
+        const grid = [...table.tBodies[0].rows].map(tr => {
+            const line = [];
+            let c = 0;
+            const place = () => { while (carry[c] && carry[c].left > 0) { line[c] = carry[c].td; carry[c].left--; c++; } };
+            [...tr.cells].forEach(td => {
+                place();
+                for (let k = 0; k < (td.colSpan || 1); k++) { line[c] = td; carry[c] = { td, left: (td.rowSpan || 1) - 1 }; c++; }
+            });
+            place();
+            return line;
+        });
+        const basicRows = grid.filter(line => line[commCol]
+            && /basic/i.test(line[commCol].textContent) && line[priceCol]);
+        const items = (entry.items || []).filter(it => Number(it.advance_option) > 0);
+        basicRows.forEach((line, i) => {
+            const amount = basicRows.length === 1 ? payoutApprovalParts(entry, "advance").total
+                : Number((items[i] || {}).advance_option) || 0;
+            line[priceCol].innerHTML = amount ? formatRM(amount) : "-";
+        });
+        // The Net Floor Price commission waits for the balance, so under the
+        // advance it has no value yet -- as on the Advance RM 300 list.
+        grid.filter(line => line[commCol] && /net\s*floor/i.test(line[commCol].textContent) && line[priceCol])
+            .forEach(line => { line[priceCol].innerHTML = "-"; });
+        return box.innerHTML;
+    }
+
+    /** Under the popup's table: every payment on the customer's invoices with
+     *  its Paid on and Created at (user, 2026-11-18: Tor Sok Chin, paid on
+     *  2026-11-01, created at 2026-11-03). */
+    function payoutApprovalPaymentDetails(entry) {
+        const items = (entry.items || []).filter(it => (it.payments || []).length);
+        if (!items.length) return "";
+        const many = items.length > 1;
+        const lines = items.flatMap(it => it.payments.map(p =>
+            `<div>${many ? `${escapeHtml(it.invoice)}: ` : ""}${formatRM(p.amount)} - paid on ${escapeHtml(p.paid_on || "-")}, created at ${escapeHtml(p.created_at || "-")}</div>`)).join("");
+        return `<div class="status-text" style="margin:12px 0 0;font-size:12px;">${lines}</div>`;
+    }
+
+    function openPayoutApprovalModal(entry, clickedTr) {
         const modal = document.getElementById("payoutApprovalModal");
         if (!modal) return;
         payoutApprovalEntry = entry;
+        payoutApprovalTableHtml = cloneCustomerRowsTable(clickedTr);
         payoutApprovalStep = 1;
         const mode = payoutApprovalMode(entry);
         payoutApprovalKind = mode === "withdraw-advance" ? "advance"
@@ -3211,21 +3324,17 @@ modalPackageType.value = defaults.pkg || "-";
         // The choice, for a deposit still below the advance trigger.
         let choice = "";
         if (payoutApprovalOffersChoice(entry)) {
-            const advanceAmt = payoutApprovalParts(entry, "advance").total;
-            const fullAmt = payoutApprovalParts(entry, "full").total;
             const option = (value, title, detail) => `
                 <label style="display:flex;gap:8px;align-items:flex-start;padding:8px 10px;margin:0 0 6px;
                     border:1px solid ${kind === value ? "var(--accent-blue, #2563eb)" : "#cbd5e1"};border-radius:6px;cursor:pointer;">
                     <input type="radio" name="payoutApprovalKind" value="${value}" ${kind === value ? "checked" : ""} style="margin-top:2px;">
-                    <span><strong>${title}</strong><br><span style="font-size:11.5px;color:var(--text-muted);">${detail}</span></span>
+                    <span><strong>${title}</strong>${detail ? `<br><span style="font-size:11.5px;color:var(--text-muted);">${detail}</span>` : ""}</span>
                 </label>`;
             choice = `
                 <p class="status-text" style="margin:0 0 8px;font-weight:600;">
-                    This customer's deposit has not reached the advance yet. What do you want to approve?</p>
-                ${option("advance", `Advance RM300 only - ${formatRM(advanceAmt)}`,
-                    `Paid in ${escapeHtml(period)} under Advance RM 300. The rest of the Basic Commission, the Net Floor Price commission, override and referral fee wait for the balance.`)}
-                ${option("full", `Full Basic Commission - ${formatRM(fullAmt)}`,
-                    `Basic + Net Floor Price commission, override and referral fee, paid in ${escapeHtml(period)} under Balance Payout. Not paid again at 75% or 100%.`)}
+                    This customer's deposit has not reached the advance yet. Choose which to approve?</p>
+                ${option("advance", "Advance RM300", "")}
+                ${option("full", "Full Basic Commission", "")}
                 <div style="height:8px;"></div>`;
         }
 
@@ -3246,13 +3355,17 @@ modalPackageType.value = defaults.pkg || "-";
                 : `Advance already approved for ${escapeHtml(entry.advance_approved_later)} by ${escapeHtml(entry.advance_approved_by || "-")}.`;
             status = `<p class="status-text" style="margin:14px 0 0;color:var(--text-muted);font-weight:600;">
                 ${later} Open ${escapeHtml(entry.approved_later || entry.advance_approved_later)} to withdraw it.</p>`;
-        } else if (kind === "advance") {
-            status = `<p class="status-text" style="margin:8px 0 0;font-size:11.5px;color:var(--text-muted);">
-                The customer stays in Special Case, showing the balance after the advance.</p>`;
         } else {
-            status = `<p class="status-text" style="margin:8px 0 0;font-size:11.5px;color:var(--text-muted);">
-                Approving moves the customer to All Payouts and Balance Payout for ${escapeHtml(period)},
-                and they are not paid again when they reach 75% or 100%.</p>`;
+            status = "";
+        }
+        // The full-approval note sits beside the Approve / Cancel buttons
+        // (user, 2026-11-18); every other note stays above them.
+        const footerNote = document.getElementById("payoutApprovalFooterNote");
+        if (footerNote) {
+            footerNote.textContent = status !== "" || mode !== "approve" ? ""
+                : kind === "advance"
+                ? `Approving moves the customer to Advance RM 300 for ${period}, and they are not paid again when they reach 4.4%.`
+                : `Approving moves the customer to All Payouts and Balance Payout for ${period}, and they are not paid again when they reach 75% or 100%.`;
         }
 
         // The total follows the choice; with none made yet it waits for one.
@@ -3274,12 +3387,13 @@ modalPackageType.value = defaults.pkg || "-";
         summary.innerHTML = `
             ${choice}
             <div style="overflow-x:auto;">
-            <table class="data-table" style="width:100%;font-size:12px;">
+            ${payoutApprovalTableForKind(payoutApprovalTableHtml, entry, kind) || `<table class="data-table" style="width:100%;font-size:12px;">
                 <thead><tr><th>Invoice</th><th>Customer</th><th>Agent</th><th>Basic Commission</th>
                     <th>Net Floor Price Commission</th><th>Override</th><th>Referral Fee</th>
                     <th>Current Payment</th></tr></thead>
                 <tbody>${itemRows}</tbody>
-            </table></div>
+            </table>`}</div>
+            ${payoutApprovalPaymentDetails(entry)}
             ${totals}
             ${status}`;
         summary.querySelectorAll('input[name="payoutApprovalKind"]').forEach(radio => {
@@ -5765,6 +5879,7 @@ modalPackageType.value = defaults.pkg || "-";
                 if (specialCaseStageOn() && state.isAdmin && !isTotalRow) {
                     const approvalEntry = specialCaseCustomerEntry(agentName, effectiveCustomerNames[ri]);
                     if (approvalEntry) {
+                        tr.dataset.scKey = `${String(approvalEntry.agent || "").toLowerCase()}||${String(approvalEntry.customer || "").toLowerCase()}`;
                         tr.style.cursor = "pointer";
                         tr.title = approvalEntry.approved || approvalEntry.advance_approved
                             ? "Approved - click to view or withdraw the approval"
@@ -5776,7 +5891,7 @@ modalPackageType.value = defaults.pkg || "-";
                             // the calculation hover; clicking them does not
                             // open the approval.
                             if (e.target.closest("td[data-no-approval]")) return;
-                            openPayoutApprovalModal(approvalEntry);
+                            openPayoutApprovalModal(approvalEntry, tr);
                         });
                     }
                 }
