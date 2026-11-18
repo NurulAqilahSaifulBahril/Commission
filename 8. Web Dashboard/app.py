@@ -2778,11 +2778,28 @@ def _build_special_case_stage(headers: list, basic_lines, nfp_by_inv_all: dict,
         first_pay = str(getattr(ln, "first_payment_date", "") or "")[:10]
         if not inv or not agent or "safwan" in agent.lower():
             continue
-        if not first_pay or first_pay > month_end:
+        # A case once the invoice is dated by the month's end and has a
+        # payment, even one made after the month (user, 2026-11-18: Tor Sok
+        # Chin, dated 29 Oct, deposit 1 Nov, is October's Special Case).
+        inv_date = str(getattr(ln, "invoice_date", "") or "")[:10]
+        if not first_pay or (min(first_pay, inv_date or first_pay)) > month_end:
             continue
         approved_for = approvals.get(inv)
         if approved_for is not None and approved_for < this_month:
             continue      # already paid out, in an earlier month
+        # Only cases still waiting for their advance and their balance (user,
+        # 2026-11-18): an invoice whose Advance RM 300 or Balance milestone
+        # was reached by the month's end -- in this month's Advance / Balance
+        # rows or an earlier month's -- is left out. One approved here this
+        # month stays, so the tick can be undone.
+        kept_for_undo = (approved_for == this_month
+                         or advance_approvals.get(inv) == this_month)
+        if not kept_for_undo:
+            adv_on = (build_commission_pack.advance_recognized_date(ln)
+                      if build_commission_pack._is_new_policy_line(ln) else "")
+            bal_on = str(getattr(ln, "pct75_date", "") or "")[:10]
+            if (adv_on and adv_on[:10] <= month_end) or (bal_on and bal_on <= month_end):
+                continue
         candidates.setdefault((inv, agent.lower()), ln)
     if not candidates:
         return {"headers": list(headers), "rows": [], "customers": {}}
@@ -2803,12 +2820,12 @@ def _build_special_case_stage(headers: list, basic_lines, nfp_by_inv_all: dict,
     try:
         pay_rows = _pg_query(f"""
             SELECT TRIM(i.invoice_number) AS inv, i.bubble_id, i.total_amount,
-                   COALESCE(SUM(p.amount), 0) AS paid
+                   COALESCE(SUM(p.amount) FILTER (
+                       WHERE p.payment_date::date <= DATE '{month_end}'), 0) AS paid
             FROM invoice i
             JOIN payment p ON p.linked_invoice = i.bubble_id
             WHERE TRIM(i.invoice_number) IN ({inv_list})
               AND p.id NOT IN ({_excl})
-              AND p.payment_date::date <= DATE '{month_end}'
             GROUP BY TRIM(i.invoice_number), i.bubble_id, i.total_amount
         """)
     except Exception as e:
@@ -2911,7 +2928,7 @@ def _build_special_case_stage(headers: list, basic_lines, nfp_by_inv_all: dict,
         if not (match or versions):
             continue
         total, paid = max(match or versions, key=lambda v: v[1])
-        if total <= 0 or paid <= 0 or paid >= total - 0.005:
+        if total <= 0 or paid < 0 or paid >= total - 0.005:
             continue
         nfp_row = (nfp_by_inv_all or {}).get(inv)
         agent_title = build_commission_pack.to_title_case(ln.agent_name)
