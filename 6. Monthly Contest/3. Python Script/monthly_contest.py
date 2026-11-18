@@ -354,6 +354,12 @@ def load_auth_token():
     print("Using hardcoded fallback token.")
     return FALLBACK_TOKEN
 
+# Late-keyed first payments keep their contest points (user, 2026-11-18: the
+# contest follows the paid-on date, like ANP). True restores the 28 Oct 2026
+# penalty that dropped them.
+CONTEST_DROP_LATE_ENTRIES = False
+
+
 def fetch_invoices_from_db(token):
     """Query all invoices from database with linked package, agent, and customer data."""
     headers = {
@@ -722,10 +728,11 @@ def calculate_monthly_contest(token=None, base_path=None, month=None, year=None,
     agent_map = {agent_key(k): v for k, v in agent_map.items()}
 
     df_matches = match_excel_cases_to_db(df_cases, df_db, agent_map)
-    # Matched first, so a late invoice still claims its roster line rather
-    # than letting another invoice take its place; then dropped, since it
-    # earns no contest points.
-    if 'DB Late' in df_matches.columns:
+    # Late entries (paid in one month, keyed in a later one) used to be dropped
+    # here (28 Oct 2026). Since 2026-11-18 the contest follows the paid-on
+    # date like ANP, so a late-keyed case keeps its points. Set
+    # CONTEST_DROP_LATE_ENTRIES to bring the old penalty back.
+    if CONTEST_DROP_LATE_ENTRIES and 'DB Late' in df_matches.columns:
         late_rows = df_matches[df_matches['DB Late'] == True]
         for _, lr in late_rows.iterrows():
             print(f"[Late entry] {lr['Excel Agent']} {lr['DB Inv Num']} ({lr['DB Cust']}): "

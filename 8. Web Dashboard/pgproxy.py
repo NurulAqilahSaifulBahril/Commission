@@ -313,6 +313,42 @@ class _DeferredCursor:
         return self._resolve().rowcount
 
 
+# Short-lived read cache (2026-11-18). One month's report reads the same
+# dashboard tables -- agent roles, contest rules, special cases -- several
+# times over, about a second per round trip, which was most of the
+# "Preparing commission data" wait. A read repeated within READ_CACHE_SECONDS
+# is answered from memory; any write sent from this process empties the cache
+# at once, so a Data page save is seen on the next read. A save made by
+# another server (Railway, another PC) shows here within READ_CACHE_SECONDS,
+# well inside the 20-second Data page check that rebuilds the figures.
+READ_CACHE_SECONDS = 15
+_read_cache: dict = {}
+_read_cache_lock = threading.Lock()
+
+
+def clear_read_cache() -> None:
+    with _read_cache_lock:
+        _read_cache.clear()
+
+
+def _cached_read(sql: str, params: list) -> dict:
+    import copy as _copy
+    import json as _json
+    import time as _time
+    key = sql + "|" + _json.dumps(params, default=str)
+    now = _time.time()
+    with _read_cache_lock:
+        hit = _read_cache.get(key)
+        if hit and now - hit[0] < READ_CACHE_SECONDS:
+            return _copy.deepcopy(hit[1])
+    result = post(sql, params)
+    with _read_cache_lock:
+        if len(_read_cache) > 500:
+            _read_cache.clear()
+        _read_cache[key] = (now, _copy.deepcopy(result))
+    return result
+
+
 class Connection:
     """One `with _connect()` block. Writes accumulate; reads run immediately."""
 
@@ -327,7 +363,7 @@ class Connection:
             # writes; otherwise the DELETE+INSERT pair stays in one transaction.
             if self._pending_tables & tables_touched(qualified):
                 self.flush()
-            result = post(numbered(qualified), list(params) if params else [])
+            result = _cached_read(numbered(qualified), list(params) if params else [])
             return Cursor(result.get("rows") or [], result.get("rowCount") or 0)
 
         self._pending.append(inline(qualified, params))
@@ -337,6 +373,7 @@ class Connection:
     def executescript(self, sql: str) -> Cursor:
         # Used once, for init_db's CREATE TABLE IF NOT EXISTS block.
         self.flush()
+        clear_read_cache()
         post(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
         post(qualify(sql), timeout=300)
         return Cursor([])
@@ -347,12 +384,14 @@ class Connection:
         if self._pending and self._pending[-1] == inline(qualified, params):
             self._pending.pop()
         self.flush()
+        clear_read_cache()
         result = post(numbered(qualified), list(params) if params else [])
         return Cursor(result.get("rows") or [], result.get("rowCount") or 0)
 
     def flush(self) -> None:
         if not self._pending:
             return
+        clear_read_cache()
         statements = self._pending
         self._pending = []
         self._pending_tables = set()

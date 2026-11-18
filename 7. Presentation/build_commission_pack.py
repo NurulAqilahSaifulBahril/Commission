@@ -28,6 +28,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import time
 import re
 import copy as _copy
 from collections import defaultdict
@@ -87,7 +88,24 @@ def _load_env_files() -> None:
             load_dotenv(candidate, override=True)
 
 
+_PROXY_CREDENTIALS_CACHE: dict = {}
+_PROXY_CREDENTIALS_SECONDS = 60
+
+
 def _resolve_proxy_credentials() -> tuple[str, str, str]:
+    """(token, url, db name) for the ERP proxy. Re-reading the .env and token
+    files costs about 0.2s a time on OneDrive and one month's report asks
+    about ten times, so the answer is kept for a minute (2026-11-18)."""
+    hit = _PROXY_CREDENTIALS_CACHE.get("v")
+    if hit and time.time() - hit[0] < _PROXY_CREDENTIALS_SECONDS:
+        return hit[1]
+    result = _resolve_proxy_credentials_uncached()
+    if result and result[0]:
+        _PROXY_CREDENTIALS_CACHE["v"] = (time.time(), result)
+    return result
+
+
+def _resolve_proxy_credentials_uncached() -> tuple[str, str, str]:
     for key in ("PG_PROXY_TOKEN", "POSTGRES_PROXY_TOKEN"):
         if not _is_valid_jwt(_clean_token(os.environ.get(key, ""))):
             os.environ.pop(key, None)
@@ -880,6 +898,13 @@ def get_anp_tier_label(comm_amount: float) -> str:
 # (agent_totals_by_month), so they can't drift from the detailed ledgers.
 # ---------------------------------------------------------------------------
 
+def _anp_row_month(r: dict) -> int | None:
+    """The month an ANP detail row counts in: its paid-on month (anp_date,
+    user 2026-11-18), falling back to the invoice date for rows built before
+    that field existed."""
+    return _parse_month(r.get("anp_date") or r.get("invoice_date"))
+
+
 def _max_anp_by_agent_for_month(anp_detail_full: list, m: int) -> dict[str, float]:
     """Outsource has no per-agent monthly ANP total anywhere upstream --
     anp_commission_accumulated_tier is a running tier value repeated across
@@ -887,7 +912,7 @@ def _max_anp_by_agent_for_month(anp_detail_full: list, m: int) -> dict[str, floa
     agent's figure for the month is the MAX seen that month, not a sum."""
     agent_max: dict[str, float] = {}
     for r in anp_detail_full:
-        if _parse_month(r.get("invoice_date")) != m:
+        if _anp_row_month(r) != m:
             continue
         agent = to_title_case(str(r.get("agent_name", "")).strip())
         if not agent:
@@ -1076,7 +1101,7 @@ def fetch_internal_anp(year: int, h1_only: bool = True):
     payout_label = f"invoice-year-{year}-h1" if h1_only else f"invoice-year-{year}"
     detail_rows, summary_rows = anp.build_report_rows(
         agents, invoices, planning, customers, period_start, period_end, payout_label,
-        ep_lookup=_anp_ep_lookup(year), skip=_anp_skip(year),
+        ep_lookup=_anp_ep_lookup(year),  # late entries count too (paid-on month, user 2026-11-18)
     )
     total_comm = sum(Decimal(str(r.get("anp_commission", 0))) for r in summary_rows)
     meta = {
@@ -1542,7 +1567,7 @@ def fetch_outsource_anp(year: int, h1_only: bool = True):
     payout_label = f"invoice-year-{year}-h1" if h1_only else f"invoice-year-{year}"
     detail_rows, summary_rows = anp.build_report_rows(
         agents, invoices, planning, customers, period_start, period_end, payout_label,
-        ep_lookup=_anp_ep_lookup(year), skip=_anp_skip(year),
+        ep_lookup=_anp_ep_lookup(year),  # late entries count too (paid-on month, user 2026-11-18)
     )
     total_comm = sum(Decimal(str(r.get("anp_commission", 0))) for r in summary_rows)
     meta = {
@@ -2612,7 +2637,7 @@ def build_internal_summary_tables(
         # ANP commission
         anp_comm_by_agent = {}
         anp_agent_monthly = defaultdict(float)
-        month_anp_detail = [r for r in anp_detail if _parse_month(r.get("invoice_date")) == m]
+        month_anp_detail = [r for r in anp_detail if _anp_row_month(r) == m]
         for r in month_anp_detail:
             agent = str(r.get("agent_name", "")).strip()
             comm = float(r.get("anp_commission_accumulated_tier", 0.0))
@@ -3513,7 +3538,7 @@ def build_outsource_summary_tables(
             customer_summary_by_month[m] = customer_rows
 
         # Build ANP customer rows: one row per customer per agent (from anp_detail)
-        month_anp_detail = [r for r in anp_detail if _parse_month(r.get("invoice_date")) == m]
+        month_anp_detail = [r for r in anp_detail if _anp_row_month(r) == m]
         anp_comm_by_agent = {}
         anp_agent_monthly = defaultdict(float)
         for r in month_anp_detail:
@@ -7310,7 +7335,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     # _expand_basic_lines_for_month() (payment milestones), so pre-filtering by
     # full_payment_date here would empty the July-policy months.
     if month is not None:
-        int_anp_detail = [r for r in int_anp_detail if _parse_month(r.get("invoice_date")) == month]
+        int_anp_detail = [r for r in int_anp_detail if _anp_row_month(r) == month]
         _m_lines = _expand_basic_lines_for_month(int_basic_lines, month)
         _m_nfp = [r for r in int_nfp_rows if _parse_month(_nfp_payout_date(r)) == month]
         int_basic_meta = {**int_basic_meta,
@@ -7352,7 +7377,7 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
     # Same month handling as the internal side above: only ANP detail is
     # pre-filtered; Basic/NFP lines stay full-year for milestone bucketing.
     if month is not None:
-        out_anp_detail = [r for r in out_anp_detail if _parse_month(r.get("invoice_date")) == month]
+        out_anp_detail = [r for r in out_anp_detail if _anp_row_month(r) == month]
         _m_out_lines = _expand_basic_lines_for_month(out_basic_lines, month)
         _m_out_nfp = [r for r in out_nfp_rows if _parse_month(_nfp_payout_date(r)) == month]
         out_basic_meta = {**out_basic_meta,
@@ -7404,13 +7429,13 @@ def build_pdf(year: int, output_path: Path, month: int | None = None, may_only: 
                     basic_t1=int_basic_t1, basic_lines=int_basic_lines, basic_t4=int_basic_t4,
                     nfp_agent_rows=int_nfp_agent, nfp_rows=int_nfp_rows,
                     nfp_by_inv_all=int_nfp_by_inv_all, anp_summary_rows=int_anp_summary_for_table,
-                    anp_detail=[r for r in int_anp_detail_full if _parse_month(r.get("invoice_date")) == m],
+                    anp_detail=[r for r in int_anp_detail_full if _anp_row_month(r) == m],
                     year=year, invoice_dates_map=invoice_dates_map, month=m)
                 _, oc, _, _ = build_outsource_summary_tables(
                     basic_t1=out_basic_t1, basic_lines=out_basic_lines, basic_meta=out_basic_meta,
                     nfp_agent_rows=out_nfp_agent, nfp_rows=out_nfp_rows,
                     nfp_by_inv_all=out_nfp_by_inv_all, anp_summary_rows=[],
-                    anp_detail=[r for r in out_anp_detail_full if _parse_month(r.get("invoice_date")) == m],
+                    anp_detail=[r for r in out_anp_detail_full if _anp_row_month(r) == m],
                     year=year, invoice_dates_map=invoice_dates_map, month=m)
                 rows = {"Internal": ic.get(m, []), "Outsource": oc.get(m, [])}
             return nfp_held_back(rows, m)

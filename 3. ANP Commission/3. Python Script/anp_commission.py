@@ -594,6 +594,16 @@ def resolve_customer_name(
     return ""
 
 
+def anp_month_date(invoice: dict[str, Any]) -> date | None:
+    """The date whose month an invoice's ANP counts in: its 1st payment's
+    paid-on date (user, 2026-11-18). An ANP_SAME_MONTH_EXCEPTIONS invoice
+    keeps its invoice date, the month it was approved in."""
+    inv_num = str(invoice.get("invoice_number") or "").strip()
+    if inv_num in ANP_SAME_MONTH_EXCEPTIONS:
+        return parse_date(invoice.get("invoice_date"))
+    return parse_date(invoice.get("1st_payment_date"))
+
+
 def invoice_in_period(
     invoice: dict[str, Any], period_start: date | None, period_end: date | None
 ) -> bool:
@@ -836,18 +846,28 @@ def build_report_rows(
     person_id: dict[str, str] = {}
 
     for inv in invoices:
-        if not invoice_in_period(inv, period_start, period_end):
+        # The ANP month is the month the 1st payment was PAID ON (user,
+        # 2026-11-18): an invoice dated or keyed in another month follows the
+        # paid-on date, and a late-keyed payment is no longer left out. Chan
+        # Jia Wei's INV-1012304/5/6, dated 1 Nov and keyed 2 Nov but paid
+        # 30-31 Oct, count in October. ANP_SAME_MONTH_EXCEPTIONS keep the
+        # invoice-date month they were approved in.
+        anp_date = anp_month_date(inv)
+        if anp_date is None:
+            continue
+        if period_start is not None and period_end is not None \
+                and not (period_start <= anp_date <= period_end):
             continue
         inv_date = parse_date(inv.get("invoice_date"))
         if inv_date is None:
             continue
-        # Require 1st payment date in the same month as invoice date,
-        # unless this invoice is a whitelisted special case.
+        # Only invoices dated in the report year count (user, 2026-11-18): a
+        # 2025 invoice first paid in 2026 stays out, as before the paid-on
+        # rule (Ching Zhe Hang's Eng Heng Huat 1007499/502/503, dated Sep 2025,
+        # paid 18 Sep 2026, would otherwise lift his September to RM 1,000).
+        if not invoice_in_period(inv, period_start, period_end):
+            continue
         inv_num = str(inv.get("invoice_number") or "").strip()
-        if inv_num not in ANP_SAME_MONTH_EXCEPTIONS:
-            first_pay_date = parse_date(inv.get("1st_payment_date"))
-            if not _same_month(inv_date, first_pay_date):
-                continue
         # A 1st_payment_date can be set without a real payment behind it
         # (data entry gap) — require an actual amount paid, however small.
         if not _is_paid(inv):
@@ -866,7 +886,7 @@ def build_report_rows(
         # person's name, keeping the first id seen for the row.
         person = " ".join(str(agent_by_id[agent_id].get("name") or agent_id).split()).lower()
         person_id.setdefault(person, agent_id)
-        key = (person, inv_date.year, inv_date.month)
+        key = (person, anp_date.year, anp_date.month)
         buckets.setdefault(key, []).append(inv)
 
     for (person, inv_year, inv_month), inv_list in sorted(
@@ -932,13 +952,16 @@ def build_report_rows(
                     "prop_type": prop_type,
                     "invoice_date": inv_date,
                     "first_payment_date": parse_date(inv.get("1st_payment_date")),
+                    # The month this row counts in (see anp_month_date);
+                    # report pages pick their month by this, not invoice_date.
+                    "anp_date": anp_month_date(inv),
                     "invoice_total_amount": total,
                     "ep_points": Decimal("0") if cancelled else points,
                     "accumulated_ep_points": line_accumulated,
                     "anp_commission_accumulated_tier": line_comm,
                     "clawback": line_clawback,
-                    "anp_commission_date": anp_commission_payout_ym(inv_date),
-                    "anp_commission_date_remark": anp_month_receive(inv_date),
+                    "anp_commission_date": anp_commission_payout_ym(anp_month_date(inv)),
+                    "anp_commission_date_remark": anp_month_receive(anp_month_date(inv)),
                 }
             )
 

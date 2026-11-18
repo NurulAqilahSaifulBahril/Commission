@@ -1231,6 +1231,15 @@ document.addEventListener("DOMContentLoaded", () => {
         return merged;
     }
 
+    function mergeCustomerInvoices(a, b) {
+        const merged = {};
+        [a, b].forEach(map => Object.keys(map || {}).forEach(k => {
+            const list = merged[k] || (merged[k] = []);
+            (map[k] || []).forEach(inv => { if (!list.includes(inv)) list.push(inv); });
+        }));
+        return merged;
+    }
+
     function mergeCommissionPayloads(internalData, outsourceData) {
         const basicNfp = unionMergeSections(internalData?.sections?.basic_nfp, outsourceData?.sections?.basic_nfp);
         // unionMergeSections rebuilds the section as bare {headers, rows}, so
@@ -1261,7 +1270,12 @@ document.addEventListener("DOMContentLoaded", () => {
             },
             sections: {
                 basic_nfp: basicNfp,
-                anp: unionMergeSections(internalData?.sections?.anp, outsourceData?.sections?.anp),
+                anp: Object.assign(
+                    unionMergeSections(internalData?.sections?.anp, outsourceData?.sections?.anp),
+                    // Re-attached: unionMergeSections keeps only headers/rows.
+                    { customer_invoices: mergeCustomerInvoices(
+                        internalData?.sections?.anp?.customer_invoices,
+                        outsourceData?.sections?.anp?.customer_invoices) }),
                 agent_summary: addReferralFeeColumn(agentSummaryMerged, referralFeeByAgent),
                 ega_esa: mergeEgaEsaSections(internalData?.sections?.ega_esa, outsourceData?.sections?.ega_esa),
                 production_bonus: mergeProductionBonusSections(internalData?.sections?.production_bonus, outsourceData?.sections?.production_bonus),
@@ -1310,14 +1324,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const requestToken = ++commissionFetchToken;
         try {
             const data = await fetchCommissionDataUntilReady({
-                onWaiting: showErrors ? (msg) => {
-                    showLoader(false);
-                    noDataView.classList.remove("hidden");
-                    const heading = noDataView.querySelector("h4");
-                    const detail = noDataView.querySelector("p");
-                    if (heading) heading.textContent = "Preparing commission data";
-                    if (detail) detail.textContent = msg || "Commission data is still being prepared. Retrying…";
-                } : undefined,
+                onWaiting: showErrors ? () => showPreparingCommission() : undefined,
             });
             if (requestToken !== commissionFetchToken) return;
             noDataView.classList.add("hidden");
@@ -1395,19 +1402,11 @@ document.addEventListener("DOMContentLoaded", () => {
             return;
         }
 
-        showLoader(true);
-        noDataView.classList.add("hidden");
-        
+        showPreparingCommission();
+
         try {
             const data = await fetchCommissionDataUntilReady({
-                onWaiting: (msg) => {
-                    showLoader(false);
-                    noDataView.classList.remove("hidden");
-                    const heading = noDataView.querySelector("h4");
-                    const detail = noDataView.querySelector("p");
-                    if (heading) heading.textContent = "Preparing commission data";
-                    if (detail) detail.textContent = msg || "Commission data is still being prepared. Retrying…";
-                },
+                onWaiting: () => showPreparingCommission(),
             });
             noDataView.classList.add("hidden");
             moveSafwanAfterGanLaiSoon(data);
@@ -1469,10 +1468,11 @@ document.addEventListener("DOMContentLoaded", () => {
             totalAgents.textContent = data.summary.total_agents;
             totalCustomers.textContent = data.summary.total_customers;
             saveCachedCommissionPayload(data);
-            
+
             // Render active section
+            showLoader(false);
             renderActiveSection();
-            
+
         } catch (err) {
             console.error(err);
             alert(`Error: ${err.message}`);
@@ -4137,7 +4137,19 @@ modalPackageType.value = defaults.pkg || "-";
         const map = state.rawData?.sections?.basic_nfp?.system_details;
         const name = String(customerName || "").trim();
         if (!map || !name) return null;
-        const entries = map[name.toLowerCase()];
+        let entries = map[name.toLowerCase()];
+        if ((!entries || !entries.length) && state.activeSection === "anp") {
+            // The ANP table names the customer record; System Details is keyed
+            // by the invoice's own name, which can differ ("Lim Kok Peng" vs
+            // "Elson Lim"). Find the customer's invoices by number instead.
+            const invs = state.rawData?.sections?.anp?.customer_invoices?.[name.toLowerCase()] || [];
+            if (invs.length) {
+                entries = [];
+                Object.values(map).forEach(list => (list || []).forEach(e => {
+                    if (e && invs.includes(e.invoice) && !entries.some(x => x.invoice === e.invoice)) entries.push(e);
+                }));
+            }
+        }
         if (!entries || !entries.length) return null;
         const lines = entries.map(e => {
             // An EV charger job is named, not counted in panels.
@@ -5141,7 +5153,12 @@ modalPackageType.value = defaults.pkg || "-";
                 return acc;
             }, [])
         );
-        const rows = sectionData.rows;
+        // ANP lists only agents who earn a Commission Price this month (user,
+        // 2026-11-18): an agent below the first tier drops out of both tables
+        // and the customer count, with all of their customer rows.
+        const rows = state.activeSection === "anp"
+            ? anpRowsWithCommission(sectionData.rows, headers)
+            : sectionData.rows;
         const isOutsource = state.activeAgentType === "outsource";
         const agentIdx = headers.findIndex(h => h.toLowerCase().trim() === "agent");
         const customerIdx = headers.findIndex(h => h.toLowerCase().trim() === "customer");
@@ -6104,6 +6121,18 @@ modalPackageType.value = defaults.pkg || "-";
                         attachAgentRoleHover(td, agentName, invoiceDateCellOf(row, headers));
                     }
 
+                    // ANP customer cell: the same System Details hover as the
+                    // Basic & NFP table (user, 2026-11-18). system_details
+                    // covers the whole year's invoices, not one month's.
+                    if (state.activeSection === "anp" && ci === customerIdx && !isTotalRow && custName) {
+                        const sysInfo = getCustomerSystemTooltip(custName);
+                        if (sysInfo) {
+                            td.addEventListener("mouseenter", (e) => showCommCalcTooltip(e, sysInfo));
+                            td.addEventListener("mousemove", (e) => moveCommCalcTooltip(e));
+                            td.addEventListener("mouseleave", hideCommCalcTooltip);
+                        }
+                    }
+
                     // "EV package" stands where a net floor price would be, and
                     // opens the same Special Case editor the commission cells
                     // do -- that is where an EV job's floor price is entered.
@@ -6185,10 +6214,29 @@ modalPackageType.value = defaults.pkg || "-";
      *  Commission Price is the agent's tier payout (repeated on each row, so
      *  the largest is taken, not the sum). `applySearch` false keeps the
      *  month's full figures for the money card. */
+    /** ANP rows of agents whose Commission Price is above zero. The agent name
+     *  sits on an agent's first row only, so rows are kept per agent block. */
+    function anpRowsWithCommission(rows, headers) {
+        const lower = (headers || []).map(h => String(h).toLowerCase().trim());
+        const agentIdx = lower.indexOf("agent");
+        const customerIdx = lower.indexOf("customer");
+        if (agentIdx === -1 || lower.indexOf("commission price") === -1) return rows || [];
+        const totals = anpAgentTotals(rows || [], headers, agentIdx, customerIdx, false);
+        let cur = "";
+        return (rows || []).filter(row => {
+            const raw = row && row[agentIdx] ? String(row[agentIdx]).trim() : "";
+            if (raw) cur = raw;
+            if (!cur || /total|grand/i.test(cur)) return true;
+            const a = totals.get(cur);
+            return !!a && a.comm > 0;
+        });
+    }
+
     function anpAgentTotals(rows, headers, agentIdx, customerIdx, applySearch) {
         const userObj = USER_ROLES[state.currentUser];
         const lower = headers.map(h => String(h).toLowerCase().trim());
         const totIdx = lower.indexOf("total amount");
+        const paidIdx = lower.indexOf("collected payment");
         const epIdx = lower.indexOf("ep point");
         const commIdx = lower.indexOf("commission price");
         const byAgent = new Map();
@@ -6201,8 +6249,9 @@ modalPackageType.value = defaults.pkg || "-";
             if (applySearch && !matchesSearch(cur, cust)) return;
             if (userObj && userObj.filterAgentName !== null
                 && cur.toLowerCase().trim() !== userObj.filterAgentName.toLowerCase().trim()) return;
-            const a = byAgent.get(cur) || { total: 0, ep: 0, comm: 0 };
+            const a = byAgent.get(cur) || { total: 0, paid: 0, ep: 0, comm: 0 };
             if (totIdx !== -1) a.total += parseMoneyValue(row[totIdx]);
+            if (paidIdx !== -1) a.paid += parseMoneyValue(row[paidIdx]);
             if (epIdx !== -1) a.ep += parseMoneyValue(row[epIdx]);
             if (commIdx !== -1) a.comm = Math.max(a.comm, parseMoneyValue(row[commIdx]));
             byAgent.set(cur, a);
@@ -6226,6 +6275,71 @@ modalPackageType.value = defaults.pkg || "-";
                 card.querySelector(".metric-value").textContent = formatRM(totalComm);
             }
         });
+        rateCardsContainer.appendChild(makeAnpRulesNoteCard());
+    }
+
+    // ANP tiers as saved on the Data page (fetched once); the built-in
+    // defaults until the fetch answers, or if it fails.
+    let anpRuleTiers = null;
+    let anpRuleTiersLoading = false;
+    const ANP_DEFAULT_TIERS = [
+        { from_amount: "0", to_amount: "59999.99", commission_rm: "0" },
+        { from_amount: "60000", to_amount: "179999.99", commission_rm: "500" },
+        { from_amount: "180000", to_amount: "359999.99", commission_rm: "1000" },
+        { from_amount: "360000", to_amount: "719999.99", commission_rm: "1500" },
+        { from_amount: "720000", to_amount: "", commission_rm: "2000" },
+    ];
+
+    function anpTierText(t) {
+        const k = v => {
+            const x = Number(String(v || "0").replace(/,/g, ""));
+            return x >= 1000 ? `${Math.round(x / 1000)}k` : String(Math.round(x));
+        };
+        const rm = `RM ${Number(String(t.commission_rm || "0").replace(/,/g, "")).toLocaleString("en-MY")}`;
+        if (Number(t.from_amount || 0) === 0) return `under ${k(Number(t.to_amount) + 0.01)} = ${rm}`;
+        return `${k(t.from_amount)}+ = ${rm}`;
+    }
+
+    /** The ANP rules, as a note card beside Total Commission. Wording set by
+     *  the user, 2026-11-18; the tier lines come from the Data page. */
+    // The commercial 40k/40% EP split starts with May 2026 (user, 2026-11-18),
+    // so the note only shows that line from the May 2026 report onwards.
+    function anpCommercialSplitApplies() {
+        const y = Number(state.activeYear) || 0, m = Number(state.activeMonth) || 0;
+        return y > 2026 || (y === 2026 && m >= 5);
+    }
+
+    function makeAnpRulesNoteCard() {
+        const card = document.createElement("div");
+        card.className = "card rate-card anp-note-card";
+        const tiers = (anpRuleTiers && anpRuleTiers.length) ? anpRuleTiers : ANP_DEFAULT_TIERS;
+        card.innerHTML = `
+            <div class="anp-note-title">ANP rules</div>
+            <ul class="anp-note-list">
+                <li>the 1st payment's paid-on date</li>
+                <li>EP (RM) = total (RM) − EPP (RM)</li>
+                ${anpCommercialSplitApplies() ? `<li>Commercial over 36 panels:<br>first RM 40,000 at 100%, rest at 40%</li>` : ""}
+                <li>Commission Tier
+                    <div class="anp-note-tiers">${tiers.map(t => `<div>${anpTierText(t)}</div>`).join("")}</div>
+                </li>
+                <li>Sample quotations earn nothing; cancelled cases are clawed back.</li>
+            </ul>`;
+        if (!anpRuleTiers && !anpRuleTiersLoading) {
+            anpRuleTiersLoading = true;
+            const now = new Date();
+            const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+            fetch(`/api/anp-rules?effective_from=${ym}`)
+                .then(r => r.ok ? r.json() : null)
+                .then(data => {
+                    if (data && Array.isArray(data.tiers) && data.tiers.length) {
+                        anpRuleTiers = data.tiers;
+                        document.querySelectorAll(".anp-note-card").forEach(old => old.replaceWith(makeAnpRulesNoteCard()));
+                    }
+                })
+                .catch(() => {})
+                .finally(() => { anpRuleTiersLoading = false; });
+        }
+        return card;
     }
 
     function renderAnpAgentSummary(rows, headers, agentIdx, customerIdx, isOutsource) {
@@ -6254,6 +6368,7 @@ modalPackageType.value = defaults.pkg || "-";
         table.className = "agent-summary-inline-table";
         table.innerHTML = `<thead><tr>
             <th>Agent</th><th class="numeric">Total Amount</th>
+            <th class="numeric">Collected Payment</th>
             <th class="numeric anp-highlight-header">EP Point</th>
             <th class="numeric anp-highlight-header">Commission Price</th>
         </tr></thead>`;
@@ -6278,7 +6393,7 @@ modalPackageType.value = defaults.pkg || "-";
             const tdAgent = document.createElement("td");
             tdAgent.textContent = resolveAgentName(agent);
             tr.appendChild(tdAgent);
-            [a.total ? formatRM(a.total) : "-", fmtPoints(a.ep), a.comm ? formatRM(a.comm) : "-"].forEach(v => {
+            [a.total ? formatRM(a.total) : "-", a.paid ? formatRM(a.paid) : "-", fmtPoints(a.ep), a.comm ? formatRM(a.comm) : "-"].forEach(v => {
                 const td = document.createElement("td");
                 td.className = "numeric";
                 td.textContent = v;
@@ -7264,7 +7379,7 @@ modalPackageType.value = defaults.pkg || "-";
         // "Gan Lai Soon (RM)" spelling as well as the bare one.
         if (h.includes("gan lai soon") || h.includes("safwan")) return true;
         // ANP's EP Point (singular) is a figure too.
-        if (h === "ep point") return true;
+        if (h === "ep point" || h === "collected payment") return true;
         return h.includes("price") || h.includes("fee") || h.includes("commission") || h.includes("amount") || h.includes("sales") || h.includes("points") || h.includes("clawback") || h.includes("total");
     }
 
@@ -7494,7 +7609,37 @@ modalPackageType.value = defaults.pkg || "-";
             loader.classList.remove("hidden");
         } else {
             loader.classList.add("hidden");
+            if (tableContainer) tableContainer.classList.remove("is-preparing");
         }
+    }
+
+    /** Switching to a month or agent type that is not loaded yet: clear the
+     *  previous page's table, cards and labels and show only "Preparing
+     *  commission data" until the new figures arrive (user, 2026-11-18). */
+    function showPreparingCommission() {
+        if (tableContainer) {
+            tableContainer.querySelectorAll(".dynamic-bonus-table-wrapper,.agent-summary-inline-wrapper,.customer-detail-title,.agent-summary-inline-actions")
+                .forEach(el => el.remove());
+            tableContainer.classList.add("is-preparing");
+        }
+        tableHeaders.innerHTML = "";
+        tableGroupHeaders.innerHTML = "";
+        tableGroupHeaders.style.display = "none";
+        tableBody.innerHTML = "";
+        dataTable.classList.add("hidden");
+        noDataView.classList.add("hidden");
+        if (rateCardsContainer) rateCardsContainer.innerHTML = "";
+        const ta = document.getElementById("totalAgents");
+        const tc = document.getElementById("totalCustomers");
+        const rc = document.getElementById("rowCount");
+        const hint = document.getElementById("tableHeaderHint");
+        if (ta) ta.textContent = "–";
+        if (tc) tc.textContent = "–";
+        if (rc) rc.textContent = "";
+        if (hint) hint.style.display = "none";
+        const label = loader.querySelector("p");
+        if (label) label.textContent = "Preparing commission data";
+        loader.classList.remove("hidden");
     }
 
     // -------------------------------------------------------------
