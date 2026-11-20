@@ -1787,14 +1787,18 @@ if SETUP_ERROR is not None:
     has_main_keys = True
 if not has_main_keys:
     _log("Cache is missing internal or outsource data on startup. Triggering background pre-fetch...")
-    start_prefetch(2026, replay=True)
+    start_prefetch(2026)
 elif SETUP_ERROR is None:
     # Pages open straight away on the data saved last time, and the rebuild
     # runs behind them. Each piece replaces its old copy only once the new one
     # is complete, so nobody ever sees a half-built figure -- just figures that
     # catch up to the database a minute or two after launch.
-    _log("Serving cached data from the last session; refreshing it in the background...")
-    start_prefetch(2026, replay=True)
+    # Live, never replayed: the replay record is restored from disk with the
+    # cache, so a replayed startup rebuild served the same old download on
+    # every restart (user, 2026-11-20: INV-1012304 keyed 2 Nov still missing
+    # on 20 Nov because the record stopped at 4 Nov).
+    _log("Serving cached data from the last session; refreshing it from the database in the background...")
+    start_prefetch(2026)
 
 def _no_store(resp):
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -2516,7 +2520,7 @@ def _build_payout_policies(basic_lines, as_at: str = "", agent_type: str = "") -
             "balance_pct": _pct_text(policy.balance_trigger),
             # pct75_date/pct5_date on a line are named for the 2026 defaults
             # but hold whatever milestones this policy names.
-            # The advance counts from its paid or Created at month (see
+            # The advance counts from its Paid on month (see
             # advance_recognized_date), so it reads as pending until then.
             "advance_date": (str(getattr(ln, "pct5_date", "") or "")[:10]
                              if multi and _as_at_date(build_commission_pack.advance_recognized_date(ln), as_at)

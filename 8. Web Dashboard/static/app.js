@@ -4803,10 +4803,7 @@ modalPackageType.value = defaults.pkg || "-";
         // applies it (user, 2026-10-30).
         if (stageTitle === "Advance RM300") {
             h4.title = "Which month the RM 300 advance falls in:\n"
-                + "• Paid and created in the same month → that month.\n"
-                + "• Paid in the last 2 working days, created in the first 2 working days of next month → paid month.\n"
-                + "• Anything else → created month.\n"
-                + "• Approved exceptions → paid month.";
+                + "• The Paid on month of the payment that reached the advance, whenever it was keyed in.";
             h4.style.cursor = "help";
         }
         headerDiv.appendChild(h4);

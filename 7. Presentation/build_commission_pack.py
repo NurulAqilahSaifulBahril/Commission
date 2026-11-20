@@ -410,63 +410,16 @@ def _basic_line_overrides(ln, agent_type: str, name_map: dict | None = None) -> 
             for h in hits]
 
 
-# Invoices whose Advance RM 300 follows the paid month even though the rule
-# below would put it in the Created at month (user, 2026-10-30). Paid in
-# August, keyed in September, all four to August; the rule itself unchanged.
-ADVANCE_PAID_MONTH_PINS = frozenset({
-    "INV-1011379",   # Wong Jia Xuan, Chin Li Kuan: paid 16 Aug, keyed 9 Sep
-    "INV-1011411",   # Wong Jia Xuan, Ee Chun Tack (Atap): paid 17 Aug, keyed 1 Sep
-    "INV-1011316",   # You Teng Hoong, Mega Signcraft (Factory): paid 27 Aug, keyed 2 Sep
-    "INV-1011470",   # You Teng Hoong, Tey Chin Chuan (Atap): paid 31 Aug, keyed 7 Sep
-})
-
-
 def advance_recognized_date(ln) -> str:
-    """The date that puts an invoice's Advance RM 300 in a month, from the
-    payment that reached the advance trigger (user, 2026-10-29):
-
-    - paid and keyed in (Created at) in the same month: that month;
-    - paid on either of the last two working days (Mon-Fri) of a month, or a
-      weekend after them, AND keyed in on either of the first two working
-      days of the next month, or a weekend before them: the paid month
-      (Leong Chee Wei: paid Fri 28 Aug, keyed Tue 1 Sep -> August);
-    - otherwise the Created at month (Shamiela: paid Sat 29 Aug, keyed
-      10 Sep -> September).
-
-    Public holidays are not skipped. Falls back to the payment date for lines
-    that carry no Created at. The Balance and NFP still go by the payment
-    date."""
+    """The date that puts an invoice's Advance RM 300 in a month: the Paid on
+    date of the payment that reached the advance trigger, whenever it was
+    keyed in (user, 2026-11-20: "refer to paid on only"). This replaced the
+    2026-10-29 Created at / last-two-working-days rule and its four pinned
+    invoices. Falls back to Created at only for a line with no Paid on. The
+    Balance and NFP also go by the payment date."""
     paid = str(getattr(ln, "pct5_date", "") or "")[:10]
     created = str(getattr(ln, "pct5_created", "") or "")[:10]
-    if not paid or not created or paid[:7] == created[:7]:
-        return paid or created
-    if str(getattr(ln, "invoice_number", "") or "").strip() in ADVANCE_PAID_MONTH_PINS:
-        return paid
-    try:
-        p = datetime.strptime(paid, "%Y-%m-%d").date()
-        c = datetime.strptime(created, "%Y-%m-%d").date()
-    except ValueError:
-        return created
-    next_first = (p.replace(day=28) + timedelta(days=4)).replace(day=1)
-    if (c.year, c.month) != (next_first.year, next_first.month):
-        return created
-    last_two = _nth_working_day(next_first - timedelta(days=1), 2, -1)
-    first_two = _nth_working_day(next_first, 2, 1)
-    if p >= last_two and c <= first_two:
-        return paid
-    return created
-
-
-def _nth_working_day(start, n: int, step: int):
-    """The n-th Monday-to-Friday counting from `start` (itself included) one
-    day at a time in the direction of `step` (+1 forwards, -1 backwards)."""
-    day, seen = start, 0
-    while True:
-        if day.weekday() < 5:
-            seen += 1
-            if seen == n:
-                return day
-        day += timedelta(days=step)
+    return paid or created
 
 
 def _expand_basic_lines_for_month(basic_lines: list, m: int) -> list:
