@@ -3161,6 +3161,54 @@ modalPackageType.value = defaults.pkg || "-";
         return "approve";
     }
 
+    function findCustomerRowForKind(agentName, customerName, kind) {
+        const sec = (typeof basicNfpSectionInView === "function" ? basicNfpSectionInView() : null) || state.rawData?.sections?.basic_nfp;
+        const allRows = (sec?.rows || []).concat(state.rawData?.sections?.basic_nfp?.rows || []);
+        const headers = sec?.headers || state.rawData?.sections?.basic_nfp?.headers || [];
+        const agentIdx = headers.findIndex(h => h.toLowerCase().trim() === "agent");
+        const custIdx = headers.findIndex(h => h.toLowerCase().trim() === "customer");
+        const commIdx = headers.findIndex(h => {
+            const n = String(h).toLowerCase().trim();
+            return n === "commission" || n === "commission type";
+        });
+        const wantAgent = String(agentName || "").toLowerCase().trim();
+        const wantCust = String(customerName || "").toLowerCase().trim();
+        let currentAgent = "";
+        for (let i = 0; i < allRows.length; i++) {
+            const r = allRows[i];
+            if (agentIdx !== -1 && r[agentIdx]) currentAgent = String(r[agentIdx]).toLowerCase().trim();
+            const rCust = custIdx !== -1 ? String(r[custIdx] || "").toLowerCase().trim() : "";
+            if (wantCust && rCust === wantCust && (!wantAgent || currentAgent === wantAgent)) {
+                const commVal = commIdx !== -1 ? String(r[commIdx] || "").toLowerCase() : "";
+                if (kind === "nfp" && (commVal.includes("net floor") || commVal.includes("netfloor"))) {
+                    return r;
+                }
+                if (kind === "basic" && commVal.includes("basic")) {
+                    return r;
+                }
+            }
+        }
+        return null;
+    }
+
+    function openAdjustSpecialCaseFromApproval(entry, kind) {
+        if (!entry) return;
+        const pair = findSpecialCasePairByKind(entry.agent, entry.customer, kind);
+        if (pair && pair.length > 0) {
+            const rowWithData = pair.find(r => r && r.specialCaseData) || pair[0];
+            openEditSpecialCaseModal(rowWithData);
+        } else {
+            const row = findCustomerRowForKind(entry.agent, entry.customer, kind);
+            openAddSpecialCaseModal(entry.agent, entry.customer, row || []);
+            if (!row || state.specialCaseRowKind !== kind) {
+                state.specialCaseRowKind = kind;
+                setSpecialCaseTypeOptions(kind);
+                const titleEl = document.querySelector("#specialCaseModal h3");
+                if (titleEl) titleEl.textContent = specialCaseTitleForKind(kind);
+            }
+        }
+    }
+
     function payoutApprovalOffersChoice(entry) {
         return payoutApprovalMode(entry) === "approve" && (entry.advance_invoices || []).length > 0;
     }
@@ -3243,11 +3291,31 @@ modalPackageType.value = defaults.pkg || "-";
                 const it = (entry.items || [])[i] || {};
                 const basicAmt = (Number(it.basic) || 0) - (Number(it.advance) || 0);
                 line[priceCol].innerHTML = basicAmt ? formatRM(basicAmt) : "-";
+                line[priceCol].setAttribute("data-adjust-kind", "basic");
+                line[priceCol].style.cursor = "pointer";
+                line[priceCol].title = "Click to adjust Special Case Basic Commission";
+                line[priceCol].classList.add("clickable-special-case");
+                if (line[commCol]) {
+                    line[commCol].setAttribute("data-adjust-kind", "basic");
+                    line[commCol].style.cursor = "pointer";
+                    line[commCol].title = "Click to adjust Special Case Basic Commission";
+                    line[commCol].classList.add("clickable-special-case");
+                }
             });
             nfpRows.forEach((line, i) => {
                 const it = (entry.items || [])[i] || {};
                 const nfpAmt = Number(it.nfp) || 0;
                 line[priceCol].innerHTML = nfpAmt ? formatRM(nfpAmt) : "-";
+                line[priceCol].setAttribute("data-adjust-kind", "nfp");
+                line[priceCol].style.cursor = "pointer";
+                line[priceCol].title = "Click to adjust Special Case Net Floor Price";
+                line[priceCol].classList.add("clickable-special-case");
+                if (line[commCol]) {
+                    line[commCol].setAttribute("data-adjust-kind", "nfp");
+                    line[commCol].style.cursor = "pointer";
+                    line[commCol].title = "Click to adjust Special Case Net Floor Price";
+                    line[commCol].classList.add("clickable-special-case");
+                }
             });
         }
         return box.innerHTML;
@@ -3400,9 +3468,21 @@ modalPackageType.value = defaults.pkg || "-";
                 Total payable in ${escapeHtml(period)}: <strong>${formatRM(parts.total)}</strong></p>`;
         }
 
+        const adjustToolbar = kind === "full" ? `
+            <div class="special-case-adjust-toolbar" style="display:flex; gap:10px; margin:0 0 12px; align-items:center; flex-wrap:wrap; padding:8px 12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;">
+                <span style="font-size:12px; font-weight:600; color:var(--text-muted, #64748b);">Adjust Commission:</span>
+                <button type="button" class="btn btn-secondary btn-sm" id="adjustSpecialCaseBasicBtn" style="font-size:12px; padding:5px 12px; cursor:pointer; font-weight:600; display:inline-flex; align-items:center; gap:5px;">
+                    ✏️ Special Case Basic Commission
+                </button>
+                <button type="button" class="btn btn-secondary btn-sm" id="adjustSpecialCaseNfpBtn" style="font-size:12px; padding:5px 12px; cursor:pointer; font-weight:600; display:inline-flex; align-items:center; gap:5px;">
+                    ✏️ Special Case Net Floor Price
+                </button>
+            </div>` : "";
+
         const summary = document.getElementById("payoutApprovalSummary");
         summary.innerHTML = `
             ${choice}
+            ${adjustToolbar}
             <div style="overflow-x:auto;">
             ${payoutApprovalTableForKind(payoutApprovalTableHtml, entry, kind) || `<table class="data-table" style="width:100%;font-size:12px;">
                 <thead><tr><th>Invoice</th><th>Customer</th><th>Agent</th><th>Basic Commission</th>
@@ -3413,6 +3493,27 @@ modalPackageType.value = defaults.pkg || "-";
             ${payoutApprovalPaymentDetails(entry)}
             ${totals}
             ${status}`;
+
+        if (kind === "full") {
+            const basicBtn = summary.querySelector("#adjustSpecialCaseBasicBtn");
+            if (basicBtn) {
+                basicBtn.addEventListener("click", () => {
+                    openAdjustSpecialCaseFromApproval(entry, "basic");
+                });
+            }
+            const nfpBtn = summary.querySelector("#adjustSpecialCaseNfpBtn");
+            if (nfpBtn) {
+                nfpBtn.addEventListener("click", () => {
+                    openAdjustSpecialCaseFromApproval(entry, "nfp");
+                });
+            }
+            summary.querySelectorAll('[data-adjust-kind]').forEach(el => {
+                el.addEventListener("click", () => {
+                    const k = el.getAttribute("data-adjust-kind");
+                    openAdjustSpecialCaseFromApproval(entry, k);
+                });
+            });
+        }
         summary.querySelectorAll('input[name="payoutApprovalKind"]').forEach(radio => {
             radio.addEventListener("change", () => {
                 payoutApprovalKind = radio.value;
@@ -5900,11 +6001,7 @@ modalPackageType.value = defaults.pkg || "-";
                             : approvalEntry.approved_later ? `Approved for ${approvalEntry.approved_later}`
                             : approvalEntry.advance_approved_later ? `Advance approved for ${approvalEntry.advance_approved_later}`
                             : "Click to approve this customer's payout";
-                        tr.addEventListener("click", (e) => {
-                            // The Commission and Commission Price cells carry
-                            // the calculation hover; clicking them does not
-                            // open the approval.
-                            if (e.target.closest("td[data-no-approval]")) return;
+                        tr.addEventListener("click", () => {
                             openPayoutApprovalModal(approvalEntry, tr);
                         });
                     }
@@ -5928,11 +6025,6 @@ modalPackageType.value = defaults.pkg || "-";
                     if (colsToMerge.includes(ci) && !cellGrid[ri][ci].visible) continue;
                     if (isGroupFollower && specialCaseMergeCols.includes(ci)) continue;
                     const td = document.createElement("td");
-                    if (specialCaseStageOn() && (ci === commissionIdx || ci === commissionPriceIdx)) {
-                        td.dataset.noApproval = "1";
-                        td.style.cursor = "default";
-                        td.setAttribute("title", "");   // not the row's "Click to approve" tip
-                    }
                     let displayVal = cellGrid[ri][ci] ? cellGrid[ri][ci].value : (cellVal === null || cellVal === undefined ? "-" : String(cellVal));
                     if (payoutStageActive && state.filters.payoutStage === "advance" && ci === commissionPriceIdx) {
                         displayVal = advanceOnlyPrice(row, displayVal);
@@ -6061,7 +6153,7 @@ modalPackageType.value = defaults.pkg || "-";
 
                     // Special row: commission price opens the case on click
                     if (isSpecialRow && ci === commissionPriceIdx) {
-                        if (userObj && !userObj.readOnly && state.activeSection === "basic_nfp" && isEditSpecialCaseEligible(rowCommType)) {
+                        if (userObj && !userObj.readOnly && state.activeSection === "basic_nfp" && !specialCaseStageOn() && isEditSpecialCaseEligible(rowCommType)) {
                             td.style.cursor = "pointer";
                             td.title = "Click to edit Special Case";
                             td.classList.add("clickable-special-case");
@@ -6071,7 +6163,7 @@ modalPackageType.value = defaults.pkg || "-";
 
                     // Special row: commission label opens the case on click
                     if (isSpecialRow && ci === commissionIdx && isEditSpecialCaseEligible(rowCommType)) {
-                        if (userObj && !userObj.readOnly) {
+                        if (userObj && !userObj.readOnly && !specialCaseStageOn()) {
                             td.style.cursor = "pointer";
                             td.title = "Click to edit Special Case";
                             td.classList.add("clickable-special-case");
@@ -6154,6 +6246,7 @@ modalPackageType.value = defaults.pkg || "-";
                     // opens the same Special Case editor the commission cells
                     // do -- that is where an EV job's floor price is entered.
                     if (state.activeSection === "basic_nfp" && !isTotalRow
+                        && !specialCaseStageOn()
                         && String(displayVal).trim() === "EV package"
                         && userObj && !userObj.readOnly) {
                         td.style.cursor = "pointer";
@@ -6191,7 +6284,7 @@ modalPackageType.value = defaults.pkg || "-";
                             }
 
                             // nfpHandedToNewRow: edit it from the New NFP row instead.
-                            if (!isFactoryCell && !nfpHandedToNewRow && userObj && !userObj.readOnly) {
+                            if (!isFactoryCell && !nfpHandedToNewRow && !specialCaseStageOn() && userObj && !userObj.readOnly) {
                                 td.style.cursor = "pointer";
                                 td.classList.add("clickable-special-case");
                                 td.addEventListener("click", () => {
@@ -6298,7 +6391,7 @@ modalPackageType.value = defaults.pkg || "-";
                                 td.addEventListener("mouseleave", hideCommCalcTooltip);
                             }
 
-                            if (!isFactoryCell && userObj && !userObj.readOnly) {
+                            if (!isFactoryCell && !specialCaseStageOn() && userObj && !userObj.readOnly) {
                                 td.style.cursor = "pointer";
                                 td.classList.add("clickable-special-case");
                                 td.addEventListener("click", () => {
@@ -8720,6 +8813,9 @@ modalPackageType.value = defaults.pkg || "-";
                 const capturedRow = state.editingPair[0] || state.editingPair[1];
                 deleteSpecialCasePair(capturedRow);
                 closeModal();
+                if (typeof payoutApprovalEntry !== "undefined" && payoutApprovalEntry) {
+                    closePayoutApprovalModal();
+                }
             }
         });
     }
@@ -9111,6 +9207,9 @@ modalPackageType.value = defaults.pkg || "-";
             closeModal();
             saveSpecialCases();
             renderActiveSection();
+            if (typeof payoutApprovalEntry !== "undefined" && payoutApprovalEntry) {
+                closePayoutApprovalModal();
+            }
         });
     }
 

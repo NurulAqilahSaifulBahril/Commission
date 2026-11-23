@@ -2746,6 +2746,11 @@ body {
     box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
 }
 
+/* Special Case pop-up modal: sits above the approval modal (z-index 9999). */
+#specialCaseModal {
+    z-index: 10500;
+}
+
 /* Special Case pop-up: wider, so Agent / Customer / Package Type and the three
    prices each fit on one row, and as tall as the window allows before the
    body scrolls. Overrides the generic .modal-content size above. */
