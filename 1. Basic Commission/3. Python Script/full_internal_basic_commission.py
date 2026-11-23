@@ -535,7 +535,7 @@ candidates AS (
     i.full_payment_date AS real_full_payment_date,
 {milestone_selects}
     COALESCE(i.total_amount, 0)::numeric AS total_amount,
-    COALESCE((SELECT SUM(p.amount) FROM payment p WHERE p.linked_invoice = i.bubble_id AND p.id NOT IN (101334, 104412, 101333, 104413, 4899)), 0)::numeric AS paid_amount,
+    COALESCE(pay.paid_sum, 0)::numeric AS paid_amount,
     COALESCE(
       NULLIF(epp_items.epp_interest, 0),
       NULLIF(pay.epp_sum, 0),
@@ -751,7 +751,9 @@ candidates AS (
            OR ii.bubble_id = ANY(i.linked_invoice_item))
   ) ev_items ON TRUE
   LEFT JOIN LATERAL (
-    SELECT SUM(COALESCE(p.epp_cost, 0)) AS epp_sum
+    SELECT
+      COALESCE(SUM(p.amount), 0) AS paid_sum,
+      SUM(COALESCE(p.epp_cost, 0)) AS epp_sum
     FROM payment p
     WHERE p.linked_invoice = i.bubble_id
       AND p.id NOT IN (101334, 104412, 101333, 104413, 4899)
@@ -772,6 +774,9 @@ candidates AS (
     ({full_col} IS NOT NULL
      AND EXTRACT(YEAR FROM {full_col})::int = {int(year)}
      AND EXTRACT(MONTH FROM {full_col})::int BETWEEN {cutover_month} AND 12)
+    OR
+    -- Special case: any invoice in this year with a recorded first payment date
+    (EXTRACT(YEAR FROM i.invoice_date)::int = {int(year)} AND i."1st_payment_date" IS NOT NULL)
   )
     AND (
       LOWER(btrim(COALESCE(a.agent_type, ''))) IN ({AGENT_TYPES_SQL})
