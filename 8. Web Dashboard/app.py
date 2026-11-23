@@ -3055,11 +3055,16 @@ def _build_special_case_stage(headers: list, basic_lines, nfp_by_inv_all: dict,
             last_agent = agent_title
             put("customer", customer_title)
             if kind == "Basic Commission":
-                # The whole commission, not the advance-only cap an internal
-                # line carries between its two milestones (full_commission).
-                # The balance approving would pay: the advance comes off, and
-                # the hover shows it ("Original Price x Rate % - 300.00").
-                put("price", rm(basic_full - advance))
+                # For an invoice whose deposit has not yet achieved the advance
+                # trigger (< 4.4%), Commission Price displays the advance amount
+                # first (RM 300.00). If advance was approved in this month, show
+                # the advance. Otherwise, show the balance (basic_full - advance).
+                if advance_option > 0:
+                    put("price", rm(advance_option))
+                elif adv_for == this_month:
+                    put("price", rm(min(basic_full, build_commission_pack._line_advance_amount(ln))))
+                else:
+                    put("price", rm(basic_full - advance))
                 put("rate", build_commission_pack._basic_line_rate_label(ln) or "-")
                 put("adv_deducted", f"{advance:,.2f}" if advance else "-")
                 # Payment at for the Advance stage: the date the payment that
@@ -3081,7 +3086,10 @@ def _build_special_case_stage(headers: list, basic_lines, nfp_by_inv_all: dict,
                 put("ref_name", ref_name)
                 put("ref_fee", rm(ref_fee))
             else:
-                put("price", rm(getattr(nfp_row, "nfp_commission", 0) if nfp_row else 0))
+                if advance_option > 0 or adv_for == this_month:
+                    put("price", "-")
+                else:
+                    put("price", rm(getattr(nfp_row, "nfp_commission", 0) if nfp_row else 0))
             put("inv_date", str(ln.invoice_date or "")[:10] or "-")
             put("first_pay", str(ln.first_payment_date or "")[:10] or "-")
             if kind != "Basic Commission":

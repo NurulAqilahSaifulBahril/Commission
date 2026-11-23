@@ -3198,7 +3198,7 @@ modalPackageType.value = defaults.pkg || "-";
      *  "Advance RM300" each Basic Commission row's Commission Price shows the
      *  advance that would be paid (user, 2026-11-18). */
     function payoutApprovalTableForKind(html, entry, kind) {
-        if (!html || kind !== "advance") return html;
+        if (!html) return html;
         const box = document.createElement("div");
         box.innerHTML = html;
         const table = box.querySelector("table");
@@ -3225,16 +3225,31 @@ modalPackageType.value = defaults.pkg || "-";
         });
         const basicRows = grid.filter(line => line[commCol]
             && /basic/i.test(line[commCol].textContent) && line[priceCol]);
-        const items = (entry.items || []).filter(it => Number(it.advance_option) > 0);
-        basicRows.forEach((line, i) => {
-            const amount = basicRows.length === 1 ? payoutApprovalParts(entry, "advance").total
-                : Number((items[i] || {}).advance_option) || 0;
-            line[priceCol].innerHTML = amount ? formatRM(amount) : "-";
-        });
-        // The Net Floor Price commission waits for the balance, so under the
-        // advance it has no value yet -- as on the Advance RM 300 list.
-        grid.filter(line => line[commCol] && /net\s*floor/i.test(line[commCol].textContent) && line[priceCol])
-            .forEach(line => { line[priceCol].innerHTML = "-"; });
+        const nfpRows = grid.filter(line => line[commCol]
+            && /net\s*floor/i.test(line[commCol].textContent) && line[priceCol]);
+
+        if (kind === "advance" || (!kind && payoutApprovalOffersChoice(entry))) {
+            const items = (entry.items || []).filter(it => Number(it.advance_option) > 0);
+            basicRows.forEach((line, i) => {
+                const amount = basicRows.length === 1 ? payoutApprovalParts(entry, "advance").total
+                    : Number((items[i] || {}).advance_option) || 0;
+                line[priceCol].innerHTML = amount ? formatRM(amount) : "-";
+            });
+            // The Net Floor Price commission waits for the balance, so under the
+            // advance it has no value yet -- as on the Advance RM 300 list.
+            nfpRows.forEach(line => { line[priceCol].innerHTML = "-"; });
+        } else if (kind === "full") {
+            basicRows.forEach((line, i) => {
+                const it = (entry.items || [])[i] || {};
+                const basicAmt = (Number(it.basic) || 0) - (Number(it.advance) || 0);
+                line[priceCol].innerHTML = basicAmt ? formatRM(basicAmt) : "-";
+            });
+            nfpRows.forEach((line, i) => {
+                const it = (entry.items || [])[i] || {};
+                const nfpAmt = Number(it.nfp) || 0;
+                line[priceCol].innerHTML = nfpAmt ? formatRM(nfpAmt) : "-";
+            });
+        }
         return box.innerHTML;
     }
 
@@ -3324,6 +3339,8 @@ modalPackageType.value = defaults.pkg || "-";
         // The choice, for a deposit still below the advance trigger.
         let choice = "";
         if (payoutApprovalOffersChoice(entry)) {
+            const fullParts = payoutApprovalParts(entry, "full");
+            const advParts = payoutApprovalParts(entry, "advance");
             const option = (value, title, detail) => `
                 <label style="display:flex;gap:8px;align-items:flex-start;padding:8px 10px;margin:0 0 6px;
                     border:1px solid ${kind === value ? "var(--accent-blue, #2563eb)" : "#cbd5e1"};border-radius:6px;cursor:pointer;">
@@ -3333,8 +3350,8 @@ modalPackageType.value = defaults.pkg || "-";
             choice = `
                 <p class="status-text" style="margin:0 0 8px;font-weight:600;">
                     This customer's deposit has not reached the advance yet. Choose which to approve?</p>
-                ${option("advance", "Advance RM300", "")}
-                ${option("full", "Full Basic Commission", "")}
+                ${option("advance", "Only Advance (RM 300)", `Pay out advance ${formatRM(advParts.total)} only; balance will be paid when completed`)}
+                ${option("full", "Full Commission", `Pay out full commission ${formatRM(fullParts.total)}`)}
                 <div style="height:8px;"></div>`;
         }
 
