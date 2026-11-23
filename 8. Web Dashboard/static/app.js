@@ -3172,14 +3172,12 @@ modalPackageType.value = defaults.pkg || "-";
         const sum = (fn) => (entry.items || []).reduce((s, it) => s + (Number(fn(it)) || 0), 0);
         if (kind === "advance") {
             const advance = sum(it => it.advance_option);
-            return { agent: advance, basic: advance, nfp: 0, override: 0, referral: 0, total: advance };
+            return { agent: advance, override: 0, referral: 0, total: advance };
         }
-        const basic = sum(it => (Number(it.basic) || 0) - (Number(it.advance) || 0));
-        const nfp = sum(it => Number(it.nfp) || 0);
         const agent = sum(it => it.payable);
         const override = sum(it => (it.overrides || []).reduce((s, o) => s + (Number(o.amount) || 0), 0));
         const referral = sum(it => it.referral_fee);
-        return { agent, basic, nfp, override, referral, total: agent + override + referral };
+        return { agent, override, referral, total: agent + override + referral };
     }
 
     function payoutApprovalTotal(entry) {
@@ -3308,30 +3306,31 @@ modalPackageType.value = defaults.pkg || "-";
         const latestPayments = state.rawData?.sections?.basic_nfp?.payout_policies
             ?.[String(entry.customer || "").toLowerCase().trim()] || [];
         const muted = (text) => `<br><span style="color:var(--text-muted);font-size:11px;">${text}</span>`;
-        const isAdv = kind === "advance";
         const itemRows = (entry.items || []).map(it => {
             const now = latestPayments.find(e => e.invoice === it.invoice && e.paid_pct) || it;
             // Basic is what a full approval pays: the whole commission less
             // the advance (paid earlier, or in this month's Advance run).
-            const basicNow = isAdv ? (Number(it.advance_option) || 300) : ((Number(it.basic) || 0) - (Number(it.advance) || 0));
-            const nfpNow = isAdv ? 0 : (Number(it.nfp) || 0);
-            const advanceNote = it.advance && !isAdv
+            const basicNow = (Number(it.basic) || 0) - (Number(it.advance) || 0);
+            // How the figure is reached, as bullets under it:
+            //   • Basic Commission RM 1,144.00
+            //   • Less Advance RM 300.00 on September 2026
+            const advanceNote = it.advance
                 ? `<ul style="margin:4px 0 0; padding-left:16px; text-align:left; font-size:11px; color:var(--text-muted);">
                        <li>Basic Commission ${formatRM(it.basic)}</li>
                        <li>Less Advance ${formatRM(it.advance)} on ${escapeHtml(monthYearOf(it.advance_on))}${it.advance_early ? " (approved early)" : ""}</li>
                    </ul>`
-                : (isAdv && it.advance_option ? `<ul style="margin:4px 0 0; padding-left:16px; text-align:left; font-size:11px; color:var(--text-muted);"><li>Advance payment RM 300.00</li></ul>` : "");
+                : "";
             return `
             <tr>
                 <td>${escapeHtml(it.invoice)}</td>
                 <td>${escapeHtml(entry.customer)}</td>
                 <td>${escapeHtml(resolveAgentName(entry.agent))}</td>
                 <td class="numeric"><strong>${formatRM(basicNow)}</strong>${advanceNote}</td>
-                <td class="numeric"><strong>${nfpNow ? formatRM(nfpNow) : "-"}</strong></td>
-                <td class="numeric">${(it.overrides || []).length && !isAdv
+                <td class="numeric"><strong>${formatRM(it.nfp)}</strong></td>
+                <td class="numeric">${(it.overrides || []).length
                     ? it.overrides.map(o => `<strong>${formatRM(o.amount)}</strong>${muted(escapeHtml(resolveAgentName(o.name)))}`).join("<br>")
                     : "-"}</td>
-                <td class="numeric">${Number(it.referral_fee) && !isAdv
+                <td class="numeric">${Number(it.referral_fee)
                     ? `<strong>${formatRM(it.referral_fee)}</strong>${muted(escapeHtml(it.referral_name))}` : "-"}</td>
                 <td class="numeric"><strong>${escapeHtml(now.paid_pct)}%</strong>${muted(`${formatRM(now.paid)} of ${formatRM(now.total)}`)}</td>
             </tr>`;
@@ -3395,8 +3394,8 @@ modalPackageType.value = defaults.pkg || "-";
                 Advance payable in ${escapeHtml(period)}: <strong>${formatRM(amt)}</strong></p>`;
         } else if (kind === "full" || mode !== "approve") {
             totals = `<p class="status-text" style="margin:12px 0 0;font-size:12px;color:var(--text-muted);">
-                Basic Commission ${formatRM(parts.basic ?? parts.agent)} &middot; Net Floor Price Commission ${formatRM(parts.nfp ?? 0)}
-                &middot; Override ${formatRM(parts.override)} &middot; Referral fee ${formatRM(parts.referral)}</p>
+                Agent commission ${formatRM(parts.agent)} &middot; Override ${formatRM(parts.override)}
+                &middot; Referral fee ${formatRM(parts.referral)}</p>
                 <p class="status-text" style="margin:4px 0 0;font-size:14px;">
                 Total payable in ${escapeHtml(period)}: <strong>${formatRM(parts.total)}</strong></p>`;
         }
@@ -3405,12 +3404,12 @@ modalPackageType.value = defaults.pkg || "-";
         summary.innerHTML = `
             ${choice}
             <div style="overflow-x:auto;">
-            <table class="data-table" style="width:100%;font-size:12px;">
+            ${payoutApprovalTableForKind(payoutApprovalTableHtml, entry, kind) || `<table class="data-table" style="width:100%;font-size:12px;">
                 <thead><tr><th>Invoice</th><th>Customer</th><th>Agent</th><th>Basic Commission</th>
                     <th>Net Floor Price Commission</th><th>Override</th><th>Referral Fee</th>
                     <th>Current Payment</th></tr></thead>
                 <tbody>${itemRows}</tbody>
-            </table></div>
+            </table>`}</div>
             ${payoutApprovalPaymentDetails(entry)}
             ${totals}
             ${status}`;
@@ -5901,7 +5900,11 @@ modalPackageType.value = defaults.pkg || "-";
                             : approvalEntry.approved_later ? `Approved for ${approvalEntry.approved_later}`
                             : approvalEntry.advance_approved_later ? `Advance approved for ${approvalEntry.advance_approved_later}`
                             : "Click to approve this customer's payout";
-                        tr.addEventListener("click", () => {
+                        tr.addEventListener("click", (e) => {
+                            // The Commission and Commission Price cells carry
+                            // the calculation hover; clicking them does not
+                            // open the approval.
+                            if (e.target.closest("td[data-no-approval]")) return;
                             openPayoutApprovalModal(approvalEntry, tr);
                         });
                     }
@@ -5925,6 +5928,11 @@ modalPackageType.value = defaults.pkg || "-";
                     if (colsToMerge.includes(ci) && !cellGrid[ri][ci].visible) continue;
                     if (isGroupFollower && specialCaseMergeCols.includes(ci)) continue;
                     const td = document.createElement("td");
+                    if (specialCaseStageOn() && (ci === commissionIdx || ci === commissionPriceIdx)) {
+                        td.dataset.noApproval = "1";
+                        td.style.cursor = "default";
+                        td.setAttribute("title", "");   // not the row's "Click to approve" tip
+                    }
                     let displayVal = cellGrid[ri][ci] ? cellGrid[ri][ci].value : (cellVal === null || cellVal === undefined ? "-" : String(cellVal));
                     if (payoutStageActive && state.filters.payoutStage === "advance" && ci === commissionPriceIdx) {
                         displayVal = advanceOnlyPrice(row, displayVal);
@@ -6103,7 +6111,7 @@ modalPackageType.value = defaults.pkg || "-";
                     // carries the override and always reads "-". Rows where he earns
                     // nothing (his own invoices, internal agents) show "-" too and are
                     // left alone rather than offering an edit that changes nothing.
-                    if (state.activeSection === "basic_nfp" && !isTotalRow && !specialCaseStageOn()
+                    if (state.activeSection === "basic_nfp" && !isTotalRow
                         && ganColIdx !== -1 && ci === ganColIdx
                         && String(row[ci] || "").trim() !== "-"
                         && String(rowCommType).toLowerCase().includes("basic")
@@ -6145,7 +6153,7 @@ modalPackageType.value = defaults.pkg || "-";
                     // "EV package" stands where a net floor price would be, and
                     // opens the same Special Case editor the commission cells
                     // do -- that is where an EV job's floor price is entered.
-                    if (state.activeSection === "basic_nfp" && !isTotalRow && !specialCaseStageOn()
+                    if (state.activeSection === "basic_nfp" && !isTotalRow
                         && String(displayVal).trim() === "EV package"
                         && userObj && !userObj.readOnly) {
                         td.style.cursor = "pointer";
@@ -6183,7 +6191,7 @@ modalPackageType.value = defaults.pkg || "-";
                             }
 
                             // nfpHandedToNewRow: edit it from the New NFP row instead.
-                            if (!isFactoryCell && !nfpHandedToNewRow && !specialCaseStageOn() && userObj && !userObj.readOnly) {
+                            if (!isFactoryCell && !nfpHandedToNewRow && userObj && !userObj.readOnly) {
                                 td.style.cursor = "pointer";
                                 td.classList.add("clickable-special-case");
                                 td.addEventListener("click", () => {

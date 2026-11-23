@@ -3040,51 +3040,60 @@ def _build_special_case_stage(headers: list, basic_lines, nfp_by_inv_all: dict,
             # the real one, which wins when it came first).
             "advance_early": bool(advance) and getattr(ln, "_advance_approved", None) is not None,
         })
-        # On Payout Stage = Special Case: show 1 row per customer/invoice
-        # (remove separate Net Floor Price row from the table; both Basic Commission
-        # and Net Floor Price are displayed and decided on the approval popup).
-        for kind in ("Basic Commission",):
+        for kind in ("Basic Commission", "Net Floor Price Commission"):
             row = ["-"] * len(headers)
 
             def put(key, value):
                 if cols[key] != -1:
                     row[cols[key]] = value
 
+            # Shaped like the month's own rows: the agent only on the first row
+            # of their block, the customer on both of its rows. The page groups
+            # a customer's rows by that cell, so a blank one on the NFP row
+            # split it from its Basic row and threw every merged cell out.
             put("agent", agent_title if agent_title != last_agent else "")
             last_agent = agent_title
             put("customer", customer_title)
-            # For an invoice whose deposit has not yet achieved the advance
-            # trigger (< 4.4%), Commission Price displays the advance amount
-            # first (RM 300.00). If advance was approved in this month, show
-            # the advance. Otherwise, show the balance (basic_full - advance).
-            if advance_option > 0:
-                put("price", rm(advance_option))
-            elif adv_for == this_month:
-                put("price", rm(min(basic_full, build_commission_pack._line_advance_amount(ln))))
+            if kind == "Basic Commission":
+                # For an invoice whose deposit has not yet achieved the advance
+                # trigger (< 4.4%), Commission Price displays the advance amount
+                # first (RM 300.00). If advance was approved in this month, show
+                # the advance. Otherwise, show the balance (basic_full - advance).
+                if advance_option > 0:
+                    put("price", rm(advance_option))
+                elif adv_for == this_month:
+                    put("price", rm(min(basic_full, build_commission_pack._line_advance_amount(ln))))
+                else:
+                    put("price", rm(basic_full - advance))
+                put("rate", build_commission_pack._basic_line_rate_label(ln) or "-")
+                put("adv_deducted", f"{advance:,.2f}" if advance else "-")
+                # Payment at for the Advance stage: the date the payment that
+                # reached the trigger carries (Created at comes from the policy).
+                put("adv_date", str(getattr(ln, "pct5_date", "") or "")[:10] if advance else "-")
+                put("rm300", "invoice before july" if not multi
+                    else ("-" if advance else "pending"))
+                # Override, Safwan, Gan Lai Soon and referral sit on the Basic
+                # row only, as on the month rows.
+                put("override", build_commission_pack.format_other_commission_for_customer(
+                    line_overrides(ln)))
+                if not is_out:
+                    put("safwan", rm(safwan_by_inv.get(inv, 0.0)))
+                else:
+                    # An outsource row shows Safwan's factory cut in its own
+                    # column as well as under OVERRIDE, as the month rows do.
+                    put("safwan", rm(getattr(ln, "safwan_override", 0) or 0))
+                    put("gan", rm(getattr(ln, "gan_lai_soon", 0) or 0))
+                put("ref_name", ref_name)
+                put("ref_fee", rm(ref_fee))
             else:
-                put("price", rm(basic_full - advance))
-            put("rate", build_commission_pack._basic_line_rate_label(ln) or "-")
-            put("adv_deducted", f"{advance:,.2f}" if advance else "-")
-            # Payment at for the Advance stage: the date the payment that
-            # reached the trigger carries (Created at comes from the policy).
-            put("adv_date", str(getattr(ln, "pct5_date", "") or "")[:10] if advance else "-")
-            put("rm300", "invoice before july" if not multi
-                else ("-" if advance else "pending"))
-            # Override, Safwan, Gan Lai Soon and referral sit on the Basic
-            # row only, as on the month rows.
-            put("override", build_commission_pack.format_other_commission_for_customer(
-                line_overrides(ln)))
-            if not is_out:
-                put("safwan", rm(safwan_by_inv.get(inv, 0.0)))
-            else:
-                # An outsource row shows Safwan's factory cut in its own
-                # column as well as under OVERRIDE, as the month rows do.
-                put("safwan", rm(getattr(ln, "safwan_override", 0) or 0))
-                put("gan", rm(getattr(ln, "gan_lai_soon", 0) or 0))
-            put("ref_name", ref_name)
-            put("ref_fee", rm(ref_fee))
+                if advance_option > 0 or adv_for == this_month:
+                    put("price", "-")
+                else:
+                    put("price", rm(getattr(nfp_row, "nfp_commission", 0) if nfp_row else 0))
             put("inv_date", str(ln.invoice_date or "")[:10] or "-")
             put("first_pay", str(ln.first_payment_date or "")[:10] or "-")
+            if kind != "Basic Commission":
+                put("rm300", "-")
             put("milestone", "pending")
             put("pkg", str(getattr(ln, "package", "") or "-"))
             put("system", rm(total))
