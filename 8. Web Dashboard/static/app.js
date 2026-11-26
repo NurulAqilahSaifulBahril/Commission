@@ -9666,10 +9666,31 @@ modalPackageType.value = defaults.pkg || "-";
         document.getElementById("slipMonthLabel").textContent = `${getMonthName(state.activeMonth)} ${state.activeYear}`;
         document.getElementById("slipCurrentDate").textContent = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: '2-digit' });
 
+        // The slip pays what the Payout Stage filter pays (user, 2026-11-26):
+        // the same rows and amounts as the table, and it prints the stage so
+        // a printed Advance slip cannot pass for the whole month. Other
+        // Commission and referral fees are paid with the balance only.
+        const stageAvailable = state.activeSection === "basic_nfp" && parseInt(state.activeMonth) >= 7;
+        const stage = stageAvailable ? (state.filters.payoutStage || "all") : "all";
+        const stageLabels = { advance: "Advance RM300", balance: "Balance Payout", special_case: "Special Case" };
+        // The stage goes in both titles (screen header and printed slip),
+        // e.g. "Monthly Commission Slip — Advance RM300".
+        const stageSuffix = stageLabels[stage] ? ` — ${stageLabels[stage]}` : "";
+        const modalTitleEl = document.getElementById("slipModalTitle");
+        if (modalTitleEl) modalTitleEl.textContent = `Monthly Commission Slip${stageSuffix}`;
+        const docTitleEl = document.getElementById("slipDocTitle");
+        if (docTitleEl) docTitleEl.textContent = `MONTHLY COMMISSION SLIP${stageSuffix.toUpperCase()}`;
+        // An Advance slip has no referral or Other Commission columns at all.
+        const slipItemsTable = document.getElementById("slipItemsTable");
+        if (slipItemsTable) slipItemsTable.classList.toggle("slip-no-extras", stage === "advance");
+        // ...and calls the price the advance is paid on its Commission Price.
+        const salesPriceHead = document.getElementById("slipSalesPriceHead");
+        if (salesPriceHead) salesPriceHead.textContent = stage === "advance" ? "Commission Price" : "Sales Price";
+
         const tableBody = document.getElementById("slipItemsTableBody");
         tableBody.innerHTML = "";
 
-        const section = state.rawData?.sections?.basic_nfp;
+        const section = stage === "special_case" ? basicNfpSectionInView() : state.rawData?.sections?.basic_nfp;
         if (!section || !section.rows || !section.headers) {
             tableBody.innerHTML = `<tr><td colspan="11" style="text-align:center; padding:20px; color:#64748b;">No data loaded for ${escapeHtml(resolvedName)}.</td></tr>`;
             return;
@@ -9690,6 +9711,17 @@ modalPackageType.value = defaults.pkg || "-";
         const refFeeIdx = headers.findIndex(h => h.toLowerCase().includes("referral fee"));
         const otherCommIdx = headers.findIndex(h => h.toLowerCase().includes("other comm") || h.toLowerCase().trim() === "override");
         const advanceIdx = headers.findIndex(h => h.toLowerCase().includes("rm300") || h.toLowerCase().includes("basic commission (rm"));
+
+        // Same classification and amounts as the table and total cards.
+        const stageIdx = payoutStageIndexes(headers);
+        const stageFilters = stage === "advance" || stage === "balance";
+        const rowInStage = (r) => !stageFilters || rowPassesPayoutStage(r, stageIdx, stage);
+        const stageAmount = (r, full) => {
+            if (stage === "advance") return advanceCappedValue(r, stageIdx, full);
+            if (stage === "balance") return balanceRemainderValue(r, stageIdx, full);
+            return full;
+        };
+        const paysExtras = stage !== "advance";
 
         const parseVal = (v) => {
             if (!v || v === "-") return 0;
@@ -9721,11 +9753,14 @@ modalPackageType.value = defaults.pkg || "-";
         // is by definition written on somebody else's invoice.
         const slipOverrideCols = overrideColumnsByAgent(headers);
         const otherCommCredits = [];
-        if (otherCommIdx !== -1 || slipOverrideCols.length) {
+        if (paysExtras && (otherCommIdx !== -1 || slipOverrideCols.length)) {
             let rowAgent = "";
             section.rows.forEach(r => {
                 const a = agentIdx !== -1 && r[agentIdx] ? String(r[agentIdx]).trim() : "";
                 if (a && !a.toLowerCase().includes("total") && !a.toLowerCase().includes("summary")) rowAgent = a;
+                // Under Balance Payout only invoices paying their balance this
+                // month carry an override, as in the summary's Other column.
+                if (!rowInStage(r)) return;
                 const cust = custIdx !== -1 && r[custIdx] ? String(r[custIdx]).trim() : "";
                 const custLower = cust.toLowerCase();
                 if (!cust || custLower.includes("total") || custLower.includes("summary")) return;
@@ -9768,15 +9803,30 @@ modalPackageType.value = defaults.pkg || "-";
         }
 
         customerGroups.forEach((rows, customerName) => {
-            let basicRow = rows.find(r => commIdx !== -1 && String(r[commIdx]).toLowerCase().includes("basic")) || rows[0];
+            const realBasicRow = rows.find(r => commIdx !== -1 && String(r[commIdx]).toLowerCase().includes("basic"));
+            let basicRow = realBasicRow || rows[0];
             let nfpRow = rows.find(r => commIdx !== -1 && String(r[commIdx]).toLowerCase().includes("net floor"));
+
+            // Under a stage, each commission line is paid only if its row is
+            // in that stage. NFP is never advanced.
+            const basicPays = !stageFilters || (!!realBasicRow && rowInStage(realBasicRow));
+            if (stageFilters && nfpRow && (stage === "advance" || !rowInStage(nfpRow))) nfpRow = undefined;
+
+            // Only what this customer's invoice credits to THIS agent. An
+            // amount on their row naming someone else is that person's.
+            const otherCommVal = otherCommCredits
+                .filter(c => c.customer === customerName && cleanAgent(c.fromAgent) === targetClean)
+                .reduce((sum, c) => sum + c.amount, 0);
+
+            if (!basicPays && !nfpRow && !otherCommVal) return;
 
             const sysPrice = sysIdx !== -1 ? parseVal(basicRow[sysIdx]) : 0;
             const salesPrice = salesIdx !== -1 ? parseVal(basicRow[salesIdx]) : 0;
-            const basicCommVal = priceIdx !== -1 ? parseVal(basicRow[priceIdx]) : 0;
+            const basicCommFull = priceIdx !== -1 ? parseVal(basicRow[priceIdx]) : 0;
+            const basicCommVal = basicPays ? stageAmount(basicRow, basicCommFull) : 0;
             const pkg = pkgIdx !== -1 ? String(basicRow[pkgIdx] || "").trim() : "";
-            
-            let basicRate = salesPrice > 0 ? ((basicCommVal / salesPrice) * 100) : getDefaultBasicRateForPackage(pkg, agentName);
+
+            let basicRate = salesPrice > 0 ? ((basicCommFull / salesPrice) * 100) : getDefaultBasicRateForPackage(pkg, agentName);
             if (isNaN(basicRate)) basicRate = 3.0;
 
             // The RM 300 advance is a flat tranche, not a percentage of the
@@ -9786,22 +9836,23 @@ modalPackageType.value = defaults.pkg || "-";
             // the advance -- its commission amount matches the Basic
             // Commission (RM300) cell -- the rate column stays blank.
             const advanceVal = advanceIdx !== -1 ? parseVal(basicRow[advanceIdx]) : 0;
-            const isAdvanceLine = advanceVal > 0 && basicCommVal > 0
-                && Math.abs(advanceVal - basicCommVal) < 0.005;
+            const isAdvanceLine = stage === "advance" || (stage === "all" && advanceVal > 0 && basicCommVal > 0
+                && Math.abs(advanceVal - basicCommVal) < 0.005);
+            // A balance that is less than the full commission is what is left
+            // after an advance paid this month.
+            const isBalanceRemainder = stage === "balance" && Math.abs(basicCommVal - basicCommFull) >= 0.005;
+            const basicLabel = !basicPays ? "-" : isAdvanceLine ? "Advance" : isBalanceRemainder ? "Balance" : "Basic";
 
             const remarks = remarksIdx !== -1 && basicRow[remarksIdx] ? String(basicRow[remarksIdx]).trim() : "";
             if (remarks && remarks !== "-") {
                 notesList.push(`Item No. ${itemNo} - ${remarks}`);
             }
 
-            const refPerson = refPersonIdx !== -1 && basicRow[refPersonIdx] ? String(basicRow[refPersonIdx]).trim() : "-";
-            const refRate = refRateIdx !== -1 ? parseVal(basicRow[refRateIdx]) : 0;
-            const refFee = refFeeIdx !== -1 ? parseVal(basicRow[refFeeIdx]) : 0;
-            // Only what this customer's invoice credits to THIS agent. An
-            // amount on their row naming someone else is that person's.
-            const otherCommVal = otherCommCredits
-                .filter(c => c.customer === customerName && cleanAgent(c.fromAgent) === targetClean)
-                .reduce((sum, c) => sum + c.amount, 0);
+            // Referral is paid with the balance, so an Advance slip leaves it out.
+            const showRef = paysExtras && basicPays;
+            const refPerson = showRef && refPersonIdx !== -1 && basicRow[refPersonIdx] ? String(basicRow[refPersonIdx]).trim() : "-";
+            const refRate = showRef && refRateIdx !== -1 ? parseVal(basicRow[refRateIdx]) : 0;
+            const refFee = showRef && refFeeIdx !== -1 ? parseVal(basicRow[refFeeIdx]) : 0;
 
             totalCommSum += basicCommVal + otherCommVal;
 
@@ -9811,9 +9862,9 @@ modalPackageType.value = defaults.pkg || "-";
                 <td><b>${escapeHtml(customerName)}</b></td>
                 <td class="numeric">${sysPrice > 0 ? formatRM(sysPrice) : "-"}</td>
                 <td class="numeric">${salesPrice > 0 ? formatRM(salesPrice) : "-"}</td>
-                <td style="text-align: center;">${isAdvanceLine ? "Advance" : "Basic"}</td>
-                <td style="text-align: center;">${isAdvanceLine ? "-" : basicRate.toFixed(2) + "%"}</td>
-                <td class="numeric" style="font-weight: 700;">${formatRM(basicCommVal)}</td>
+                <td style="text-align: center;">${basicLabel}</td>
+                <td style="text-align: center;">${!basicPays || isAdvanceLine ? "-" : basicRate.toFixed(2) + "%"}</td>
+                <td class="numeric" style="font-weight: 700;">${basicPays ? formatRM(basicCommVal) : "-"}</td>
                 <td style="text-align: center;">${escapeHtml(refPerson)}</td>
                 <td style="text-align: center;">${refRate > 0 ? refRate.toFixed(1) + "%" : "-"}</td>
                 <td class="numeric">${refFee > 0 ? formatRM(refFee) : "-"}</td>
@@ -9879,6 +9930,11 @@ modalPackageType.value = defaults.pkg || "-";
             tableBody.appendChild(tr);
             itemNo++;
         });
+
+        if (itemNo === 1) {
+            const stageText = stageLabels[stage] ? ` under ${stageLabels[stage]}` : "";
+            tableBody.innerHTML = `<tr><td colspan="11" style="text-align:center; padding:20px; color:#64748b; font-style:italic;">Nothing payable for ${escapeHtml(resolvedName)}${escapeHtml(stageText)} in ${getMonthName(state.activeMonth)} ${state.activeYear}.</td></tr>`;
+        }
 
         const notesContent = document.getElementById("slipNotesContent");
         if (notesContent) {

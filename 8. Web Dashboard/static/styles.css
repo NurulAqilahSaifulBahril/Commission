@@ -2039,6 +2039,19 @@ body {
     font-family: 'JetBrains Mono', 'Courier New', monospace;
 }
 
+/* Advance RM 300 slip: referral and Other Commission are paid with the
+   balance, so their four columns (8-11) are dropped, and the advance is a
+   flat amount, so Commission Rate % (6) goes too, as does System Price (3).
+   A full-width message row is a single cell, so it is unaffected. */
+.slip-table.slip-no-extras th:nth-child(3),
+.slip-table.slip-no-extras td:nth-child(3),
+.slip-table.slip-no-extras th:nth-child(6),
+.slip-table.slip-no-extras td:nth-child(6),
+.slip-table.slip-no-extras th:nth-child(n+8),
+.slip-table.slip-no-extras td:nth-child(n+8) {
+    display: none;
+}
+
 .slip-summary-footer {
     display: flex;
     justify-content: space-between;
