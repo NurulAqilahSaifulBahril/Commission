@@ -9014,8 +9014,8 @@ def _role_matches_agent(row: dict, agent: str) -> bool:
 @app.route("/api/slip-notes", methods=["GET", "POST"])
 @login_required
 def slip_notes_api():
-    """Notes typed on the Monthly Commission Slip, saved per agent, month and
-    Payout Stage. They show on that slip only -- the Basic & NFP table's
+    """Notes and the date typed on the Monthly Commission Slip, saved per
+    agent, month and Payout Stage. They show on that slip only -- the Basic & NFP table's
     Remarks and the packs never read them -- so no cache needs clearing.
     """
     if request.method == "GET":
@@ -9035,8 +9035,12 @@ def slip_notes_api():
         return jsonify({"error": "Admin access required"}), 403
     body = request.json or {}
     try:
+        # Only the fields sent change: the notes box and the date save apart.
+        fields = {k: body[k] for k in ("notes", "slip_date") if k in body}
+        if not fields:
+            return jsonify({"error": "Nothing to save"}), 400
         saved = db.save_slip_notes(body.get("year"), body.get("month"), body.get("agent"),
-                                   body.get("stage"), body.get("notes"), user["username"])
+                                   body.get("stage"), user["username"], **fields)
         return jsonify({"status": "success", "saved": saved})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400

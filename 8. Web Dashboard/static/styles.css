@@ -2212,9 +2212,13 @@ body {
 }
 
 @media print {
+    /* Zero page margin: the browser prints its header and footer (date,
+       page title, URL, page number) inside the page margin, so with none
+       there is nowhere to put them. The white space moves into the slip
+       itself (.slip-document-container below). */
     @page {
         size: A4;
-        margin: 14mm 12mm;
+        margin: 0;
     }
 
     /* Never print the edit affordance or its save feedback. */
@@ -2275,9 +2279,28 @@ body {
     }
 
     .slip-document-container {
-        padding: 0 !important;
+        /* The page margin @page no longer gives, repeated on every page. */
+        padding: 14mm 12mm !important;
+        -webkit-box-decoration-break: clone;
+        box-decoration-break: clone;
         margin: 0 !important;
         width: 100% !important;
+        box-sizing: border-box !important;
+    }
+
+    /* Every word in the slip's tables prints black: headers, line items
+       (including red negative NFP amounts) and the totals, Deduction and
+       Amount Payable cells. */
+    .slip-table,
+    .slip-table *,
+    .slip-totals-table,
+    .slip-totals-table * {
+        color: #000000 !important;
+    }
+    /* The Amount Payable label is white-on-navy on screen; black text needs
+       a light fill to stay readable when background graphics print. */
+    .slip-totals-table td.label-cell {
+        background-color: #e2e8f0 !important;
     }
 
     /* Keep table rows and the totals block from splitting across a page break. */

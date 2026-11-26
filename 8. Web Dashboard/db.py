@@ -551,6 +551,9 @@ def init_db() -> None:
             -- Columns added after the tables above first shipped. Postgres's
             -- IF NOT EXISTS makes these safe to re-run every startup, unlike
             -- the PRAGMA table_info() dance SQLite needed.
+            -- The date printed on the slip, typed over today's date (blank = today).
+            ALTER TABLE slip_notes ADD COLUMN IF NOT EXISTS slip_date TEXT;
+
             ALTER TABLE basic_rates ADD COLUMN IF NOT EXISTS rate_type TEXT NOT NULL DEFAULT 'Basic Commission';
             ALTER TABLE basic_rates ADD COLUMN IF NOT EXISTS agent TEXT;
             ALTER TABLE basic_rates ADD COLUMN IF NOT EXISTS condition TEXT;
@@ -983,35 +986,48 @@ def _slip_notes_key(year: str, month: str, agent: str, stage: str) -> tuple[str,
 
 
 def get_slip_notes(year: str, month: str, agent: str, stage: str) -> dict[str, Any] | None:
-    """The notes saved on one agent's slip for one month and Payout Stage, or
-    None when the slip still shows the notes built from Remarks."""
+    """What was typed on one agent's slip for one month and Payout Stage --
+    notes (blank = the notes built from Remarks) and slip_date (blank =
+    today) -- or None when nothing was."""
     year, month, agent, stage = _slip_notes_key(year, month, agent, stage)
     with _connect() as conn:
         row = conn.execute(
-            """SELECT notes, updated_by, updated_at FROM slip_notes
+            """SELECT notes, slip_date, updated_by, updated_at FROM slip_notes
                 WHERE year = %s AND month = %s AND agent = %s AND stage = %s""",
             (year, month, agent, stage),
         ).fetchone()
     return dict(row) if row else None
 
 
-def save_slip_notes(year: str, month: str, agent: str, stage: str,
-                    notes: str, username: str) -> dict[str, Any] | None:
-    """Save the notes typed on a slip. Blank notes delete the entry, so the
-    slip goes back to the notes built from Remarks."""
+_UNCHANGED = object()
+
+
+def save_slip_notes(year: str, month: str, agent: str, stage: str, username: str,
+                    notes: Any = _UNCHANGED, slip_date: Any = _UNCHANGED) -> dict[str, Any] | None:
+    """Save what was typed on a slip. Only the fields passed change, so the
+    notes and the date save independently. A blank field goes back to its
+    default (Remarks notes, today's date); when both are blank the entry is
+    deleted."""
     year, month, agent, stage = _slip_notes_key(year, month, agent, stage)
-    notes = str(notes or "").replace("\r\n", "\n").strip()
     now = _now()
+    key = (year, month, agent, stage)
     with _lock, _connect() as conn:
         existing = conn.execute(
-            """SELECT notes FROM slip_notes
+            """SELECT notes, slip_date FROM slip_notes
                 WHERE year = %s AND month = %s AND agent = %s AND stage = %s""",
-            (year, month, agent, stage),
+            key,
         ).fetchone()
-        before = existing["notes"] if existing else None
-        key = (year, month, agent, stage)
+        before = ({"notes": existing["notes"] or "", "slip_date": existing["slip_date"] or ""}
+                  if existing else None)
+        after = dict(before or {"notes": "", "slip_date": ""})
+        if notes is not _UNCHANGED:
+            after["notes"] = str(notes or "").replace("\r\n", "\n").strip()
+        if slip_date is not _UNCHANGED:
+            after["slip_date"] = str(slip_date or "").strip()
+        if not after["notes"] and not after["slip_date"]:
+            after = None
 
-        if not notes:
+        if after is None:
             action = "delete"
             conn.execute(
                 """DELETE FROM slip_notes
@@ -1021,20 +1037,19 @@ def save_slip_notes(year: str, month: str, agent: str, stage: str,
         elif existing:
             action = "update"
             conn.execute(
-                """UPDATE slip_notes SET notes = %s, updated_by = %s, updated_at = %s
+                """UPDATE slip_notes SET notes = %s, slip_date = %s, updated_by = %s, updated_at = %s
                     WHERE year = %s AND month = %s AND agent = %s AND stage = %s""",
-                (notes, username, now) + key,
+                (after["notes"], after["slip_date"], username, now) + key,
             )
         else:
             action = "create"
             conn.execute(
                 """INSERT INTO slip_notes
-                   (year, month, agent, stage, notes,
+                   (year, month, agent, stage, notes, slip_date,
                     created_by, created_at, updated_by, updated_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                key + (notes, username, now, username, now),
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                key + (after["notes"], after["slip_date"], username, now, username, now),
             )
-        after = notes or None
 
         if before != after:
             conn.execute(
@@ -1045,7 +1060,7 @@ def save_slip_notes(year: str, month: str, agent: str, stage: str,
                 (username, action, f"{agent} / {year}-{int(month):02d} / {stage}",
                  json.dumps(before), json.dumps(after), now),
             )
-    return {"notes": notes, "updated_by": username, "updated_at": now} if notes else None
+    return dict(after, updated_by=username, updated_at=now) if after else None
 
 
 def list_payout_approvals(agent_type: str | None = None) -> list[dict[str, Any]]:

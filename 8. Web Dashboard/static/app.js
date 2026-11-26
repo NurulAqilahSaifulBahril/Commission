@@ -9664,7 +9664,10 @@ modalPackageType.value = defaults.pkg || "-";
             })
             .catch(() => {});
         document.getElementById("slipMonthLabel").textContent = `${getMonthName(state.activeMonth)} ${state.activeYear}`;
-        document.getElementById("slipCurrentDate").textContent = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: '2-digit' });
+        // Today's date until a typed date is loaded for this slip.
+        slipNotesState.todayText = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: '2-digit' });
+        slipNotesState.dateSaved = false;
+        renderSlipDate("");
 
         // The slip pays what the Payout Stage filter pays (user, 2026-11-26):
         // the same rows and amounts as the table, and it prints the stage so
@@ -9701,6 +9704,9 @@ modalPackageType.value = defaults.pkg || "-";
             staleNotes.dataset.saved = "";
             staleNotes.removeAttribute("contenteditable");
         }
+        const staleDate = document.getElementById("slipCurrentDate");
+        if (staleDate) staleDate.removeAttribute("contenteditable");
+        setSlipDateStatus("", "");
 
         const section = stage === "special_case" ? basicNfpSectionInView() : state.rawData?.sections?.basic_nfp;
         if (!section || !section.rows || !section.headers) {
@@ -9961,7 +9967,73 @@ modalPackageType.value = defaults.pkg || "-";
         slipNotesState.hasSaved = false;
         renderSlipNotes(notesList);
         setupSlipNotesEditing();
+        setupSlipDateEditing();
         loadSavedSlipNotes();
+    }
+
+    // -------------------------------------------------------------
+    // Editable slip date: saved with the slip's notes (same agent, month and
+    // Payout Stage). Blank, or today's date typed back, returns to today.
+    // -------------------------------------------------------------
+    function renderSlipDate(savedText) {
+        const el = document.getElementById("slipCurrentDate");
+        if (!el) return;
+        el.textContent = savedText || slipNotesState.todayText || "-";
+        el.dataset.saved = el.textContent;
+    }
+
+    function setSlipDateStatus(msg, cls) {
+        const el = document.getElementById("slipDateStatus");
+        if (!el) return;
+        el.textContent = msg;
+        el.className = "slip-ic-status" + (cls ? " " + cls : "");
+    }
+
+    async function saveSlipDate(text) {
+        const key = slipNotesState.key;
+        if (!key) return;
+        const value = (!text || text === slipNotesState.todayText) ? "" : text;
+        if (!value && !slipNotesState.dateSaved) { renderSlipDate(""); return; }
+        setSlipDateStatus("Saving…", "");
+        try {
+            const res = await fetch("/api/slip-notes", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ ...key, slip_date: value })
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(body.error || "Save failed");
+            slipNotesState.dateSaved = !!value;
+            renderSlipDate(value);
+            setSlipDateStatus(value ? "Saved" : "Back to today", "ok");
+            setTimeout(() => setSlipDateStatus("", ""), 2500);
+        } catch (err) {
+            setSlipDateStatus(err.message || "Save failed", "err");
+        }
+    }
+
+    function setupSlipDateEditing() {
+        const el = document.getElementById("slipCurrentDate");
+        if (!el) return;
+        setSlipDateStatus("", "");
+        if (!state.isAdmin || !slipNotesState.key) {
+            el.removeAttribute("contenteditable");
+            el.title = "";
+            return;
+        }
+        el.setAttribute("contenteditable", "true");
+        el.title = "Click to edit the date — saves when you click away. Clear it to go back to today.";
+        if (el.dataset.bound) return;
+        el.dataset.bound = "true";
+        el.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { e.preventDefault(); el.blur(); }
+            if (e.key === "Escape") { el.textContent = el.dataset.saved || ""; el.blur(); }
+        });
+        el.addEventListener("blur", () => {
+            const text = el.textContent.replace(/\s+/g, " ").trim();
+            if (text === (el.dataset.saved || "")) { el.textContent = text; return; }
+            saveSlipDate(text);
+        });
     }
 
     // -------------------------------------------------------------
@@ -10014,6 +10086,10 @@ modalPackageType.value = defaults.pkg || "-";
             const res = await fetch("/api/slip-notes?" + new URLSearchParams(key).toString());
             const body = await res.json().catch(() => ({}));
             if (token !== slipNotesState.token || !res.ok) return;
+            if (body.saved && body.saved.slip_date) {
+                slipNotesState.dateSaved = true;
+                renderSlipDate(body.saved.slip_date);
+            }
             if (body.saved && body.saved.notes) {
                 slipNotesState.hasSaved = true;
                 renderSlipNotes(slipNotesLines(body.saved.notes));
