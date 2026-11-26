@@ -9011,6 +9011,40 @@ def _role_matches_agent(row: dict, agent: str) -> bool:
     return False
 
 
+@app.route("/api/slip-notes", methods=["GET", "POST"])
+@login_required
+def slip_notes_api():
+    """Notes typed on the Monthly Commission Slip, saved per agent, month and
+    Payout Stage. They show on that slip only -- the Basic & NFP table's
+    Remarks and the packs never read them -- so no cache needs clearing.
+    """
+    if request.method == "GET":
+        args = request.args
+        try:
+            saved = db.get_slip_notes(args.get("year"), args.get("month"),
+                                      args.get("agent"), args.get("stage"))
+            return jsonify({"saved": saved})
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:
+            _log("[SLIP NOTES READ ERROR]\n" + traceback.format_exc())
+            return jsonify({"error": str(e)}), 500
+
+    user = auth.current_user()
+    if user["role"] != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    body = request.json or {}
+    try:
+        saved = db.save_slip_notes(body.get("year"), body.get("month"), body.get("agent"),
+                                   body.get("stage"), body.get("notes"), user["username"])
+        return jsonify({"status": "success", "saved": saved})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        _log("[SLIP NOTES SAVE ERROR]\n" + traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/agent-ic", methods=["POST"])
 @login_required
 def agent_ic_api():

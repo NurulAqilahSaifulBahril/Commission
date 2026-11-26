@@ -9689,6 +9689,18 @@ modalPackageType.value = defaults.pkg || "-";
 
         const tableBody = document.getElementById("slipItemsTableBody");
         tableBody.innerHTML = "";
+        // Cleared up front so an early return never shows the last agent's.
+        const staleDeductionRow = document.getElementById("slipDeductionRow");
+        if (staleDeductionRow) staleDeductionRow.style.display = "none";
+        slipNotesState.key = null;
+        slipNotesState.token++;
+        setSlipNotesStatus("", "");
+        const staleNotes = document.getElementById("slipNotesContent");
+        if (staleNotes) {
+            staleNotes.textContent = "No special notes for this period.";
+            staleNotes.dataset.saved = "";
+            staleNotes.removeAttribute("contenteditable");
+        }
 
         const section = stage === "special_case" ? basicNfpSectionInView() : state.rawData?.sections?.basic_nfp;
         if (!section || !section.rows || !section.headers) {
@@ -9936,15 +9948,148 @@ modalPackageType.value = defaults.pkg || "-";
             tableBody.innerHTML = `<tr><td colspan="11" style="text-align:center; padding:20px; color:#64748b; font-style:italic;">Nothing payable for ${escapeHtml(resolvedName)}${escapeHtml(stageText)} in ${getMonthName(state.activeMonth)} ${state.activeYear}.</td></tr>`;
         }
 
-        const notesContent = document.getElementById("slipNotesContent");
-        if (notesContent) {
-            notesContent.innerHTML = notesList.length > 0
-                ? notesList.map(n => `<div>${escapeHtml(n)}</div>`).join("")
-                : "No special notes for this period.";
-        }
-
         document.getElementById("slipTotalComm").textContent = formatRM(totalCommSum);
-        document.getElementById("slipAmountPayable").textContent = formatRM(totalCommSum);
+
+        // Notes start as the ones built from Remarks; notes an admin typed on
+        // this slip (same agent, month and stage) replace them once loaded.
+        slipNotesState.key = {
+            year: String(state.activeYear), month: String(state.activeMonth),
+            agent: resolvedName, stage
+        };
+        slipNotesState.builtLines = notesList.slice();
+        slipNotesState.total = totalCommSum;
+        slipNotesState.hasSaved = false;
+        renderSlipNotes(notesList);
+        setupSlipNotesEditing();
+        loadSavedSlipNotes();
+    }
+
+    // -------------------------------------------------------------
+    // Editable slip notes. Saved per agent + month + Payout Stage in the
+    // slip_notes table and shown on the slip only -- the table's Remarks are
+    // never changed. Clearing the box goes back to the notes from Remarks.
+    // -------------------------------------------------------------
+    const slipNotesState = { key: null, builtLines: [], total: 0, hasSaved: false, token: 0 };
+
+    function slipNotesLines(text) {
+        return String(text || "").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    }
+
+    function setSlipNotesStatus(msg, cls) {
+        const el = document.getElementById("slipNotesStatus");
+        if (!el) return;
+        el.textContent = msg;
+        el.className = "slip-ic-status" + (cls ? " " + cls : "");
+    }
+
+    // A Notes line that mentions a deduction carries its amount, e.g.
+    // "Deduction RM 200 (panel damage)": those amounts go in a Deduction row
+    // under the total and come off Amount Payable.
+    function applySlipDeduction(lines) {
+        const deductionSum = lines.reduce((sum, note) => sum + slipDeductionAmount(note), 0);
+        const deductionRow = document.getElementById("slipDeductionRow");
+        if (deductionRow) deductionRow.style.display = deductionSum > 0 ? "" : "none";
+        const deductionEl = document.getElementById("slipDeduction");
+        if (deductionEl) deductionEl.textContent = `- ${formatRM(deductionSum)}`;
+        const payableEl = document.getElementById("slipAmountPayable");
+        if (payableEl) payableEl.textContent = formatRM(slipNotesState.total - deductionSum);
+    }
+
+    function renderSlipNotes(lines) {
+        const el = document.getElementById("slipNotesContent");
+        if (el) {
+            el.innerHTML = lines.length > 0
+                ? lines.map(n => `<div>${escapeHtml(n)}</div>`).join("")
+                : "No special notes for this period.";
+            el.dataset.saved = lines.join("\n");
+        }
+        applySlipDeduction(lines);
+    }
+
+    async function loadSavedSlipNotes() {
+        const key = slipNotesState.key;
+        const token = ++slipNotesState.token;
+        setSlipNotesStatus("", "");
+        try {
+            const res = await fetch("/api/slip-notes?" + new URLSearchParams(key).toString());
+            const body = await res.json().catch(() => ({}));
+            if (token !== slipNotesState.token || !res.ok) return;
+            if (body.saved && body.saved.notes) {
+                slipNotesState.hasSaved = true;
+                renderSlipNotes(slipNotesLines(body.saved.notes));
+                setSlipNotesStatus("Edited", "");
+            }
+        } catch (_) { /* the Remarks notes stay */ }
+    }
+
+    async function saveSlipNotes(lines) {
+        const key = slipNotesState.key;
+        if (!key) return;
+        // Typing the Remarks notes back, or clearing the box, removes the
+        // saved notes so the slip follows Remarks again.
+        const same = lines.join("\n") === slipNotesState.builtLines.join("\n");
+        const notes = (!lines.length || same) ? "" : lines.join("\n");
+        if (!notes && !slipNotesState.hasSaved) { renderSlipNotes(lines.length ? lines : slipNotesState.builtLines); return; }
+        setSlipNotesStatus("Saving…", "");
+        try {
+            const res = await fetch("/api/slip-notes", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ ...key, notes })
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(body.error || "Save failed");
+            slipNotesState.hasSaved = !!notes;
+            renderSlipNotes(notes ? lines : slipNotesState.builtLines);
+            setSlipNotesStatus(notes ? "Saved" : "Back to Remarks", "ok");
+            setTimeout(() => setSlipNotesStatus(slipNotesState.hasSaved ? "Edited" : "", ""), 2500);
+        } catch (err) {
+            setSlipNotesStatus(err.message || "Save failed", "err");
+        }
+    }
+
+    function setupSlipNotesEditing() {
+        const el = document.getElementById("slipNotesContent");
+        if (!el) return;
+        if (!state.isAdmin) {
+            el.removeAttribute("contenteditable");
+            el.title = "";
+            return;
+        }
+        el.setAttribute("contenteditable", "true");
+        el.title = "Click to edit — one note per line; saves when you click away. Clear it to go back to Remarks.";
+        if (el.dataset.bound) return;
+        el.dataset.bound = "true";
+
+        el.addEventListener("focus", () => {
+            if (!el.dataset.saved) el.textContent = "";
+        });
+        // The Deduction row and Amount Payable follow the notes as you type.
+        el.addEventListener("input", () => applySlipDeduction(slipNotesLines(el.innerText)));
+        el.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") { renderSlipNotes(slipNotesLines(el.dataset.saved)); el.blur(); }
+        });
+        el.addEventListener("blur", () => {
+            const lines = slipNotesLines(el.innerText);
+            if (lines.join("\n") === (el.dataset.saved || "")) {
+                renderSlipNotes(lines);
+                return;
+            }
+            saveSlipNotes(lines);
+        });
+    }
+
+    // The amount a slip note deducts: 0 unless the remark mentions a
+    // deduction. Prefers the figures written with "RM"; without one, takes
+    // the last number in the remark. Always counted as a positive deduction.
+    function slipDeductionAmount(note) {
+        const remark = String(note || "").replace(/^Item No\. \d+ - /, "");
+        if (!/deduct/i.test(remark)) return 0;
+        const toNum = (s) => Math.abs(parseFloat(String(s).replace(/[^0-9.]/g, "")) || 0);
+        const rm = remark.match(/RM\s*-?\s*[\d,]+(?:\.\d+)?/gi);
+        if (rm) return rm.reduce((sum, s) => sum + toNum(s), 0);
+        const nums = remark.match(/\d[\d,]*(?:\.\d+)?/g);
+        return nums ? toNum(nums[nums.length - 1]) : 0;
     }
 
     const closeSlipModalBtn = document.getElementById("closeSlipModalBtn");

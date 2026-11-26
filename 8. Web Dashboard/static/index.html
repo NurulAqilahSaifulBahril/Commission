@@ -582,13 +582,17 @@
 
                 <div class="slip-summary-footer">
                     <div class="slip-notes-box">
-                        <div class="slip-notes-title">Notes:</div>
-                        <div id="slipNotesContent" style="color: #334155; line-height: 1.4;">Item No. 1 - FB lead</div>
+                        <div class="slip-notes-title">Notes:<span id="slipNotesStatus" class="slip-ic-status"></span></div>
+                        <div id="slipNotesContent" class="slip-notes-editable" style="color: #334155; line-height: 1.4;">Item No. 1 - FB lead</div>
                     </div>
                     <table class="slip-totals-table">
                         <tr>
                             <td class="label-cell">Total Commission Amount (RM)</td>
                             <td class="value-cell" id="slipTotalComm">RM 0.00</td>
+                        </tr>
+                        <tr id="slipDeductionRow" style="display:none;">
+                            <td class="label-cell">Deduction (RM)</td>
+                            <td class="value-cell" id="slipDeduction" style="color: #dc2626;">RM 0.00</td>
                         </tr>
                         <tr>
                             <td class="label-cell" style="background-color: #0f172a; color: #ffffff; font-size: 13px; font-weight: 700;">Amount Payable (RM)</td>

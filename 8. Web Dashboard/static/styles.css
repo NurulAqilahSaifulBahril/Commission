@@ -2197,6 +2197,20 @@ body {
 .slip-ic-status.ok { color: #16a34a; }
 .slip-ic-status.err { color: #dc2626; }
 
+/* Editable slip notes (admins): a dashed box on screen, plain when printed. */
+.slip-notes-editable[contenteditable="true"] {
+    border: 1px dashed #94a3b8;
+    border-radius: 4px;
+    padding: 4px 6px;
+    min-height: 2.8em;
+    cursor: text;
+}
+.slip-notes-editable[contenteditable="true"]:focus {
+    outline: none;
+    border-color: var(--accent-blue, #2563eb);
+    background: #eff6ff;
+}
+
 @media print {
     @page {
         size: A4;
@@ -2212,6 +2226,12 @@ body {
     }
     .slip-ic-status {
         display: none !important;
+    }
+    .slip-notes-editable {
+        border: none !important;
+        background: none !important;
+        padding: 0 !important;
+        min-height: 0 !important;
     }
 
     html, body {
